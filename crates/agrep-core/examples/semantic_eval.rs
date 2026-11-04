@@ -192,10 +192,19 @@ fn main() -> Result<()> {
             reference_recall += 1;
         }
     }
-    println!(
-        "{}",
-        json!({"load_s":load_s,"total_s":started.elapsed().as_secs_f64(),"minimum_cosine":minimum,"recall_at_5":recall as f64/10.,"top5_agreement":agree,"ids_equal":window==1024,"window":window,"reference_recall_at_1":reference_recall as f64/tasks.len() as f64,"long_tail_recall_at_1":long_recall as f64/10.})
-    );
+    let mut report = json!({"load_s":load_s,"total_s":started.elapsed().as_secs_f64(),"minimum_cosine":minimum,"recall_at_5":recall as f64/10.,"top5_agreement":agree,"ids_equal":window==1024,"window":window,"reference_recall_at_1":reference_recall as f64/tasks.len() as f64,"long_tail_recall_at_1":long_recall as f64/10.});
+    let query_passed = if args.get(2).is_none_or(|s| s == "cpu") && window == 1024 {
+        let (metrics, passed) = query_gate(Path::new(path), &model, &texts, &expected, &ids)?;
+        if let (Some(report), serde_json::Value::Object(metrics)) =
+            (report.as_object_mut(), metrics)
+        {
+            report.extend(metrics);
+        }
+        passed
+    } else {
+        true
+    };
+    println!("{report}");
     if args.get(2).is_none_or(|s| s == "cpu") && window == 1024 && minimum < 0.99999999999 {
         bail!("F32 model parity failed: cosine {minimum}");
     }
@@ -207,8 +216,8 @@ fn main() -> Result<()> {
     {
         bail!("semantic recall/neighbor gate failed");
     }
-    if args.get(2).is_none_or(|s| s == "cpu") && window == 1024 {
-        query_gate(Path::new(path), &model, &texts, &expected, &ids)?;
+    if !query_passed {
+        bail!("query path gate failed");
     }
     Ok(())
 }
@@ -222,7 +231,7 @@ fn query_gate(
     texts: &[String],
     expected: &[Vec<f32>],
     ids: &[Vec<u32>],
-) -> Result<()> {
+) -> Result<(serde_json::Value, bool)> {
     let mut parity = true;
     for name in ["tokenizer.json", "tokenizer-compact.json"] {
         if path.join(name).exists() {
@@ -230,12 +239,11 @@ fn query_gate(
         }
     }
     let query = Embedder::load_query(path)?;
+    let mut ids_equal = true;
     let mut identical = 0;
     let mut minimum = 1f64;
     for (i, text) in texts.iter().enumerate() {
-        if query.token_ids(text)? != ids[i] {
-            bail!("query token ids differ at {i}");
-        }
+        ids_equal &= query.token_ids(text)? == ids[i];
         let alone = std::slice::from_ref(text);
         let (fast, single) = (query.embed(alone)?.remove(0), bulk.embed(alone)?.remove(0));
         identical += usize::from(
@@ -251,12 +259,13 @@ fn query_gate(
         let norm = |x: &[f32]| x.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
         minimum = minimum.min(dot / (norm(&fast) * norm(&expected[i])));
     }
-    println!(
-        "{}",
-        json!({"query_mapped":query.mapped(),"query_tokenizer_parity":parity,"query_identical":identical,"query_texts":texts.len(),"query_minimum_cosine":minimum})
-    );
-    if !query.mapped() || !parity || identical != texts.len() || minimum < 0.99999999999 {
-        bail!("query path gate failed");
-    }
-    Ok(())
+    let passed = query.mapped()
+        && parity
+        && ids_equal
+        && identical == texts.len()
+        && minimum >= 0.99999999999;
+    Ok((
+        json!({"query_mapped":query.mapped(),"query_tokenizer_parity":parity,"query_ids_equal":ids_equal,"query_identical":identical,"query_texts":texts.len(),"query_minimum_cosine":minimum}),
+        passed,
+    ))
 }

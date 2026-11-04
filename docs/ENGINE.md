@@ -1,5 +1,56 @@
 # 0.5.0 keyword engine
 
+## Caller exclusion: indexed probes and a seeking session walk
+
+A measured checkpoint, **not SPEC §9 acceptance**. Inside an agent shell every search resolves the caller and counts the rows it withholds. Three costs dominated, measured in-process on the owner's history:
+
+- **Live side chats** were collected with a recursive walk that, at each step, scanned all of the agent's sessions: 72–146 ms per command for pi callers with large families. Each step now seeks the children of one session through `sessions_parent`: 1.5–3 ms, same members.
+- **Window probes** counted the caller's window as a `--chat <session>` scope from the window's oldest timestamp, then subtracted earlier turns of that range. Without table statistics the planner read such a scope through the agent/time index, every pi row since the window opened. `query::Filters` now has `session_rows` (an exact session and a first position), read through `prose_session` and `event_position`, so the window is counted directly.
+- **The "matched earlier" probe** keeps 0.4.9's `--chat` prefix scope. Any session scope (`--chat` or `session_rows`) now keeps agent, time and project predicates off the access path with a unary plus, so it is read through the session indexes (131–148 ms → 4–17 ms for that probe; `--chat` user queries with `--agent`/`--since` benefit the same way). The probes of one count share one plan cache (word expansions, postings, term weights), since they search one pattern over different scopes.
+
+Probe counts follow 0.4.9's definition (each probe a `--chat <session>` query, then the session's withheld rows): an integration test compares every count against exactly that, over a window whose earlier turns are newer than its first ones, tool rows, side chats, `--no-self`, `--no-meta` and related-term fallback; another fails if probe work grows with other sessions' rows. One corner changed: for a caller with no recap whose session id another id extends, a related-term count stood in when the extending session held the exact phrase only in rows older than the caller's first row; it is now 0, as in 0.4.9 (the test covers it). With one interposed wall-clock instant, stdout, stderr and exit codes of the previous head (0415e32d) and this binary match on **400 of 400** caller cases ([report](measurements/caller-exclusion-eng2.json)), 172 with a nonzero withheld count.
+
+Eight ABBA pairs per case, normal census and detached refresh, run as a caller (`AGREP_PI_SESSION_ID` / `CODEX_THREAD_ID`). The owner's stores had changed for an hour, so every command also paid a full census and refresh spawn (the unchanged `error` control is 145 ms here, against 41 ms on a quiet index); both binaries saw the same.
+
+| Case | Previous head p50 / p95 ms | This change p50 / p95 ms | Head ÷ new | Load 1 / 5 / 15 |
+|---|---:|---:|---:|---|
+| pi caller (window, 4 sessions): `error` | 125.4 / 131.0 | 48.9 / 67.4 | 2.56× | 4 / 7 / 9 |
+| pi caller: `release workflow --json` | 162.4 / 165.0 | 85.0 / 87.1 | 1.91× | 4 / 7 / 9 |
+| pi caller, compact: natural question | 352.0 / 363.4 | 123.8 / 127.8 | 2.84× | 4 / 7 / 9 |
+| pi caller, compact: `flaky windows cache` | 284.3 / 396.7 | 57.0 / 163.1 | 4.99× | 4 / 7 / 9 |
+| pi caller: `error --who tool --json` | 287.6 / 320.7 | 212.9 / 231.5 | 1.35× | 4 / 7 / 9 |
+| pi caller: `error -c` | 385.3 / 404.0 | 303.5 / 324.3 | 1.27× | 4 / 7 / 9 |
+| codex caller: `error` | 161.1 / 176.8 | 154.4 / 178.9 | 1.04× | 4 / 7 / 9 |
+| codex caller: `release workflow --json` | 181.8 / 202.4 | 186.3 / 203.0 | 0.98× | 4 / 7 / 9 |
+| codex caller, compact: natural question | 183.9 / 189.3 | 184.2 / 196.5 | 1.00× | 4 / 7 / 9 |
+| codex caller, compact: `flaky windows cache` | 159.7 / 171.8 | 153.0 / 172.7 | 1.04× | 4 / 7 / 9 |
+| codex caller: `error --who tool --json` | 225.7 / 246.3 | 220.8 / 240.7 | 1.02× | 4 / 7 / 9 |
+| largest pi session as caller: `error` | 286.5 / 319.5 | 151.0 / 167.9 | 1.90× | 4 / 7 / 9 |
+| largest pi session, compact: natural question | 321.3 / 341.1 | 176.6 / 197.6 | 1.82× | 4 / 7 / 9 |
+| `error`, no caller (unchanged code) | 145.9 / 171.9 | 144.6 / 164.6 | 1.01× | 4 / 7 / 9 |
+
+The Codex caller's probe was already 8–15 ms (its window is one small session); the largest pi session has more than eight live side chats, so it gains only the resolution. Remaining: a caller-filtered `-c` joins every corpus-wide match to the row table (about 150 ms over the unfiltered count); the probes could reuse the main search's plans.
+
+## `--chat` scopes read their sessions through the session indexes
+
+A measured checkpoint, **not SPEC §9 acceptance**. `--chat` filtered rows with `session LIKE 'prefix%'`. A case-insensitive LIKE cannot use the session indexes, so the bundled SQLite (3.46.0) answered the scope probe by walking the tool lane's stored-text index, every active event row, and by scanning the whole prose table: 361 ms and 43 ms for the largest session's scope on the owner's history, repeated by every pass. The prefix is now matched once, with the same LIKE, on the 8,640-row `sessions` table, and rows are filtered with `session IN (SELECT value FROM json_each(?))`, which the planner reads through `prose_session` and `event_sessions_session` → `event_position` (6.6 ms and 1.0 ms). The store writes a `sessions` row for every row's session and deletes it only when no row remains, so the same rows match. A plan test fails on the LIKE path; an integration test compares prefix scopes (ids that extend each other, differ in case or hold LIKE wildcards) with the unscoped rows in both lanes, as pages and counts.
+
+With one interposed wall-clock instant, stdout, stderr and exit codes of the previous head (5fdd762a) and this binary match on **425 of 432** real-history cases (18 queries over the newest Codex session, the largest session and its tool lane; text, JSON, `-l`, `-c`, `-n 0`, `--sort time`, `-n 5`, compact). The other 7 differ only in the floor count of that tool lane (`N+ matches (floor)`, JSON `completeness.total` with basis `floor`): the old plan read the lane's rows in stored-text order and stopped counting earlier, the new one reads them in id order, and each new floor equals the exact `-c` count. Rows, order, scores, snippets, handles and exit codes are identical.
+
+Ten ABBA-interleaved fresh-process pairs per case on one isolated index of the owner's history, normal census and detached refresh; every sample and load is in the [report](measurements/chat-scope-eng2.json).
+
+| Case | Previous head p50 / p95 ms | This change p50 / p95 ms | Head ÷ new | Load 1 / 5 / 15 |
+|---|---:|---:|---:|---|
+| `error --chat <largest> --who tool --json` | 818.9 / 1013.1 | 120.6 / 153.5 | 6.79× | 9 / 9 / 9 |
+| `error --chat <largest>` | 814.8 / 1460.0 | 90.5 / 106.7 | 9.00× | 10 / 9 / 9 |
+| `release workflow --chat <largest>` | 1141.1 / 1219.3 | 82.7 / 93.5 | 13.80× | 10 / 9 / 9 |
+| `error --chat <largest> -c` | 337.8 / 361.8 | 222.0 / 231.9 | 1.52× | 9 / 9 / 9 |
+| `error --chat <newest codex>` | 759.0 / 812.8 | 72.0 / 126.0 | 10.55× | 9 / 9 / 9 |
+| `release workflow --chat <newest codex> --who tool` | 692.9 / 724.5 | 42.6 / 65.9 | 16.27× | 9 / 9 / 9 |
+| `error` (no `--chat`, unchanged code) | 40.7 / 49.2 | 41.8 / 96.4 | 0.97× | 9 / 9 / 9 |
+
+The `-c` case still counts through the prose index's corpus-wide match stream, joined to the scope; the unscoped control runs identical code and its p95 is one slow sample.
+
 ## Windowed ranking at the previous head's speed
 
 A measured checkpoint, **not SPEC §9 acceptance**. Scoring keyword hits inside 0.4.9's snippet window (b23d2727) lowered page scores, so more blocks cleared their ceilings and more tool lanes ran; against the previous head (084e77af) it was 0.43–0.88× on release, regex, json, natural, compact_release, tool_error and recall ([before and after](measurements/window-speed-eng.json)). Profiles: `tool_error` decoded 42,012 tool rows to find 3,847 holding the term (57% of samples in decompression); release spent 62% of its samples in per-block FTS queries, each seeking every word in each of the 13 tool segments; regex read 200 prose and 95 tool blocks. Windowed gram counts would not help: replayed on the owner's newest tool blocks, they would drop 4 of 104 blocks for `error` and 1 of 177 for `release workflow`.

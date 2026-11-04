@@ -1346,6 +1346,244 @@ fn caller_predicates_filter_the_window_and_mark_older_rows() {
     o.filters.caller.as_mut().unwrap().exclude_family = true;
     assert_eq!(agrep_core::query::search(&c, &o).unwrap().total, 0);
 }
+/// One pi transcript at `path`: user turns, `recap:` compactions and `tool:` results,
+/// each at the given second.
+fn pi_turns(path: &Path, id: &str, turns: &[(&str, i64)]) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let at = |s: i64| {
+        chrono::DateTime::from_timestamp(1_793_000_000 + s, 0)
+            .unwrap()
+            .to_rfc3339()
+    };
+    let mut lines = vec![serde_json::json!({"type":"session","id":id,"version":3,"cwd":"/work/project","timestamp":at(0)}).to_string()];
+    let mut parent = Value::Null;
+    for (n, (text, s)) in turns.iter().enumerate() {
+        let entry = format!("e{n}");
+        if let Some(summary) = text.strip_prefix("recap:") {
+            lines.push(serde_json::json!({"type":"compaction","id":entry,"parentId":parent,"timestamp":at(*s),"summary":summary,"tokensBefore":1000,"firstKeptEntryId":"e0"}).to_string());
+        } else if let Some(output) = text.strip_prefix("tool:") {
+            let call = format!("c{n}");
+            lines.push(serde_json::json!({"type":"message","id":call,"parentId":parent,"timestamp":at(*s),"message":{"role":"assistant","content":[{"type":"toolCall","id":entry,"name":"bash","arguments":{"command":"run"}}]}}).to_string());
+            lines.push(serde_json::json!({"type":"message","id":entry,"parentId":call,"timestamp":at(*s),"message":{"role":"toolResult","toolCallId":entry,"toolName":"bash","content":[{"type":"text","text":output}]}}).to_string());
+        } else {
+            lines.push(serde_json::json!({"type":"message","id":entry,"parentId":parent,"timestamp":at(*s),"message":{"role":"user","content":text}}).to_string());
+        }
+        parent = Value::String(entry);
+    }
+    fs::write(path, lines.join("\n") + "\n").unwrap();
+}
+fn resolved(c: &Connection, session: &str) -> agrep_core::caller::Caller {
+    let caller = agrep_core::caller::Caller::resolve(
+        c,
+        agrep_core::caller::Identity {
+            session: Some(session.into()),
+            reason: "pi".into(),
+            agent_context: true,
+            published_sessions: vec![],
+        },
+    )
+    .unwrap();
+    assert!(caller.resolved);
+    caller
+}
+/// The rows 0.4.9 counted as withheld: each probed session's `--chat <session>` query,
+/// then that session's rows the policy withholds, without tooling roles under --no-meta.
+fn chat_probe_counts(
+    c: &Connection,
+    o: &agrep_core::query::Options,
+    caller: &agrep_core::caller::Caller,
+    no_self: bool,
+) -> agrep_core::caller::Withheld {
+    let window = (!no_self).then(|| caller.boundary.unwrap_or(0));
+    let members = if no_self {
+        &caller.members
+    } else {
+        &caller.live_members
+    };
+    let mut sessions: std::collections::BTreeSet<_> = members.iter().cloned().collect();
+    sessions.insert(caller.session.clone());
+    let mut counted = agrep_core::caller::Withheld::default();
+    for probed in sessions {
+        let from = window.filter(|_| probed == caller.session);
+        let mut q = o.clone();
+        (q.limit, q.exact, q.chats, q.sort) = (0, true, false, "time".into());
+        q.filters.caller = None;
+        q.filters.no_meta = false;
+        q.filters.chat = Some(probed.clone());
+        q.filters.agent = Some(caller.agent.clone());
+        for hit in agrep_core::query::search(c, &q).unwrap().hits {
+            let tooling = matches!(hit.who.as_str(), "harness" | "synthetic")
+                || (hit.who == "subagent" && hit.turn == 0);
+            if hit.session != probed
+                || from.is_some_and(|from| hit.turn < from)
+                || (o.filters.no_meta && tooling)
+            {
+                continue;
+            }
+            if hit.who == "tool" {
+                counted.tools += 1;
+            } else {
+                counted.prose += 1;
+            }
+        }
+    }
+    counted
+}
+// 0.4.9 ran each probe as a `--chat <session>` query and kept the session's rows the
+// policy withholds.
+#[test]
+fn self_exclusion_counts_match_0_4_9_chat_probes() {
+    use agrep_core::caller::Request;
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let d = t.path().join("d");
+    let work = h.join(".pi/agent/sessions/work");
+    // Turns before the recap are newer than the window's first turns, and a tool
+    // result before it matches too.
+    pi_turns(
+        &work.join("2026-01-01T00-00-00-000Z_caller-one.jsonl"),
+        "caller-one",
+        &[
+            ("flaky windows cache first", 100),
+            ("tool:windows cache tool output before", 400),
+            ("drafting notes before", 150),
+            ("recap:summary of earlier work", 200),
+            ("flaky windows cache in window", 210),
+            ("tool:backoff windows cache window tool", 220),
+            ("drafting continued in the window", 230),
+            ("cache now in the window", 240),
+        ],
+    );
+    pi_turns(
+        &work.join("2026-01-01T00-00-00-000Z_caller-one/side.jsonl"),
+        "caller-one-side",
+        &[("flaky windows cache side", 300), ("drafting side", 310)],
+    );
+    // An id that another one extends, whose extension alone holds the exact phrase.
+    pi_turns(
+        &work.join("2026-01-02T00-00-00-000Z_plain.jsonl"),
+        "plain",
+        &[("drafting plain row", 500), ("windows cache plain", 510)],
+    );
+    pi_turns(
+        &work.join("2026-01-03T00-00-00-000Z_plain-ext.jsonl"),
+        "plain-ext",
+        &[("how did the drafting runs", 50)],
+    );
+    pi_turns(
+        &work.join("2026-01-04T00-00-00-000Z_other.jsonl"),
+        "other",
+        &[("flaky windows cache other", 250), ("drafting other", 260)],
+    );
+    ok(cli(&h, &d, &["index"]));
+    let root = DataRoot::open(&d, false).unwrap();
+    let c = store::reader(&root).unwrap();
+    let mut checked = 0;
+    for session in ["caller-one", "plain"] {
+        let caller = resolved(&c, session);
+        for no_self in [false, true] {
+            let request = Request {
+                no_self,
+                ..Request::default()
+            };
+            let policy = caller.policy(request).unwrap();
+            for pattern in [
+                "windows cache",
+                "flaky windows cache",
+                "how did the drafting runs",
+                "backoff",
+            ] {
+                for (content, tools, no_meta) in [
+                    (false, false, false),
+                    (true, false, false),
+                    (true, true, false),
+                    (false, true, true),
+                    (true, true, true),
+                ] {
+                    let mut o = retrieval_options(pattern);
+                    (o.content, o.tools) = (content, tools);
+                    o.filters.no_meta = no_meta;
+                    let o = agrep_core::caller::options(&o, &caller, false, no_self);
+                    let want = chat_probe_counts(&c, &o, &caller, no_self);
+                    assert_eq!(
+                        policy.withheld(&c, &o, None).unwrap(),
+                        Some(want),
+                        "{session} no_self={no_self} {pattern} {content} {tools} {no_meta}"
+                    );
+                    checked += usize::from(want.total() > 0);
+                }
+            }
+        }
+    }
+    assert!(checked >= 20, "{checked}");
+}
+// Each probe reads the withheld session's rows through its index, not every row of the
+// caller's agent newer than the window.
+#[test]
+fn self_exclusion_probes_do_not_read_other_sessions() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let mut work = Vec::new();
+    for n in [1024, 4096] {
+        let t = TempDir::new().unwrap();
+        let h = t.path().join("h");
+        let d = t.path().join("d");
+        let sessions = h.join(".pi/agent/sessions/work");
+        pi_turns(
+            &sessions.join("2026-01-01T00-00-00-000Z_caller-one.jsonl"),
+            "caller-one",
+            &[
+                ("needle before", 100),
+                ("recap:summary", 200),
+                ("needle in window", 210),
+                ("tool:needle tool in window", 220),
+            ],
+        );
+        let others: Vec<(String, i64)> = (0..n)
+            .map(|i| (format!("needle other {i}"), 300 + i as i64))
+            .collect();
+        let others: Vec<(&str, i64)> = others.iter().map(|(t, s)| (t.as_str(), *s)).collect();
+        pi_turns(
+            &sessions.join("2026-01-02T00-00-00-000Z_other.jsonl"),
+            "other",
+            &others,
+        );
+        ok(cli(&h, &d, &["index"]));
+        let c = store::reader(&DataRoot::open(&d, false).unwrap()).unwrap();
+        let caller = resolved(&c, "caller-one");
+        let policy = caller
+            .policy(agrep_core::caller::Request::default())
+            .unwrap();
+        let mut o = retrieval_options("needle");
+        o.tools = true;
+        let probes: Vec<_> = [false, true]
+            .into_iter()
+            .map(|content| {
+                o.content = content;
+                let options = agrep_core::caller::options(&o, &caller, false, false);
+                let want = chat_probe_counts(&c, &options, &caller, false);
+                assert!(want.prose > 0 && want.tools > 0, "{want:?}");
+                (options, want)
+            })
+            .collect();
+        let steps = Arc::new(AtomicUsize::new(0));
+        let capture = steps.clone();
+        c.progress_handler(
+            100,
+            Some(move || {
+                capture.fetch_add(100, Ordering::Relaxed);
+                false
+            }),
+        );
+        for (options, want) in probes {
+            assert_eq!(policy.withheld(&c, &options, None).unwrap(), Some(want));
+        }
+        work.push(steps.load(Ordering::Relaxed));
+    }
+    assert!(work[1] < work[0] * 2, "{work:?}");
+}
 #[test]
 fn coverage_weights_rare_terms_and_stops_on_block_bounds() {
     let t = TempDir::new().unwrap();
@@ -1826,6 +2064,75 @@ fn word_edges_and_metadata_filters_preserve_literal_semantics() {
     assert_eq!(agrep_core::query::search(&c, &o).unwrap().total, 0);
     o.filters.chat = Some("TEST-".into());
     assert_eq!(agrep_core::query::search(&c, &o).unwrap().hits.len(), 3);
+}
+
+#[test]
+fn chat_prefixes_match_every_row_of_their_sessions_in_both_lanes() {
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let d = t.path().join("d");
+    // Ids that extend each other, differ in case and hold LIKE wildcards.
+    let ids = [
+        "alpha-one",
+        "alpha-one-extended",
+        "ALPHA-two",
+        "al_pha%x",
+        "beta",
+    ];
+    for (i, id) in ids.iter().enumerate() {
+        let path = h.join(format!(".pi/agent/sessions/project/chat-{i}.jsonl"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut lines = vec![serde_json::json!({"type":"session","id":id,"version":3,"cwd":"/work/project","timestamp":"2026-10-29T12:00:00Z"}).to_string()];
+        for n in 0..3 {
+            lines.push(serde_json::json!({"type":"message","id":format!("m{n}"),"parentId":if n==0{Value::Null}else{Value::String(format!("m{}",n-1))},"timestamp":"2026-10-29T12:00:01Z","message":{"role":"user","content":format!("needle shared {id} {n}")}}).to_string());
+        }
+        fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let texts: Vec<String> = (0..4).map(|n| format!("needle tool {id} {n}")).collect();
+        append_tool_results(&path, "m2", 0, &texts);
+    }
+    ok(cli(&h, &d, &["index"]));
+    let root = DataRoot::open(&d, false).unwrap();
+    let c = store::reader(&root).unwrap();
+    let key = |hit: &agrep_core::query::Hit| (hit.session.clone(), hit.turn, hit.who.clone());
+    for who in [None, Some("tool")] {
+        let mut o = retrieval_options("needle");
+        (o.limit, o.exact, o.tools, o.sort) = (0, true, true, "time".into());
+        o.filters.who = who.map(Into::into);
+        let every = agrep_core::query::search(&c, &o).unwrap().hits;
+        assert_eq!(every.len(), if who.is_some() { 20 } else { 35 });
+        for prefix in [
+            "alpha-one",
+            "ALPHA",
+            "alpha-one-",
+            "al_",
+            "al_pha%",
+            "a",
+            "BETA",
+            "beta-",
+            "%",
+        ] {
+            o.filters.chat = Some(prefix.into());
+            let found = agrep_core::query::search(&c, &o).unwrap();
+            let want: Vec<_> = every
+                .iter()
+                .filter(|hit| {
+                    hit.session
+                        .to_ascii_lowercase()
+                        .starts_with(&prefix.to_ascii_lowercase())
+                })
+                .map(key)
+                .collect();
+            assert_eq!(
+                found.hits.iter().map(key).collect::<Vec<_>>(),
+                want,
+                "{prefix} {who:?}"
+            );
+            assert_eq!(found.total, want.len(), "{prefix} {who:?}");
+            o.count_only = true;
+            assert_eq!(agrep_core::query::search(&c, &o).unwrap().total, want.len());
+            o.count_only = false;
+        }
+    }
 }
 
 #[test]

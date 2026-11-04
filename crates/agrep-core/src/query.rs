@@ -19,6 +19,12 @@ pub struct CallerFilter {
     #[serde(default)]
     pub excluded_sessions: Vec<String>,
 }
+/// Rows of exactly one session from one position on, read through the session indexes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionRows {
+    pub session: String,
+    pub from: Option<i64>,
+}
 #[derive(Default, Clone, Debug, Serialize, Deserialize)]
 pub struct Filters {
     pub agent: Option<String>,
@@ -35,6 +41,8 @@ pub struct Filters {
     pub no_side: bool,
     #[serde(default)]
     pub caller: Option<CallerFilter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_rows: Option<SessionRows>,
 }
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -1320,17 +1328,25 @@ fn id_list(ids: &[i64]) -> String {
 fn sql_filters(f: &Filters, alias: &str, c: &Connection) -> Result<(String, Vec<Value>)> {
     let mut clauses = vec![];
     let mut values = vec![];
+    // A session scope holds a few sessions' rows. Without table statistics the planner
+    // ranks the agent, time and project indexes above the session indexes and reads
+    // every row of the agent; a unary plus keeps those columns off the access path.
+    let off = if f.chat.is_some() || f.session_rows.is_some() {
+        "+"
+    } else {
+        ""
+    };
     if let Some(v) = &f.agent {
         let agents: Vec<_> = v.split(',').collect();
         clauses.push(format!(
-            "{alias}.agent IN ({})",
+            "{off}{alias}.agent IN ({})",
             vec!["?"; agents.len()].join(",")
         ));
         values.extend(agents.into_iter().map(|v| Value::Text(v.into())));
     }
     // add's borrow is not used after the separate agent clause.
     let mut add = |col: &str, op: &str, value: Value| {
-        clauses.push(format!("{alias}.{col} {op} ?"));
+        clauses.push(format!("{off}{alias}.{col} {op} ?"));
         values.push(value);
     };
     if let Some(v) = f.since {
@@ -1340,8 +1356,31 @@ fn sql_filters(f: &Filters, alias: &str, c: &Connection) -> Result<(String, Vec<
         add("ts", "<", v.into());
     }
     if let Some(v) = &f.chat {
-        clauses.push(format!("{alias}.session LIKE ? ESCAPE '\\'"));
-        values.push(Value::Text(format!("{}%", escape_like(v))));
+        // The prefix is matched on the small `sessions` table, which names every row's
+        // session, so the rows are then reached through the session indexes; a LIKE
+        // on the rows themselves cannot use them and scans the whole lane.
+        let mut ids: Vec<String> = c
+            .prepare_cached("SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\'")?
+            .query_map([format!("{}%", escape_like(v))], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            clauses.push("0".into());
+        } else {
+            clauses.push(format!(
+                "{alias}.session IN (SELECT value FROM json_each(?))"
+            ));
+            values.push(Value::Text(serde_json::to_string(&ids)?));
+        }
+    }
+    if let Some(rows) = &f.session_rows {
+        clauses.push(format!("{alias}.session=?"));
+        values.push(Value::Text(rows.session.clone()));
+        if let Some(from) = rows.from {
+            clauses.push(format!("{alias}.position>=?"));
+            values.push(Value::Integer(from));
+        }
     }
     if let Some(v) = &f.model {
         clauses.push(if f.model_soft {
@@ -1370,7 +1409,7 @@ fn sql_filters(f: &Filters, alias: &str, c: &Connection) -> Result<(String, Vec<
                 }
             } else {
                 clauses.push(format!(
-                    "{alias}.project {}IN ({})",
+                    "{off}{alias}.project {}IN ({})",
                     if exclude { "NOT " } else { "" },
                     vec!["?"; projects.len()].join(",")
                 ));
@@ -1693,11 +1732,19 @@ fn block_bounds(
     Ok(out)
 }
 pub fn search(c: &Connection, o: &Options) -> Result<Results> {
+    search_with(c, o, &mut Plans::default())
+}
+/// Word expansions, posting estimates and term weights of one pattern and lane set,
+/// kept across searches of that pattern over different scopes.
+#[derive(Default)]
+pub struct Plans(PlanCache);
+pub fn search_with(c: &Connection, o: &Options, plans: &mut Plans) -> Result<Results> {
     if o.filters.no_meta && (o.count_only || o.count_by_tier) {
         bail!("--no-meta cannot be combined with counts");
     }
     let started = Instant::now();
-    let result = search_unfiltered(c, o)?;
+    plans.0.scopes.clear();
+    let result = search_unfiltered(c, o, &mut plans.0)?;
     let mut result = finish_meta(c, result)?;
     result.timings.total_ms = started.elapsed().as_secs_f64() * 1000.;
     Ok(result)
@@ -1738,7 +1785,7 @@ fn finish_meta(c: &Connection, mut result: Results) -> Result<Results> {
     result.meta_fallback = None;
     Ok(result)
 }
-fn search_unfiltered(c: &Connection, o: &Options) -> Result<Results> {
+fn search_unfiltered(c: &Connection, o: &Options, cache: &mut PlanCache) -> Result<Results> {
     let started = Instant::now();
     if !o.regex && !o.word && boundary_rank::query_tokens(&o.pattern).len() > 1 {
         crate::fts_span::install(c)?;
@@ -1759,19 +1806,18 @@ fn search_unfiltered(c: &Connection, o: &Options) -> Result<Results> {
             .join(",");
     }
     let o = &normalized;
-    let mut cache = PlanCache::default();
     let optimized = !o.regex && !o.word && o.limit > 0 && !o.exact && o.sort == "score";
     let mut result = if optimized {
-        let mut phrase = search_pass(c, o, false, 1, None, &mut cache, 0)?;
+        let mut phrase = search_pass(c, o, false, 1, None, cache, 0)?;
         if !o.chats && phrase.hits.len() >= o.limit {
             // Lower tiers have not been counted, even if the phrase stream ended.
             phrase.total_basis = "floor".into();
             phrase
         } else {
-            search_pass(c, o, false, 2, Some(phrase), &mut cache, 0)?
+            search_pass(c, o, false, 2, Some(phrase), cache, 0)?
         }
     } else {
-        search_pass(c, o, false, 0, None, &mut cache, 0)?
+        search_pass(c, o, false, 0, None, cache, 0)?
     };
     if result.total == 0 && o.content && !o.regex && !o.word && automatic_content(&o.pattern) {
         let count = content_terms(&o.pattern).len();
@@ -1779,7 +1825,7 @@ fn search_unfiltered(c: &Connection, o: &Options) -> Result<Results> {
         // Disjoint MaxScore partitions: rare terms first, then rows lacking every
         // earlier term. The complement's IDF ceiling can rule out common terms.
         for stage in 0..count {
-            fallback = Some(search_pass(c, o, true, 0, fallback, &mut cache, stage)?);
+            fallback = Some(search_pass(c, o, true, 0, fallback, cache, stage)?);
         }
         let mut fallback = fallback.unwrap_or_default();
         fallback.timings.add(&result.timings);
@@ -2171,7 +2217,8 @@ fn search_pass(
                     && f.until.is_none()
                     && !f.no_side
                     && !f.no_meta
-                    && f.caller.is_none();
+                    && f.caller.is_none()
+                    && f.session_rows.is_none();
                 if table == "tools" {
                     result.timings.plan_ms += plan_started.elapsed().as_secs_f64() * 1000.;
                     let started = Instant::now();
@@ -2238,7 +2285,8 @@ fn search_pass(
             || o.filters.since.is_some()
             || o.filters.model.is_some()
             || o.filters.project.is_some()
-            || o.filters.until.is_some();
+            || o.filters.until.is_some()
+            || o.filters.session_rows.is_some();
         let scope_blocks = if let Some(blocks) = cache.scopes.get(table) {
             blocks.clone()
         } else if has_scope {
@@ -2964,5 +3012,82 @@ mod regex_bound_tests {
         let re = fancy_regex::Regex::new("(?i:release.*workflow)").unwrap();
         let snippet = "release a workflow … release b workflow release c";
         assert_eq!(re.find_iter(snippet).count(), 1);
+    }
+}
+#[cfg(test)]
+mod chat_scope_tests {
+    use super::*;
+    fn plan(c: &Connection, table: &str, filters: &Filters) -> Vec<String> {
+        let (scope, values) = sql_filters(filters, "p", c).unwrap();
+        c.prepare(&format!(
+            "EXPLAIN QUERY PLAN SELECT p.id FROM {table} p WHERE 1{scope}"
+        ))
+        .unwrap()
+        .query_map(params_from_iter(values), |r| r.get(3))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+    // The selective-scope probe, which a LIKE on the rows turned into a full scan, and
+    // which an agent or time index outranks without statistics.
+    #[test]
+    fn session_scopes_read_rows_through_the_session_indexes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::data::DataRoot::open(temp.path().join("data"), true).unwrap();
+        let c = store::writer(&root).unwrap();
+        c.execute_batch(
+            "INSERT INTO sessions VALUES('pi','chat-one','p','','','chat-one',0,'',0,0);
+             INSERT INTO sessions VALUES('codex','chat-two','p','','','chat-two',0,'',0,0);",
+        )
+        .unwrap();
+        let chat = Filters {
+            chat: Some("CHAT-O".into()),
+            ..Filters::default()
+        };
+        assert_eq!(
+            sql_filters(&chat, "p", &c).unwrap().1,
+            [Value::Text(r#"["chat-one"]"#.into())]
+        );
+        let narrowed = Filters {
+            agent: Some("pi".into()),
+            project: Some("p".into()),
+            since: Some(1),
+            until: Some(2),
+            ..chat.clone()
+        };
+        let rows = Filters {
+            chat: None,
+            session_rows: Some(SessionRows {
+                session: "chat-one".into(),
+                from: Some(3),
+            }),
+            ..narrowed.clone()
+        };
+        for (filters, tool_rows) in [
+            (&chat, "(session_key=?)"),
+            (&narrowed, "(session_key=?)"),
+            (&rows, "(session_key=? AND position>?)"),
+        ] {
+            let prose = plan(&c, "prose", filters);
+            assert!(
+                prose
+                    .iter()
+                    .any(|step| step.contains("INDEX prose_session (session=?)")),
+                "{prose:?}"
+            );
+            assert!(!prose.iter().any(|step| step.starts_with("SCAN p")));
+            let tools = plan(&c, "tools", filters);
+            for step in [
+                "INDEX event_sessions_session (session=?)".to_owned(),
+                format!("INDEX event_position {tool_rows}"),
+            ] {
+                assert!(tools.iter().any(|s| s.contains(&step)), "{tools:?}");
+            }
+        }
+        let none = Filters {
+            chat: Some("chat-one%".into()),
+            ..Filters::default()
+        };
+        assert_eq!(sql_filters(&none, "p", &c).unwrap().0, " AND 0");
     }
 }

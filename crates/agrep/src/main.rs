@@ -450,6 +450,7 @@ impl Scope {
             until: self.until.as_deref().map(date).transpose()?,
             no_side: self.no_side,
             caller: None,
+            session_rows: None,
         })
     }
 }

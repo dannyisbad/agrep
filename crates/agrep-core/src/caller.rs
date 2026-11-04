@@ -129,6 +129,7 @@ impl Caller {
         Ok(self.sessions.get_or_init(|| index))
     }
     pub fn resolve(c: &Connection, identity: Identity) -> Result<Self> {
+        let _span = crate::semantic_profile::span("caller_resolve");
         let mut out = Self {
             identity,
             ..Self::default()
@@ -182,9 +183,11 @@ impl Caller {
             rusqlite::params![out.session, out.boundary.unwrap_or(0)],
             |r| r.get(0),
         )?;
+        // Each step seeks the children of one session, rather than walking all of the
+        // agent's sessions for every descendant.
         out.live_members = c
             .prepare(
-                "WITH RECURSIVE descendants(id) AS (SELECT ?1 UNION SELECT s.id FROM sessions s JOIN descendants d ON s.parent=d.id WHERE s.agent=?2) SELECT id FROM sessions WHERE agent=?2 AND family=?3 AND side=1 AND first_ts>=?4 AND id IN descendants",
+                "WITH RECURSIVE descendants(id) AS (SELECT ?1 UNION SELECT s.id FROM descendants d CROSS JOIN sessions s ON s.agent=?2 AND s.parent=d.id) SELECT id FROM sessions WHERE agent=?2 AND family=?3 AND side=1 AND first_ts>=?4 AND id IN descendants",
             )?
             .query_map(
                 rusqlite::params![out.session, out.agent, out.root, ts.unwrap_or(0)],
@@ -319,6 +322,7 @@ impl Policy<'_> {
         o: &Options,
         chat: Option<&str>,
     ) -> Result<Option<Withheld>> {
+        let _span = crate::semantic_profile::span("self_exclusion_count");
         let caller = self.caller;
         let mut sessions = vec![self.session().to_owned()];
         let members = if self.window.is_some() {
@@ -340,14 +344,14 @@ impl Policy<'_> {
         if sessions.len() > 8 {
             return Ok(None);
         }
-        // `chat` holds an exact session id here, and its LIKE reaches the session
-        // indexes only when case-sensitive; that is what keeps these probes cheap.
-        let indexed = !o.filters.model_soft;
-        if indexed {
+        // `chat` holds an exact session id here, whose prefix these probes match
+        // case-sensitively; a soft model filter keeps LIKE's default instead.
+        let sensitive = !o.filters.model_soft;
+        if sensitive {
             c.execute_batch("PRAGMA case_sensitive_like=ON")?;
         }
         let counted = self.count(c, o, &sessions);
-        if indexed {
+        if sensitive {
             c.execute_batch("PRAGMA case_sensitive_like=OFF")?;
         }
         counted.map(Some)
@@ -355,6 +359,8 @@ impl Policy<'_> {
     fn count(&self, c: &Connection, o: &Options, sessions: &[String]) -> Result<Withheld> {
         let caller = self.caller;
         let mut withheld = Withheld::default();
+        // Every probe searches the same pattern over another scope.
+        let mut plans = query::Plans::default();
         for session in sessions {
             let from = self.window.filter(|_| session == &caller.session);
             let mut scoped = o.clone();
@@ -365,7 +371,6 @@ impl Policy<'_> {
             scoped.filters.caller = None;
             scoped.filters.no_side = false;
             scoped.filters.no_meta = false;
-            scoped.filters.chat = Some(session.clone());
             if caller.resolved
                 && o.filters.agent.as_deref().is_none_or(|agents| {
                     agents
@@ -375,104 +380,69 @@ impl Policy<'_> {
             {
                 scoped.filters.agent = Some(caller.agent.clone());
             }
-            // Whether rows before the window share its time range and must be subtracted.
-            let mut overlap = false;
-            if let Some(from) = from {
-                // Every row of the window is at least as new as its oldest row, so this
-                // keeps the probe on the window instead of the whole transcript.
-                let (start, last_before) = c.query_row(
-                    "SELECT (SELECT min(ts) FROM (SELECT min(ts) AS ts FROM prose WHERE visible=1 AND session=?1 AND position>=?2 UNION ALL SELECT min(ts) FROM tools WHERE visible=1 AND session=?1 AND position>=?2)), (SELECT max(ts) FROM (SELECT max(ts) AS ts FROM prose WHERE visible=1 AND session=?1 AND position<?2 UNION ALL SELECT max(ts) FROM tools WHERE visible=1 AND session=?1 AND position<?2))",
-                    rusqlite::params![session, from],
-                    |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)),
-                )?;
-                let Some(start) = start else {
-                    continue;
-                };
-                overlap = last_before.is_some_and(|ts| ts >= start);
-                scoped.filters.since = Some(scoped.filters.since.map_or(start, |s| s.max(start)));
-            }
-            let before = from
-                .filter(|&from| from > 0)
-                .map(|from| query::CallerFilter {
-                    agent: caller.agent.clone(),
-                    session: session.clone(),
-                    family: caller.root.clone(),
-                    exclude_from_turn: Some(from),
-                    exclude_family: false,
-                    excluded_sessions: vec![],
-                });
-            // Counts skip hit hydration. Rows are read only where a count cannot tell
-            // what 0.4.9 kept: tooling roles under --no-meta, or a session id another
-            // one extends, which the prefix filter would also match.
-            let rows = o.filters.no_meta
-                || c.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sessions WHERE id LIKE ?1 ESCAPE '\\' AND id<>?2)",
-                    rusqlite::params![
-                        format!(
-                            "{}%",
-                            session
-                                .replace('\\', "\\\\")
-                                .replace('%', "\\%")
-                                .replace('_', "\\_")
-                        ),
-                        session
-                    ],
-                    |r| r.get::<_, bool>(0),
-                )?;
-            let tally = |content: bool| -> Result<Withheld> {
+            // The scope 0.4.9 probed, `--chat` with this session's id: the session and
+            // any session whose id extends it.
+            let mut prefix = scoped.clone();
+            prefix.filters.chat = Some(session.clone());
+            prefix.content = false;
+            prefix.count_only = true;
+            prefix.count_by_tier = true;
+            scoped.filters.chat = None;
+            scoped.filters.session_rows = Some(query::SessionRows {
+                session: session.clone(),
+                from,
+            });
+            let tally = |content: bool, plans: &mut query::Plans| -> Result<Withheld> {
                 let mut probe = scoped.clone();
                 probe.content = content;
-                probe.count_only = !rows;
-                probe.count_by_tier = !rows;
-                if rows {
-                    let mut tally = Withheld::default();
-                    for h in query::search(c, &probe)?.hits.iter().filter(|h| {
-                        &h.session == session
-                            && from.is_none_or(|from| h.turn >= from)
-                            // 0.4.9's probes dropped only rows its `_meta_row` stored as tooling.
-                            && !(o.filters.no_meta
-                                && (matches!(h.who.as_str(), "harness" | "synthetic")
-                                    || (h.who == "subagent" && h.turn == 0)))
-                    }) {
-                        if h.who == "tool" {
-                            tally.tools += 1;
-                        } else {
-                            tally.prose += 1;
-                        }
-                    }
-                    return Ok(tally);
+                // Counts skip hit hydration. Rows are read only under --no-meta, whose
+                // tooling roles 0.4.9's probes dropped.
+                probe.count_only = !o.filters.no_meta;
+                probe.count_by_tier = !o.filters.no_meta;
+                let found = query::search_with(c, &probe, plans)?;
+                if !o.filters.no_meta {
+                    return Ok(Withheld {
+                        prose: found.total - found.tool_rows,
+                        tools: found.tool_rows,
+                    });
                 }
-                let all = query::search(c, &probe)?;
-                let mut tally = Withheld {
-                    prose: all.total - all.tool_rows,
-                    tools: all.tool_rows,
-                };
-                if let Some(before) = before.as_ref().filter(|_| overlap) {
-                    probe.filters.caller = Some(before.clone());
-                    let early = query::search(c, &probe)?;
-                    tally.prose = tally.prose.saturating_sub(early.total - early.tool_rows);
-                    tally.tools = tally.tools.saturating_sub(early.tool_rows);
+                let mut tally = Withheld::default();
+                for h in found.hits.iter().filter(|h| {
+                    !(matches!(h.who.as_str(), "harness" | "synthetic")
+                        || (h.who == "subagent" && h.turn == 0))
+                }) {
+                    if h.who == "tool" {
+                        tally.tools += 1;
+                    } else {
+                        tally.prose += 1;
+                    }
                 }
                 Ok(tally)
             };
-            let mut found = tally(false)?;
+            let mut found = tally(false, &mut plans)?;
             if found.total() == 0 && o.content {
-                // 0.4.9 probed the whole transcript: related-term rows stood in only when
-                // no turn of it matched exactly, including turns before the window.
-                let matched_earlier = match &before {
-                    Some(before) => {
-                        let mut earlier = scoped.clone();
-                        earlier.content = false;
-                        earlier.count_only = true;
-                        earlier.count_by_tier = true;
-                        earlier.filters.since = o.filters.since;
-                        earlier.filters.caller = Some(before.clone());
-                        query::search(c, &earlier)?.total > 0
+                // 0.4.9 stood in related-term rows only when nothing in its probe scope
+                // matched exactly: no turn before the window, and no session whose id
+                // extends this one.
+                let matched = match from.filter(|&from| from > 0) {
+                    Some(from) => {
+                        prefix.filters.caller = Some(query::CallerFilter {
+                            agent: caller.agent.clone(),
+                            session: session.clone(),
+                            family: caller.root.clone(),
+                            exclude_from_turn: Some(from),
+                            exclude_family: false,
+                            excluded_sessions: vec![],
+                        });
+                        query::search_with(c, &prefix, &mut plans)?.total > 0
                     }
-                    None => false,
+                    None => {
+                        extended(c, session)?
+                            && query::search_with(c, &prefix, &mut plans)?.total > 0
+                    }
                 };
-                if !matched_earlier {
-                    found = tally(true)?;
+                if !matched {
+                    found = tally(true, &mut plans)?;
                 }
             }
             withheld.prose += found.prose;
@@ -480,6 +450,24 @@ impl Policy<'_> {
         }
         Ok(withheld)
     }
+}
+/// Whether another indexed session id extends `session`, so a `--chat` prefix of it
+/// also matches that session.
+fn extended(c: &Connection, session: &str) -> Result<bool> {
+    Ok(c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sessions WHERE id LIKE ?1 ESCAPE '\\' AND id<>?2)",
+        rusqlite::params![
+            format!(
+                "{}%",
+                session
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_")
+            ),
+            session
+        ],
+        |r| r.get(0),
+    )?)
 }
 /// Matching rows a policy withheld, by 0.4.9's two keyword lanes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
