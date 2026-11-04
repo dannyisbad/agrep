@@ -1,6 +1,6 @@
 use crate::{ready, Around};
 use agrep_core::{
-    evidence::{self, Display, Request},
+    evidence::{self, Display, Rendered, Request},
     store, surface,
 };
 use anyhow::{bail, Result};
@@ -36,7 +36,10 @@ pub(crate) fn run(mut a: Around, no_auto: bool, color: &str) -> Result<i32> {
         let c = store::reader(&root)?;
         let w = evidence::load(&c, &Request::new(&a.session, a.turn, radius))?;
         let pending_sources = crate::finish_census(&root, census)?;
-        let text = evidence::render(
+        let checked = agrep_core::render::checked(no_auto);
+        let (who_given, who_tool) = (a.who.is_some(), a.who.as_deref() == Some("tool"));
+        let tool_handle = w.claim.as_ref().is_some_and(|c| c.event.is_some());
+        let rendered = evidence::render(
             &w,
             &Display {
                 caller: agrep_core::caller::Caller::resolve(
@@ -44,7 +47,7 @@ pub(crate) fn run(mut a: Around, no_auto: bool, color: &str) -> Result<i32> {
                     agrep_core::caller::Identity::detect(),
                 )?,
                 json: a.json,
-                checked: agrep_core::render::checked(no_auto),
+                checked,
                 pending_sources,
                 full: a.full,
                 max_chars: a.max_chars.unwrap_or(4000),
@@ -62,8 +65,45 @@ pub(crate) fn run(mut a: Around, no_auto: bool, color: &str) -> Result<i32> {
                 }
             }
         }
-        surface::write(&text)?;
-        Ok(0)
+        match rendered {
+            Rendered::Page { text, tools } => {
+                surface::write(&text)?;
+                // 0.4.9's `_warn_if_oversized`: a large pull names the lever that shrinks it.
+                if text.len() >= 30_000 {
+                    let cheaper = if radius.is_none() {
+                        (!who_given).then(|| "`--who user` keeps the user's turns only".to_owned())
+                    } else if tools && !who_tool && !tool_handle {
+                        let flag = if a.full || a.tool_output.is_none() {
+                            "--full"
+                        } else {
+                            "--tool-output"
+                        };
+                        Some(format!("dropping `{flag}` keeps the conversation only"))
+                    } else {
+                        None
+                    };
+                    if let Some(cheaper) = cheaper {
+                        eprintln!("large pull: ~{}KB rendered - {cheaper}", text.len() / 1024);
+                    }
+                }
+                Ok(0)
+            }
+            // 0.4.9's `_miss`: an unchecked absence is unverified, not a clean miss.
+            Rendered::Miss { reason, scope } => {
+                if a.json {
+                    let mut row = serde_json::json!({"kind":"agrep-meta","miss":{"code":"no-speaker-match","reason":reason,"scope":scope}});
+                    if !checked {
+                        row["freshness"] = agrep_core::render::freshness(checked, pending_sources);
+                    }
+                    surface::line(&agrep_core::json_output::to_string(&row)?)?;
+                } else if checked {
+                    eprintln!("{reason}");
+                } else {
+                    eprintln!("{reason}; automatic freshness checks are disabled by --no-auto");
+                }
+                Ok(if checked { 1 } else { 2 })
+            }
+        }
     })();
     match result {
         Err(e) if a.json => {

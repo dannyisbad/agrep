@@ -1,0 +1,30 @@
+[1;36m0fff0000 · pi · /work/tools[0m  [2mturns 0-1 of 0-1[0m
+[2m── turn [0m[33m0[0m [2m──────────────────────────────────────── 2026-10-01 12:00[0m
+[33muser:[0m run the needle tools
+  [2m⚙ bash cd /work && grep -rn 'needle' src/ --include=*.ext0 --include=*.ext1 --include=*.ext2 --include=*.ext3 --include=*.ext4 … (42B)[0m
+    
+    
+       first   line  of    output   [+12 indexed chars]
+  [1;31m✗ FAILED bash false && echo 'spaced out' (6B)[0m
+    exit 1
+  [2m⚙ bash echo step 0 (6B)[0m
+    step 0
+  [2m⚙ bash echo step 1 (6B)[0m
+    step 1
+  [2m⚙ bash echo step 2 (6B)[0m
+    step 2
+  [2m⚙ bash echo step 3 (6B)[0m
+    step 3
+  [2m⚙ bash echo step 4 (6B)[0m
+    step 4
+  [2m⚙ bash echo step 5 (6B)[0m
+    step 5
+[36magent:[0m running
+[2m── turn [0m[33m1[0m [2m──────────────────────────────────────── 2026-10-01 12:00[0m
+[33muser:[0m repeat it
+  [2m⚙ bash echo same (4B)[0m
+    same
+  [2m⚙ bash echo same (4B)[0m
+    same
+  [2m⚙ bash echo same (4B)[0m
+    same

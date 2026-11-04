@@ -83,7 +83,11 @@ impl Identity {
         }
         value
     }
-    pub fn disclose(&self, forced: bool) {
+    /// The stderr line for a caller that self-exclusion cannot name. A forced `--no-self`
+    /// says it was not applied in 0.4.9's words: recall and pack (`recall`) spoke for the
+    /// caller, search, chats and summary for this session (py/recall.py:2018,
+    /// py/session_context.py:1754).
+    pub fn disclose(&self, forced: bool, recall: bool) {
         static SAID: AtomicBool = AtomicBool::new(false);
         if (!self.agent_context && !forced)
             || self.session.is_some()
@@ -91,14 +95,23 @@ impl Identity {
         {
             return;
         }
+        let conflict = self.reason == "identity-conflict";
         eprintln!(
             "{}",
-            if self.reason == "identity-conflict" {
-                "caller session identities conflict: self-exclusion is off and this chat's own rows may appear"
-            } else {
-                if forced {
-                    "caller unknown: --no-self was not applied"
-                } else {
+            match (forced, recall, conflict) {
+                (true, true, _) => {
+                    "--no-self was not applied: caller identity is unknown; no session was excluded"
+                }
+                (true, false, true) => {
+                    "--no-self was not applied: caller session identities conflict; self-exclusion is disabled and current conversations may appear"
+                }
+                (true, false, false) => {
+                    "--no-self was not applied: could not identify this session - results may include the current conversation"
+                }
+                (false, _, true) => {
+                    "caller session identities conflict: self-exclusion is off and this chat's own rows may appear"
+                }
+                (false, _, false) => {
                     "agent shell, caller unknown: this chat's own rows may appear (pi/omp: `agrep setup` installs the extension that names it)"
                 }
             }
@@ -396,9 +409,10 @@ impl Policy<'_> {
                 let mut probe = scoped.clone();
                 probe.content = content;
                 // Counts skip hit hydration. Rows are read only under --no-meta, whose
-                // tooling roles 0.4.9's probes dropped.
+                // tooling roles 0.4.9's probes dropped. A related-term fallback counts each
+                // stage by its coverage rules, which only a tiered count applies.
                 probe.count_only = !o.filters.no_meta;
-                probe.count_by_tier = !o.filters.no_meta;
+                probe.count_by_tier = !o.filters.no_meta && content;
                 let found = query::search_with(c, &probe, plans)?;
                 if !o.filters.no_meta {
                     return Ok(Withheld {
@@ -510,8 +524,26 @@ pub fn search(
     include_self: bool,
     no_self: bool,
 ) -> Result<Results> {
+    search_with(
+        c,
+        o,
+        caller,
+        include_self,
+        no_self,
+        &mut query::Plans::default(),
+    )
+}
+/// `search` keeping its plans for later searches of the same pattern.
+pub fn search_with(
+    c: &Connection,
+    o: &Options,
+    caller: &Caller,
+    include_self: bool,
+    no_self: bool,
+    plans: &mut query::Plans,
+) -> Result<Results> {
     let options = options(o, caller, include_self, no_self);
-    let mut result = query::search(c, &options)?;
+    let mut result = query::search_with(c, &options, plans)?;
     decorate(c, &mut result, caller)?;
     Ok(result)
 }

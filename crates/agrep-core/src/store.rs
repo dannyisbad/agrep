@@ -165,7 +165,10 @@ CREATE INDEX IF NOT EXISTS {table}_model ON {table}(model,ts DESC);
 "))?;
             c.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS {table}_count_insert AFTER INSERT ON {table} WHEN new.visible=1 BEGIN INSERT INTO state(key,value) VALUES('{table}_count',1) ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1; END;
 CREATE TRIGGER IF NOT EXISTS {table}_count_delete AFTER DELETE ON {table} WHEN old.visible=1 BEGIN UPDATE state SET value=CAST(value AS INTEGER)-1 WHERE key='{table}_count'; END;
-CREATE TRIGGER IF NOT EXISTS {table}_count_visibility AFTER UPDATE OF visible ON {table} WHEN old.visible!=new.visible BEGIN UPDATE state SET value=CAST(value AS INTEGER)+new.visible-old.visible WHERE key='{table}_count'; END;"))?;
+CREATE TRIGGER IF NOT EXISTS {table}_count_visibility AFTER UPDATE OF visible ON {table} WHEN old.visible!=new.visible BEGIN UPDATE state SET value=CAST(value AS INTEGER)+new.visible-old.visible WHERE key='{table}_count'; END;
+CREATE TRIGGER IF NOT EXISTS prose_user_count_insert AFTER INSERT ON prose WHEN new.visible=1 AND new.who!='agent' BEGIN INSERT INTO state(key,value) VALUES('prose_user_count',1) ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1; END;
+CREATE TRIGGER IF NOT EXISTS prose_user_count_delete AFTER DELETE ON prose WHEN old.visible=1 AND old.who!='agent' BEGIN UPDATE state SET value=CAST(value AS INTEGER)-1 WHERE key='prose_user_count'; END;
+CREATE TRIGGER IF NOT EXISTS prose_user_count_visibility AFTER UPDATE OF visible ON prose WHEN old.visible!=new.visible AND new.who!='agent' BEGIN UPDATE state SET value=CAST(value AS INTEGER)+new.visible-old.visible WHERE key='prose_user_count'; END;"))?;
         }
         let columns = "text";
         let tokenizer = if table == "tools" {
@@ -420,7 +423,12 @@ fn refresh_inner(
     let start = Instant::now();
     WRITE_TIMES.set((0, 0));
     let first = !root.db().exists();
-    let lock = root.lock(explicit || first)?;
+    let lock = match root.lock(explicit || first)? {
+        // A merge step is bounded and yields to queued writers, so wait for it rather
+        // than leave the change pending until another command starts a worker.
+        None if root.merging()? => root.lock(true)?,
+        lock => lock,
+    };
     if lock.is_none() {
         return Ok(Refresh {
             skipped_lock: true,
@@ -453,6 +461,9 @@ fn refresh_inner(
             "prose_count_insert",
             "prose_count_delete",
             "prose_count_visibility",
+            "prose_user_count_insert",
+            "prose_user_count_delete",
+            "prose_user_count_visibility",
             "tools_count_insert",
             "tools_count_delete",
             "tools_count_visibility",
@@ -910,9 +921,15 @@ fn refresh_inner(
     }
     if first {
         schema(&tx)?;
-        for table in ["prose", "tools"] {
-            tx.execute(&format!("INSERT INTO state(key,value) SELECT '{table}_count',count(*) FROM {table} WHERE visible=1 ON CONFLICT(key) DO UPDATE SET value=excluded.value"),[])?;
+        let (rows, user_rows): (i64, i64) = tx.query_row(
+            "SELECT count(*),coalesce(sum(who!='agent'),0) FROM prose WHERE visible=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        for (key, value) in [("prose_count", rows), ("prose_user_count", user_rows)] {
+            tx.execute("INSERT INTO state(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key, value])?;
         }
+        tx.execute("INSERT INTO state(key,value) SELECT 'tools_count',count(*) FROM tools WHERE visible=1 ON CONFLICT(key) DO UPDATE SET value=excluded.value",[])?;
     }
     info.stats_ms = phase.elapsed().as_secs_f64() * 1000.;
     if first || rebuild {
@@ -2903,6 +2920,63 @@ mod event_contract_tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn user_side_count_follows_inserts_visibility_and_deletes() {
+        let mut c = Connection::open_in_memory().unwrap();
+        schema(&c).unwrap();
+        let mut changes = Changes::default();
+        let tx = c.transaction().unwrap();
+        for (turn, who) in [
+            (0, "user"),
+            (0, "agent"),
+            (1, "user"),
+            (1, "agent"),
+            (2, "recap"),
+        ] {
+            let row = NewRow {
+                agent: "pi",
+                session: "s",
+                project: "p",
+                turn,
+                who,
+                model: "m",
+                model_source: "explicit",
+                ts: 1,
+                text: "body",
+                extra: String::new(),
+                bulk: false,
+            };
+            upsert(&tx, "prose", 1, row, &mut changes).unwrap();
+        }
+        let counted = |tx: &rusqlite::Transaction| -> (i64, i64) {
+            let kept: i64 = tx
+                .query_row(
+                    "SELECT CAST(value AS INTEGER) FROM state WHERE key='prose_user_count'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let scanned: i64 = tx
+                .query_row(
+                    "SELECT count(*) FROM prose WHERE visible=1 AND who!='agent'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            (kept, scanned)
+        };
+        assert_eq!(counted(&tx), (3, 3));
+        tx.execute("UPDATE prose SET visible=0 WHERE turn=1", [])
+            .unwrap();
+        assert_eq!(counted(&tx), (2, 2));
+        tx.execute("UPDATE prose SET visible=1 WHERE who='user'", [])
+            .unwrap();
+        assert_eq!(counted(&tx), (3, 3));
+        tx.execute("DELETE FROM prose WHERE who IN ('recap','agent')", [])
+            .unwrap();
+        assert_eq!(counted(&tx), (2, 2));
     }
 }
 

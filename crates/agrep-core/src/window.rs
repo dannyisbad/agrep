@@ -224,11 +224,15 @@ pub(crate) struct Snip {
 
 impl Snip {
     pub fn new(text: &str, spans: &[Range<usize>]) -> Self {
+        Self::padded(text, spans, PAD)
+    }
+    /// `snip_spans` with `pad` characters kept on each side of a span.
+    pub fn padded(text: &str, spans: &[Range<usize>], pad: usize) -> Self {
         let mut sorted = spans.to_vec();
         sorted.sort_by_key(|span| (span.start, span.end));
         let mut windows: Vec<Range<usize>> = Vec::new();
         for span in sorted {
-            let (a, b) = (back(text, span.start, PAD), forward(text, span.end, PAD));
+            let (a, b) = (back(text, span.start, pad), forward(text, span.end, pad));
             match windows.last_mut() {
                 Some(last) if a <= last.end => last.end = last.end.max(b),
                 _ => windows.push(a..b),

@@ -327,7 +327,7 @@ fn resolve_scan(
     } = scan;
     let want = if o.limit == 0 { 200 } else { o.limit.min(200) };
     let mut result = Results::default();
-    let mut resolve=c.prepare("SELECT p.id,p.session,p.agent,p.project,p.position,p.who,p.model,p.model_source,p.ts,p.text,s.family,s.side,v.ordinal FROM semantic_chunks v JOIN semantic_refs r ON r.content_key=v.content_key JOIN prose p ON p.id=r.row_id AND p.digest=r.digest JOIN sessions s ON s.id=p.session AND s.agent=p.agent WHERE v.block=? AND v.slot=? AND p.visible=1")?;
+    let mut resolve=c.prepare("SELECT p.id,p.session,p.agent,p.project,p.position,p.who,p.model,p.model_source,p.ts,p.text,s.family,s.side FROM semantic_chunks v JOIN semantic_refs r ON r.content_key=v.content_key JOIN prose p ON p.id=r.row_id AND p.digest=r.digest JOIN sessions s ON s.id=p.session AND s.agent=p.agent WHERE v.block=? AND v.slot=? AND p.visible=1")?;
     let mut hits = Vec::<Hit>::new();
     let mut matched_groups = HashSet::new();
     let compare = |a: &Hit, b: &Hit| {
@@ -372,35 +372,32 @@ fn resolve_scan(
         }
         resolved += 1;
         let rows = resolve.query_map(params![names[block], slot], |r| {
-            Ok((
-                Hit {
-                    rowid: r.get(0)?,
-                    session: r.get(1)?,
-                    agent: r.get(2)?,
-                    project: r.get(3)?,
-                    turn: r.get(4)?,
-                    who: r.get(5)?,
-                    model: r.get(6)?,
-                    model_source: r.get(7)?,
-                    ts: r.get(8)?,
-                    text: store::decode("prose", r.get::<_, Vec<u8>>(9)?).map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            9,
-                            rusqlite::types::Type::Blob,
-                            e.into_boxed_dyn_error(),
-                        )
-                    })?,
-                    family: r.get(10)?,
-                    side: r.get(11)?,
-                    score: score as f64,
-                    matched: "semantic".into(),
-                    ..Default::default()
-                },
-                r.get::<_, usize>(12)?,
-            ))
+            Ok(Hit {
+                rowid: r.get(0)?,
+                session: r.get(1)?,
+                agent: r.get(2)?,
+                project: r.get(3)?,
+                turn: r.get(4)?,
+                who: r.get(5)?,
+                model: r.get(6)?,
+                model_source: r.get(7)?,
+                ts: r.get(8)?,
+                text: store::decode("prose", r.get::<_, Vec<u8>>(9)?).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        9,
+                        rusqlite::types::Type::Blob,
+                        e.into_boxed_dyn_error(),
+                    )
+                })?,
+                family: r.get(10)?,
+                side: r.get(11)?,
+                score: score as f64,
+                matched: "semantic".into(),
+                ..Default::default()
+            })
         })?;
         for row in rows {
-            let (mut h, ordinal) = row?;
+            let mut h = row?;
             if !matches_filters(&h, o)
                 || (o.filters.no_meta && crate::history_meta::is_meta(c, &h, &o.pattern)?)
             {
@@ -435,11 +432,18 @@ fn resolve_scan(
                 h.turn,
                 query::content_digest(&h.text)
             );
-            let chunks = semantic_model::chunks(&h.agent, &h.who, &h.text);
-            let matched_chunk = chunks
-                .get(ordinal)
-                .ok_or_else(|| anyhow::anyhow!("semantic chunk ordinal exceeds source text"))?;
-            h.snippet = query::snippet(matched_chunk, &o.pattern, 280);
+            // 0.4.9's meaning rows showed their text's first 240 characters with whitespace
+            // runs (Python's, which counts \x1c-\x1f) folded to one space; compact pages
+            // then narrow that around a keyword match.
+            h.snippet = h
+                .text
+                .split(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
+                .filter(|word| !word.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(240)
+                .collect();
             hits.push(h);
             hits.sort_by(compare);
             hits.truncate(want + 1);
@@ -771,7 +775,7 @@ mod tests {
         assert!(coverage(&c).unwrap().partial());
     }
     #[test]
-    fn semantic_snippet_comes_from_the_winning_long_row_chunk() {
+    fn semantic_snippet_is_the_rows_first_240_characters() {
         let (_t, r, mut o) = setup();
         insert(&r, 1, "root", "alpha");
         let text = format!("{} connection exception explanation", "x".repeat(1022));
@@ -797,9 +801,7 @@ mod tests {
         .unwrap();
         o.pattern = "database failure".into();
         let found = search_vector(&r, &store::reader(&r).unwrap(), &o, true, &last).unwrap();
-        assert!(found.hits[0]
-            .snippet
-            .contains("connection exception explanation"));
+        assert_eq!(found.hits[0].snippet, "x".repeat(240));
         assert_eq!(found.hits[0].text, text);
     }
     #[test]

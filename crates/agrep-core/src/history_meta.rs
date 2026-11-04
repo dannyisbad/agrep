@@ -314,76 +314,122 @@ fn input(s: &str) -> Invocation {
     }
     out
 }
-fn event(text: Vec<u8>, body: String) -> Result<Invocation> {
-    let v: Value = serde_json::from_str(&body)?;
-    if v["kind"] != "tool" {
-        return Ok(Invocation::default());
-    }
-    let name = v["name"].as_str().unwrap_or("");
-    if ![
-        "bash",
-        "cmd",
-        "exec",
-        "exec_command",
-        "powershell",
-        "pwsh",
-        "shell",
-        "terminal",
-        "run_terminal_cmd",
-    ]
-    .contains(
-        &name
-            .rsplit('.')
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase()
-            .as_str(),
-    ) {
-        return Ok(Invocation::default());
-    }
-    let text = store::decode("tools", text)?;
-    let (command, _) = crate::tool_text::split(
-        &text,
-        "tool",
-        name,
-        v["ok"].as_bool(),
-        v["input_end"].as_u64().map(|n| n as usize),
-        v["output_start"].as_u64().map(|n| n as usize),
-    );
-    if command.is_empty()
-        || command.len() > 64 * 1024
-        || v["input_chars"].as_u64() != Some(command.chars().count() as u64)
-    {
-        return Ok(Invocation::default());
-    }
-    Ok(input(&command))
+/// A stored tool call, read from its event row without the `tools`/`events` views.
+struct Call {
+    kind: String,
+    name: String,
+    ok: Option<bool>,
+    input_end: Option<usize>,
+    input_chars: i64,
+    tool_id: i64,
+    blob: Option<i64>,
 }
+const CALLS: &str = "SELECT k.value,n.value,e.ok,e.input_end,e.input_chars,e.tool_id,e.blob FROM event_rows e JOIN symbols k ON k.id=e.kind_key JOIN symbols n ON n.id=e.name_key";
+fn call(r: &rusqlite::Row) -> rusqlite::Result<Call> {
+    Ok(Call {
+        kind: r.get(0)?,
+        name: r.get(1)?,
+        ok: r.get(2)?,
+        input_end: r.get::<_, Option<i64>>(3)?.map(|n| n as usize),
+        input_chars: r.get(4)?,
+        tool_id: r.get(5)?,
+        blob: r.get(6)?,
+    })
+}
+/// The history-reading invocations among `calls`, decoding only shell calls whose
+/// indexed words name agrep or its cli.py: every invocation `argv` accepts does.
+fn invocations(c: &Connection, calls: Vec<Call>) -> Result<Vec<Invocation>> {
+    let shells: Vec<Call> = calls
+        .into_iter()
+        .filter(|call| {
+            call.kind == "tool"
+                && call.blob.is_some()
+                && [
+                    "bash",
+                    "cmd",
+                    "exec",
+                    "exec_command",
+                    "powershell",
+                    "pwsh",
+                    "shell",
+                    "terminal",
+                    "run_terminal_cmd",
+                ]
+                .contains(
+                    &call
+                        .name
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or("")
+                        .to_ascii_lowercase()
+                        .as_str(),
+                )
+        })
+        .collect();
+    let (Some(low), Some(high)) = (
+        shells.iter().map(|call| call.tool_id).min(),
+        shells.iter().map(|call| call.tool_id).max(),
+    ) else {
+        return Ok(vec![]);
+    };
+    let named = c
+        .prepare_cached(
+            "SELECT rowid FROM tools_fts WHERE tools_fts MATCH 'agrep OR cli' AND rowid>=? AND rowid<=?",
+        )?
+        .query_map([low, high], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+    let mut out = vec![];
+    for call in shells
+        .into_iter()
+        .filter(|call| named.contains(&call.tool_id))
+    {
+        let text = store::decode(
+            "tools",
+            c.prepare_cached("SELECT body FROM tool_blobs WHERE id=?")?
+                .query_row([call.blob], |r| r.get(0))?,
+        )?;
+        let (command, _) =
+            crate::tool_text::split(&text, "tool", &call.name, call.ok, call.input_end, None);
+        if !command.is_empty()
+            && command.len() <= 64 * 1024
+            && call.input_chars == command.chars().count() as i64
+        {
+            out.push(input(&command));
+        }
+    }
+    Ok(out)
+}
+/// How deep 0.4.9 fetched a `--no-meta` page before dropping its ~meta rows.
+pub(crate) const ROWS_PER_QUERY: usize = 40;
 pub(crate) fn is_meta(c: &Connection, h: &Hit, query: &str) -> Result<bool> {
     if matches!(h.who.as_str(), "harness" | "synthetic") || (h.who == "subagent" && h.turn == 0) {
         return Ok(true);
     }
     if h.who == "tool" {
-        let row:Option<(Vec<u8>,String)>=c.query_row("SELECT t.text,e.body FROM tools t JOIN events e ON e.source=t.source AND e.session=t.session AND e.call_id=t.extra WHERE t.id=?",[h.rowid],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-        return match row {
-            Some((t, b)) => Ok(event(t, b)?.read),
-            None => Ok(false),
-        };
+        let found = c
+            .prepare_cached(&format!(
+                "{CALLS} WHERE e.tool_id=? AND e.active=1 AND e.blob IS NOT NULL"
+            ))?
+            .query_row([h.rowid], call)
+            .optional()?;
+        return Ok(invocations(c, found.into_iter().collect())?
+            .iter()
+            .any(|i| i.read));
     }
     if !matches!(h.who.as_str(), "agent" | "subagent") {
         return Ok(false);
     }
-    let mut q=c.prepare("SELECT t.text,e.body FROM tools t JOIN events e ON e.source=t.source AND e.session=t.session AND e.call_id=t.extra WHERE t.agent=?1 AND t.session=?2 AND t.position>=?3 AND t.position<=?4 AND t.visible=1")?;
+    let calls = c
+        .prepare_cached(&format!("{CALLS} JOIN event_sessions s ON s.id=e.session_key WHERE s.agent=?1 AND s.session=?2 AND e.position>=?3 AND e.position<=?4 AND e.visible=1 AND e.active=1 AND e.blob IS NOT NULL"))?
+        .query_map(
+            params![h.agent, h.session, h.turn.saturating_sub(4), h.turn],
+            call,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     let query = norm(query);
-    for row in q.query_map(
-        params![h.agent, h.session, h.turn.saturating_sub(4), h.turn],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )? {
-        let (t, b) = row?;
-        if event(t, b)?.queries.contains(&query) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(invocations(c, calls)?
+        .iter()
+        .any(|i| i.queries.contains(&query)))
 }
 #[cfg(test)]
 mod tests {

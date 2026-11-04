@@ -1,0 +1,9 @@
+0fff0000 · pi · /work/tools  turns 0-1 of 0-1
+3 messages omitted · agrep around 0fff0000 0 -C 4
+── turn 0 ──────────────────────────────────────── 2026-10-01 12:00
+  ✗ FAILED bash false && echo 'spaced out' exit 1 (6B)
+  ⚙ 7 tool calls (7 bash) - agrep around 0fff0000 0 -C 0 --full shows each
+── turn 1 ──────────────────────────────────────── 2026-10-01 12:00
+  ⚙ bash echo same same (4B)
+  ⚙ bash echo same same (4B)
+  ⚙ bash echo same same (4B)

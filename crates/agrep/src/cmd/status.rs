@@ -28,13 +28,28 @@ pub fn run(json: bool, no_auto: bool) -> Result<i32> {
         );
         if s["index"]["state"] == "ready" {
             let n = &s["index"]["counts"];
+            let count = |v: &serde_json::Value| {
+                agrep_core::surface::number(v.as_u64().unwrap_or(0) as usize)
+            };
+            // 0.4.9's corpus row: the age of the last refresh, "just now" under a minute.
+            let age = match s["last_indexed_age_s"].as_i64() {
+                None => String::new(),
+                Some(age) if age < 60 => " · updated just now".into(),
+                Some(_) => format!(
+                    " · updated {} ago",
+                    render::age(s["index"]["last_refresh"].as_i64().unwrap_or(0))
+                ),
+            };
             println!(
-                "{} sessions · {} prose rows · {} tool rows",
-                n["sessions"], n["prose"], n["tools"]
+                "{} sessions · {} prose rows · {} tool rows{age}",
+                count(&n["sessions"]),
+                count(&n["prose"]),
+                count(&n["tools"])
             );
             println!(
-                "last refresh: {} · disk: {} bytes",
-                s["index"]["last_refresh"], s["disk_bytes"]
+                "footprint: {:.1} MiB across {} files",
+                s["disk_bytes"].as_u64().unwrap_or(0) as f64 / (1024. * 1024.),
+                count(&s["disk_files"])
             );
         } else if s["index"]["state"] == "first build in progress" {
             println!("first build in progress");
@@ -77,7 +92,13 @@ pub fn run(json: bool, no_auto: bool) -> Result<i32> {
                 render::safe(path.as_str().unwrap_or(""))
             );
         }
-        for item in s["integrations"].as_array().into_iter().flatten() {
+        let integrations = s["integrations"].as_array().map_or(&[][..], Vec::as_slice);
+        if integrations.is_empty() {
+            println!(
+                "instructions: not installed - `agrep setup` teaches your agents to search this history"
+            );
+        }
+        for item in integrations {
             println!(
                 "integration {}: {}",
                 if item["present"] == true {

@@ -271,23 +271,29 @@ pub fn load_events(c: &Connection, session: &str, lo: i64, hi: i64) -> Result<Ve
             .unwrap_or_default();
         let raw: Value = serde_json::from_str(&body)?;
         let string = |key: &str| raw[key].as_str().unwrap_or_default().to_owned();
-        let identity = handles::event_id(session, ts, if text.is_empty() { &body } else { &text });
-        if !seen.insert(identity.clone()) {
+        // Replay copies of one call share its id; separate identical calls stay separate.
+        if !seen.insert(string("call_id")) {
             continue;
         }
-        let (input, output) = crate::tool_text::split(
-            &text,
-            raw["kind"].as_str().unwrap_or("tool"),
-            &string("name"),
-            raw["ok"].as_bool(),
-            raw["input_end"].as_u64().map(|v| v as usize),
-            raw["output_start"].as_u64().map(|v| v as usize),
-        );
+        let identity = handles::event_id(session, ts, if text.is_empty() { &body } else { &text });
+        let kind = raw["kind"].as_str().unwrap_or("tool");
+        let (input, output) = if kind == "control" {
+            (string("meta"), String::new())
+        } else {
+            crate::tool_text::split(
+                &text,
+                kind,
+                &string("name"),
+                raw["ok"].as_bool(),
+                raw["input_end"].as_u64().map(|v| v as usize),
+                raw["output_start"].as_u64().map(|v| v as usize),
+            )
+        };
         events.push(Event {
             turn,
             ts,
             name: string("name"),
-            kind: raw["kind"].as_str().unwrap_or("tool").into(),
+            kind: kind.into(),
             input_chars: raw["input_chars"]
                 .as_u64()
                 .map_or_else(|| input.chars().count(), |v| v as usize),
@@ -1101,9 +1107,82 @@ fn tool_output_preview(e: &Event, span: Option<(usize, usize)>) -> (String, Opti
     };
     (shown, bytes)
 }
+/// 0.4.9's structural control events and what a disclosure calls each, in the order it
+/// lists them. Each renders as a line of its own and never counts as a tool call.
+pub const MARKERS: [(&str, &str); 3] = [
+    ("api_error", "API error"),
+    ("compacted", "compaction"),
+    ("task_notification", "task notification"),
+];
+const BAD: &str = "\x1b[1;31m";
+const HEAD: &str = "\x1b[1;36m";
+const DIM: &str = "\x1b[2m";
+const YELLOW: &str = "\x1b[33m";
+const CYAN: &str = "\x1b[36m";
+const RESET: &str = "\x1b[0m";
+impl Event {
+    pub fn is_marker(&self) -> bool {
+        self.kind == "control" && MARKERS.iter().any(|(name, _)| *name == self.name)
+    }
+}
+/// 0.4.9's `_marker_line`.
+fn marker_line(e: &Event, color: bool) -> String {
+    let raw = one_line(&e.input);
+    let body = match e.name.as_str() {
+        "api_error" => {
+            let mut text = surface::safe(&raw, false);
+            if text.chars().count() > 120 {
+                text = text.chars().take(120).collect::<String>() + "…";
+            }
+            let label = if text.to_lowercase().starts_with("api error") {
+                ""
+            } else {
+                "API error: "
+            };
+            format!("✗ {label}{text}")
+                .trim_end_matches([' ', ':'])
+                .to_owned()
+        }
+        "compacted" => "· context compacted".to_owned(),
+        _ => {
+            let status = raw
+                .split(' ')
+                .map(|part| part.split_once('=').unwrap_or((part, "")))
+                .find(|(key, value)| *key == "status" && !value.is_empty())
+                .map_or(String::new(), |(_, value)| surface::safe(value, false));
+            format!(
+                "↳ background task {}",
+                if status.is_empty() {
+                    "notification"
+                } else {
+                    &status
+                }
+            )
+        }
+    };
+    if color {
+        let tone = if e.name == "api_error" { BAD } else { DIM };
+        format!("  {tone}{body}{RESET}")
+    } else {
+        format!("  {body}")
+    }
+}
 /// 0.4.9's `_tool_line` without color or output lines: a tool event's glyph, name, input
 /// and output preview with its size, or the selected match where it fell outside the output.
 pub fn tool_line(e: &Event, output_span: Option<(usize, usize)>, preview: Option<&str>) -> String {
+    if e.is_marker() {
+        return marker_line(e, false);
+    }
+    format!("  {}", tool_body(e, 0, output_span, preview))
+}
+/// The body of 0.4.9's `_tool_line`; with `out_cap` set the output follows on lines of its
+/// own instead of as a preview.
+fn tool_body(
+    e: &Event,
+    out_cap: usize,
+    output_span: Option<(usize, usize)>,
+    preview: Option<&str>,
+) -> String {
     let mut input = surface::safe(&one_line(&e.input), false);
     if input.chars().count() > 120 {
         input = input.chars().take(120).collect::<String>() + "…";
@@ -1115,7 +1194,7 @@ pub fn tool_line(e: &Event, output_span: Option<(usize, usize)>, preview: Option
         );
     }
     let centered = surface::safe(preview.unwrap_or_default(), false);
-    let body = match e.kind.as_str() {
+    match e.kind.as_str() {
         "subagent_start" => format!(
             "⇒ subagent {}",
             if centered.is_empty() {
@@ -1159,7 +1238,7 @@ pub fn tool_line(e: &Event, output_span: Option<(usize, usize)>, preview: Option
                 "⚙"
             };
             let (shown, bytes) = tool_output_preview(e, output_span);
-            let out = if shown.is_empty() {
+            let out = if out_cap > 0 || shown.is_empty() {
                 String::new()
             } else {
                 format!(" {}", surface::safe(&shown, false))
@@ -1184,10 +1263,251 @@ pub fn tool_line(e: &Event, output_span: Option<(usize, usize)>, preview: Option
                 format!("{mark} {name} {input}{out}{size}")
             }
         }
-    };
-    format!("  {body}")
+    }
 }
-pub fn render(w: &Window, d: &Display) -> Result<String> {
+/// 0.4.9's `_tool_line` in `around`: the tool line, colored, and with `out_cap` the
+/// output's first `out_cap` characters on indented lines below it.
+fn around_tool_line(e: &Event, color: bool, out_cap: usize, m: &ToolMatch) -> String {
+    if e.is_marker() {
+        return marker_line(e, color);
+    }
+    let body = tool_body(e, out_cap, m.output_span, m.preview.as_deref());
+    let mut line = if color {
+        let tone = if e.ok == Some(false) { BAD } else { DIM };
+        format!("  {tone}{body}{RESET}")
+    } else {
+        format!("  {body}")
+    };
+    if out_cap > 0 && !e.output.is_empty() {
+        let kept: String = e.output.chars().take(out_cap).collect();
+        let more = e.output.chars().count() - kept.chars().count();
+        let out = surface::safe(&kept, true);
+        // Python's `splitlines`: the sanitizer left `\n` as the only line break.
+        let lines = out.strip_suffix('\n').unwrap_or(&out).split('\n');
+        line += "\n";
+        line += &lines
+            .map(|l| format!("    {l}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if more > 0 {
+            line += &format!(" [+{} indexed chars]", surface::number(more));
+        }
+        if e.output_truncated() {
+            line += " [source truncated at ingest]";
+        }
+    }
+    line
+}
+const TOOL_RUN_MIN: usize = 5;
+const TOOL_DETAIL_MAX: usize = 16;
+/// 0.4.9's `_tool_run_summary`: a run of successful calls folded into one line.
+fn tool_run_summary(events: &[&Event], color: bool, expand: &str) -> String {
+    let mut by_name: Vec<(&str, usize)> = Vec::new();
+    for e in events {
+        match by_name.iter_mut().find(|(name, _)| *name == e.name) {
+            Some((_, count)) => *count += 1,
+            None => by_name.push((&e.name, 1)),
+        }
+    }
+    by_name.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    let top = &by_name[..by_name.len().min(3)];
+    let rest = events.len() - top.iter().map(|(_, count)| count).sum::<usize>();
+    let body = format!(
+        "⚙ {} tool calls ({}{}) - {expand} shows each",
+        events.len(),
+        top.iter()
+            .map(|(name, count)| format!("{count} {}", surface::safe(name, false)))
+            .collect::<Vec<_>>()
+            .join(" · "),
+        if rest > 0 {
+            format!(" · {rest} other")
+        } else {
+            String::new()
+        }
+    );
+    dim_line(&body, color)
+}
+fn dim_line(body: &str, color: bool) -> String {
+    if color {
+        format!("  {DIM}{body}{RESET}")
+    } else {
+        format!("  {body}")
+    }
+}
+/// 0.4.9's `_spread_tool_groups`: at most `limit` items sampled across the whole run.
+fn spread<T: Copy>(items: &[T], limit: usize) -> Vec<T> {
+    if limit == 0 || items.is_empty() {
+        return Vec::new();
+    }
+    if items.len() <= limit {
+        return items.to_vec();
+    }
+    if limit == 1 {
+        return vec![items[0]];
+    }
+    let picked: BTreeSet<usize> = (0..limit)
+        .map(|offset| {
+            ((offset * (items.len() - 1)) as f64 / (limit - 1) as f64).round_ties_even() as usize
+        })
+        .collect();
+    picked.into_iter().map(|index| items[index]).collect()
+}
+/// 0.4.9's `_tool_rows`: each rendered tool call's index in `tools` and its line, `None`
+/// for a collapse summary. Long tails keep failures and the selected call visible.
+fn tool_rows(
+    tools: &[&Event],
+    color: bool,
+    out_cap: usize,
+    expand: &str,
+    collapse: bool,
+    claim: (Option<&str>, Option<(usize, usize)>),
+) -> Vec<(Option<usize>, String)> {
+    let selected = tools.iter().enumerate().find_map(|(at, e)| {
+        let m = selected_tool_match(e, claim.0, claim.1);
+        m.selected.then_some((at, m))
+    });
+    let is_selected = |at: usize| selected.as_ref().is_some_and(|(s, _)| *s == at);
+    let line = |at: usize| {
+        let m = selected
+            .as_ref()
+            .filter(|(s, _)| *s == at)
+            .map(|(_, m)| m.clone())
+            .unwrap_or_default();
+        around_tool_line(tools[at], color, out_cap, &m)
+    };
+    let every = || (0..tools.len()).map(|at| (Some(at), line(at))).collect();
+    let plain: Vec<usize> = (0..tools.len())
+        .filter(|&at| {
+            !matches!(
+                tools[at].kind.as_str(),
+                "subagent_start" | "subagent_result"
+            ) && tools[at].ok == Some(true)
+                && !is_selected(at)
+        })
+        .collect();
+    let plain_events: Vec<&Event> = plain.iter().map(|&at| tools[at]).collect();
+    if !collapse || out_cap > 0 || (plain.len() < TOOL_RUN_MIN && tools.len() <= TOOL_DETAIL_MAX) {
+        return every();
+    }
+    let details: Vec<usize> = (0..tools.len()).filter(|at| !plain.contains(at)).collect();
+    if plain.len() >= TOOL_RUN_MIN && details.len() < TOOL_DETAIL_MAX {
+        let mut lines: Vec<_> = details.iter().map(|&at| (Some(at), line(at))).collect();
+        lines.push((None, tool_run_summary(&plain_events, color, expand)));
+        return lines;
+    }
+    // Groups of identical evidence, in first-seen order: (call, count, order).
+    let mut groups: Vec<(usize, usize, usize)> = Vec::new();
+    for (order, &at) in details.iter().enumerate() {
+        let e = tools[at];
+        let same = |g: &&mut (usize, usize, usize)| {
+            let o = tools[g.0];
+            !is_selected(g.0)
+                && (&o.kind, &o.name, &o.input, &o.output, o.ok)
+                    == (&e.kind, &e.name, &e.input, &e.output, e.ok)
+                && (o.input_chars, o.output_chars, o.output_bytes)
+                    == (e.input_chars, e.output_chars, e.output_bytes)
+        };
+        match groups.iter_mut().find(same).filter(|_| !is_selected(at)) {
+            Some(group) => group.1 += 1,
+            None => groups.push((at, 1, order)),
+        }
+    }
+    let failed = |g: &(usize, usize, usize)| tools[g.0].ok == Some(false);
+    let mut required: Vec<usize> = (0..groups.len())
+        .filter(|&g| is_selected(groups[g].0))
+        .collect();
+    let singletons: Vec<usize> = (0..groups.len())
+        .filter(|&g| failed(&groups[g]) && groups[g].1 == 1 && !is_selected(groups[g].0))
+        .collect();
+    if singletons.len() == 1 {
+        required.push(singletons[0]);
+    }
+    let remaining: Vec<usize> = (0..groups.len())
+        .filter(|g| !required.contains(g))
+        .collect();
+    let failures: Vec<usize> = remaining
+        .iter()
+        .copied()
+        .filter(|&g| failed(&groups[g]))
+        .collect();
+    let other: Vec<usize> = remaining
+        .iter()
+        .copied()
+        .filter(|&g| !failed(&groups[g]))
+        .collect();
+    let mut slots = TOOL_DETAIL_MAX.saturating_sub(required.len());
+    let mut chosen = required;
+    let picked = spread(&failures, slots);
+    slots -= picked.len();
+    chosen.extend(picked);
+    chosen.extend(spread(&other, slots));
+    chosen.sort_by_key(|&g| groups[g].2);
+    let mut lines: Vec<(Option<usize>, String)> = chosen
+        .iter()
+        .map(|&g| {
+            let (at, count, _) = groups[g];
+            let mut text = line(at);
+            if count > 1 {
+                text += &format!(" [×{} identical]", surface::number(count));
+            }
+            (Some(at), text)
+        })
+        .collect();
+    let collapsed = tools.len() - chosen.len();
+    let collapsed_failed: usize = (0..groups.len())
+        .filter(|&g| failed(&groups[g]))
+        .map(|g| groups[g].1 - usize::from(chosen.contains(&g)))
+        .sum();
+    if plain.len() >= TOOL_RUN_MIN && collapsed == plain.len() && collapsed_failed == 0 {
+        lines.push((None, tool_run_summary(&plain_events, color, expand)));
+    } else {
+        let failed = if collapsed_failed > 0 {
+            format!(" ({} failed)", surface::number(collapsed_failed))
+        } else {
+            String::new()
+        };
+        let body = format!(
+            "⚙ {} tool event details collapsed{failed} - {expand} shows each",
+            surface::number(collapsed)
+        );
+        lines.push((None, dim_line(&body, color)));
+    }
+    lines
+}
+/// 0.4.9's `_tool_block`: one turn's tool lines with each marker in place among them and
+/// any collapse summary after the last tool call.
+fn tool_block(
+    events: &[&Event],
+    color: bool,
+    out_cap: usize,
+    expand: &str,
+    collapse: bool,
+    claim: (Option<&str>, Option<(usize, usize)>),
+) -> Vec<String> {
+    let tools: Vec<usize> = (0..events.len())
+        .filter(|&at| !events[at].is_marker())
+        .collect();
+    let calls: Vec<&Event> = tools.iter().map(|&at| events[at]).collect();
+    let summary_at = tools.last().map_or(-1, |&at| 2 * at as i64 + 1);
+    let mut placed: Vec<(i64, String)> = tool_rows(&calls, color, out_cap, expand, collapse, claim)
+        .into_iter()
+        .map(|(at, line)| (at.map_or(summary_at, |at| 2 * tools[at] as i64), line))
+        .collect();
+    placed.extend(
+        (0..events.len())
+            .filter(|&at| events[at].is_marker())
+            .map(|at| (2 * at as i64, marker_line(events[at], color))),
+    );
+    placed.sort_by_key(|(at, _)| *at);
+    placed.into_iter().map(|(_, line)| line).collect()
+}
+/// An `around` result: the rendered page and whether it shows tool events, or 0.4.9's
+/// `no-speaker-match` miss when the window holds nothing the selection keeps.
+pub enum Rendered {
+    Page { text: String, tools: bool },
+    Miss { reason: String, scope: Value },
+}
+pub fn render(w: &Window, d: &Display) -> Result<Rendered> {
     if d.no_tools && w.claim.as_ref().is_some_and(|c| c.event.is_some()) {
         bail!("--no-tools conflicts with this tool result handle because it would erase the cited evidence")
     }
@@ -1217,25 +1537,45 @@ pub fn render(w: &Window, d: &Display) -> Result<String> {
     } else {
         "excluded"
     };
-    let events: Vec<_> = w
+    let claim_event = w.claim.as_ref().and_then(|c| c.event.as_deref());
+    let claim = (claim_event, w.claim.as_ref().and_then(|c| c.span));
+    let tools_wanted = d
+        .who
+        .as_deref()
+        .is_none_or(|who| who.split(',').any(|s| s == "tool"));
+    let events: Vec<&Event> = w
         .events
         .iter()
         .filter(|e| {
-            tool_mode == "all"
-                || (tool_mode == "selected"
-                    && w.claim
-                        .as_ref()
-                        .and_then(|c| c.event.as_ref())
-                        .is_some_and(|id| id == &e.identity))
+            tools_wanted
+                && (tool_mode == "all"
+                    || (tool_mode == "selected" && claim_event == Some(e.identity.as_str())))
         })
         .collect();
-    let row_cap = if d.full
-        || (w.side
-            && w.claim
-                .as_ref()
-                .is_some_and(|c| c.digest.is_some() && c.event.is_none())
-            && !d.explicit_max_chars)
-    {
+    if rows.is_empty() && events.is_empty() {
+        let (first, last) = match (w.rows.first(), w.rows.last()) {
+            (Some(first), Some(last)) => (first.turn, last.turn),
+            _ => (w.center, w.center),
+        };
+        let role = d
+            .who
+            .as_deref()
+            .map_or("default-scope".into(), |who| surface::safe(who, false));
+        let mut reason =
+            format!("no {role} messages or events in turns {first}-{last} of {target}");
+        if d.who.is_none() {
+            reason += "; use --full to include tool events";
+        }
+        let scope = json!({"session":w.session,"who":d.who,"first_turn":first,"last_turn":last});
+        return Ok(Rendered::Miss { reason, scope });
+    }
+    let delegated_exact = w.side
+        && w.claim
+            .as_ref()
+            .is_some_and(|c| c.digest.is_some() && c.event.is_none())
+        && !d.explicit_max_chars
+        && !d.full;
+    let row_cap = if d.full || delegated_exact {
         0
     } else {
         d.max_chars
@@ -1253,7 +1593,7 @@ pub fn render(w: &Window, d: &Display) -> Result<String> {
             }
         );
         let source = if !d.json && row_cap > 0 && r.who != "agent" {
-            r.text.split_whitespace().collect::<Vec<_>>().join(" ")
+            one_line(&r.text)
         } else {
             r.text.clone()
         };
@@ -1261,28 +1601,34 @@ pub fn render(w: &Window, d: &Display) -> Result<String> {
         truncated += usize::from(omitted > 0);
         rendered.push((*r, text, omitted));
     }
-    let expansion = vec![
-        "agrep".to_owned(),
-        "around".into(),
-        target.clone(),
-        w.center.to_string(),
-        "-C".into(),
-        w.radius
-            .unwrap_or((w.center - w.first).max(w.last - w.center))
-            .to_string(),
-        "--full".into(),
-    ];
+    let center = w.center.to_string();
+    let around = |extra: &[&str]| {
+        let mut argv: Vec<String> = vec!["agrep".into(), "around".into(), target.clone()];
+        argv.push(center.clone());
+        match w.radius {
+            Some(radius) => argv.extend(["-C".into(), radius.to_string()]),
+            None => argv.push("--whole".into()),
+        }
+        argv.extend(extra.iter().map(|s| s.to_string()));
+        argv
+    };
+    let all_events: Vec<&Event> = w.events.iter().collect();
+    let markers_available = tally(
+        all_events
+            .iter()
+            .filter(|e| e.is_marker())
+            .map(|e| &*e.name),
+    );
+    let markers_shown = tally(events.iter().filter(|e| e.is_marker()).map(|e| &*e.name));
+    let total = |counts: &[(&str, usize)]| counts.iter().map(|(_, n)| n).sum::<usize>();
+    let tools_available = all_events.len() - total(&markers_available);
+    let tools_shown = events.len() - total(&markers_shown);
     let mut out = String::new();
     if d.json {
-        let counts = |rs: &[&Row]| {
-            let mut v = BTreeMap::<String, usize>::new();
-            for r in rs {
-                *v.entry(r.who.clone()).or_default() += 1;
-            }
-            v
-        };
         let all: Vec<_> = w.rows.iter().collect();
-        let mut meta = json!({"kind":"agrep-meta","scope":{"policy":if d.full{"forensic"}else if w.claim.is_some(){"bounded_inclusive"}else{"root_prose"},"session":w.session,"selected_session_role":if w.side{"delegated"}else{"root_main"},"selected_record_role":if w.claim.is_none(){"none"}else if w.claim.as_ref().is_some_and(|c|c.event.is_some()){"tool"}else{"prose_turn_inclusive"},"center_turn":w.center,"radius":w.radius.unwrap_or((w.center-w.first).max(w.last-w.center)),"bounds":{"first_indexed_turn":w.first,"last_indexed_turn":w.last},"selection_order":if w.radius.is_none(){"whole_chat"}else if w.latest{"newest_tail"}else{"requested_center"},"render_order":"chronological","family_widened":false,"project_or_folder_ranked":false,"counts_state":"exact","tools":{"mode":tool_mode,"available":w.events.len(),"shown":events.len(),"hidden":w.events.len()-events.len()},"prose":{"available_by_role":counts(&all),"shown_by_role":counts(&rows),"hidden":w.rows.len()-rows.len()},"adoption":if w.side{"unresolved"}else{"root_main"},"truncation":{"message_cap_chars":if row_cap==0{None}else{Some(row_cap)},"message_cap_state":if d.full{"forensic_uncapped"}else if row_cap==0{"explicit_uncapped"}else{"bounded"},"render_truncated_rows":truncated,"source_truncated_agent_rows":w.rows.iter().filter(|r|r.reply_truncated()).count(),"source_truncated_events":w.events.iter().filter(|e|e.input_truncated()||e.output_truncated()).count()},"expansion_argv":expansion}});
+        let prose_available = tally(all.iter().map(|r| &*r.who));
+        let prose_shown = tally(rows.iter().map(|r| &*r.who));
+        let mut meta = json!({"kind":"agrep-meta","scope":{"policy":if d.full{"forensic"}else if w.claim.is_none(){"root_prose"}else if claim_event.is_some(){"role_aware"}else{"bounded_inclusive"},"session":w.session,"selected_session_role":if w.side{"delegated"}else{"root_main"},"selected_record_role":if w.claim.is_none(){"none"}else if claim_event.is_some(){"tool"}else{"prose_turn_inclusive"},"center_turn":w.center,"radius":w.radius.unwrap_or((w.center-w.first).max(w.last-w.center)),"bounds":{"first_indexed_turn":w.first,"last_indexed_turn":w.last},"selection_order":if w.radius.is_none(){"whole_chat"}else if w.latest{"newest_tail"}else{"requested_center"},"render_order":"chronological","family_widened":false,"project_or_folder_ranked":false,"counts_state":"exact","tools":{"mode":tool_mode,"available":tools_available,"shown":tools_shown,"hidden":tools_available.saturating_sub(tools_shown)},"markers":{"available_by_name":object(&markers_available),"shown_by_name":object(&markers_shown),"hidden":total(&markers_available).saturating_sub(total(&markers_shown))},"prose":{"available_by_role":object(&prose_available),"shown_by_role":object(&prose_shown),"hidden":w.rows.len()-rows.len()},"adoption":if w.side{"unresolved"}else{"root_main"},"truncation":{"message_cap_chars":if row_cap==0{None}else{Some(row_cap)},"message_cap_state":if d.full{"forensic_uncapped"}else if delegated_exact{"selected_delegated_exact_turn_uncapped"}else if row_cap==0{"explicit_uncapped"}else{"bounded"},"render_truncated_rows":truncated,"source_truncated_agent_rows":w.rows.iter().filter(|r|r.reply_truncated()).count(),"source_truncated_events":w.events.iter().filter(|e|e.input_truncated()||e.output_truncated()).count()},"expansion_argv":around(&["--full"])}});
         meta["self_exclusion"] = d.caller.metadata(
             crate::caller::Request {
                 waived: Some("chat-filter"),
@@ -1304,22 +1650,65 @@ pub fn render(w: &Window, d: &Display) -> Result<String> {
             .join(" · ");
         let lo = w.rows.first().map(|r| r.turn).unwrap_or(w.center);
         let hi = w.rows.last().map(|r| r.turn).unwrap_or(w.center);
-        out += &format!("{head}  turns {lo}-{hi} of {}-{}\n", w.first, w.last);
-        if w.events.len() > events.len() || w.rows.len() > rows.len() || w.side {
-            let mut parts = Vec::new();
-            if w.side {
-                parts.push("subagent conversation".into())
-            }
-            if w.events.len() > events.len() {
-                parts.push(format!(
-                    "{} tool events omitted",
-                    w.events.len() - events.len()
-                ))
-            }
-            if w.rows.len() > rows.len() {
-                parts.push(format!("{} messages omitted", w.rows.len() - rows.len()))
-            }
-            out += &format!("{} · {}\n", parts.join(" · "), surface::shell(&expansion));
+        let span = format!("turns {lo}-{hi} of {}-{}", w.first, w.last);
+        out += &if d.color {
+            format!("{HEAD}{head}{RESET}  {DIM}{span}{RESET}\n")
+        } else {
+            format!("{head}  {span}\n")
+        };
+        let hidden_tools = tools_available.saturating_sub(tools_shown);
+        let hidden_prose = w.rows.len() - rows.len();
+        let count = |counts: &[(&str, usize)], name: &str| {
+            counts
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map_or(0, |(_, n)| *n)
+        };
+        let hidden_markers: Vec<String> = MARKERS
+            .iter()
+            .filter_map(|(name, noun)| {
+                let n = count(&markers_available, name) - count(&markers_shown, name);
+                (n > 0).then(|| {
+                    format!(
+                        "{} {noun}{}",
+                        surface::number(n),
+                        if n == 1 { "" } else { "s" }
+                    )
+                })
+            })
+            .collect();
+        let hidden = hidden_tools > 0 || hidden_prose > 0 || !hidden_markers.is_empty();
+        let mut parts = Vec::new();
+        if w.side {
+            parts.push("subagent conversation".to_owned());
+        }
+        if hidden_tools > 0 {
+            parts.push(format!(
+                "{} tool events omitted",
+                surface::number(hidden_tools)
+            ));
+        }
+        if !hidden_markers.is_empty() {
+            parts.push(format!("{} omitted", hidden_markers.join(", ")));
+        }
+        if hidden_prose > 0 {
+            parts.push(format!(
+                "{} messages omitted",
+                surface::number(hidden_prose)
+            ));
+        }
+        if hidden {
+            // A speaker-filtered read is lifted by dropping the filter, not by --full.
+            let extra: &[&str] = if d.who.is_some() { &[] } else { &["--full"] };
+            parts.push(surface::shell(&around(extra)));
+        }
+        if !parts.is_empty() {
+            let line = parts.join(" · ");
+            out += &if d.color {
+                format!("{DIM}{line}{RESET}\n")
+            } else {
+                format!("{line}\n")
+            };
         }
     }
     let turns: BTreeSet<_> = rows
@@ -1329,16 +1718,13 @@ pub fn render(w: &Window, d: &Display) -> Result<String> {
         .collect();
     for turn in turns {
         if !d.json {
-            let ts = rows
-                .iter()
-                .find(|r| r.turn == turn)
-                .map(|r| r.ts)
-                .unwrap_or(0);
-            out += &format!(
-                "── turn {turn} {} {}\n",
-                "─".repeat(40),
-                surface::timestamp(ts)
-            );
+            let ts = w.rows.iter().find(|r| r.turn == turn).map_or(0, |r| r.ts);
+            let (rule, stamp) = ("─".repeat(40), surface::timestamp(ts));
+            out += &if d.color {
+                format!("{DIM}── turn {RESET}{YELLOW}{turn}{RESET} {DIM}{rule} {stamp}{RESET}\n")
+            } else {
+                format!("── turn {turn} {rule} {stamp}\n")
+            };
         }
         for (r, text, omitted) in rendered
             .iter()
@@ -1346,74 +1732,39 @@ pub fn render(w: &Window, d: &Display) -> Result<String> {
         {
             out += &prose_output(w, d, r, text, *omitted);
         }
-        for e in events.iter().filter(|e| e.turn == turn) {
-            let selected = w
-                .claim
-                .as_ref()
-                .and_then(|c| c.event.as_ref())
-                .is_some_and(|id| id == &e.identity);
-            let preview = if selected {
-                w.claim
-                    .as_ref()
-                    .and_then(|c| c.span)
-                    .filter(|(_, end)| *end <= e.text.chars().count())
-                    .map(|(start, end)| {
-                        e.text
-                            .chars()
-                            .skip(start.saturating_sub(60))
-                            .take((end - start + 120).min(360))
-                            .collect::<String>()
-                    })
-            } else {
-                None
-            };
-            if d.json {
+        let turn_events: Vec<&Event> = events.iter().copied().filter(|e| e.turn == turn).collect();
+        if d.json {
+            for e in turn_events {
+                let m = selected_tool_match(e, claim.0, claim.1);
                 let mut v = json!({"kind":e.kind,"session":w.session,"project":w.project,"turn":e.turn,"ts":e.ts,"name":e.name,"input":e.input,"ok":e.ok,"input_chars":e.input_chars,"output_chars":e.output_chars,"output_bytes":e.output_bytes,"input_truncated":e.input_truncated(),"output_truncated":e.output_truncated()});
-                if let Some(p) = preview {
-                    v["match_preview"] = json!(p);
+                if let Some(preview) = m.preview.filter(|p| m.selected && !p.is_empty()) {
+                    v["match_preview"] = json!(preview);
                 }
                 if d.tool_output > 0 {
                     v["output"] = json!(e.output.chars().take(d.tool_output).collect::<String>())
                 }
                 out += &format!("{}\n", crate::json_output::to_string(&v)?);
-            } else {
-                let input = surface::clip(
-                    &surface::safe(preview.as_deref().unwrap_or(&e.input), false),
-                    240,
-                );
-                let output = if d.tool_output == 0 && preview.is_none() && !e.output.is_empty() {
-                    format!(" {}", surface::clip(&surface::safe(&e.output, false), 240))
-                } else {
-                    String::new()
-                };
-                let size = e
-                    .output_bytes
-                    .map(|n| format!(" ({}B)", surface::number(n)))
-                    .unwrap_or_default();
-                out += &format!(
-                    "  {} {} {input}{output}{size}\n",
-                    if e.ok == Some(false) {
-                        "✗ FAILED"
-                    } else {
-                        "⚙"
-                    },
-                    surface::safe(&e.name, false)
-                );
-                if d.tool_output > 0 {
-                    out += &format!(
-                        "    {}{}\n",
-                        surface::safe(
-                            &e.output.chars().take(d.tool_output).collect::<String>(),
-                            true
-                        )
-                        .replace('\n', "\n    "),
-                        if e.output_truncated() {
-                            " [source truncated at ingest]"
-                        } else {
-                            ""
-                        }
-                    )
-                }
+            }
+        } else {
+            let expand = surface::shell(&[
+                "agrep".into(),
+                "around".into(),
+                target.clone(),
+                turn.to_string(),
+                "-C".into(),
+                "0".into(),
+                "--full".into(),
+            ]);
+            for line in tool_block(
+                &turn_events,
+                d.color,
+                d.tool_output,
+                &expand,
+                !d.full,
+                claim,
+            ) {
+                out += &line;
+                out.push('\n');
             }
         }
         for (r, text, omitted) in rendered
@@ -1423,9 +1774,44 @@ pub fn render(w: &Window, d: &Display) -> Result<String> {
             out += &prose_output(w, d, r, text, *omitted);
         }
     }
-    Ok(out)
+    Ok(Rendered::Page {
+        text: out,
+        tools: !events.is_empty(),
+    })
 }
 
+/// Counts by name in first-seen order, as 0.4.9's dicts kept them.
+fn tally<'a>(names: impl Iterator<Item = &'a str>) -> Vec<(&'a str, usize)> {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for name in names {
+        match counts.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((name, 1)),
+        }
+    }
+    counts
+}
+fn object(counts: &[(&str, usize)]) -> Value {
+    Value::Object(
+        counts
+            .iter()
+            .map(|(name, count)| ((*name).to_owned(), json!(count)))
+            .collect(),
+    )
+}
+/// 0.4.9's `_dim_markers`: cap and ingest-loss markers in a body read as plumbing.
+fn dim_markers(text: &str, color: bool) -> String {
+    static MARKER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\[(?:\+[\d,]+ chars - [^\]]*|source[^\]]*at ingest[^\]]*)\]")
+            .expect("valid marker pattern")
+    });
+    if !color {
+        return text.to_owned();
+    }
+    MARKER
+        .replace_all(text, |c: &regex::Captures| format!("{DIM}{}{RESET}", &c[0]))
+        .into_owned()
+}
 fn prose_output(w: &Window, d: &Display, r: &Row, text: &str, omitted: usize) -> String {
     if d.json {
         let mut v = json!({"kind":"msg","self":d.caller.resolved && d.caller.agent == w.agent && d.caller.session == w.session,"session":w.session,"project":w.project,"turn":r.turn,"who":r.who,"ts":r.ts,"text":text,"omitted_chars":omitted});
@@ -1446,19 +1832,13 @@ fn prose_output(w: &Window, d: &Display, r: &Row, text: &str, omitted: usize) ->
     } else {
         String::new()
     };
-    let text = surface::safe(text, true);
+    let text = dim_markers(&(surface::safe(text, true) + &loss), d.color);
+    let who = surface::safe(&r.who, false);
     if d.color {
-        format!(
-            "{}{}:\x1b[0m {text}{loss}\n",
-            if r.who == "agent" {
-                "\x1b[36m"
-            } else {
-                "\x1b[33m"
-            },
-            r.who
-        )
+        let tone = if r.who == "agent" { CYAN } else { YELLOW };
+        format!("{tone}{who}:{RESET} {text}\n")
     } else {
-        format!("{}: {text}{loss}\n", r.who)
+        format!("{who}: {text}\n")
     }
 }
 

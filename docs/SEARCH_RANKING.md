@@ -171,7 +171,7 @@ explicit semantic search. Partial coverage is shown as indexed/total rows.
 A vector belongs only to the exact text it embedded; changed rows are
 keyword-searchable until embedded. A completed semantic miss with partial
 coverage exits 1 and reports that coverage. See [OUTPUT_CONTRACTS.md](OUTPUT_CONTRACTS.md)
-and [PORTING.md](PORTING.md) for the interface and implementation status.
+for the interface and [PORTING.md](PORTING.md) for deliberate differences from 0.4.9.
 
 In the automatic hybrid merge, a meaning row is corroborated when its
 conversation family also holds a strong lexical row; bag-of-words scatter

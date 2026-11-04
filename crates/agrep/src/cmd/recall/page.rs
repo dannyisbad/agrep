@@ -235,17 +235,11 @@ fn gap_line(previous: i64, turn: i64) -> String {
         format!("       [turns {}-{} not shown]", previous + 1, turn - 1)
     }
 }
-/// Control events a footer counts apart from tool calls, in its order, with their nouns.
-const MARKERS: [(&str, &str); 3] = [
-    ("api_error", "API error"),
-    ("compacted", "compaction"),
-    ("task_notification", "task notification"),
-];
 fn marker_counts(events: &[&Event]) -> [usize; 3] {
-    MARKERS.map(|(name, _)| {
+    evidence::MARKERS.map(|(name, _)| {
         events
             .iter()
-            .filter(|e| e.kind == "control" && e.name == name)
+            .filter(|e| e.is_marker() && e.name == name)
             .count()
     })
 }
@@ -254,7 +248,7 @@ fn events_tail(tools: usize, markers: &[usize; 3], expand: &str) -> String {
     if tools > 0 {
         parts.push(format!("{tools} tool calls"));
     }
-    for (n, (_, noun)) in markers.iter().zip(MARKERS) {
+    for (n, (_, noun)) in markers.iter().zip(evidence::MARKERS) {
         if *n > 0 {
             parts.push(format!(
                 "{} {noun}{}",

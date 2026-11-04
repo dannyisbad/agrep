@@ -4,7 +4,7 @@ use agrep_core::{
     caller::{self, Caller, Identity},
     evidence::{self, Request, Window},
     handles, hybrid,
-    query::{Hit, Options},
+    query::{Hit, Options, Results},
     render, semantic, store, surface,
 };
 use anyhow::{bail, Result};
@@ -94,6 +94,90 @@ fn head(h: &Hit) -> String {
     .filter(|field| !field.is_empty())
     .collect::<Vec<_>>()
     .join(" · ")
+}
+fn family_key(h: &Hit, per_session: bool) -> &str {
+    if per_session {
+        &h.session
+    } else {
+        &h.family
+    }
+}
+/// 0.4.9's `_weak_scatter`: a bag-of-words row, never strong evidence.
+fn scatter(h: &Hit) -> bool {
+    h.matched == "all-terms" || h.matched == "content-terms"
+}
+/// 0.4.9's recall under `--no-meta` selected from heads, not rows: the best row of each
+/// of up to `max(target, 40)` families (chats under `per_session`) from the prose lane,
+/// plus the tool lane's when prose held fewer than `target` or only bag-of-words
+/// heads. Proven ~meta heads were dropped, the best one kept when every head was one,
+/// and the rest ordered lived first, then by strength, lane and score.
+struct MetaHeads {
+    heads: Vec<Hit>,
+    dropped: usize,
+    retained: bool,
+}
+impl MetaHeads {
+    /// `chats(limit, lane)` ranks chat heads: `Some(false)` prose, `Some(true)` tool rows,
+    /// `None` the scope's own `--who` lane.
+    fn rank(
+        c: &rusqlite::Connection,
+        query: &str,
+        target: usize,
+        per_session: bool,
+        who: bool,
+        chats: impl Fn(usize, Option<bool>) -> Result<Results>,
+    ) -> Result<(Results, Self)> {
+        let want = target.max(40);
+        let lane = |tools: Option<bool>| -> Result<(Results, Vec<Hit>)> {
+            let mut limit = want;
+            loop {
+                let mut ranked = chats(limit, tools)?;
+                let all = ranked.hits.len() < limit;
+                let mut seen = HashSet::new();
+                let heads: Vec<Hit> = std::mem::take(&mut ranked.hits)
+                    .into_iter()
+                    .filter(|h| seen.insert(family_key(h, per_session).to_owned()))
+                    .take(want)
+                    .collect();
+                if all || heads.len() == want {
+                    return Ok((ranked, heads));
+                }
+                limit *= 2;
+            }
+        };
+        let (base, mut heads) = lane((!who).then_some(false))?;
+        if !who && (heads.len() < target || heads.iter().all(scatter)) {
+            heads.extend(lane(Some(true))?.1);
+        }
+        let meta = agrep_core::query::meta_rows(c, &heads, query)?;
+        let mut ranked: Vec<(Hit, bool)> = heads.into_iter().zip(meta).collect();
+        ranked.sort_by(|(a, a_meta), (b, b_meta)| {
+            a_meta
+                .cmp(b_meta)
+                .then(scatter(a).cmp(&scatter(b)))
+                .then((!who && a.who == "tool").cmp(&(!who && b.who == "tool")))
+                .then((a.matched == "all-terms").cmp(&(b.matched == "all-terms")))
+                .then(b.score.total_cmp(&a.score))
+        });
+        let lived = ranked.iter().any(|(_, meta)| !meta);
+        let mut out = MetaHeads {
+            heads: Vec::new(),
+            dropped: 0,
+            retained: false,
+        };
+        for (mut h, meta) in ranked {
+            if !meta {
+                out.heads.push(h);
+            } else if !lived && !out.retained {
+                h.meta_marker = true;
+                out.heads.push(h);
+                out.retained = true;
+            } else {
+                out.dropped += 1;
+            }
+        }
+        Ok((base, out))
+    }
 }
 /// Takes each query's next hit in turn, skipping turns already taken and
 /// families that query already supplied, until `target` hits. Also reports,
@@ -455,7 +539,7 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
     let include_self = a.scope.include_self || (a.scope.chat.is_some() && !a.scope.no_self);
     let identity = Identity::detect();
     if !a.json && !a.scope.include_self && (a.scope.no_self || identity.agent_context) {
-        identity.disclose(a.scope.no_self);
+        identity.disclose(a.scope.no_self, true);
     }
     let caller = Caller::resolve(&c, identity)?;
     let request = caller::Request {
@@ -502,9 +586,11 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
             direct_filters.join(", ")
         );
     }
+    let handle_only = queries.iter().all(|q| handles::is_handle(q));
     let mut buckets = Vec::new();
     let mut known_sessions = HashSet::new();
     let mut totals_exact = true;
+    let (mut meta_dropped, mut meta_retained) = (0, 0);
     let mut deepen = Vec::new();
     for query in &queries {
         if handles::is_handle(query) {
@@ -554,7 +640,21 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
                 ..Hit::default()
             };
             known_sessions.insert(w.session.clone());
-            buckets.push(vec![h]);
+            // 0.4.9 hides a handle into the caller's own window and counts it withheld
+            // (py/recall.py:2452-2471).
+            let hidden = policy.is_some()
+                && caller::excludes(
+                    &caller,
+                    &h.agent,
+                    &h.session,
+                    h.turn,
+                    include_self,
+                    a.scope.no_self,
+                );
+            if hidden {
+                excluded = Some(excluded.unwrap_or(0) + 1);
+            }
+            buckets.push(if hidden { vec![] } else { vec![h] });
             deepen.push(None);
             continue;
         }
@@ -577,6 +677,38 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
             filters: filters.clone(),
         };
         let options = caller::options(&options, &caller, include_self, a.scope.no_self);
+        // The withheld-row probes drop --no-meta's stored tooling roles themselves; the
+        // searches leave ~meta rows to the family heads below.
+        let probes = options.clone();
+        let mut options = options;
+        options.filters.no_meta = false;
+        let per_session = a.scope.all_side_chats || filters.chat.is_some();
+        let mut meta = if a.scope.no_meta && !a.semantic {
+            let who = options.filters.who.is_some();
+            Some(MetaHeads::rank(
+                &c,
+                query,
+                target,
+                per_session,
+                who,
+                |limit, tools| {
+                    let mut heads = Options {
+                        chats: true,
+                        limit,
+                        ..options.clone()
+                    };
+                    match tools {
+                        Some(true) if !options.tools => return Ok(Default::default()),
+                        Some(true) => heads.filters.who = Some("tool".into()),
+                        Some(false) => heads.tools = false,
+                        None => {}
+                    }
+                    caller::search(&c, &heads, &caller, include_self, a.scope.no_self)
+                },
+            )?)
+        } else {
+            None
+        };
         let lane = if !semantic_failed
             && (a.semantic
                 || (!a.lexical
@@ -604,6 +736,12 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
         };
         let keyword = if a.semantic && !semantic_failed {
             Default::default()
+        } else if let Some((base, heads)) = meta.as_mut() {
+            meta_dropped += heads.dropped;
+            meta_retained += usize::from(heads.retained);
+            let mut keyword = std::mem::take(base);
+            keyword.hits = std::mem::take(&mut heads.heads);
+            keyword
         } else {
             let _span = agrep_core::semantic_profile::span("keyword");
             let page = Options {
@@ -657,7 +795,7 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
             .as_ref()
             .filter(|_| queries.len() == 1 && !a.semantic && !semantic_ran)
         {
-            if let Some(withheld) = policy.withheld(&c, &options, filters.chat.as_deref())? {
+            if let Some(withheld) = policy.withheld(&c, &probes, filters.chat.as_deref())? {
                 let tools = filters.who.is_some()
                     || filters.no_who.is_some()
                     || tool_lane(&r.hits, depth, target, a.scope.all_side_chats, |limit| {
@@ -676,9 +814,19 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
         }
         totals_exact &= r.total_basis == "exact";
         known_sessions.extend(r.hits.iter().map(|h| h.session.clone()));
-        deepen.push((depth < options.limit && r.hits.len() == depth).then_some(options));
+        // A --no-meta bucket already holds every head 0.4.9 selected from.
+        deepen.push(
+            (meta.is_none() && depth < options.limit && r.hits.len() == depth).then_some(options),
+        );
         buckets.push(r.hits);
     }
+    // 0.4.9's JSON note for a keyword lane that fell back to its any-order tiers
+    // (py/recall.py:2379-2382, 2916-2917).
+    let fell_back = buckets
+        .iter()
+        .flatten()
+        .any(|h| h.matched == "all-terms" || h.matched == "content-terms")
+        && !buckets.iter().flatten().any(|h| h.matched == "phrase");
     let selected = select_deepening(
         &mut buckets,
         &mut deepen,
@@ -696,7 +844,7 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
     let windows_span = agrep_core::semantic_profile::span("windows");
     let windows = evidence::windows(&c, &requests)?;
     // The caller's current window stays excluded after expansion reads neighboring turns.
-    let before = (caller.resolved && !include_self && !handles::is_handle(&queries[0]))
+    let before = (caller.resolved && !include_self)
         .then(|| (caller.session.clone(), caller.boundary.unwrap_or(0)));
     let query_of: HashMap<String, usize> = selected
         .iter()
@@ -727,6 +875,9 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
             }
         }
         blocks.retain(|b| !b.window.rows.is_empty());
+    }
+    if let Some(line) = agrep_core::query::meta_notice(meta_dropped, meta_retained) {
+        eprintln!("{line}");
     }
     if !a.json {
         agrep_core::coverage::disclose(&coverage);
@@ -784,14 +935,10 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
             )
         } else {
             let count: i64 = c.query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))?;
-            format!(
-                "recall: no confident match in {count} past conversations{}",
-                if checked {
-                    ""
-                } else {
-                    "; freshness unchecked (--no-auto)"
-                }
-            )
+            if !checked {
+                eprintln!("{}", render::NO_AUTO_STALE);
+            }
+            format!("recall: no confident match in {count} past conversations")
         };
         if a.budget > 0 && line.len() + 1 > a.budget {
             if let Some(b) = confident {
@@ -820,14 +967,20 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
     let color = color == "always" || (color == "auto" && std::io::stdout().is_terminal());
     let page = page::Page::new(&blocks, &queries, a.budget);
     if a.json {
-        let mut value = json!({"query":if pack{json!(queries)}else{json!(queries[0])},"engine":"sqlite","hits":[],"semantic_status":{"state":if semantic_failed{"failed"}else if semantic_ran{"complete"}else{"not-run"},"reason":if semantic_failed{Some("retrieval-failed")}else if semantic_ran{None}else{Some(if a.lexical{"--lexical"}else if !semantic::installed(&root){"model-not-installed"}else{"query-ineligible"})}},"self_exclusion":caller.metadata(request,excluded),"filter_coverage":coverage,"freshness":render::freshness(checked,pending_sources),"semantic_coverage":semantic_coverage});
+        let mut value = json!({"query":if pack{json!(queries)}else{json!(queries[0])},"engine":if handle_only{"handle"}else{"sqlite"},"hits":[],"semantic_status":{"state":if semantic_failed{"failed"}else if semantic_ran{"complete"}else{"not-run"},"reason":if semantic_failed{Some("retrieval-failed")}else if semantic_ran{None}else{Some(if handle_only{"handle-lookup"}else if a.lexical{"--lexical"}else if !semantic::installed(&root){"model-not-installed"}else{"query-ineligible"})}},"self_exclusion":caller.metadata(request,excluded),"filter_coverage":coverage,"freshness":render::freshness(checked,pending_sources),"semantic_coverage":semantic_coverage});
         if override_filters {
             value["filter_override"] = json!({"supplied":direct_filters,"reason":"direct-handle"});
+        }
+        if fell_back {
+            value["note"] = json!("no exact phrase match; showing hits containing all terms");
         }
         surface::write(&page::json(&page, &mut value)?)?;
     } else if blocks.is_empty() {
         let n: i64 = c.query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))?;
         eprintln!("no hits across {n} indexed sessions.");
+        if !checked {
+            eprintln!("{}", render::NO_AUTO_STALE);
+        }
     } else {
         surface::write(&page::text(&page, color)?)?;
     }

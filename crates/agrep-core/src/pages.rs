@@ -26,15 +26,23 @@ pub struct Frozen {
     pub chat_scoped: bool,
     #[serde(default)]
     pub full_argv: Vec<String>,
+    /// Whether `-c` can count a floor total exactly: not for a `--no-meta` page that
+    /// dropped rows.
+    #[serde(default)]
+    pub exhaustible: bool,
 }
 #[derive(Debug)]
 pub struct Page {
     pub text: String,
     pub remainder: Frozen,
 }
+/// 0.4.9's compact page budget (`compact.DEFAULT_BYTE_BUDGET`), and the rows a page shows
+/// before that budget can end it (`MIN_PAGE_HITS`).
+const BUDGET: usize = 3584;
+const MIN_ROWS: usize = 4;
 pub fn select(mut frozen: Frozen) -> Page {
-    let mut text = String::new();
     let mut selected = Vec::new();
+    let mut used = 0;
     let mut counts = HashMap::<String, usize>::new();
     let tool_cap = if frozen.records.iter().all(|r| r.tool) {
         4
@@ -58,20 +66,27 @@ pub fn select(mut frozen: Frozen) -> Page {
         if selected.len() >= frozen.requested.filter(|n| *n > 0).unwrap_or(16).min(16) {
             break;
         }
-        if frozen.requested.is_none() && selected.len() >= 4 && r.score < first_score * 0.35 {
+        if selected.len() >= MIN_ROWS && used + r.line.len() + 1 > BUDGET {
+            break;
+        }
+        if frozen.requested.is_none() && selected.len() >= MIN_ROWS && r.score < first_score * 0.35
+        {
             continue;
         }
-        let identity_bytes = r.line.split_whitespace().next().map(str::len).unwrap_or(0);
-        let line = surface::clip(&r.line, 848.max(identity_bytes + 100));
-        if text.len() + line.len() + 1 > 3584 {
-            continue;
-        }
-        text += &line;
-        text.push('\n');
+        used += r.line.len() + 1;
         selected.push(i);
         *count += 1;
         tools += usize::from(r.tool);
         identities.insert(r.identity.clone());
+    }
+    let lines: Vec<&str> = selected
+        .iter()
+        .map(|&i| frozen.records[i].line.as_str())
+        .collect();
+    let mut text = String::new();
+    for line in fit(&lines, BUDGET) {
+        text += &line;
+        text.push('\n');
     }
     frozen.shown += selected.len();
     for i in selected.into_iter().rev() {
@@ -81,6 +96,61 @@ pub fn select(mut frozen: Frozen) -> Page {
         text,
         remainder: frozen,
     }
+}
+/// 0.4.9's `_fit_page_records`: rows that overrun the budget share it. A row no longer
+/// than an even share keeps its length; the others split what is left and are cut at a
+/// character boundary, ending in `…`.
+fn fit(lines: &[&str], budget: usize) -> Vec<String> {
+    let sizes: Vec<usize> = lines.iter().map(|line| line.len()).collect();
+    if sizes.iter().sum::<usize>() + lines.len() <= budget {
+        return lines.iter().map(|line| (*line).to_owned()).collect();
+    }
+    let mut available = budget.saturating_sub(lines.len());
+    let mut caps = vec![0; lines.len()];
+    let mut pending: std::collections::BTreeSet<usize> = (0..lines.len()).collect();
+    while !pending.is_empty() {
+        let (share, extra) = (available / pending.len(), available % pending.len());
+        let small: Vec<usize> = pending
+            .iter()
+            .copied()
+            .filter(|&i| sizes[i] <= share)
+            .collect();
+        if small.is_empty() {
+            for (offset, &i) in pending.iter().enumerate() {
+                caps[i] = share + usize::from(offset < extra);
+            }
+            break;
+        }
+        for i in small {
+            caps[i] = sizes[i];
+            available -= sizes[i];
+            pending.remove(&i);
+        }
+    }
+    lines
+        .iter()
+        .zip(caps)
+        .map(|(line, cap)| cut(line, cap))
+        .collect()
+}
+/// 0.4.9's `_truncate_visible_line`.
+fn cut(line: &str, cap: usize) -> String {
+    if line.len() <= cap {
+        return line.to_owned();
+    }
+    let marker = if cap >= 3 {
+        "…".to_owned()
+    } else {
+        ".".repeat(cap)
+    };
+    let room = cap - marker.len();
+    let end = line
+        .char_indices()
+        .map(|(at, c)| at + c.len_utf8())
+        .take_while(|&end| end <= room)
+        .last()
+        .unwrap_or(0);
+    format!("{}{marker}", line[..end].trim_end())
 }
 fn schema(c: &Connection) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS pages(handle TEXT PRIMARY KEY,expires_ms INTEGER NOT NULL,body TEXT NOT NULL) WITHOUT ROWID;")?;
@@ -144,7 +214,8 @@ pub fn footer(f: &Frozen, more: Option<&str>) -> String {
     let basis = if f.exact {
         format!("{total} {}", if f.total == 1 { "match" } else { "matches" })
     } else {
-        format!("{total}+ matches (floor; -c exact)")
+        let lever = if f.exhaustible { "; -c exact" } else { "" };
+        format!("{total}+ matches (floor{lever})")
     };
     match more {
         Some(h) => format!("{basis} · more: agrep --more {h}"),
@@ -158,6 +229,20 @@ pub fn footer(f: &Frozen, more: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn overrunning_rows_share_the_budget_and_short_rows_stay_whole() {
+        let short = "@short:1 kept whole".to_owned();
+        let long = format!("@long:2 {}", "é".repeat(2000));
+        let lines = fit(&[&short, &long, &long], 3584);
+        assert_eq!(lines[0], short);
+        // The long rows split what the short one leaves, cut between characters.
+        for line in &lines[1..] {
+            assert_eq!(line.len(), 1781);
+            assert!(line.ends_with("é…"));
+        }
+        assert!(lines.iter().map(|line| line.len() + 1).sum::<usize>() <= 3584);
+        assert_eq!(fit(&[&short], 3584), [short]);
+    }
     #[test]
     fn page_preserves_whole_utf8_rows() {
         let f = Frozen {
@@ -178,6 +263,7 @@ mod tests {
             requested: None,
             chat_scoped: false,
             full_argv: vec![],
+            exhaustible: true,
         };
         let page = select(f);
         assert!(page.text.len() <= 3584);

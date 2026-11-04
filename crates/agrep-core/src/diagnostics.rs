@@ -4,19 +4,21 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::{fs, path::Path};
-pub fn disk_bytes(path: &Path) -> Result<u64> {
+/// Bytes and files under `path`, without following links.
+pub fn disk_usage(path: &Path) -> Result<(u64, u64)> {
     let m = fs::symlink_metadata(path)?;
     if m.file_type().is_symlink() {
-        return Ok(0);
+        return Ok((0, 0));
     }
     if m.is_file() {
-        return Ok(m.len());
+        return Ok((m.len(), 1));
     }
-    let mut n = 0;
+    let (mut bytes, mut files) = (0, 0);
     for e in fs::read_dir(path)? {
-        n += disk_bytes(&e?.path())?;
+        let (b, f) = disk_usage(&e?.path())?;
+        (bytes, files) = (bytes + b, files + f);
     }
-    Ok(n)
+    Ok((bytes, files))
 }
 pub fn table_exists(c: &Connection, name: &str) -> Result<bool> {
     Ok(c.query_row(
@@ -49,7 +51,12 @@ pub fn status(root: &DataRoot) -> Result<Value> {
         Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => "missing",
         Err(_) => "unreadable",
     };
-    let mut out = json!({"version":env!("CARGO_PKG_VERSION"),"data_root":root.0,"format":format,"disk_bytes":if root.0.exists(){Some(disk_bytes(&root.0)?)}else{None},"index":{"state":"missing"},"sources":[],"agents":[],"semantic":{"model_present":false,"indexed_rows":0,"total_rows":0,"backlog":0},"integrations":[],"archive":{"present":root.0.join("archive").is_dir()}});
+    let usage = if root.0.exists() {
+        Some(disk_usage(&root.0)?)
+    } else {
+        None
+    };
+    let mut out = json!({"version":env!("CARGO_PKG_VERSION"),"data_root":root.0,"format":format,"disk_bytes":usage.map(|u| u.0),"disk_files":usage.map(|u| u.1),"index":{"state":"missing"},"sources":[],"agents":[],"semantic":{"model_present":false,"indexed_rows":0,"total_rows":0,"backlog":0},"integrations":[],"archive":{"present":root.0.join("archive").is_dir()}});
     if format != "valid" {
         return Ok(out);
     }
@@ -90,7 +97,10 @@ pub fn status(root: &DataRoot) -> Result<Value> {
             return Ok(out);
         }
     };
-    out["index"] = json!({"state":"ready","counts":counts,"last_refresh":state(&c,"refreshed")?});
+    let refreshed: Option<i64> = state(&c, "refreshed")?.and_then(|ms| ms.parse().ok());
+    out["index"] = json!({"state":"ready","counts":counts,"last_refresh":refreshed});
+    out["last_indexed_age_s"] =
+        json!(refreshed.map(|ms| (chrono::Utc::now().timestamp_millis() - ms).max(0) / 1000));
     if let Some(counts) = counts.as_object() {
         for (key, value) in counts {
             out[key] = value.clone();
@@ -126,7 +136,9 @@ pub fn status(root: &DataRoot) -> Result<Value> {
         None
     };
     out["semantic"] = json!({"model_present":present&&integrity.is_none(),"model_installed":present,"integrity_error":integrity,"model_path":model,"indexed_rows":coverage.embedded,"total_rows":coverage.total,"backlog":coverage.total.saturating_sub(coverage.embedded)});
-    out["disk_bytes"] = json!(disk_bytes(&root.0)?);
+    let (bytes, files) = disk_usage(&root.0)?;
+    out["disk_bytes"] = json!(bytes);
+    out["disk_files"] = json!(files);
     Ok(out)
 }
 pub fn integrations(config: &crate::data::Config) -> Result<Vec<Value>> {

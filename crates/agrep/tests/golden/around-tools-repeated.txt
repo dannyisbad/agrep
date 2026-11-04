@@ -1,0 +1,6 @@
+0fff0000 · pi · /work/tools  turns 1-1 of 0-1
+── turn 1 ──────────────────────────────────────── 2026-10-01 12:00
+user: repeat it
+  ⚙ bash echo same same (4B)
+  ⚙ bash echo same same (4B)
+  ⚙ bash echo same same (4B)

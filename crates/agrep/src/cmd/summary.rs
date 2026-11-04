@@ -105,7 +105,11 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
         ..Default::default()
     };
     h::validate_filters(&filters)?;
-    let caller = agrep_core::caller::Caller::resolve(&c, agrep_core::caller::Identity::detect())?;
+    let identity = agrep_core::caller::Identity::detect();
+    if args.no_self && !args.include_self && !args.json {
+        identity.disclose(true, false);
+    }
+    let caller = agrep_core::caller::Caller::resolve(&c, identity)?;
     let request = agrep_core::caller::Request {
         include_self: args.include_self,
         no_self: args.no_self,
@@ -340,8 +344,38 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
                 }
             }
         }
-        for caveat in &caveats {
-            eprintln!("{caveat}");
+        // 0.4.9's footer (py/summary.py:2207-2322): one line per mode.
+        let noun = |n: usize, word: &str| {
+            format!(
+                "{} {word}{}",
+                agrep_core::surface::number(n),
+                if n == 1 { "" } else { "s" }
+            )
+        };
+        let relative = regex::Regex::new(r"(?i)^\d+\s*[a-z]+$")?.is_match(since_text.trim());
+        let window_text = match (&args.until, &args.since) {
+            (Some(until), None) => format!("in the 7d before {until}"),
+            (Some(until), Some(_)) => format!("from {since_text} to {until}"),
+            _ if relative => format!("in the last {since_text}"),
+            _ => format!("since {since_text}"),
+        };
+        match args.mode.as_deref() {
+            Some("pending") => eprintln!(
+                "{} across {} {window_text}, most confident first",
+                noun(rows.len(), "open item"),
+                noun(families.len(), "chat")
+            ),
+            Some("time") => {
+                for caveat in &caveats {
+                    eprintln!("{caveat}");
+                }
+            }
+            _ => eprintln!(
+                "{}, {} {window_text}, most active first · estimated active time with a {} idle cap, side chats folded into their family",
+                noun(rows.len(), "project"),
+                noun(families.len(), "chat"),
+                args.idle_cap
+            ),
         }
         if unknown > 0 {
             eprintln!(

@@ -37,7 +37,11 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
         .as_ref()
         .is_some_and(|id| all.iter().any(|s| s.id.starts_with(id)));
     filters.no_side = !args.side && !direct;
-    let caller = agrep_core::caller::Caller::resolve(&c, agrep_core::caller::Identity::detect())?;
+    let detected = agrep_core::caller::Identity::detect();
+    if args.scope.no_self && !args.scope.include_self && !args.json {
+        detected.disclose(true, false);
+    }
+    let caller = agrep_core::caller::Caller::resolve(&c, detected)?;
     // A bare listing is identity, not an echo: only --no-self narrows it.
     let request = agrep_core::caller::Request {
         include_self: args.scope.include_self,
@@ -145,6 +149,7 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
         }
         println!("{}", agrep_core::json_output::to_string(&meta)?);
     }
+    let index = agrep_core::handles::SessionIndex::load(&c)?;
     for s in &selected {
         let latest = h::latest(&c, s)?;
         let latest_handle = latest.as_ref().map(|r| h::handle(&s.id, r));
@@ -169,12 +174,15 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
             }
             println!("{}", agrep_core::json_output::to_string(&row)?);
         } else {
+            // 0.4.9 named each chat by its shortest unique prefix and project leaf.
+            let target = format!("@{}", index.target(&s.id));
+            let followup = followup.replacen(&h::target(&s.id), &target, 1);
             println!(
                 "{} {} {} {} {}t{}  {}{} · agrep around {}",
-                super::paint(&h::target(&s.id), color),
+                super::paint(&target, color),
                 render::safe(&s.agent),
-                render::safe(&s.project),
-                h::age(hit.map_or(s.last_ts, |h| h.ts)),
+                render::safe(&render::project(&s.project)),
+                render::age(hit.map_or(s.last_ts, |h| h.ts)),
                 turns,
                 if s.side { " [side chat]" } else { "" },
                 if hit.is_some() { "match: " } else { "" },
@@ -185,10 +193,11 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
     }
     if !args.json {
         eprintln!(
-            "showing {} of {}{} matching chats, {}{}",
+            "showing {} of {}{} matching chat{}, {}{}",
             selected.len(),
             total,
             if exact { "" } else { "+" },
+            if total == 1 { "" } else { "s" },
             if pattern.is_empty() || direct {
                 "newest first"
             } else {

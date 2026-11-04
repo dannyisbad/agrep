@@ -43,6 +43,9 @@ pub struct Filters {
     pub caller: Option<CallerFilter>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_rows: Option<SessionRows>,
+    /// Rows of exactly these sessions, under any agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sessions: Option<Vec<String>>,
 }
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -107,8 +110,17 @@ pub struct Results {
     pub timings: Timings,
     #[serde(skip)]
     session_keys: HashSet<(String, String)>,
+    /// Matching rows, which `total` counts too unless it counts chats.
     #[serde(skip)]
-    meta_fallback: Option<Hit>,
+    rows: usize,
+    /// Proven ~meta rows `--no-meta` dropped from the fetched page, and kept as the only evidence.
+    #[serde(default)]
+    pub meta_dropped: usize,
+    #[serde(default)]
+    pub meta_retained: usize,
+    /// Counted rows per session id, kept when the scope names its sessions.
+    #[serde(skip)]
+    session_counts: HashMap<String, usize>,
 }
 #[derive(Default, Clone, Serialize, Deserialize, Debug)]
 pub struct Timings {
@@ -302,8 +314,24 @@ struct PlanCache {
     /// Per lane, a selective metadata scope's blocks; None when the scope is
     /// too broad to scan.
     scopes: HashMap<String, Option<ScopeBlocks>>,
+    /// The pattern's matcher before any pass adjusts it, keyed by pattern and mode:
+    /// compiling its expressions costs more than a pass over a small corpus.
+    matcher: Option<((String, bool, bool), Matcher)>,
 }
 impl PlanCache {
+    fn matcher(&mut self, o: &Options, c: &Connection) -> Result<Matcher> {
+        let key = (o.pattern.clone(), o.regex, o.word);
+        if self
+            .matcher
+            .as_ref()
+            .is_none_or(|(cached, _)| *cached != key)
+        {
+            self.matcher = Some((key, Matcher::new(o, c)?));
+        }
+        let mut m = self.matcher.as_ref().expect("cached above").1.clone();
+        m.quick_count = o.count_only && !o.count_by_tier;
+        Ok(m)
+    }
     fn coverage_bounds(
         &mut self,
         c: &Connection,
@@ -467,6 +495,7 @@ impl PlanCache {
         Ok(self.words(c, term)?.map(|words| words.doc))
     }
 }
+#[derive(Clone)]
 struct Matcher {
     quick_count: bool,
     partial: bool,
@@ -1331,7 +1360,7 @@ fn sql_filters(f: &Filters, alias: &str, c: &Connection) -> Result<(String, Vec<
     // A session scope holds a few sessions' rows. Without table statistics the planner
     // ranks the agent, time and project indexes above the session indexes and reads
     // every row of the agent; a unary plus keeps those columns off the access path.
-    let off = if f.chat.is_some() || f.session_rows.is_some() {
+    let off = if f.chat.is_some() || f.session_rows.is_some() || f.sessions.is_some() {
         "+"
     } else {
         ""
@@ -1381,6 +1410,12 @@ fn sql_filters(f: &Filters, alias: &str, c: &Connection) -> Result<(String, Vec<
             clauses.push(format!("{alias}.position>=?"));
             values.push(Value::Integer(from));
         }
+    }
+    if let Some(sessions) = &f.sessions {
+        clauses.push(format!(
+            "{alias}.session IN (SELECT value FROM json_each(?))"
+        ));
+        values.push(Value::Text(serde_json::to_string(sessions)?));
     }
     if let Some(v) = &f.model {
         clauses.push(if f.model_soft {
@@ -1740,50 +1775,90 @@ pub fn search(c: &Connection, o: &Options) -> Result<Results> {
 pub struct Plans(PlanCache);
 pub fn search_with(c: &Connection, o: &Options, plans: &mut Plans) -> Result<Results> {
     if o.filters.no_meta && (o.count_only || o.count_by_tier) {
-        bail!("--no-meta cannot be combined with counts");
+        bail!("--no-meta cannot narrow -c/--count-by-tier; machine counts keep grep parity");
     }
     let started = Instant::now();
     plans.0.scopes.clear();
-    let result = search_unfiltered(c, o, &mut plans.0)?;
-    let mut result = finish_meta(c, result)?;
+    let mut result = if o.filters.no_meta {
+        // 0.4.9 filtered only the page it fetched, at least 40 rows (or chats) deep.
+        let mut fetched = o.clone();
+        fetched.filters.no_meta = false;
+        if o.limit > 0 {
+            fetched.limit = o.limit.max(crate::history_meta::ROWS_PER_QUERY);
+        }
+        let result = search_unfiltered(c, &fetched, &mut plans.0)?;
+        drop_meta(c, result, o)?
+    } else {
+        search_unfiltered(c, o, &mut plans.0)?
+    };
     result.timings.total_ms = started.elapsed().as_secs_f64() * 1000.;
     Ok(result)
 }
-fn save_meta(result: &mut Results, hit: Hit, o: &Options) {
-    if result
-        .meta_fallback
-        .as_ref()
-        .is_none_or(|old| compare(&hit, old, &o.sort, o.chats).is_lt())
-    {
-        result.meta_fallback = Some(hit);
-    }
-}
-fn finish_meta(c: &Connection, mut result: Results) -> Result<Results> {
-    if result.hits.is_empty() {
-        if let Some(mut hit) = result.meta_fallback.take() {
-            (hit.family, hit.side) = c.query_row(
-                "SELECT family,side FROM sessions WHERE agent=?1 AND id=?2",
-                [&hit.agent, &hit.session],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
-            let class = match hit.tier {
-                1 => "all_terms",
-                2 => "content_terms",
-                _ => match hit.boundary_class.as_str() {
-                    "aligned" => "phrase_aligned",
-                    "partial" => "phrase_partial",
-                    _ => "phrase_interior",
-                },
-            };
-            result.tiers.insert(class.into(), 1);
-            result.tiers.insert("total".into(), 1);
-            result.tool_rows = usize::from(hit.who == "tool");
-            result.total = 1;
-            result.hits.push(hit);
+/// 0.4.9's `_filter_meta_rows`: a proven ~meta row leaves the page unless it is the
+/// best of a page holding nothing else; the totals then count only the kept rows.
+fn drop_meta(c: &Connection, mut result: Results, o: &Options) -> Result<Results> {
+    let fetched = result.hits.len();
+    let meta = meta_rows(c, &result.hits, &o.pattern)?;
+    let lived = meta.contains(&false);
+    let mut kept = Vec::with_capacity(fetched);
+    for (mut h, meta) in std::mem::take(&mut result.hits).into_iter().zip(meta) {
+        if !meta {
+            kept.push(h);
+        } else if !lived && result.meta_retained == 0 {
+            h.meta_marker = true;
+            kept.push(h);
+            result.meta_retained = 1;
+        } else {
+            result.meta_dropped += 1;
         }
     }
-    result.meta_fallback = None;
+    let total = kept.len();
+    if o.limit > 0 {
+        kept.truncate(o.limit);
+    }
+    if result.meta_dropped + result.meta_retained > 0 {
+        // 0.4.9 compared its matching-row total with the page, also for chat heads.
+        let complete = result.total_basis == "exact" && result.rows <= fetched;
+        result.total = total;
+        result.total_basis = if complete { "exact" } else { "floor" }.into();
+        result.tool_rows = kept.iter().filter(|h| h.who == "tool").count();
+    }
+    result.hits = kept;
     Ok(result)
+}
+/// Which rows 0.4.9's `--no-meta` proved to be tooling about history: stored harness,
+/// synthetic and spawned-task rows, history-reading tool calls, and agent prose within
+/// four turns after a history read of `query`.
+pub fn meta_rows(c: &Connection, hits: &[Hit], query: &str) -> Result<Vec<bool>> {
+    hits.iter()
+        .map(|h| crate::history_meta::is_meta(c, h, query))
+        .collect()
+}
+/// 0.4.9's one `--no-meta` disclosure line.
+pub fn meta_notice(dropped: usize, retained: usize) -> Option<String> {
+    let rows = |n: usize, noun: &str| {
+        format!(
+            "{} {noun}{}",
+            crate::surface::number(n),
+            if n == 1 { "" } else { "s" }
+        )
+    };
+    match (dropped, retained) {
+        (0, 0) => None,
+        (dropped, 0) => Some(format!(
+            "excluded {} (--no-meta)",
+            rows(dropped, "~meta row")
+        )),
+        (0, retained) => Some(format!(
+            "only ~meta evidence; retained {} (--no-meta)",
+            rows(retained, "best row")
+        )),
+        (dropped, retained) => Some(format!(
+            "excluded {}; retained {} (--no-meta)",
+            rows(dropped, "~meta row"),
+            rows(retained, "sole ~meta row")
+        )),
+    }
 }
 fn search_unfiltered(c: &Connection, o: &Options, cache: &mut PlanCache) -> Result<Results> {
     let started = Instant::now();
@@ -1829,9 +1904,6 @@ fn search_unfiltered(c: &Connection, o: &Options, cache: &mut PlanCache) -> Resu
         }
         let mut fallback = fallback.unwrap_or_default();
         fallback.timings.add(&result.timings);
-        if let Some(hit) = result.meta_fallback.take() {
-            save_meta(&mut fallback, hit, o);
-        }
         result = fallback;
     }
     result.timings.total_ms = started.elapsed().as_secs_f64() * 1000.;
@@ -1894,7 +1966,12 @@ pub fn coverage(c: &Connection, o: &Options) -> Result<Results> {
     for stage in 0..count {
         result = Some(search_pass(c, o, true, 0, result, &mut cache, stage)?);
     }
-    let mut result = finish_meta(c, result.unwrap_or_default())?;
+    let result = result.unwrap_or_default();
+    let mut result = if o.filters.no_meta {
+        drop_meta(c, result, o)?
+    } else {
+        result
+    };
     result.timings.total_ms = started.elapsed().as_secs_f64() * 1000.;
     Ok(result)
 }
@@ -2059,6 +2136,149 @@ fn count_tool_terms(
     }
     Ok(count)
 }
+/// The matches among a session-shaped scope's rows, which `rows` yields as (id, session)
+/// through the session indexes. The text index answers which of them match, one rowid
+/// range per run of consecutive blocks holding them, so the work follows the scope's
+/// size rather than the pattern's matches across the corpus. Prose matches
+/// `expression`; a tool run matches the words its own blocks hold. Each match is
+/// tallied under its session in `tally` when one is given.
+fn count_scope(
+    c: &Connection,
+    m: &Matcher,
+    table: &str,
+    expression: Option<&str>,
+    rows: &str,
+    values: &[Value],
+    tally: Option<&mut HashMap<String, usize>>,
+) -> Result<usize> {
+    let mut names: Vec<String> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut ids: Vec<(i64, usize)> = Vec::new();
+    {
+        let mut stmt = c.prepare_cached(rows)?;
+        let mut found = stmt.query(params_from_iter(values))?;
+        while let Some(r) = found.next()? {
+            let session = r.get_ref(1)?.as_str()?;
+            let at = match index.get(session) {
+                Some(&at) => at,
+                None => {
+                    names.push(session.to_owned());
+                    index.insert(session.to_owned(), names.len() - 1);
+                    names.len() - 1
+                }
+            };
+            ids.push((r.get(0)?, at));
+        }
+    }
+    ids.sort_unstable();
+    let mut counts = vec![0usize; names.len()];
+    let mut query = c.prepare_cached(&format!(
+        "SELECT rowid FROM {table}_fts WHERE {table}_fts MATCH ?1 AND rowid>=?2 AND rowid<?3"
+    ))?;
+    let mut rest = &ids[..];
+    while let Some(&(first, _)) = rest.first() {
+        let mut blocks = vec![first / BLOCK];
+        let mut length = 1;
+        while let Some(&(id, _)) = rest.get(length) {
+            let (block, last) = (id / BLOCK, blocks[blocks.len() - 1]);
+            if block > last + 1 {
+                break;
+            }
+            if block > last {
+                blocks.push(block);
+            }
+            length += 1;
+        }
+        let (run, tail) = rest.split_at(length);
+        rest = tail;
+        let own;
+        let expression = match expression {
+            Some(expression) => expression,
+            None => match m.fts(Some(&blocks)) {
+                Some(words) => {
+                    own = words;
+                    own.as_str()
+                }
+                None => continue,
+            },
+        };
+        let bounds = (first, run[run.len() - 1].0 + 1);
+        let bind = rusqlite::params![expression, bounds.0, bounds.1];
+        for id in query.query_map(bind, |r| r.get::<_, i64>(0))? {
+            if let Ok(at) = run.binary_search_by_key(&id?, |&(id, _)| id) {
+                counts[run[at].1] += 1;
+            }
+        }
+    }
+    if let Some(tally) = tally {
+        for (name, n) in names.into_iter().zip(&counts) {
+            *tally.entry(name).or_default() += n;
+        }
+    }
+    Ok(counts.iter().sum())
+}
+/// The matches among the rows a caller filter alone withholds: rows of its agent in the
+/// sessions it names (and its family's, when it excludes the family) that it rejects.
+fn caller_withheld(
+    c: &Connection,
+    m: &Matcher,
+    table: &str,
+    expression: Option<&str>,
+    caller: &CallerFilter,
+) -> Result<usize> {
+    let only = Filters {
+        caller: Some(caller.clone()),
+        ..Filters::default()
+    };
+    let (kept, kept_values) = sql_filters(&only, "p", c)?;
+    if kept.is_empty() {
+        return Ok(0);
+    }
+    let mut sessions = caller.excluded_sessions.clone();
+    sessions.push(caller.session.clone());
+    if caller.exclude_family {
+        sessions.extend(
+            c.prepare_cached("SELECT id FROM sessions WHERE agent=? AND family=?")?
+                .query_map([&caller.agent, &caller.family], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()?,
+        );
+    }
+    sessions.sort_unstable();
+    sessions.dedup();
+    let rows = format!("SELECT p.id,p.session FROM {table} p WHERE p.visible=1 AND +p.agent=? AND p.session IN (SELECT value FROM json_each(?)) AND NOT (1{kept})");
+    let mut values = vec![
+        Value::Text(caller.agent.clone()),
+        Value::Text(serde_json::to_string(&sessions)?),
+    ];
+    values.extend(kept_values);
+    count_scope(c, m, table, expression, &rows, &values, None)
+}
+/// The exact matching rows of `o` in each of `sessions`, matched by exact id under any
+/// agent, as 0.4.9 counted a chat listing's `session_hits`: over the query's filters, not
+/// narrowed by `--no-meta`, which only withholds displayed rows.
+pub fn session_counts(
+    c: &Connection,
+    o: &Options,
+    sessions: &[String],
+    plans: &mut Plans,
+) -> Result<Vec<usize>> {
+    if sessions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut scoped = o.clone();
+    (scoped.chats, scoped.content, scoped.limit) = (false, false, 0);
+    (scoped.count_only, scoped.count_by_tier, scoped.exact) = (true, false, true);
+    scoped.filters.no_meta = false;
+    let mut ids = sessions.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    scoped.filters.sessions = Some(ids);
+    let found = search_with(c, &scoped, plans)?;
+    Ok(sessions
+        .iter()
+        .map(|s| found.session_counts.get(s).copied().unwrap_or(0))
+        .collect())
+}
 fn search_pass(
     c: &Connection,
     o: &Options,
@@ -2069,7 +2289,7 @@ fn search_pass(
     coverage_stage: usize,
 ) -> Result<Results> {
     let started = Instant::now();
-    let mut m = Matcher::new(o, c)?;
+    let mut m = cache.matcher(o, c)?;
     m.partial = partial;
     m.phase = phase;
     // The tier this pass's rows take; a pass over both tiers is bounded as phrase rows.
@@ -2206,39 +2426,48 @@ fn search_pass(
             };
             if let Some(expression) = expression {
                 let f = &o.filters;
-                let unfiltered = f.agent.is_none()
-                    && f.project.is_none()
-                    && f.exclude_project.is_none()
-                    && f.model.is_none()
-                    && f.who.is_none()
-                    && f.no_who.is_none()
-                    && f.chat.is_none()
-                    && f.since.is_none()
-                    && f.until.is_none()
-                    && !f.no_side
-                    && !f.no_meta
-                    && f.caller.is_none()
-                    && f.session_rows.is_none();
-                if table == "tools" {
-                    result.timings.plan_ms += plan_started.elapsed().as_secs_f64() * 1000.;
-                    let started = Instant::now();
-                    let count = count_tool_terms(c, &m, &scope, &values, unfiltered)?;
-                    result.timings.sqlite_ms += started.elapsed().as_secs_f64() * 1000.;
-                    result.total += count;
-                    result.tool_rows += count;
-                    continue;
-                }
-                let mut bind = vec![Value::Text(expression)];
-                let sql = if unfiltered {
-                    format!("SELECT count(*) FROM {table}_fts WHERE {table}_fts MATCH ?")
-                } else {
-                    bind.extend(values.clone());
-                    format!("SELECT count(*) FROM {table}_fts f CROSS JOIN {table} p ON p.id=f.rowid WHERE {table}_fts MATCH ?{scope}")
-                };
+                let narrowed = f.agent.is_some()
+                    || f.project.is_some()
+                    || f.exclude_project.is_some()
+                    || f.model.is_some()
+                    || f.who.is_some()
+                    || f.no_who.is_some()
+                    || f.since.is_some()
+                    || f.until.is_some()
+                    || f.no_side;
+                let sessions = f.chat.is_some() || f.session_rows.is_some() || f.sessions.is_some();
+                let prose = (table == "prose").then_some(expression.as_str());
                 result.timings.plan_ms += plan_started.elapsed().as_secs_f64() * 1000.;
-                let sql_started = Instant::now();
-                let count: usize = c.query_row(&sql, params_from_iter(bind), |r| r.get(0))?;
-                result.timings.sqlite_ms += sql_started.elapsed().as_secs_f64() * 1000.;
+                let started = Instant::now();
+                let count = if sessions {
+                    let rows = format!("SELECT p.id,p.session FROM {table} p WHERE 1{scope}");
+                    let tally = f.sessions.is_some().then_some(&mut result.session_counts);
+                    count_scope(c, &m, table, prose, &rows, &values, tally)?
+                } else if narrowed {
+                    if table == "tools" {
+                        count_tool_terms(c, &m, &scope, &values, false)?
+                    } else {
+                        let mut bind = vec![Value::Text(expression.clone())];
+                        bind.extend(values.clone());
+                        c.query_row(&format!("SELECT count(*) FROM {table}_fts f CROSS JOIN {table} p ON p.id=f.rowid WHERE {table}_fts MATCH ?{scope}"), params_from_iter(bind), |r| r.get(0))?
+                    }
+                } else {
+                    // Every match minus those inside the rows the caller withholds.
+                    let all = if table == "tools" {
+                        count_tool_terms(c, &m, "", &[], true)?
+                    } else {
+                        c.query_row(
+                            &format!("SELECT count(*) FROM {table}_fts WHERE {table}_fts MATCH ?"),
+                            [&expression],
+                            |r| r.get::<_, usize>(0),
+                        )?
+                    };
+                    match &f.caller {
+                        Some(caller) => all - caller_withheld(c, &m, table, prose, caller)?,
+                        None => all,
+                    }
+                };
+                result.timings.sqlite_ms += started.elapsed().as_secs_f64() * 1000.;
                 result.total += count;
                 if table == "tools" {
                     result.tool_rows += count;
@@ -2286,7 +2515,8 @@ fn search_pass(
             || o.filters.model.is_some()
             || o.filters.project.is_some()
             || o.filters.until.is_some()
-            || o.filters.session_rows.is_some();
+            || o.filters.session_rows.is_some()
+            || o.filters.sessions.is_some();
         let scope_blocks = if let Some(blocks) = cache.scopes.get(table) {
             blocks.clone()
         } else if has_scope {
@@ -2682,25 +2912,15 @@ fn search_pass(
                     continue;
                 };
                 let (tier, score) = (scored.tier, scored.score);
-                let meta_marker = o.filters.no_meta
-                    && crate::history_meta::is_meta(
-                        c,
-                        &Hit {
-                            agent: r.get(2)?,
-                            session: r.get(1)?,
-                            turn: r.get(4)?,
-                            who: who.clone(),
-                            rowid: r.get(0)?,
-                            ..Default::default()
-                        },
-                        &o.pattern,
-                    )?;
-                if !meta_marker {
-                    result.total += 1;
-                    sessions.insert((r.get::<_, String>(2)?, r.get::<_, String>(1)?));
-                    if table == "tools" {
-                        result.tool_rows += 1;
-                    }
+                result.total += 1;
+                result.rows += 1;
+                let session: String = r.get(1)?;
+                if o.filters.sessions.is_some() {
+                    *result.session_counts.entry(session.clone()).or_default() += 1;
+                }
+                sessions.insert((r.get::<_, String>(2)?, session));
+                if table == "tools" {
+                    result.tool_rows += 1;
                 }
                 if scored.class == "unscored" {
                     continue;
@@ -2716,7 +2936,7 @@ fn search_pass(
                         _ => "phrase_interior",
                     }
                 };
-                if !m.quick_count && !meta_marker {
+                if !m.quick_count {
                     *result.tiers.entry(class.into()).or_default() += 1;
                 }
                 if o.count_only {
@@ -2724,7 +2944,7 @@ fn search_pass(
                 }
                 let session: String = r.get(1)?;
                 let turn = r.get(4)?;
-                if !meta_marker && !o.chats && o.limit > 0 && result.hits.len() >= o.limit {
+                if !o.chats && o.limit > 0 && result.hits.len() >= o.limit {
                     let ranked = Hit {
                         session: session.clone(),
                         turn,
@@ -2797,15 +3017,11 @@ fn search_pass(
                     boundary_class: scored.class.into(),
                     handle,
                     self_marker,
-                    meta_marker,
+                    meta_marker: false,
                     rowid: r.get(0)?,
                     tier,
                     span,
                 };
-                if meta_marker {
-                    save_meta(&mut result, h, o);
-                    continue;
-                }
                 if o.chats {
                     if let Some(i) = result
                         .hits
@@ -2901,6 +3117,9 @@ fn event_id(session: &str, ts: i64, text: &str) -> String {
     }
     state.finalize().to_hex().to_string()
 }
+/// A meaning match's snippet. 0.4.9 served the matched row's text as it is stored
+/// (py/segment_query.py:650, py/search.py:1012), leaving control characters for the
+/// sanitizer to quote.
 pub fn snippet(text: &str, query: &str, max: usize) -> String {
     let chars: Vec<_> = text.chars().collect();
     let needle = boundary_rank::query_tokens(query)
@@ -2918,14 +3137,23 @@ pub fn snippet(text: &str, query: &str, max: usize) -> String {
     format!(
         "{}{}{}",
         if start > 0 { "…" } else { "" },
-        chars[start..end]
-            .iter()
-            .map(|c| if c.is_control() { ' ' } else { *c })
-            .collect::<String>(),
+        chars[start..end].iter().collect::<String>(),
         if end < chars.len() { "…" } else { "" }
     )
 }
 
+#[cfg(test)]
+mod snippet_tests {
+    #[test]
+    fn meaning_snippets_keep_control_characters_for_the_sanitizer() {
+        let snippet = super::snippet("alpha \x1b[31mred\x07 beta", "red", 280);
+        assert_eq!(snippet, "alpha \x1b[31mred\x07 beta");
+        assert_eq!(
+            crate::surface::safe(&snippet, false),
+            r"alpha \u001b[31mred\u0007 beta"
+        );
+    }
+}
 #[cfg(test)]
 mod handle_tests {
     #[test]
@@ -3089,5 +3317,39 @@ mod chat_scope_tests {
             ..Filters::default()
         };
         assert_eq!(sql_filters(&none, "p", &c).unwrap().0, " AND 0");
+    }
+}
+#[cfg(test)]
+mod matcher_cache_tests {
+    use super::*;
+    // Every pass of a search clones one compiled matcher: a pass adjusts only its copy,
+    // a count takes its own counting mode, and another pattern compiles anew.
+    #[test]
+    fn passes_share_one_compiled_matcher() {
+        let c = Connection::open_in_memory().unwrap();
+        let mut o = Options {
+            pattern: "cobalt lantern".into(),
+            regex: false,
+            word: false,
+            sort: "score".into(),
+            limit: 40,
+            exact: false,
+            count_only: false,
+            count_by_tier: false,
+            content: true,
+            chats: false,
+            tools: true,
+            filters: Filters::default(),
+        };
+        let mut cache = PlanCache::default();
+        let mut first = cache.matcher(&o, &c).unwrap();
+        assert!(!first.quick_count);
+        first.terms.clear();
+        o.count_only = true;
+        let second = cache.matcher(&o, &c).unwrap();
+        assert!(second.quick_count);
+        assert_eq!(second.terms.len(), 2);
+        o.pattern = "deployment".into();
+        assert_eq!(cache.matcher(&o, &c).unwrap().terms.len(), 1);
     }
 }

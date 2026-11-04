@@ -67,7 +67,7 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
     }
     let identity = caller::Identity::detect();
     if !s.json && !s.scope.include_self && (s.scope.no_self || identity.agent_context) {
-        identity.disclose(s.scope.no_self);
+        identity.disclose(s.scope.no_self, false);
     }
     let caller = caller::Caller::resolve(&c, identity)?;
     let options = Options {
@@ -129,11 +129,20 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
         None
     };
     let keyword_start = std::time::Instant::now();
+    // Word expansions and term estimates of this pattern, reused by the chats' counts.
+    let mut plans = agrep_core::query::Plans::default();
     let keyword = if s.semantic {
         Default::default()
     } else {
         let _span = agrep_core::semantic_profile::span("keyword");
-        caller::search(&c, &options, &caller, include_self, s.scope.no_self)?
+        caller::search_with(
+            &c,
+            &options,
+            &caller,
+            include_self,
+            s.scope.no_self,
+            &mut plans,
+        )?
     };
     if timing {
         agrep_core::semantic_profile::event(serde_json::json!({
@@ -273,6 +282,14 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
         finish_census(&root, census)?
     };
     result.pending_sources = pending_sources;
+    // 0.4.9's `session_hits`: each listed chat's exact matching rows.
+    let session_hits = if s.chats && !s.count && !s.count_by_tier {
+        let _span = agrep_core::semantic_profile::span("session_hits");
+        let sessions: Vec<String> = result.hits.iter().map(|h| h.session.clone()).collect();
+        agrep_core::query::session_counts(&c, &options, &sessions, &mut plans)?
+    } else {
+        Vec::new()
+    };
     let style = Style {
         json: s.json,
         flat: s.flat
@@ -283,6 +300,8 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
         tiers: s.count_by_tier,
         chats: s.chats,
         semantic: s.semantic && semantic_coverage.is_some(),
+        regex: s.regex,
+        word: s.word,
         checked: agrep_core::render::checked(no_auto),
         full_argv,
         color: color == "always" || (color == "auto" && std::io::stdout().is_terminal()),
@@ -293,7 +312,11 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
         self_exclusion: caller.metadata(request, excluded),
         filter_coverage: coverage.clone(),
         pending_sources,
+        session_hits,
     };
+    if let Some(line) = agrep_core::query::meta_notice(result.meta_dropped, result.meta_retained) {
+        eprintln!("{line}");
+    }
     {
         let _span = agrep_core::semantic_profile::span("render");
         render::emit_semantic(&result, &pattern, &f, &style, semantic_coverage.as_ref())?;
@@ -325,15 +348,28 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
         }
     }
     if result.total == 0 && !s.json && !s.count && !s.count_by_tier {
-        let n = store::counts(&c)?["prose"].as_u64().unwrap_or(0);
+        // 0.4.9's matcher_empty_line (py/display_policy.py:1358-1370) names the matcher and
+        // its corpus: one message record per user-side row, its reply attached
+        // (py/common.py:290-298 sums sessions.jsonl's per-session `n`).
+        let n: i64 = c.query_row(
+            "SELECT coalesce((SELECT CAST(value AS INTEGER) FROM state WHERE key='prose_user_count'),0)",
+            [],
+            |r| r.get(0),
+        )?;
+        let (label, lever) = if s.word {
+            ("word", " - `-s` runs semantic search")
+        } else if s.regex {
+            ("regex", " - `-s` runs semantic search")
+        } else {
+            ("keyword", "")
+        };
         eprintln!(
-            "keyword: 0 matching rows across {n} indexed messages{}",
-            if style.checked {
-                ""
-            } else {
-                "; freshness unchecked (--no-auto)"
-            }
+            "{label}: 0 matching rows across {} indexed messages{lever}",
+            agrep_core::surface::number(n.max(0) as usize)
         );
+        if !style.checked {
+            eprintln!("{}", render::NO_AUTO_STALE);
+        }
     }
     if !s.json {
         agrep_core::coverage::disclose(&coverage);

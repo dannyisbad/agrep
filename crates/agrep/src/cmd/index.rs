@@ -2,6 +2,7 @@ use super::super::*;
 pub(crate) fn run(full: bool, with_semantic: bool) -> Result<i32> {
     let root = DataRoot::discover()?;
     root.validate(true)?;
+    let _foreground = root.foreground()?;
     let refresh = store::refresh(&root, true, full)?;
     agrep_core::surface::line(&agrep_core::surface::refresh_json(&refresh)?)?;
     agrep_core::coverage::initialize(&root)?;

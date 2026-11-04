@@ -97,6 +97,7 @@ fn pages_advance_with_zero_limit_and_do_not_need_writer_lock() {
         requested: Some(0),
         chat_scoped: false,
         full_argv: vec![],
+        exhaustible: true,
     };
     let page = pages::select(frozen);
     assert_eq!(page.remainder.shown, 16);

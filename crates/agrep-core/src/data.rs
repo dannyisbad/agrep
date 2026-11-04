@@ -107,7 +107,10 @@ impl DataRoot {
         Ok(())
     }
     pub fn writer_active(&self) -> Result<bool> {
-        let path = self.0.join("writer.lock");
+        self.held("writer.lock")
+    }
+    fn held(&self, name: &str) -> Result<bool> {
+        let path = self.0.join(name);
         if !path.exists() {
             return Ok(false);
         }
@@ -121,13 +124,42 @@ impl DataRoot {
             Err(error) => Err(error.into()),
         }
     }
+    /// A blocking acquisition queues on `writer.queue` while it waits, and a merge step
+    /// starts only while no writer is queued ([`Self::lock_behind_writers`]), so a
+    /// waiting writer is delayed by at most the step in progress. Neither flock nor
+    /// LockFileEx hands a released lock to a waiter before the releasing process can
+    /// take it again.
     pub fn lock(&self, blocking: bool) -> Result<Option<WriterLock>> {
-        self.lock_named("writer.lock", blocking)
+        if !blocking {
+            return self.lock_named("writer.lock", false, false);
+        }
+        let _queued = self.lock_named("writer.queue", true, true)?;
+        self.lock_named("writer.lock", true, false)
+    }
+    /// A place in the writer queue for an explicit command's whole run: no merge step
+    /// starts before it exits, so it waits for at most the step in progress.
+    pub fn foreground(&self) -> Result<WriterLock> {
+        self.lock_named("writer.queue", true, true)?
+            .context("blocking queue lock")
+    }
+    /// The writer lock for one background merge step, taken once no writer is queued.
+    pub fn lock_behind_writers(&self) -> Result<WriterLock> {
+        let turn = self.lock_named("writer.queue", true, false)?;
+        let lock = self.lock_named("writer.lock", true, false)?;
+        drop(turn);
+        lock.context("blocking writer lock")
     }
     pub fn work_lock(&self, blocking: bool) -> Result<Option<WriterLock>> {
-        self.lock_named("work.lock", blocking)
+        self.lock_named("work.lock", blocking, false)
     }
-    fn lock_named(&self, name: &str, blocking: bool) -> Result<Option<WriterLock>> {
+    /// Held by the one process merging FTS segments, which holds no `work.lock` meanwhile.
+    pub fn merge_lock(&self) -> Result<Option<WriterLock>> {
+        self.lock_named("merge.lock", false, false)
+    }
+    pub fn merging(&self) -> Result<bool> {
+        self.held("merge.lock")
+    }
+    fn lock_named(&self, name: &str, blocking: bool, shared: bool) -> Result<Option<WriterLock>> {
         if read_only() {
             bail!("data directory is read-only")
         }
@@ -137,7 +169,9 @@ impl DataRoot {
             .create(true)
             .truncate(false)
             .open(self.0.join(name))?;
-        if blocking {
+        if shared {
+            f.lock_shared()?
+        } else if blocking {
             f.lock()?
         } else {
             match f.try_lock() {
@@ -235,5 +269,49 @@ mod lock_tests {
         fs::remove_file(root.path().join("work.lock")).unwrap();
         fs::create_dir(root.path().join("work.lock")).unwrap();
         assert!(root.work_lock(false).is_err());
+    }
+
+    #[test]
+    fn a_merge_step_starts_only_after_the_queued_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = DataRoot::open(temp.path(), true).unwrap();
+        let step = root.lock_behind_writers().unwrap();
+        // What lock(true) holds while it waits for writer.lock.
+        let queued = root
+            .lock_named("writer.queue", true, true)
+            .unwrap()
+            .unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let merger = {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                let next = root.lock_behind_writers().unwrap();
+                sender.send(()).unwrap();
+                drop(next);
+            })
+        };
+        drop(step);
+        let writer = root
+            .lock_named("writer.lock", true, false)
+            .unwrap()
+            .unwrap();
+        drop(queued);
+        assert!(receiver.try_recv().is_err());
+        drop(writer);
+        receiver.recv().unwrap();
+        merger.join().unwrap();
+        // A blocking writer leaves the queue once it holds the lock.
+        let writer = root.lock(true).unwrap().unwrap();
+        assert!(root
+            .lock_named("writer.queue", false, false)
+            .unwrap()
+            .is_some());
+        drop(writer);
+        assert!(!root.merging().unwrap());
+        let merging = root.merge_lock().unwrap().unwrap();
+        assert!(root.merging().unwrap());
+        assert!(root.merge_lock().unwrap().is_none());
+        drop(merging);
+        assert!(!root.merging().unwrap());
     }
 }

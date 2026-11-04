@@ -1,6 +1,7 @@
 //! FTS5 segment upkeep. A refresh adds at most one segment to each FTS table and never
-//! merges; the detached worker merges them in bounded steps, so lookups, which seek
-//! every segment for every term, stay on few segments.
+//! merges; a detached worker merges them in bounded steps, so lookups, which seek
+//! every segment for every term, stay on few segments, and no foreground writer
+//! waits for more than one step.
 use crate::{data::DataRoot, store};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -89,9 +90,26 @@ pub fn segments(levels: &[Level]) -> usize {
     levels.iter().map(|l| l.pages.len()).sum()
 }
 
+/// Whether [`upkeep`] has work: an unfinished merge, a level holding two segments, or
+/// more than [`CAP`] segments in a table.
+pub fn pending(c: &Connection) -> Result<bool> {
+    for table in TABLES {
+        let levels = levels(c, table)?;
+        if segments(&levels) > CAP || levels.iter().any(|l| l.merging > 0 || l.pages.len() > 1) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct Upkeep {
     pub tables: Vec<TableUpkeep>,
+    /// Another process held `merge.lock`, so this one merged nothing.
+    pub skipped_lock: bool,
+    pub checkpoint_ms: f64,
+    /// The longest a queued writer can have waited for this process.
+    pub max_step_ms: f64,
     pub ms: f64,
 }
 #[derive(Debug, Default, Serialize)]
@@ -113,42 +131,63 @@ pub fn upkeep(root: &DataRoot) -> Result<Upkeep> {
 /// Each segment adds a few percent to lookups; each step up halves how often the
 /// large segment is rewritten (see docs/ENGINE.md).
 pub const CAP: usize = 5;
-/// Output leaf pages per step: 20-40 ms of merge work.
-const STEP_PAGES: i64 = 500;
+/// Output leaf pages a step asks for. FTS5 ends a step only between terms, so a
+/// common trigram's doclist still makes one step of thousands of pages; a small budget
+/// keeps every other step to a few milliseconds.
+const STEP_PAGES: i64 = 64;
+/// WAL bytes the merge leaves before it checkpoints them itself: well below the
+/// 4096-page auto-checkpoint that would make a foreground commit copy them.
+const CHECKPOINT_BYTES: u64 = 4 << 20;
 
 /// Level merges come first: with `usermerge=2` FTS5 merges any level that holds two
 /// segments into the next, so each refresh's segment carries upward like a binary
 /// counter and the large segment is rewritten only when a carry reaches its level.
 /// When more than `cap` segments remain, the whole table is merged into one. Every
-/// step is its own transaction of at most `step_pages` output pages under the writer
-/// lock, so readers never wait and a foreground writer waits for one step at most.
+/// step is its own transaction under a writer lock taken only while no writer is
+/// queued, and the worker checkpoints the WAL it grows. One process merges at a
+/// time, under `merge.lock`.
 fn upkeep_with(root: &DataRoot, cap: usize, step_pages: i64) -> Result<Upkeep> {
     let start = Instant::now();
     let mut out = Upkeep::default();
     if !root.db().exists() {
         return Ok(out);
     }
-    let c = {
-        let _lock = root.lock(true)?;
-        store::writer(root)?
-    };
-    for table in TABLES {
-        let table_start = Instant::now();
-        let before = segments(&levels(&c, table)?);
-        let mut report = TableUpkeep {
-            table,
-            segments_before: before,
-            ..Default::default()
+    loop {
+        let Some(merging) = root.merge_lock()? else {
+            out.skipped_lock = out.tables.is_empty();
+            break;
         };
-        if before > 1 {
-            report.merge_steps = steps(root, &c, table, step_pages)?;
+        let c = {
+            let _lock = root.lock_behind_writers()?;
+            store::writer(root)?
+        };
+        c.execute_batch("PRAGMA wal_autocheckpoint=0")?;
+        let mut worked = false;
+        for table in TABLES {
+            let table_start = Instant::now();
+            let before = segments(&levels(&c, table)?);
+            let mut report = TableUpkeep {
+                table,
+                segments_before: before,
+                ..Default::default()
+            };
+            if before > 1 {
+                report.merge_steps = steps(root, &c, table, step_pages, &mut out)?;
+            }
+            if segments(&levels(&c, table)?) > cap {
+                report.optimize_steps = steps(root, &c, table, -step_pages, &mut out)?;
+            }
+            report.segments_after = segments(&levels(&c, table)?);
+            report.ms = table_start.elapsed().as_secs_f64() * 1000.;
+            worked |= report.merge_steps + report.optimize_steps > 0;
+            out.tables.push(report);
         }
-        if segments(&levels(&c, table)?) > cap {
-            report.optimize_steps = steps(root, &c, table, -step_pages)?;
+        drop(merging);
+        // A writer that found merge.lock held while this process finished its last step
+        // left its new segment to this process.
+        if !worked || !pending(&c)? {
+            break;
         }
-        report.segments_after = segments(&levels(&c, table)?);
-        report.ms = table_start.elapsed().as_secs_f64() * 1000.;
-        out.tables.push(report);
     }
     out.ms = start.elapsed().as_secs_f64() * 1000.;
     Ok(out)
@@ -156,7 +195,13 @@ fn upkeep_with(root: &DataRoot, cap: usize, step_pages: i64) -> Result<Upkeep> {
 
 /// Run FTS5 `merge` steps (a negative budget merges every segment into one) until a
 /// step leaves the structure record unchanged.
-fn steps(root: &DataRoot, c: &Connection, table: &str, pages: i64) -> Result<usize> {
+fn steps(
+    root: &DataRoot,
+    c: &Connection,
+    table: &str,
+    pages: i64,
+    out: &mut Upkeep,
+) -> Result<usize> {
     let record = |c: &Connection| -> Result<Vec<u8>> {
         Ok(c.query_row(
             &format!("SELECT block FROM {table}_data WHERE id=10"),
@@ -164,9 +209,12 @@ fn steps(root: &DataRoot, c: &Connection, table: &str, pages: i64) -> Result<usi
             |r| r.get(0),
         )?)
     };
+    let mut wal = root.db().into_os_string();
+    wal.push("-wal");
     let mut n = 0;
     loop {
-        let _lock = root.lock(true)?;
+        let lock = root.lock_behind_writers()?;
+        let started = Instant::now();
         c.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> Result<bool> {
             let before = record(c)?;
@@ -176,19 +224,28 @@ fn steps(root: &DataRoot, c: &Connection, table: &str, pages: i64) -> Result<usi
             )?;
             Ok(record(c)? != before)
         })();
-        match result {
+        let changed = match result {
             Ok(changed) => {
                 c.execute_batch("COMMIT")?;
-                if !changed {
-                    return Ok(n);
-                }
-                n += 1;
+                changed
             }
             Err(e) => {
                 let _ = c.execute_batch("ROLLBACK");
                 return Err(e);
             }
+        };
+        drop(lock);
+        out.max_step_ms = out.max_step_ms.max(started.elapsed().as_secs_f64() * 1000.);
+        // PASSIVE never waits: a writer that started meanwhile appends after these frames.
+        if !changed || std::fs::metadata(&wal).is_ok_and(|m| m.len() >= CHECKPOINT_BYTES) {
+            let started = Instant::now();
+            c.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))?;
+            out.checkpoint_ms += started.elapsed().as_secs_f64() * 1000.;
         }
+        if !changed {
+            return Ok(n);
+        }
+        n += 1;
     }
 }
 

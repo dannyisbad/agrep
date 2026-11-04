@@ -29,6 +29,8 @@ static STAT_POOL: std::sync::LazyLock<rayon::ThreadPool> = std::sync::LazyLock::
         .build()
         .expect("source stat thread pool")
 });
+/// Sources per stat task within one directory.
+const STAT_CHUNK: usize = 64;
 
 #[derive(Clone)]
 pub(crate) struct Directory {
@@ -60,6 +62,8 @@ pub struct Pending {
     pub listed_directories: usize,
     pub cached_directories: usize,
     pub stat_files: usize,
+    /// FTS segments need a merge, for instance one a killed worker left unfinished.
+    pub merge_pending: bool,
 }
 fn encode_names(names: &[String]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -143,9 +147,12 @@ fn walk(cached: HashMap<String, Directory>, listing_ms: f64) -> Census {
                         .unwrap()
                         .name();
                     stat_files.fetch_add(d.files.len(), std::sync::atomic::Ordering::Relaxed);
+                    // A flat store holds thousands of sources in one directory; its stats
+                    // split across the pool, while a small directory stays one task.
                     let files = d
                         .files
-                        .iter()
+                        .par_iter()
+                        .with_min_len(STAT_CHUNK)
                         .filter_map(|name| {
                             if name.is_empty() {
                                 store::stamp_present(owner, Path::new(&d.path))
@@ -317,10 +324,15 @@ pub fn pending(root: &DataRoot) -> Result<Pending> {
     let cached = cached_directories(&c)?;
     let listing_ms = listing.elapsed().as_secs_f64() * 1000.;
     // The walk is syscall-bound; the index's fingerprints are read meanwhile.
-    let (census, old) =
-        STAT_POOL.install(|| rayon::join(move || walk(cached, listing_ms), move || indexed(&c)));
+    let (census, old) = STAT_POOL.install(|| {
+        rayon::join(
+            move || walk(cached, listing_ms),
+            move || -> Result<_> { Ok((indexed(&c)?, crate::fts_segments::pending(&c)?)) },
+        )
+    });
+    let (old, merge_pending) = old?;
     let (mut next, mut changed) = (0, 0);
-    for (path, size, mtime_ns, token) in &old? {
+    for (path, size, mtime_ns, token) in &old {
         while next < census.stamps.len() && census.stamps[next].path < *path {
             changed += 1;
             next += 1;
@@ -347,6 +359,7 @@ pub fn pending(root: &DataRoot) -> Result<Pending> {
         listed_directories: census.listed_directories,
         cached_directories: census.cached_directories,
         stat_files: census.stat_files,
+        merge_pending,
     })
 }
 /// Spawn only an eligible one-shot worker. Kernel locks arbitrate concurrent spawns.
@@ -354,8 +367,24 @@ pub fn spawn(root: &DataRoot, binary: &Path) -> Result<bool> {
     let Some(guard) = root.work_lock(false)? else {
         return Ok(false);
     };
+    detached(root, binary, &["__work"], guard)
+}
+/// Spawn a merging worker unless a process already merges; callers spawn it only when
+/// [`crate::fts_segments::pending`] reports merge work.
+pub fn spawn_merge(root: &DataRoot, binary: &Path) -> Result<bool> {
+    let Some(guard) = root.merge_lock()? else {
+        return Ok(false);
+    };
+    detached(root, binary, &["__work", "merge"], guard)
+}
+fn detached(
+    root: &DataRoot,
+    binary: &Path,
+    args: &[&str],
+    guard: crate::data::WriterLock,
+) -> Result<bool> {
     let mut cmd = Command::new(binary);
-    cmd.arg("__work")
+    cmd.args(args)
         .env("AGREP_DATA_DIR", root.path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())

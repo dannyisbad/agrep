@@ -1,9 +1,12 @@
 //! Search output: stable machine rows and frozen, byte-bounded agent pages.
 use crate::{
+    boundary_rank,
     data::DataRoot,
+    evidence::{content_terms, py_space},
     pages,
     query::{Filters, Hit, Results},
     surface,
+    window::Snip,
 };
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -17,6 +20,9 @@ pub struct Style {
     pub tiers: bool,
     pub chats: bool,
     pub semantic: bool,
+    /// The query is a regular expression (`-E`) or a whole word (`-w`).
+    pub regex: bool,
+    pub word: bool,
     pub checked: bool,
     pub color: bool,
     pub full_argv: Vec<String>,
@@ -27,6 +33,37 @@ pub struct Style {
     pub self_exclusion: Value,
     pub filter_coverage: Value,
     pub pending_sources: usize,
+    /// Each `--chats` hit's matching rows in its chat (0.4.9's `session_hits`).
+    pub session_hits: Vec<usize>,
+}
+/// 0.4.9's `_chat_head`: a chat's agent, project and marks, then its handle, matching
+/// rows and age (omitted when unknown); bracketed without color.
+fn chat_head(first: &Hit, n: usize, color: bool) -> String {
+    let mut crumbs = format!(
+        "{} · {}",
+        safe(&first.agent),
+        safe(&project(&first.project))
+    );
+    if first.side || first.who == "subagent" {
+        crumbs.push_str(" · [side chat]");
+    }
+    if first.self_marker {
+        crumbs.push_str(" · ~self");
+    }
+    let mut tail = format!(
+        "{} · {n} hit{}",
+        safe(&first.handle),
+        if n == 1 { "" } else { "s" }
+    );
+    let age = age(first.ts);
+    if age != "-" {
+        tail += &format!(" · {age}");
+    }
+    if color {
+        format!("\x1b[1;36m{crumbs}\x1b[0m  \x1b[2m{tail}\x1b[0m\n")
+    } else {
+        format!("{crumbs}  [{tail}]\n")
+    }
 }
 fn speaker_legend(style: &Style, terminal: bool) -> Option<&'static str> {
     (terminal
@@ -59,6 +96,9 @@ pub fn age(ts: i64) -> String {
         format!("{}y", n / (86400 * 365))
     }
 }
+/// 0.4.9's freshness-story line for an absence read with `--no-auto`.
+pub const NO_AUTO_STALE: &str =
+    "history may be stale: automatic freshness checks are disabled by --no-auto";
 pub fn checked(no_auto: bool) -> bool {
     !no_auto && !crate::data::read_only()
 }
@@ -84,7 +124,124 @@ pub fn hit_value(h: &Hit) -> Value {
     }
     value
 }
-pub fn compact_line(h: &Hit) -> String {
+/// 0.4.9's snippet patterns: what re-finds a hit's match in its snippet, to paint it
+/// (`_hl`) and to center the compact page's narrower window (`_compact_snippet`).
+pub struct Marks {
+    /// `_match_pat`: the phrase with `[\W_]*` between its tokens, a whole word, or the
+    /// user's regex; none for a meaning-only result.
+    pattern: Option<fancy_regex::Regex>,
+    /// `_terms_hl_pat`: each content term, for keyword rows matched in any order.
+    terms: Option<fancy_regex::Regex>,
+    /// The query's boundary terms, which place an any-order row's matches.
+    prepared: boundary_rank::PreparedQuery,
+}
+impl Marks {
+    pub fn new(q: &str, s: &Style) -> Self {
+        let build = |pattern: String| {
+            let mut b = fancy_regex::RegexBuilder::new(&format!("(?i:{pattern})"));
+            b.backtrack_limit(100_000);
+            b.build().ok()
+        };
+        let keyword = !s.semantic && !s.regex && !s.word;
+        let pattern = if s.semantic {
+            None
+        } else if s.regex {
+            build(q.to_owned())
+        } else if s.word {
+            build(format!(r"(?<!\w)(?:{})(?!\w)", regex::escape(q)))
+        } else {
+            let tokens: Vec<String> = q
+                .split(|c: char| py_space(c) || c == '-' || c == '_')
+                .filter(|t| !t.is_empty())
+                .map(regex::escape)
+                .collect();
+            (!tokens.is_empty())
+                .then(|| build(tokens.join(r"[\W_]*")))
+                .flatten()
+        };
+        let mut variants: Vec<String> = content_terms(q)
+            .iter()
+            .filter(|t| t.chars().count() >= 3)
+            .flat_map(|t| boundary_rank::term_variants(t))
+            .collect();
+        variants.sort_by(|a, b| {
+            b.chars()
+                .count()
+                .cmp(&a.chars().count())
+                .then_with(|| a.cmp(b))
+        });
+        variants.dedup();
+        let terms = (keyword && !variants.is_empty())
+            .then(|| {
+                build(
+                    variants
+                        .iter()
+                        .map(|v| regex::escape(v))
+                        .collect::<Vec<_>>()
+                        .join("|"),
+                )
+            })
+            .flatten();
+        Self {
+            pattern,
+            terms,
+            prepared: boundary_rank::prepare_query(q, &boundary_rank::Stats::new()),
+        }
+    }
+    /// `_hl` with `_row_hl_pat`: the sanitized snippet with each match painted.
+    fn paint(&self, h: &Hit, color: bool) -> String {
+        let snippet = safe(&h.snippet);
+        let pattern = match &self.terms {
+            Some(terms) if ["all-terms", "content-terms"].contains(&h.matched.as_str()) => {
+                Some(terms)
+            }
+            _ => self.pattern.as_ref(),
+        };
+        match pattern.filter(|_| color) {
+            Some(p) => p
+                .try_replacen(&snippet, 0, |m: &fancy_regex::Captures| {
+                    format!("\x1b[1;31m{}\x1b[0m", &m[0])
+                })
+                .map_or_else(|_| snippet.clone(), |s| s.into_owned()),
+            None => snippet,
+        }
+    }
+    /// `_compact_snippet`: the snippet narrowed to 32 characters around its matches.
+    fn compact(&self, h: &Hit) -> String {
+        let text = h.snippet.as_str();
+        let spans: Vec<std::ops::Range<usize>> = if h.matched == "all-terms" {
+            let byte = |at: i64| {
+                text.char_indices()
+                    .nth(at as usize)
+                    .map_or(text.len(), |(b, _)| b)
+            };
+            self.prepared
+                .evaluate(text, None, true)
+                .map(|score| {
+                    score
+                        .spans
+                        .iter()
+                        .flatten()
+                        .map(|[start, end]| byte(*start)..byte(*end))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            self.pattern
+                .as_ref()
+                .and_then(|p| p.find(text).ok().flatten())
+                .map(|m| m.start()..m.end())
+                .into_iter()
+                .collect()
+        };
+        if spans.is_empty() {
+            text.to_owned()
+        } else {
+            Snip::padded(text, &spans, 32).text
+        }
+    }
+}
+pub fn compact_line(h: &Hit, marks: &Marks) -> String {
     let quality = if h.matched == "semantic" {
         if h.score < 0.84 {
             "~semantic-weak (meaning match)"
@@ -98,7 +255,7 @@ pub fn compact_line(h: &Hit) -> String {
     } else {
         ""
     };
-    let snippet = surface::safe(&h.snippet, false);
+    let snippet = surface::safe(&marks.compact(h), false);
     [
         h.handle.clone(),
         format!("{}/{}", safe(&h.agent), safe(&h.who)),
@@ -110,6 +267,11 @@ pub fn compact_line(h: &Hit) -> String {
             String::new()
         },
         quality.into(),
+        if h.meta_marker {
+            "~meta".into()
+        } else {
+            String::new()
+        },
         snippet,
     ]
     .into_iter()
@@ -128,6 +290,7 @@ pub fn emit_semantic(
     coverage: Option<&crate::semantic::Coverage>,
 ) -> Result<()> {
     let truncated = ((!s.count && !s.tiers) && r.hits.len() < r.total) || r.total_basis != "exact";
+    let marks = Marks::new(q, s);
     let mut out = String::new();
     if s.count {
         out = format!(
@@ -189,12 +352,21 @@ pub fn emit_semantic(
             meta["hits"] = json!([])
         }
         out += &format!("{}\n", crate::json_output::to_string(&meta)?);
-        for h in &r.hits {
+        for (i, h) in r.hits.iter().enumerate() {
             let mut value = hit_value(h);
             if s.caller_unknown {
                 value["self"] = Value::Null;
             }
+            if let Some(n) = s.session_hits.get(i) {
+                value["session_hits"] = json!(n);
+            }
             out += &format!("{}\n", crate::json_output::to_string(&value)?);
+        }
+    } else if s.chats && !s.compact {
+        // 0.4.9's `_emit_chats`: one head line per matching chat (`grep -l`).
+        for (i, h) in r.hits.iter().enumerate() {
+            let n = s.session_hits.get(i).copied().unwrap_or(1);
+            out += &chat_head(h, n, s.color);
         }
     } else if s.flat {
         for h in &r.hits {
@@ -205,7 +377,7 @@ pub fn emit_semantic(
                 safe(&project(&h.project)),
                 h.turn,
                 safe(&h.who),
-                highlight(&safe(&h.snippet), q, s.color)
+                marks.paint(h, s.color)
             );
         }
     } else if s.compact {
@@ -221,7 +393,7 @@ pub fn emit_semantic(
             records: ordered
                 .iter()
                 .map(|h| pages::Record {
-                    line: compact_line(h),
+                    line: compact_line(h, &marks),
                     family: format!("{}:{}", h.agent, h.family),
                     score: h.score,
                     lane: h.matched.clone(),
@@ -240,6 +412,8 @@ pub fn emit_semantic(
             requested: s.requested,
             chat_scoped: _f.chat.is_some() || !s.diversify,
             full_argv: s.full_argv.clone(),
+            // 0.4.9: a --no-meta page that dropped rows bounds only what it fetched.
+            exhaustible: r.meta_dropped + r.meta_retained == 0,
         };
         let page = pages::select(frozen);
         out = page.text;
@@ -264,25 +438,7 @@ pub fn emit_semantic(
             if i > 0 {
                 out.push('\n');
             }
-            let first = hits[0];
-            let mut crumbs = format!(
-                "{} · {}",
-                safe(&first.agent),
-                safe(&project(&first.project))
-            );
-            if first.side {
-                crumbs.push_str(" · [side chat]");
-            }
-            if first.self_marker {
-                crumbs.push_str(" · ~self");
-            }
-            let count = format!(
-                "{} hit{}",
-                hits.len(),
-                if hits.len() == 1 { "" } else { "s" }
-            );
-            let tail = format!("{} · {} · {}", first.handle, count, age(first.ts));
-            out += &format!("\x1b[1;36m{crumbs}\x1b[0m  \x1b[2m{tail}\x1b[0m\n");
+            out += &chat_head(hits[0], hits.len(), true);
             for h in hits {
                 let mark = match h.who.as_str() {
                     "agent" => "→",
@@ -291,10 +447,11 @@ pub fn emit_semantic(
                     _ => "›",
                 };
                 out += &format!(
-                    "  \x1b[33m{:>4}\x1b[0m \x1b[2m{mark}\x1b[0m {}\x1b[2m{}\x1b[0m\n",
+                    "  \x1b[33m{:>4}\x1b[0m \x1b[2m{mark}\x1b[0m {}\x1b[2m{}{}\x1b[0m\n",
                     h.turn,
-                    highlight(&safe(&h.snippet), q, true),
-                    if h.self_marker { " ~self" } else { "" }
+                    marks.paint(h, true),
+                    if h.self_marker { " ~self" } else { "" },
+                    if h.meta_marker { " ~meta" } else { "" }
                 );
             }
         }
@@ -317,19 +474,6 @@ pub fn emit_semantic(
     }
     Ok(())
 }
-fn highlight(s: &str, q: &str, color: bool) -> String {
-    if !color || q.is_empty() {
-        return s.into();
-    }
-    let re = regex::RegexBuilder::new(&regex::escape(q))
-        .case_insensitive(true)
-        .build();
-    match re {
-        Ok(re) => re.replace_all(s, "\x1b[1;31m$0\x1b[0m").into_owned(),
-        Err(_) => s.into(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,7 +484,34 @@ mod tests {
             session: "semantic-session".into(),
             ..Hit::default()
         };
-        assert!(compact_line(&hit).contains("meaning match"));
+        assert!(compact_line(&hit, &Marks::new("", &Style::default())).contains("meaning match"));
+    }
+    #[test]
+    fn compact_meaning_rows_narrow_their_whole_text_around_a_keyword() {
+        let text = format!(
+            "{} the lantern checklist {}",
+            "a".repeat(400),
+            "b".repeat(400)
+        );
+        let hit = Hit {
+            matched: "semantic".into(),
+            score: 0.9,
+            snippet: text.clone(),
+            text,
+            session: "semantic-session".into(),
+            ..Hit::default()
+        };
+        let line = compact_line(&hit, &Marks::new("lantern", &Style::default()));
+        assert!(line.contains("lantern checklist"), "{line}");
+        assert!(line.len() < 200, "{line}");
+        let hit = Hit {
+            snippet: "no keyword here".into(),
+            ..hit
+        };
+        assert!(
+            compact_line(&hit, &Marks::new("lantern", &Style::default()))
+                .ends_with("no keyword here")
+        );
     }
     #[test]
     fn legend_is_scoped_to_classic_terminals() {

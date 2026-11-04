@@ -19,8 +19,13 @@ pub(crate) fn run(tasks: &[String]) -> Result<i32> {
     execute(&root, tasks, false, false)
 }
 
+/// An explicit index or reindex finishes the background tasks inline except merging,
+/// which it leaves to a detached worker so that it waits for no merge step.
 pub(crate) fn after_index(root: &DataRoot, force_semantic: bool) -> Result<i32> {
-    let tasks = TASKS[1..].iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    if root.db().exists() && agrep_core::fts_segments::pending(&store::reader(root)?)? {
+        agrep_core::freshness::spawn_merge(root, &std::env::current_exe()?)?;
+    }
+    let tasks = TASKS[2..].iter().map(|s| s.to_string()).collect::<Vec<_>>();
     execute(root, &tasks, true, force_semantic)
 }
 
@@ -35,19 +40,28 @@ fn execute(
             bail!("unknown background task: {task}");
         }
     }
-    let Some(_lock) = root.work_lock(blocking)? else {
-        return Ok(0);
-    };
     let selected = |task: &str| requested.is_empty() || requested.iter().any(|t| t == task);
     if selected("refresh") {
+        let Some(_lock) = root.work_lock(blocking)? else {
+            return Ok(0);
+        };
         let refresh = store::refresh(root, false, false)?;
         if refresh.changed_rows > 0 {
             semantic::mark_index_changed(root)?;
         }
     }
+    // Merging holds merge.lock instead of work.lock, so a worker started meanwhile
+    // refreshes after at most one merge step.
     if selected("merge") {
-        agrep_core::fts_segments::upkeep(root)?;
+        let merge = agrep_core::fts_segments::upkeep(root)?;
+        agrep_core::semantic_profile::event(serde_json::json!({ "merge": merge }));
     }
+    if !TASKS[2..].iter().any(|task| selected(task)) {
+        return Ok(0);
+    }
+    let Some(_lock) = root.work_lock(blocking)? else {
+        return Ok(0);
+    };
     if selected("semantic") {
         semantic::drain(root, force_semantic)?;
     }

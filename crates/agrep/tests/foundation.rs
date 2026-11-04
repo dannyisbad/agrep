@@ -760,6 +760,82 @@ fn unselective_agent_keeps_the_bounded_prose_access_path() {
     assert!(work[1] < work[0] * 2, "{work:?}");
 }
 
+/// A pi chat in its own directory: `users` matching user turns, then `tools` matching
+/// shell results.
+fn needle_chat(home: &Path, id: &str, users: usize, tools: usize) {
+    let p = home.join(".pi/agent/sessions").join(id).join("chat.jsonl");
+    fs::create_dir_all(p.parent().unwrap()).unwrap();
+    let mut lines = vec![
+        serde_json::json!({"type":"session","id":id,"version":3,"cwd":"/work/project","timestamp":"2026-10-29T12:00:00Z"}),
+    ];
+    let mut parent = Value::Null;
+    let mut push = |message: Value, id: String| {
+        lines.push(serde_json::json!({"type":"message","id":id,"parentId":parent,"timestamp":"2026-10-29T12:00:01Z","message":message}));
+        parent = Value::String(id);
+    };
+    for i in 0..users {
+        push(
+            serde_json::json!({"role":"user","content":format!("needle row {i}")}),
+            format!("u{i}"),
+        );
+    }
+    for i in 0..tools {
+        push(
+            serde_json::json!({"role":"assistant","content":[{"type":"toolCall","id":format!("t{i}"),"name":"shell","arguments":{"command":"ls"}}]}),
+            format!("c{i}"),
+        );
+        push(
+            serde_json::json!({"role":"toolResult","toolCallId":format!("t{i}"),"toolName":"shell","content":[{"type":"text","text":format!("needle output {i}")}]}),
+            format!("r{i}"),
+        );
+    }
+    let body: Vec<String> = lines.iter().map(Value::to_string).collect();
+    fs::write(&p, body.join("\n") + "\n").unwrap();
+}
+// A chat listing counts every listed chat's matching rows. Counting each chat by
+// scanning the pattern's matches across the corpus made the work grow with the listed
+// chats times the corpus; the counts must cost the same however much else matches.
+#[test]
+fn chat_listing_counts_follow_the_listed_chats_not_the_corpus() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let listed: Vec<String> = (0..6).map(|i| format!("listed-chat-{i}")).collect();
+    let mut work = Vec::new();
+    for filler in [2_000, 8_000] {
+        let t = TempDir::new().unwrap();
+        let (home, data) = (t.path().join("home"), t.path().join("data"));
+        for id in &listed {
+            needle_chat(&home, id, 5, 2);
+        }
+        needle_chat(&home, "filler-chat", filler, filler / 4);
+        ok(cli(&home, &data, &["index"]));
+        let c = store::reader(&DataRoot::open(&data, false).unwrap()).unwrap();
+        let steps = Arc::new(AtomicUsize::new(0));
+        let capture = steps.clone();
+        c.progress_handler(
+            100,
+            Some(move || {
+                capture.fetch_add(100, Ordering::Relaxed);
+                false
+            }),
+        );
+        let mut options = retrieval_options("needle");
+        options.tools = true;
+        let counts = agrep_core::query::session_counts(
+            &c,
+            &options,
+            &listed,
+            &mut agrep_core::query::Plans::default(),
+        )
+        .unwrap();
+        assert_eq!(counts, vec![7; listed.len()]);
+        work.push(steps.load(Ordering::Relaxed));
+    }
+    assert!(work[1] < work[0] * 2, "{work:?}");
+}
+
 #[test]
 fn sparse_old_matches_ignore_the_recency_of_unrelated_rows() {
     let mut work = Vec::new();
@@ -1306,6 +1382,14 @@ fn the_census_counts_exactly_the_sources_a_full_build_would_change() {
     ] {
         session(&pi.join(path), id, &format!("{id} first prompt"));
     }
+    // More sources than one stat task takes, so their stats split across the pool.
+    for i in 0..300 {
+        session(
+            &pi.join(format!("flat/s{i:03}.jsonl")),
+            &format!("s{i}"),
+            &format!("flat prompt {i}"),
+        );
+    }
     ok(cli(&h, &d, &["index"]));
     type Change<'a> = Box<dyn Fn() + 'a>;
     let steps: Vec<(&str, Change)> = vec![
@@ -1346,6 +1430,24 @@ fn the_census_counts_exactly_the_sources_a_full_build_would_change() {
         (
             "not a source",
             Box::new(|| fs::write(pi.join("p2/notes.md"), "notes").unwrap()),
+        ),
+        (
+            "append in a large directory",
+            Box::new(|| {
+                let mut f = fs::OpenOptions::new()
+                    .append(true)
+                    .open(pi.join("flat/s150.jsonl"))
+                    .unwrap();
+                writeln!(f, "{}", serde_json::json!({"type":"message","id":"m1","parentId":"m0","timestamp":"2026-10-29T12:00:02Z","message":{"role":"user","content":"appended"}})).unwrap();
+            }),
+        ),
+        (
+            "removed from a large directory",
+            Box::new(|| fs::remove_file(pi.join("flat/s007.jsonl")).unwrap()),
+        ),
+        (
+            "new in a large directory",
+            Box::new(|| session(&pi.join("flat/s300.jsonl"), "s300", "flat prompt 300")),
         ),
     ];
     for (n, (name, change)) in steps.iter().enumerate() {
@@ -1435,6 +1537,70 @@ fn caller_predicates_filter_the_window_and_mark_older_rows() {
     assert!(r.hits[0].self_marker);
     o.filters.caller.as_mut().unwrap().exclude_family = true;
     assert_eq!(agrep_core::query::search(&c, &o).unwrap().total, 0);
+}
+// Exact counts under the caller's exclusion and session scopes start from the excluded
+// or scoped sessions' rows; a tiered count verifies every candidate row instead, so the
+// two must agree in each lane.
+#[test]
+fn session_scoped_counts_match_verified_counts() {
+    use agrep_core::query::{CallerFilter, Filters, SessionRows};
+    let t = TempDir::new().unwrap();
+    let (home, data) = (t.path().join("home"), t.path().join("data"));
+    for (id, users, tools) in [
+        ("caller-chat", 6, 3),
+        ("caller-chat-side", 4, 2),
+        ("other-chat", 5, 4),
+    ] {
+        needle_chat(&home, id, users, tools);
+    }
+    ok(cli(&home, &data, &["index"]));
+    let c = store::reader(&DataRoot::open(&data, false).unwrap()).unwrap();
+    let caller = |from: Option<i64>, sessions: &[&str], family: bool| Filters {
+        caller: Some(CallerFilter {
+            agent: "pi".into(),
+            session: "caller-chat".into(),
+            family: "caller-chat".into(),
+            exclude_from_turn: from,
+            exclude_family: family,
+            excluded_sessions: sessions.iter().map(|s| s.to_string()).collect(),
+        }),
+        ..Filters::default()
+    };
+    let scopes = [
+        caller(Some(3), &[], false),
+        caller(None, &["caller-chat", "caller-chat-side"], false),
+        caller(Some(0), &["caller-chat-side"], false),
+        caller(None, &[], true),
+        caller(None, &[], false),
+        Filters {
+            chat: Some("caller-chat".into()),
+            ..Filters::default()
+        },
+        Filters {
+            session_rows: Some(SessionRows {
+                session: "caller-chat".into(),
+                from: Some(2),
+            }),
+            ..Filters::default()
+        },
+    ];
+    let mut totals = Vec::new();
+    for filters in scopes {
+        let mut o = retrieval_options("needle");
+        (o.tools, o.limit, o.exact, o.count_only) = (true, 0, true, true);
+        o.filters = filters;
+        let quick = agrep_core::query::search(&c, &o).unwrap();
+        o.count_by_tier = true;
+        let verified = agrep_core::query::search(&c, &o).unwrap();
+        assert_eq!(
+            (quick.total, quick.tool_rows),
+            (verified.total, verified.tool_rows),
+            "{:?}",
+            o.filters
+        );
+        totals.push(quick.total);
+    }
+    assert_eq!(totals, [18, 9, 9, 15, 24, 15, 7]);
 }
 /// One pi transcript at `path`: user turns, `recap:` compactions and `tool:` results,
 /// each at the given second.
@@ -2555,50 +2721,125 @@ fn no_meta_uses_proven_event_lineage_and_retains_only_evidence() {
 }
 
 #[test]
-fn no_meta_filters_before_the_page_limit() {
+fn no_meta_filters_the_page_0_4_9_fetched() {
     use serde_json::json;
-    let t = TempDir::new().unwrap();
-    let home = t.path().join("home");
-    let data = t.path().join("data");
-    let path = home.join(".pi/agent/sessions/test/meta-page.jsonl");
-    let mut records =
-        vec![json!({"type":"session","id":"meta-page","version":3,"cwd":"/work/test"})];
-    let mut parent = String::new();
-    for i in 0..81 {
-        let call = format!("call-{i}");
-        let result = format!("result-{i}");
-        let (time, command, output) = if i < 80 {
-            (
-                "2099-01-01T00:00:00Z",
-                "agrep search 'needle marker'",
-                "needle marker from history",
-            )
+    // 0.4.9 fetched max(-n, 40) rows, dropped the proven ~meta rows among them and kept
+    // the best one only when nothing else was left; its totals then count the kept rows.
+    for meta_rows in [30, 80] {
+        let t = TempDir::new().unwrap();
+        let home = t.path().join("home");
+        let data = t.path().join("data");
+        let path = home.join(".pi/agent/sessions/test/meta-page.jsonl");
+        let mut records =
+            vec![json!({"type":"session","id":"meta-page","version":3,"cwd":"/work/test"})];
+        let mut parent = String::new();
+        for i in 0..=meta_rows {
+            let call = format!("call-{i}");
+            let result = format!("result-{i}");
+            let (time, command, output) = if i < meta_rows {
+                (
+                    "2099-01-01T00:00:00Z",
+                    "agrep search 'needle marker'",
+                    "needle marker from history",
+                )
+            } else {
+                (
+                    "2024-01-01T00:00:00Z",
+                    "printf 'needle marker'",
+                    "needle marker ordinary evidence",
+                )
+            };
+            records.push(json!({"type":"message","id":call,"parentId":parent,"timestamp":time,"message":{"role":"assistant","content":[{"type":"toolCall","id":call,"name":"shell","arguments":{"command":command}}]}}));
+            records.push(json!({"type":"message","id":result,"parentId":call,"timestamp":time,"message":{"role":"toolResult","toolCallId":call,"content":output}}));
+            parent = result;
+        }
+        write_records(&path, &records, false);
+        ok(cli(&home, &data, &["index"]));
+        let root = DataRoot::open(&data, false).unwrap();
+        let c = store::reader(&root).unwrap();
+        let mut o = retrieval_options("needle marker");
+        o.tools = true;
+        o.limit = 1;
+        o.filters.who = Some("tool".into());
+        let unfiltered = agrep_core::query::search(&c, &o).unwrap();
+        assert!(unfiltered.hits[0].text.contains("agrep search"));
+        o.filters.no_meta = true;
+        let r = agrep_core::query::search(&c, &o).unwrap();
+        assert_eq!(r.hits.len(), 1);
+        let shape = (
+            r.meta_dropped,
+            r.meta_retained,
+            r.total,
+            r.total_basis.as_str(),
+        );
+        if meta_rows < 40 {
+            assert!(r.hits[0].text.contains("ordinary evidence"));
+            assert!(!r.hits[0].meta_marker);
+            assert_eq!(shape, (meta_rows, 0, 1, "exact"));
         } else {
-            (
-                "2024-01-01T00:00:00Z",
-                "printf 'needle marker'",
-                "needle marker ordinary evidence",
-            )
-        };
-        records.push(json!({"type":"message","id":call,"parentId":parent,"timestamp":time,"message":{"role":"assistant","content":[{"type":"toolCall","id":call,"name":"shell","arguments":{"command":command}}]}}));
-        records.push(json!({"type":"message","id":result,"parentId":call,"timestamp":time,"message":{"role":"toolResult","toolCallId":call,"content":output}}));
-        parent = result;
+            assert!(r.hits[0].text.contains("agrep search"));
+            assert!(r.hits[0].meta_marker);
+            assert_eq!(shape, (39, 1, 1, "floor"));
+        }
     }
-    write_records(&path, &records, false);
-    ok(cli(&home, &data, &["index"]));
-    let root = DataRoot::open(&data, false).unwrap();
-    let c = store::reader(&root).unwrap();
-    let mut o = retrieval_options("needle marker");
-    o.tools = true;
-    o.limit = 1;
-    o.filters.who = Some("tool".into());
-    let unfiltered = agrep_core::query::search(&c, &o).unwrap();
-    assert!(unfiltered.hits[0].text.contains("agrep search"));
-    o.filters.no_meta = true;
-    let result = agrep_core::query::search(&c, &o).unwrap();
-    assert_eq!(result.hits.len(), 1);
-    assert!(result.hits[0].text.contains("ordinary evidence"));
-    assert!(!result.hits[0].meta_marker);
+}
+
+#[test]
+fn no_meta_work_follows_the_page_not_the_corpus() {
+    use serde_json::json;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let mut extra = vec![];
+    for n in [64, 256] {
+        let t = TempDir::new().unwrap();
+        let home = t.path().join("home");
+        let data = t.path().join("data");
+        for i in 0..n {
+            write_records(
+                &home.join(format!(".pi/agent/sessions/test/lineage-{i}.jsonl")),
+                &[
+                    json!({"type":"session","id":format!("lineage-{i}"),"version":3,"cwd":"/work/test"}),
+                    json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":format!("question {i}")}}),
+                    json!({"type":"message","id":"c","parentId":"u","message":{"role":"assistant","content":[{"type":"toolCall","id":"call","name":"shell","arguments":{"command":"agrep search needle"}}]}}),
+                    json!({"type":"message","id":"r","parentId":"c","message":{"role":"toolResult","toolCallId":"call","content":format!("needle from history {i}")}}),
+                    json!({"type":"message","id":"a","parentId":"r","message":{"role":"assistant","content":format!("needle history answer {i}")}}),
+                ],
+                false,
+            );
+        }
+        ok(cli(&home, &data, &["index"]));
+        let c = store::reader(&DataRoot::open(&data, false).unwrap()).unwrap();
+        let steps = Arc::new(AtomicUsize::new(0));
+        let capture = steps.clone();
+        c.progress_handler(
+            100,
+            Some(move || {
+                capture.fetch_add(100, Ordering::Relaxed);
+                false
+            }),
+        );
+        let mut o = retrieval_options("needle");
+        o.tools = true;
+        o.chats = true;
+        let mut work = vec![];
+        for no_meta in [false, true] {
+            o.filters.no_meta = no_meta;
+            let before = steps.load(Ordering::Relaxed);
+            let r = agrep_core::query::search(&c, &o).unwrap();
+            work.push(steps.load(Ordering::Relaxed) - before);
+            if no_meta {
+                // Every chat's best row is an answer read from history: the 40 fetched
+                // heads are checked, and only the best one stays.
+                assert_eq!((r.meta_dropped, r.meta_retained, r.hits.len()), (39, 1, 1));
+            } else {
+                assert_eq!(r.hits.len(), 10);
+            }
+        }
+        extra.push(work[1].saturating_sub(work[0]));
+    }
+    assert!(extra[1] < extra[0] * 2, "{extra:?}");
 }
 
 #[test]
@@ -2881,6 +3122,99 @@ fn a_refresh_adds_one_segment_per_text_index_and_the_worker_merges_them() {
         ok(cli(&h, &d, &["--no-auto", "novel3x4", "-c"])).stdout,
         ok(cli(&h, &full, &["--no-auto", "novel3x4", "-c"])).stdout
     );
+}
+
+/// A merger mid-merge holds merge.lock and starts no step while a writer is queued.
+/// The test holds both, so an `index` that merged inline or waited for the merger
+/// would merge here or never return.
+#[test]
+fn index_waits_for_no_merge_step_and_leaves_merging_to_the_merger() {
+    use serde_json::json;
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let d = t.path().join("d");
+    let path = transcript(&h, &["prose turn marker"]);
+    ok(cli(&h, &d, &["index"]));
+    let append = |id: &str, parent: &str, text: &str| {
+        write_records(
+            &path,
+            &[
+                json!({"type":"message","id":id,"parentId":parent,"timestamp":"2026-10-30T12:00:00Z","message":{"role":"user","content":text}}),
+            ],
+            true,
+        );
+    };
+    append("u0", "m0", "first change cobaltzero");
+    ok(cli(&h, &d, &["__work", "refresh"]));
+    append("u1", "u0", "second change cobaltone");
+    ok(cli(&h, &d, &["__work", "refresh"]));
+    let pending = || {
+        let c = Connection::open_with_flags(d.join("index.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+        agrep_core::fts_segments::pending(&c).unwrap()
+    };
+    assert!(pending());
+    let before = fts_segments(&d);
+    let root = DataRoot::open(&d, false).unwrap();
+    let merging = root.merge_lock().unwrap().unwrap();
+    let queued = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(d.join("writer.queue"))
+        .unwrap();
+    queued.lock_shared().unwrap();
+    append("u2", "u1", "third change cobalttwo");
+    let child = Command::new(support::binary())
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", &h)
+        .env("AGREP_HOME", &h)
+        .env("AGREP_DATA_DIR", &d)
+        .env("AGREP_PROFILE", "classic")
+        .arg("index")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || sender.send(child.wait_with_output()));
+    // A watchdog, not synchronization: an index that waits for the merger never exits.
+    let index = receiver
+        .recv_timeout(std::time::Duration::from_secs(300))
+        .expect("index waited for the merge in progress")
+        .unwrap();
+    ok(index);
+    let after = fts_segments(&d);
+    assert_eq!(after[0], before[0] + 1, "{before:?} -> {after:?}");
+    assert_eq!(after[1..], before[1..]);
+    assert!(pending());
+    queued.unlock().unwrap();
+    drop(merging);
+    // Commands start a merger when their census reports merge work.
+    let merge_pending = || {
+        serde_json::from_slice::<Value>(&ok(cli(&h, &d, &["__census"])).stdout).unwrap()
+            ["merge_pending"]
+            .as_bool()
+            .unwrap()
+    };
+    assert!(merge_pending());
+    ok(cli(&h, &d, &["__work", "merge"]));
+    assert!(!pending());
+    assert!(!merge_pending());
+    assert!(fts_segments(&d)
+        .iter()
+        .all(|&n| n <= agrep_core::fts_segments::CAP));
+    let full = t.path().join("full");
+    ok(cli(&h, &full, &["index"]));
+    assert_eq!(fts_contents(&d), fts_contents(&full));
+    for term in ["cobaltzero", "cobaltone", "cobalttwo"] {
+        assert_eq!(
+            ok(cli(&h, &d, &["--no-auto", term, "-c"])).stdout,
+            ok(cli(&h, &full, &["--no-auto", term, "-c"])).stdout
+        );
+    }
 }
 
 #[test]

@@ -451,6 +451,7 @@ impl Scope {
             no_side: self.no_side,
             caller: None,
             session_rows: None,
+            sessions: None,
         })
     }
 }
@@ -489,19 +490,22 @@ fn ready(no_auto: bool) -> Result<(DataRoot, Option<CensusTask>)> {
     Ok((root, census))
 }
 fn finish_census(root: &DataRoot, census: Option<CensusTask>) -> Result<usize> {
-    let pending = if let Some(task) = census {
-        task.join()
-            .map_err(|_| anyhow::anyhow!("source census failed"))??
-            .changed_sources
-    } else {
-        0
+    let Some(task) = census else {
+        semantic::schedule(root)?;
+        return Ok(0);
     };
-    if pending > 0 {
+    let census = task
+        .join()
+        .map_err(|_| anyhow::anyhow!("source census failed"))??;
+    if census.changed_sources > 0 {
         agrep_core::freshness::spawn(root, &std::env::current_exe()?)?;
     } else {
+        if census.merge_pending {
+            agrep_core::freshness::spawn_merge(root, &std::env::current_exe()?)?;
+        }
         semantic::schedule(root)?;
     }
-    Ok(pending)
+    Ok(census.changed_sources)
 }
 
 fn run(cli: Cli) -> Result<i32> {
@@ -551,6 +555,7 @@ fn run(cli: Cli) -> Result<i32> {
         Some(Command::Reindex { full }) => {
             let root = DataRoot::discover()?;
             root.validate(true)?;
+            let _foreground = root.foreground()?;
             let result = store::reindex(&root)?;
             agrep_core::surface::line(&agrep_core::surface::refresh_json(&result)?)?;
             if full {

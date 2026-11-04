@@ -248,7 +248,14 @@ impl Writer {
         let tool_id = old.as_ref().map_or(physical_id, |v| v.tool_id);
         let end = separator.map(|n| n as i64);
         let start = separator.map(|n| if n == 0 { 0 } else { n as i64 + 1 });
-        tx.prepare_cached("INSERT INTO event_rows(id,tool_id,source,session_key,call_id,kind_key,name_key,ts,native_turn,position,input_chars,output_chars,output_bytes,ok,child_session,meta,state,input_end,output_start,project_key,blob) VALUES(?19,?20,?1,?2,?3,?4,?5,?6,?7,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18) ON CONFLICT(source,session_key,call_id) WHERE active=1 DO UPDATE SET kind_key=excluded.kind_key,name_key=excluded.name_key,ts=excluded.ts,native_turn=excluded.native_turn,input_chars=excluded.input_chars,output_chars=excluded.output_chars,output_bytes=excluded.output_bytes,ok=excluded.ok,child_session=excluded.child_session,meta=excluded.meta,state=excluded.state,input_end=excluded.input_end,output_start=excluded.output_start,project_key=excluded.project_key,blob=excluded.blob")?.execute(params![source,session,call_id,kind,name,e.ts,turn,e.input_chars as i64,e.output_chars as i64,e.output_bytes as i64,e.ok,e.child_session,e.meta,e.state,end,start,project,blob,physical_id,tool_id])?;
+        // A control event has no searchable text; its input (an API error's message, a
+        // notification's fields) is kept in `meta`, which no control event otherwise uses.
+        let meta = if e.kind == "control" {
+            &e.input
+        } else {
+            &e.meta
+        };
+        tx.prepare_cached("INSERT INTO event_rows(id,tool_id,source,session_key,call_id,kind_key,name_key,ts,native_turn,position,input_chars,output_chars,output_bytes,ok,child_session,meta,state,input_end,output_start,project_key,blob) VALUES(?19,?20,?1,?2,?3,?4,?5,?6,?7,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18) ON CONFLICT(source,session_key,call_id) WHERE active=1 DO UPDATE SET kind_key=excluded.kind_key,name_key=excluded.name_key,ts=excluded.ts,native_turn=excluded.native_turn,input_chars=excluded.input_chars,output_chars=excluded.output_chars,output_bytes=excluded.output_bytes,ok=excluded.ok,child_session=excluded.child_session,meta=excluded.meta,state=excluded.state,input_end=excluded.input_end,output_start=excluded.output_start,project_key=excluded.project_key,blob=excluded.blob")?.execute(params![source,session,call_id,kind,name,e.ts,turn,e.input_chars as i64,e.output_chars as i64,e.output_bytes as i64,e.ok,e.child_session,meta,e.state,end,start,project,blob,physical_id,tool_id])?;
         let text_changed = old.as_ref().map_or(blob.is_some(), |v| v.blob != blob);
         let dirty = text_changed
             || old
