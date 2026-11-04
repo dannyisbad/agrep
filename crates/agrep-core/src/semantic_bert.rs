@@ -160,6 +160,10 @@ impl MappedTensor {
 
 /// `x · wᵀ` for row-major `x` (m×k) and `w` (n×k), through the same BLAS call
 /// and arguments Candle's CPU matmul uses for `Linear`, so results are identical.
+/// `gemm` runs on the calling thread: Candle would hand every product of a short
+/// query to the Rayon pool and wait for it; `projection` already splits long inputs
+/// into row blocks across the pool. Each output element's dot product is computed
+/// the same way with or without threads, which `semantic_eval` checks bit for bit.
 fn matmul_transposed(x: &[f32], m: usize, k: usize, w: &[f32], n: usize) -> Vec<f32> {
     let mut out = vec![0f32; m * n];
     #[cfg(target_os = "macos")]
@@ -201,7 +205,6 @@ fn matmul_transposed(x: &[f32], m: usize, k: usize, w: &[f32], n: usize) -> Vec<
     }
     #[cfg(not(target_os = "macos"))]
     unsafe {
-        let threads = candle_core::utils::get_num_threads();
         gemm::gemm(
             m,
             n,
@@ -221,11 +224,7 @@ fn matmul_transposed(x: &[f32], m: usize, k: usize, w: &[f32], n: usize) -> Vec<
             false,
             false,
             false,
-            if threads > 1 {
-                gemm::Parallelism::Rayon(threads)
-            } else {
-                gemm::Parallelism::None
-            },
+            gemm::Parallelism::None,
         );
     }
     out

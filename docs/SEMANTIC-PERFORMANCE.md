@@ -346,6 +346,45 @@ the mapped converted file in place (bit-identical, see SEMANTIC.md). The tokeniz
 `serde_json::Value`, before building the BPE; going straight to the BPE deserializer
 removes that pass. The tokenizer is now the longest stage: about 13.5 ms of it is
 parsing and allocating 50,280 vocabulary strings and 50,009 merge pairs and the library
-builder's merge map, which any use of the library BPE model pays. A compact BPE table
-written at provisioning, read by a `tokenizers::Model` implementation without per-entry
-allocation, would remove it; that is not done here.
+builder's merge map, which any use of the library BPE model pays. Those tables are now written at provisioning (next section).
+
+## Queries on a saturated runner
+
+CI at 8bc9c204 lost one case: macos-14 warm_hybrid p95 (231 against 0.4.9's 196 ms) at
+one-minute load 11-12 on 3 vCPUs, while semantic_only won. Reproduced in an aarch64
+Linux VM: the measuring container is pinned to 3 CPUs and runs at nice 10, and twelve
+busy loops at nice 10 share that cpuset (one-minute load 9.9-10.7 during the cases).
+0.4.9 is prepared as the matched harness prepares it and its resident processes keep
+running during each case. Twenty alternating samples per lane on the semantic workload,
+median / p95 ms, and CPU per process (0.4.9's is its client; its resident worker is not
+counted):
+
+| Case | Load | 0.4.9 | before (3ea801ab) | after |
+|---|---|---:|---:|---:|
+| semantic_only | uncontended | 57.8 / 67.8 (15.1 CPU) | 54.1 / 72.0 (75.6 CPU) | 36.8 / 44.0 (40.8 CPU) |
+| warm_hybrid | uncontended | 93.9 / 100.2 (14.7) | 52.9 / 56.8 (93.8) | 37.2 / 38.6 (61.8) |
+| semantic_only | contended | 89.9 / 99.3 (14.7) | 113.6 / 147.5 (69.3) | 60.2 / 88.2 (38.7) |
+| warm_hybrid | contended | 182.1 / 216.7 (14.4) | 124.7 / 149.7 (91.6) | 79.2 / 92.6 (60.2) |
+
+The matched harness in the same VM agrees. Contended before: warm_hybrid 127.1 / 146.7
+against 192.3 / 198.8 and semantic_only 119.9 / 159.9 against 101.2 / 129.8, a loss.
+Contended after: 75.1 / 84.0 against 196.4 / 219.4 and 59.8 / 72.2 against
+110.1 / 129.4. Uncontended first_hybrid: before 56.0 / 62.5, after 37.1 / 46.9, against
+514-519. On the M2 Max (`RAYON_NUM_THREADS=3`, uncontended, load 7.8): semantic_only
+42.7 / 56.7 to 28.3 / 41.9 ms (47.1 to 28.0 ms CPU), warm_hybrid 43.2 / 45.2 to
+34.2 / 36.1 ms (68.4 to 51.0 ms CPU).
+
+On a saturated cpuset each stage costs about its CPU time times the oversubscription,
+plus a scheduling wait at every handoff between threads. Contended before, the
+warm_hybrid query spent 85.9 ms (28.3 ms CPU) building the library tokenizer, and
+40.8 ms in inference although its own thread used 3.5 ms: `gemm` hands every product of
+more than 48·48·256 multiply-adds to the Rayon pool, so each of the 48 projections of a
+12-token query waited for pool workers. The query now reads `tokenizer-query.bin`
+(2.2 ms, 1.0 ms CPU, contended), runs its products on its own thread, and keeps scans
+below 32,768 vectors and opens below 32 blocks off the pool; `projection` still spreads
+inputs of 256 rows or more across the pool, and owner-scale scans stay parallel. These
+are input-size rules, the same for every machine.
+
+What remains is CPU that has to run: contended after, inference is 39-55 ms wall on one
+thread (22.6 ms CPU), and in warm_hybrid the keyword lane's planner takes 42.6 ms
+(22.8 ms CPU) of its 43.7 ms. The planner is outside the semantic lane and unchanged.

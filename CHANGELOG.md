@@ -15,6 +15,8 @@
   `-s` requires the model. Coverage is reported as indexed/total rows.
 - Six platform wheels bundle the executable. npm verifies package-pinned hashes
   before caching and executing the matching GitHub release binary.
+- Linux and Windows arm64 builds require ARMv8.2-A with FP16 (Raspberry Pi 5,
+  Graviton2 and later). Raspberry Pi 3/4 and Graviton1 are no longer supported.
 - CI runs tests and a blocking full-process performance comparison with agrep
   0.4.9 on Linux, macOS and Windows, including arm64 runners: every measured case
   must beat 0.4.9 at median and p95. Release publication requires it.

@@ -413,7 +413,7 @@ pub(crate) fn refresh(
             "INSERT INTO tool_lexicon(tool_lexicon) VALUES('optimize')",
             [],
         )?;
-        tx.execute_batch("INSERT INTO tool_lexicon(tool_lexicon,rank) VALUES('automerge',4);INSERT INTO tool_lexicon(tool_lexicon,rank) VALUES('crisismerge',16);INSERT INTO tool_lexicon(tool_lexicon,rank) VALUES('hashsize',1048576);")?;
+        crate::fts_segments::configure(tx, "tool_lexicon")?;
     } else {
         let tokenizers = Tokenizers::new(tx)?;
         let mut tokenizer = tokenizers.tokenizer()?;
@@ -453,8 +453,8 @@ pub(crate) fn refresh(
             let mut deltas: HashMap<u32, i64> = HashMap::new();
             let mut vocabulary = tx.prepare("SELECT b.term,coalesce((SELECT doc FROM tools_vocab WHERE term=b.term),0) FROM tool_word_batch_vocab b WHERE length(b.term)>=3")?;
             let mut select = tx.prepare("SELECT id,doc FROM tool_words WHERE term=?")?;
-            let mut insert = tx.prepare("INSERT INTO tool_words(term,doc) VALUES(?1,?2)")?;
             let mut update = tx.prepare("UPDATE tool_words SET doc=?2 WHERE id=?1")?;
+            let mut new_words = Vec::new();
             let mut rows = vocabulary.query([])?;
             while let Some(row) = rows.next()? {
                 let term: String = row.get(0)?;
@@ -463,10 +463,7 @@ pub(crate) fn refresh(
                     .query_row([&term], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
                     .optional()?;
                 let delta = match old {
-                    None => {
-                        insert.execute(params![term, doc])?;
-                        doc
-                    }
+                    None => doc,
                     Some((id, before)) => {
                         if before != doc {
                             update.execute(params![id, doc])?;
@@ -479,7 +476,22 @@ pub(crate) fn refresh(
                         *deltas.entry(code).or_default() += delta;
                     }
                 }
+                if old.is_none() {
+                    new_words.push((term, doc));
+                }
             }
+            drop(rows);
+            // The batch is discarded before any statement opens a savepoint, so its
+            // pending terms never become a segment.
+            tx.execute(
+                "INSERT INTO tool_word_batch(tool_word_batch) VALUES('delete-all')",
+                [],
+            )?;
+            // One statement: the lexicon rows its trigger writes join a single segment.
+            tx.execute(
+                "INSERT INTO tool_words(term,doc) SELECT value->>0,value->>1 FROM json_each(?1)",
+                [serde_json::to_string(&new_words)?],
+            )?;
             let mut apply = tx.prepare("INSERT INTO tool_trigrams(gram,doc) VALUES(?1,?2) ON CONFLICT(gram) DO UPDATE SET doc=doc+excluded.doc")?;
             for (code, delta) in deltas {
                 if delta != 0 {
@@ -487,7 +499,6 @@ pub(crate) fn refresh(
                 }
             }
         }
-        tx.execute("DELETE FROM tool_word_batch", [])?;
         // Removed rows leave their blocks listed: presence may only overstate.
         let mut select = tx.prepare_cached("SELECT id,blocks FROM tool_words WHERE term=?")?;
         let mut update = tx.prepare_cached("UPDATE tool_words SET blocks=?2 WHERE id=?1")?;

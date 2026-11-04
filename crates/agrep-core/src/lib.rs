@@ -30,6 +30,7 @@ mod row_stats;
 mod tool_index;
 mod tool_store;
 
+pub mod fts_segments;
 mod fts_span;
 
 pub mod briefing;
@@ -64,6 +65,7 @@ mod semantic_policy;
 #[doc(hidden)]
 pub mod semantic_profile;
 mod semantic_store;
+pub mod semantic_tokenizer;
 pub mod surface;
 pub mod terminal;
 

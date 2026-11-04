@@ -1274,6 +1274,96 @@ fn reader_does_not_parse_changed_sources_and_work_lock_arbitrates_refresh() {
     ok(cli(&h, &d, &["pending", "-c", "--no-auto"]));
     assert_eq!(pending_sources(&h, &d), 0);
 }
+/// The index's fingerprint of every file source, by path.
+fn source_fingerprints(data: &Path) -> std::collections::BTreeMap<String, (i64, i64, String)> {
+    let c = Connection::open_with_flags(data.join("index.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .unwrap();
+    let mut q = c
+        .prepare("SELECT path,size,mtime_ns,change_token FROM sources WHERE path NOT LIKE '@%' AND path NOT LIKE 'token:%'")
+        .unwrap();
+    q.query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?))))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+#[test]
+fn the_census_counts_exactly_the_sources_a_full_build_would_change() {
+    use std::io::Write;
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let d = t.path().join("d");
+    let session = |path: &Path, id: &str, text: &str| {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, format!("{}\n{}\n", serde_json::json!({"type":"session","id":id,"version":3,"cwd":"/work/p"}), serde_json::json!({"type":"message","id":"m0","parentId":null,"timestamp":"2026-10-29T12:00:01Z","message":{"role":"user","content":text}}))).unwrap();
+    };
+    let pi = h.join(".pi/agent/sessions");
+    for (path, id) in [
+        ("p1/a.jsonl", "a"),
+        ("p1/b.jsonl", "b"),
+        ("p1/a/side.jsonl", "a-side"),
+        ("p2/x.jsonl", "x"),
+        ("p2/y.jsonl", "y"),
+    ] {
+        session(&pi.join(path), id, &format!("{id} first prompt"));
+    }
+    ok(cli(&h, &d, &["index"]));
+    type Change<'a> = Box<dyn Fn() + 'a>;
+    let steps: Vec<(&str, Change)> = vec![
+        ("unchanged", Box::new(|| {})),
+        (
+            "append",
+            Box::new(|| {
+                let mut f = fs::OpenOptions::new()
+                    .append(true)
+                    .open(pi.join("p1/a.jsonl"))
+                    .unwrap();
+                writeln!(f, "{}", serde_json::json!({"type":"message","id":"m1","parentId":"m0","timestamp":"2026-10-29T12:00:02Z","message":{"role":"user","content":"appended"}})).unwrap();
+            }),
+        ),
+        (
+            "same bytes rewritten",
+            Box::new(|| {
+                let p = pi.join("p1/b.jsonl");
+                fs::write(&p, fs::read(&p).unwrap()).unwrap();
+            }),
+        ),
+        (
+            "new file",
+            Box::new(|| session(&pi.join("p1/c.jsonl"), "c", "c prompt")),
+        ),
+        (
+            "new directory",
+            Box::new(|| session(&pi.join("p2/x/side.jsonl"), "x-side", "side prompt")),
+        ),
+        (
+            "removed file",
+            Box::new(|| fs::remove_file(pi.join("p2/y.jsonl")).unwrap()),
+        ),
+        (
+            "removed directory",
+            Box::new(|| fs::remove_dir_all(pi.join("p1/a")).unwrap()),
+        ),
+        (
+            "not a source",
+            Box::new(|| fs::write(pi.join("p2/notes.md"), "notes").unwrap()),
+        ),
+    ];
+    for (n, (name, change)) in steps.iter().enumerate() {
+        change();
+        let full = t.path().join(format!("full-{n}"));
+        ok(cli(&h, &full, &["index"]));
+        let (indexed, current) = (source_fingerprints(&d), source_fingerprints(&full));
+        let differing = indexed
+            .keys()
+            .chain(current.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter(|p| indexed.get(*p) != current.get(*p))
+            .count();
+        assert!(n == 0 || differing > 0, "{name} changed no fingerprint");
+        assert_eq!(pending_sources(&h, &d), differing, "{name}");
+    }
+}
 #[test]
 fn positional_tool_count_does_not_hydrate_text() {
     let t = TempDir::new().unwrap();
@@ -2702,6 +2792,95 @@ fn appended_block_bounds_equal_a_complete_rebuild() {
     let incremental = bounds(&root);
     store::rebuild_bounds(&root).unwrap();
     assert_eq!(incremental, bounds(&root));
+}
+
+fn fts_segments(data: &Path) -> Vec<usize> {
+    let c = Connection::open_with_flags(data.join("index.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .unwrap();
+    ["prose_fts", "tools_fts", "tool_lexicon"]
+        .iter()
+        .map(|t| {
+            agrep_core::fts_segments::segments(&agrep_core::fts_segments::levels(&c, t).unwrap())
+        })
+        .collect()
+}
+/// What lookups read from the text indexes, whatever their segment layout.
+fn fts_contents(data: &Path) -> Vec<Vec<(String, i64, i64)>> {
+    let c = Connection::open_with_flags(data.join("index.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .unwrap();
+    [
+        "SELECT term,doc,cnt FROM prose_vocab ORDER BY term",
+        "SELECT term,doc,cnt FROM tools_vocab ORDER BY term",
+        "SELECT term,doc,0 FROM tool_words ORDER BY term",
+        "SELECT w.term,count(*),0 FROM tool_words w CROSS JOIN tool_lexicon l ON l.rowid=w.id WHERE tool_lexicon MATCH '\"' || substr(w.term,1,3) || '\"' GROUP BY w.term ORDER BY w.term",
+    ]
+    .iter()
+    .map(|sql| {
+        c.prepare(sql)
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    })
+    .collect()
+}
+#[test]
+fn a_refresh_adds_one_segment_per_text_index_and_the_worker_merges_them() {
+    use serde_json::json;
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let d = t.path().join("d");
+    let turns: Vec<String> = (0..40).map(|i| format!("prose turn {i} marker")).collect();
+    let path = transcript(&h, &turns.iter().map(String::as_str).collect::<Vec<_>>());
+    let outputs: Vec<String> = (0..40)
+        .map(|i| format!("tool output {i} alpha{i}"))
+        .collect();
+    let mut parent = append_tool_results(&path, "m39", 0, &outputs);
+    ok(cli(&h, &d, &["index"]));
+    let mut before = fts_segments(&d);
+    assert_eq!(before, [1, 1, 1]);
+    for round in 0..6 {
+        let mut records = Vec::new();
+        for i in 0..12 {
+            let id = format!("r{round}u{i}");
+            records.push(json!({"type":"message","id":&id,"parentId":&parent,"timestamp":"2026-10-30T12:00:00Z","message":{"role":"user","content":format!("round {round} prompt {i} about cobalt{round}x{i}")}}));
+            parent = id;
+        }
+        write_records(&path, &records, true);
+        let novel: Vec<String> = (0..12)
+            .map(|i| format!("new tool text novel{round}x{i} with alpha{i}"))
+            .collect();
+        parent = append_tool_results(&path, &parent, 100 + round * 12, &novel);
+        if round == 3 {
+            // An interior edit re-parses the source and replaces changed rows' entries.
+            let text = fs::read_to_string(&path)
+                .unwrap()
+                .replace("prose turn 5 marker", "prose turn 5 edited")
+                .replace("tool output 7 alpha7", "tool output 7 rewritten");
+            fs::write(&path, text).unwrap();
+        }
+        ok(cli(&h, &d, &["__work", "refresh"]));
+        let after = fts_segments(&d);
+        for (b, a) in before.iter().zip(&after) {
+            assert!(a <= &(b + 1), "round {round}: {before:?} -> {after:?}");
+        }
+        before = after;
+    }
+    assert!(before.iter().all(|&n| n > 3), "{before:?}");
+    let full = t.path().join("full");
+    ok(cli(&h, &full, &["index"]));
+    let contents = fts_contents(&full);
+    assert_eq!(fts_contents(&d), contents);
+    ok(cli(&h, &d, &["__work", "merge"]));
+    assert!(fts_segments(&d)
+        .iter()
+        .all(|&n| n <= agrep_core::fts_segments::CAP));
+    assert_eq!(fts_contents(&d), contents);
+    assert_eq!(
+        ok(cli(&h, &d, &["--no-auto", "novel3x4", "-c"])).stdout,
+        ok(cli(&h, &full, &["--no-auto", "novel3x4", "-c"])).stdout
+    );
 }
 
 #[test]

@@ -706,7 +706,7 @@ fn refresh_inner(
             })?,
         )
     };
-    let mut dirty = BTreeSet::new();
+    let mut changes = Changes::default();
     let mut canonical_sessions = HashSet::new();
     let mut fast_sessions = HashSet::new();
     let mut forced_sessions = HashSet::new();
@@ -716,7 +716,7 @@ fn refresh_inner(
         source_sessions(&tx, key, &mut forced_sessions)?;
 
         for t in ["prose", "tools"] {
-            remove_source(&tx, t, key, &mut dirty)?;
+            remove_source(&tx, t, key, &mut changes)?;
         }
         tx.execute("DELETE FROM sources WHERE path=?", [key])?;
     }
@@ -728,7 +728,7 @@ fn refresh_inner(
             source_sessions(&tx, key, &mut forced_sessions)?;
 
             for table in ["prose", "tools"] {
-                remove_source(&tx, table, key, &mut dirty)?;
+                remove_source(&tx, table, key, &mut changes)?;
             }
         }
 
@@ -748,7 +748,7 @@ fn refresh_inner(
                     source_sessions(&tx, key, &mut forced_sessions)?;
 
                     for table in ["prose", "tools"] {
-                        remove_source(&tx, table, key, &mut dirty)?;
+                        remove_source(&tx, table, key, &mut changes)?;
                     }
                     tx.execute("DELETE FROM sources WHERE path=?", [key])?;
                 }
@@ -801,7 +801,7 @@ fn refresh_inner(
                     .iter()
                     .map(|e| (e.agent.to_string(), e.session.clone())),
             );
-            let changed_rows = replace(&tx, &s, &mut dirty, first)?;
+            let changed_rows = replace(&tx, &s, &mut changes, first)?;
             info.changed_rows += changed_rows;
             info.bytes_read += s.bytes_read;
             info.bytes_parsed += s.bytes_parsed;
@@ -882,15 +882,22 @@ fn refresh_inner(
     }
     fast_sessions.retain(|s| !forced_sessions.contains(s));
     let phase = Instant::now();
-    canonicalize(&tx, &canonical_sessions, &fast_sessions, &mut dirty, first)?;
+    canonicalize(
+        &tx,
+        &canonical_sessions,
+        &fast_sessions,
+        &mut changes,
+        first,
+    )?;
     info.canonical_ms = phase.elapsed().as_secs_f64() * 1000.;
+    changes.fts.apply(&tx)?;
     let presence = if first { build_fts(&tx)? } else { None };
     let phase = Instant::now();
     crate::tool_index::refresh(&tx, first || rebuild, presence)?;
     info.dictionary_ms = phase.elapsed().as_secs_f64() * 1000.;
     info.write_ms = write_start.elapsed().as_secs_f64() * 1000.;
     let phase = Instant::now();
-    update_blocks(&tx, &dirty, append_from)?;
+    update_blocks(&tx, &changes.blocks, append_from)?;
     tx.execute("DELETE FROM bound_updates", [])?;
     info.bounds_ms = phase.elapsed().as_secs_f64() * 1000.;
     let phase = Instant::now();
@@ -1076,24 +1083,69 @@ fn build_fts(tx: &Transaction<'_>) -> Result<Option<crate::tool_index::Presence>
             &format!("INSERT INTO {table}_fts({table}_fts) VALUES('optimize')"),
             [],
         )?;
-        tx.execute_batch(&format!("INSERT INTO {table}_fts({table}_fts,rank) VALUES('automerge',4);INSERT INTO {table}_fts({table}_fts,rank) VALUES('crisismerge',16);INSERT INTO {table}_fts({table}_fts,rank) VALUES('hashsize',1048576);"))?;
+        crate::fts_segments::configure(tx, &format!("{table}_fts"))?;
     }
     Ok(collected)
 }
-fn insert_fts(tx: &Transaction<'_>, table: &str, id: i64, text: &str) -> Result<()> {
-    let _timer = WriteTimer::new(true);
-    let normalized = normalize(text);
-    if table == "prose" {
-        tx.prepare_cached("INSERT INTO prose_fts(rowid,text) VALUES(?1,?2)")?
-            .execute(params![id, normalized])?;
-    } else {
-        tx.prepare_cached("INSERT INTO tools_fts(rowid,text) VALUES(?1,?2)")?
-            .execute(params![
-                id,
-                crate::tool_index::index_text(&normalized).as_ref()
-            ])?;
+/// What one transaction's row writes leave for derived structures to catch up on.
+#[derive(Default)]
+struct Changes {
+    /// Blocks whose bounds are recomputed: prose block ids, tool blocks as `-1 - id`.
+    blocks: BTreeSet<i64>,
+    fts: FtsWrites,
+}
+/// The FTS rows a transaction touched, per lane: whether each was indexed when the
+/// transaction began and whether it is indexed at its end.
+///
+/// FTS5 flushes its pending terms into a new segment whenever a write's rowid is not
+/// above the previous write's, and at every statement savepoint, which each row
+/// statement with a trigger opens. Writing the net change once, in rowid order and
+/// after the row statements, leaves one new segment per table.
+#[derive(Default)]
+struct FtsWrites([BTreeMap<i64, (bool, bool)>; 2]);
+impl FtsWrites {
+    fn insert(&mut self, table: &str, id: i64) {
+        self.0[usize::from(table == "tools")]
+            .entry(id)
+            .or_insert((false, false))
+            .1 = true;
     }
-    Ok(())
+    fn delete(&mut self, table: &str, id: i64) {
+        self.0[usize::from(table == "tools")]
+            .entry(id)
+            .or_insert((true, false))
+            .1 = false;
+    }
+    /// Indexed text is read back from the rows, as the first build reads it.
+    fn apply(&mut self, tx: &Transaction<'_>) -> Result<()> {
+        let _timer = WriteTimer::new(true);
+        for (table, rows) in ["prose", "tools"].into_iter().zip(&mut self.0) {
+            let mut delete =
+                tx.prepare_cached(&format!("DELETE FROM {table}_fts WHERE rowid=?"))?;
+            let mut insert = tx.prepare_cached(&format!(
+                "INSERT INTO {table}_fts(rowid,text) VALUES(?1,?2)"
+            ))?;
+            let mut text = tx.prepare_cached(&format!("SELECT text FROM {table} WHERE id=?"))?;
+            for (id, (before, after)) in std::mem::take(rows) {
+                if before {
+                    delete.execute([id])?;
+                }
+                if after {
+                    let normalized =
+                        normalize(&decode(table, text.query_row([id], |r| r.get(0))?)?);
+                    if table == "tools" {
+                        insert.execute(params![
+                            id,
+                            crate::tool_index::index_text(&normalized).as_ref()
+                        ])?;
+                    } else {
+                        insert.execute(params![id, normalized])?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 fn reply_metadata(m: &crate::model::Message) -> Result<String> {
     let mut value = serde_json::to_value(&*m.reply_shape)?;
@@ -1170,7 +1222,7 @@ fn set_visibility(
     id: i64,
     old: (bool, i64),
     new: (bool, i64),
-    dirty: &mut BTreeSet<i64>,
+    changes: &mut Changes,
     bulk: bool,
 ) -> Result<()> {
     let (old_visible, old_position) = old;
@@ -1180,20 +1232,16 @@ fn set_visibility(
     }
     if old_visible != visible && !bulk {
         if visible {
-            let text: Vec<u8> =
-                tx.query_row(&format!("SELECT text FROM {table} WHERE id=?"), [id], |r| {
-                    r.get(0)
-                })?;
-            insert_fts(tx, table, id, &decode(table, text)?)?;
+            changes.fts.insert(table, id);
         } else {
-            tx.execute(&format!("DELETE FROM {table}_fts WHERE rowid=?"), [id])?;
+            changes.fts.delete(table, id);
         }
     }
     tx.execute(
         &format!("UPDATE {table} SET visible=?2,position=?3 WHERE id=?1"),
         params![id, visible, position],
     )?;
-    dirty.insert(if table == "tools" {
+    changes.blocks.insert(if table == "tools" {
         -1 - id / BLOCK
     } else {
         id / BLOCK
@@ -1209,7 +1257,7 @@ fn canonicalize(
     tx: &Transaction<'_>,
     sessions: &HashSet<(String, String)>,
     fast: &HashSet<(String, String)>,
-    dirty: &mut BTreeSet<i64>,
+    changes: &mut Changes,
     bulk: bool,
 ) -> Result<()> {
     for (agent, session) in sessions {
@@ -1372,7 +1420,7 @@ fn canonicalize(
                 r.id,
                 (r.visible, r.position),
                 (retained, position.unwrap_or(r.turn)),
-                dirty,
+                changes,
                 bulk,
             )?;
         }
@@ -1387,7 +1435,7 @@ fn canonicalize(
                 id,
                 (old_visible, old_position),
                 (retained, position),
-                dirty,
+                changes,
                 bulk,
             )?;
         }
@@ -1422,7 +1470,7 @@ fn remove_source(
     tx: &Transaction<'_>,
     table: &str,
     key: &str,
-    dirty: &mut BTreeSet<i64>,
+    changes: &mut Changes,
 ) -> Result<()> {
     let ids: Vec<i64> = tx
         .prepare(&format!(
@@ -1431,7 +1479,7 @@ fn remove_source(
         .query_map([key], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     for id in ids {
-        erase(tx, table, id, dirty)?;
+        erase(tx, table, id, changes)?;
     }
     if table == "tools" {
         if let Some(source) = tx
@@ -1462,10 +1510,10 @@ fn remove_source(
     }
     Ok(())
 }
-fn erase(tx: &Transaction<'_>, t: &str, id: i64, dirty: &mut BTreeSet<i64>) -> Result<()> {
-    tx.execute(&format!("DELETE FROM {t}_fts WHERE rowid=?"), [id])?;
+fn erase(tx: &Transaction<'_>, t: &str, id: i64, changes: &mut Changes) -> Result<()> {
+    changes.fts.delete(t, id);
     tx.execute(&format!("DELETE FROM {t} WHERE id=?"), [id])?;
-    dirty.insert(if t == "tools" {
+    changes.blocks.insert(if t == "tools" {
         -1 - id / BLOCK
     } else {
         id / BLOCK
@@ -1490,12 +1538,7 @@ struct BulkRows {
     lanes: [Vec<Vec<rusqlite::types::Value>>; 2],
 }
 impl BulkRows {
-    fn flush(
-        &mut self,
-        tx: &Transaction<'_>,
-        lane: usize,
-        dirty: &mut BTreeSet<i64>,
-    ) -> Result<()> {
+    fn flush(&mut self, tx: &Transaction<'_>, lane: usize, changes: &mut Changes) -> Result<()> {
         let rows = &mut self.lanes[lane];
         if rows.is_empty() {
             return Ok(());
@@ -1508,7 +1551,7 @@ impl BulkRows {
             r.get::<_, i64>(0)
         })? {
             let id = id?;
-            dirty.insert(if lane == 0 {
+            changes.blocks.insert(if lane == 0 {
                 id / BLOCK
             } else {
                 -1 - id / BLOCK
@@ -1523,11 +1566,11 @@ impl BulkRows {
         table: &str,
         source: i64,
         row: NewRow<'_>,
-        dirty: &mut BTreeSet<i64>,
+        changes: &mut Changes,
     ) -> Result<usize> {
         use rusqlite::types::Value;
         if !row.bulk {
-            return upsert(tx, table, source, row, dirty);
+            return upsert(tx, table, source, row, changes);
         }
         let lane = usize::from(table == "tools");
         {
@@ -1554,7 +1597,7 @@ impl BulkRows {
             ]);
         }
         if self.lanes[lane].len() >= 64 {
-            self.flush(tx, lane, dirty)?;
+            self.flush(tx, lane, changes)?;
         }
         Ok(1)
     }
@@ -1571,7 +1614,7 @@ fn store_event(
     project: &str,
     text: Option<&str>,
     bulk: bool,
-    dirty: &mut BTreeSet<i64>,
+    changes: &mut Changes,
 ) -> Result<usize> {
     let _timer = WriteTimer::new(false);
     let changed = writer.event(
@@ -1579,17 +1622,14 @@ fn store_event(
     )?;
     if changed.text_changed && !bulk {
         if changed.old_visible {
-            tx.execute(
-                "DELETE FROM tools_fts WHERE rowid=?",
-                [changed.old_id.unwrap()],
-            )?;
+            changes.fts.delete("tools", changed.old_id.unwrap());
         }
         if changed.has_text {
-            insert_fts(tx, "tools", changed.id, text.unwrap())?;
+            changes.fts.insert("tools", changed.id);
         }
     }
     if changed.dirty {
-        dirty.insert(-1 - changed.id / BLOCK);
+        changes.blocks.insert(-1 - changed.id / BLOCK);
     }
     Ok(usize::from(changed.text_changed))
 }
@@ -1598,7 +1638,7 @@ fn upsert(
     table: &str,
     source: i64,
     r: NewRow<'_>,
-    dirty: &mut BTreeSet<i64>,
+    changes: &mut Changes,
 ) -> Result<usize> {
     let _timer = WriteTimer::new(false);
     let dg = digest(r.text);
@@ -1609,7 +1649,7 @@ fn upsert(
             r.text.as_bytes().to_vec()
         };
         let id=tx.prepare_cached(&format!("INSERT INTO {table}(source,agent,session,project,turn,who,model,model_source,ts,text,digest,extra,position) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?5) ON CONFLICT(source,session,turn,who,extra) DO UPDATE SET project=excluded.project,model=excluded.model,model_source=excluded.model_source,ts=excluded.ts,text=excluded.text,digest=excluded.digest RETURNING id"))?.query_row(params![source,r.agent,r.session,r.project,r.turn,r.who,r.model,r.model_source,r.ts,encoded,dg,r.extra],|row|row.get::<_,i64>(0))?;
-        dirty.insert(if table == "tools" {
+        changes.blocks.insert(if table == "tools" {
             -1 - id / BLOCK
         } else {
             id / BLOCK
@@ -1628,7 +1668,7 @@ fn upsert(
                 return Ok(0);
             }
             if old_ts != r.ts {
-                dirty.insert(if table == "tools" {
+                changes.blocks.insert(if table == "tools" {
                     -1 - id / BLOCK
                 } else {
                     id / BLOCK
@@ -1648,13 +1688,13 @@ fn upsert(
             r.text.as_bytes().to_vec()
         };
         if visible {
-            tx.execute(&format!("DELETE FROM {table}_fts WHERE rowid=?"), [id])?;
+            changes.fts.delete(table, id);
         }
         tx.prepare_cached(&format!("UPDATE {table} SET project=?2,model=?3,model_source=?4,ts=?5,text=?6,digest=?7 WHERE id=?1"))?.execute(params![id,r.project,r.model,r.model_source,r.ts,encoded,dg])?;
         if visible {
-            insert_fts(tx, table, id, r.text)?;
+            changes.fts.insert(table, id);
         }
-        dirty.insert(if table == "tools" {
+        changes.blocks.insert(if table == "tools" {
             -1 - id / BLOCK
         } else {
             id / BLOCK
@@ -1668,8 +1708,8 @@ fn upsert(
     };
     tx.prepare_cached(&format!("INSERT INTO {table}(source,agent,session,project,turn,who,model,model_source,ts,text,digest,extra,position) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?5)"))?.execute(params![source,r.agent,r.session,r.project,r.turn,r.who,r.model,r.model_source,r.ts,encoded,dg,r.extra])?;
     let id = tx.last_insert_rowid();
-    insert_fts(tx, table, id, r.text)?;
-    dirty.insert(if table == "tools" {
+    changes.fts.insert(table, id);
+    changes.blocks.insert(if table == "tools" {
         -1 - id / BLOCK
     } else {
         id / BLOCK
@@ -1679,7 +1719,7 @@ fn upsert(
 fn replace(
     tx: &Transaction<'_>,
     s: &SourceBatch,
-    dirty: &mut BTreeSet<i64>,
+    changes: &mut Changes,
     bulk: bool,
 ) -> Result<usize> {
     tx.execute(
@@ -1828,7 +1868,7 @@ fn replace(
                     extra,
                     bulk,
                 },
-                dirty,
+                changes,
             )?;
         }
     }
@@ -1923,7 +1963,7 @@ fn replace(
                 project,
                 None,
                 bulk,
-                dirty,
+                changes,
             )?;
             continue;
         }
@@ -1942,14 +1982,14 @@ fn replace(
             project,
             Some(&text),
             bulk,
-            dirty,
+            changes,
         )?;
         if !bulk || !meta.contains_key(e.session.as_str()) {
             tx.prepare_cached("INSERT INTO sessions(agent,id,project,parent,family,side,title,first_ts,last_ts) VALUES(?1,?2,?3,'',?2,0,'',?4,?4) ON CONFLICT(agent,id) DO UPDATE SET first_ts=min(first_ts,?4),last_ts=max(last_ts,?4)")?.execute(params![e.agent,e.session,project,e.ts])?;
         }
     }
-    bulk_rows.flush(tx, 0, dirty)?;
-    bulk_rows.flush(tx, 1, dirty)?;
+    bulk_rows.flush(tx, 0, changes)?;
+    bulk_rows.flush(tx, 1, changes)?;
     for (session, (first, last, _, title)) in initial_bounds {
         tx.prepare_cached(
             "UPDATE sessions SET first_ts=?3,last_ts=?4,title=?5 WHERE agent=?1 AND id=?2",
@@ -1979,7 +2019,7 @@ fn replace(
             .map(|(id, _)| id)
             .collect();
         for id in stale {
-            erase(tx, t, id, dirty)?;
+            erase(tx, t, id, changes)?;
             count += 1;
         }
     }
@@ -2718,7 +2758,7 @@ mod row_diff_tests {
                 }),
             );
             let tx = c.transaction().unwrap();
-            let mut dirty = std::collections::BTreeSet::new();
+            let mut changes = super::Changes::default();
             for i in 0..n {
                 let source = crate::intake_batch::SourceBatch {
                     key: format!("source-{i}"),
@@ -2743,7 +2783,7 @@ mod row_diff_tests {
                     }],
                     ..Default::default()
                 };
-                assert_eq!(super::replace(&tx, &source, &mut dirty, true).unwrap(), 1);
+                assert_eq!(super::replace(&tx, &source, &mut changes, true).unwrap(), 1);
             }
             counts.push(operations.load(Ordering::Relaxed));
         }
@@ -2774,9 +2814,9 @@ mod row_diff_tests {
             extra: String::new(),
             bulk: false,
         };
-        let mut dirty = std::collections::BTreeSet::new();
+        let mut changes = super::Changes::default();
         let tx = c.transaction().unwrap();
-        super::upsert(&tx, "prose", 1, row("a"), &mut dirty).unwrap();
+        super::upsert(&tx, "prose", 1, row("a"), &mut changes).unwrap();
         tx.commit().unwrap();
         let count = Arc::new(AtomicUsize::new(0));
         let seen = count.clone();
@@ -2788,11 +2828,11 @@ mod row_diff_tests {
             },
         ));
         let tx = c.transaction().unwrap();
-        super::upsert(&tx, "prose", 1, row("a"), &mut dirty).unwrap();
+        super::upsert(&tx, "prose", 1, row("a"), &mut changes).unwrap();
         tx.commit().unwrap();
         assert_eq!(count.load(Ordering::Relaxed), 0);
         let tx = c.transaction().unwrap();
-        super::upsert(&tx, "prose", 1, row("b"), &mut dirty).unwrap();
+        super::upsert(&tx, "prose", 1, row("b"), &mut changes).unwrap();
         tx.commit().unwrap();
         assert_eq!(count.load(Ordering::Relaxed), 1);
     }
@@ -2824,7 +2864,7 @@ mod event_contract_tests {
             state: String::new(),
         };
         let tx = c.transaction().unwrap();
-        let mut dirty = BTreeSet::new();
+        let mut changes = Changes::default();
         let source = SourceBatch {
             key: "fixture".into(),
             agent: "pi".into(),
@@ -2834,7 +2874,7 @@ mod event_contract_tests {
             ],
             ..Default::default()
         };
-        replace(&tx, &source, &mut dirty, false).unwrap();
+        replace(&tx, &source, &mut changes, false).unwrap();
         for name in ["compaction", "shell"] {
             let body: String = tx
                 .query_row("SELECT body FROM events WHERE call_id=?", [name], |r| {

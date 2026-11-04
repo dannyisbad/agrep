@@ -1,6 +1,13 @@
 use super::super::*;
 
-const TASKS: &[&str] = &["refresh", "semantic", "reclaim", "archive", "post_index"];
+const TASKS: &[&str] = &[
+    "refresh",
+    "merge",
+    "semantic",
+    "reclaim",
+    "archive",
+    "post_index",
+];
 
 pub(crate) fn run(tasks: &[String]) -> Result<i32> {
     semantic::configure_background()?;
@@ -37,6 +44,9 @@ fn execute(
         if refresh.changed_rows > 0 {
             semantic::mark_index_changed(root)?;
         }
+    }
+    if selected("merge") {
+        agrep_core::fts_segments::upkeep(root)?;
     }
     if selected("semantic") {
         semantic::drain(root, force_semantic)?;

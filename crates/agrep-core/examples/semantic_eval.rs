@@ -222,7 +222,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// The query path (mapped converted weights, direct tokenizer loading) embeds each
+/// The query path (mapped converted weights, query tokenizer tables) embeds each
 /// text alone, as a query is embedded. Its token ids, tokenizer and vectors must
 /// equal the bulk CPU model's exactly, so every bulk gate above applies to it.
 fn query_gate(
@@ -235,9 +235,11 @@ fn query_gate(
     let mut parity = true;
     for name in ["tokenizer.json", "tokenizer-compact.json"] {
         if path.join(name).exists() {
-            parity &= agrep_core::semantic_model::tokenizer_parity(&path.join(name))?;
+            parity &= agrep_core::semantic_tokenizer::parity(&path.join(name))?;
         }
     }
+    // Every vocabulary entry's text and the oracle texts, query tables against the library.
+    let tables = agrep_core::semantic_tokenizer::query_parity(path, texts)?;
     let query = Embedder::load_query(path)?;
     let mut ids_equal = true;
     let mut identical = 0;
@@ -265,7 +267,7 @@ fn query_gate(
         && identical == texts.len()
         && minimum >= 0.99999999999;
     Ok((
-        json!({"query_mapped":query.mapped(),"query_tokenizer_parity":parity,"query_ids_equal":ids_equal,"query_identical":identical,"query_texts":texts.len(),"query_minimum_cosine":minimum}),
+        json!({"query_mapped":query.mapped(),"query_tokenizer_parity":parity,"query_tokenizer_inputs":tables,"query_ids_equal":ids_equal,"query_identical":identical,"query_texts":texts.len(),"query_minimum_cosine":minimum}),
         passed,
     ))
 }

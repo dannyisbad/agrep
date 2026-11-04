@@ -89,93 +89,72 @@ fn mtime(m: &fs::Metadata) -> i64 {
 }
 pub(crate) fn scan(c: &Connection, force: bool) -> Result<Census> {
     let started = Instant::now();
+    let cached = if force {
+        HashMap::new()
+    } else {
+        cached_directories(c)?
+    };
+    Ok(walk(cached, started.elapsed().as_secs_f64() * 1000.))
+}
+fn cached_directories(c: &Connection) -> Result<HashMap<String, Directory>> {
     let mut cached = HashMap::new();
-    if !force {
-        let mut stmt = c.prepare("SELECT path,agent,mtime,dirs,files FROM source_directories")?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let d = Directory {
-                path: row.get(0)?,
-                agent: row.get(1)?,
-                mtime: row.get(2)?,
-                dirs: Arc::new(decode_names(&row.get::<_, Vec<u8>>(3)?)?),
-                files: Arc::new(decode_names(&row.get::<_, Vec<u8>>(4)?)?),
-                dirty: false,
-            };
-            cached.insert(d.path.clone(), d);
-        }
+    let mut stmt = c.prepare("SELECT path,agent,mtime,dirs,files FROM source_directories")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let d = Directory {
+            path: row.get(0)?,
+            agent: row.get(1)?,
+            mtime: row.get(2)?,
+            dirs: Arc::new(decode_names(row.get_ref(3)?.as_blob()?)?),
+            files: Arc::new(decode_names(row.get_ref(4)?.as_blob()?)?),
+            dirty: false,
+        };
+        cached.insert(d.path.clone(), d);
     }
+    Ok(cached)
+}
+/// Each directory's sources are stat'ed in the same task that confirmed its listing,
+/// so the walk is one parallel pass per directory level.
+fn walk(cached: HashMap<String, Directory>, listing_ms: f64) -> Census {
+    let started = Instant::now();
     let mut queue: Vec<_> = ADAPTERS
         .iter()
         .flat_map(|a| a.freshness_roots().into_iter().map(|p| (a.name(), p)))
         .collect();
     let mut seen = HashSet::new();
     let mut directories = Vec::new();
-    let mut files = Vec::new();
+    let mut stamps = Vec::new();
     let mut issues = Vec::new();
     let listings = std::sync::atomic::AtomicUsize::new(0);
     let cache_hits = std::sync::atomic::AtomicUsize::new(0);
+    let stat_files = std::sync::atomic::AtomicUsize::new(0);
     while !queue.is_empty() {
         queue.retain(|(_, p)| seen.insert(p.clone()));
         let batch: Vec<_> = STAT_POOL.install(|| {
             queue
                 .par_iter()
-                .map(|(agent, path)| -> Result<Option<Directory>> {
-                    let meta = match fs::symlink_metadata(path) {
-                        Ok(m) => m,
-                        Err(e) if registry::stat_proves_absent(path, &e) => return Ok(None),
-                        Err(e) => return Err(e.into()),
-                    };
-                    if registry::metadata_is_link(&meta) {
+                .map(|(agent, path)| -> Result<Option<(Directory, Vec<Stamp>)>> {
+                    let Some(d) = directory(&cached, agent, path, &listings, &cache_hits)? else {
                         return Ok(None);
-                    }
-                    let a = ADAPTERS.iter().find(|a| a.name() == *agent).unwrap();
-                    if meta.is_file() {
-                        return Ok(Some(Directory {
-                            path: path.to_string_lossy().into(),
-                            agent: (*agent).into(),
-                            mtime: mtime(&meta),
-                            dirs: Arc::default(),
-                            files: Arc::new(if a.freshness_content(path) {
-                                vec![String::new()]
+                    };
+                    let owner = ADAPTERS
+                        .iter()
+                        .find(|a| a.name() == d.agent)
+                        .unwrap()
+                        .name();
+                    stat_files.fetch_add(d.files.len(), std::sync::atomic::Ordering::Relaxed);
+                    let files = d
+                        .files
+                        .iter()
+                        .filter_map(|name| {
+                            if name.is_empty() {
+                                store::stamp_present(owner, Path::new(&d.path))
                             } else {
-                                vec![]
-                            }),
-                            dirty: true,
-                        }));
-                    }
-                    if !meta.is_dir() {
-                        return Ok(None);
-                    }
-                    if let Some(d) = cached
-                        .get(path.to_string_lossy().as_ref())
-                        .filter(|d| d.mtime == mtime(&meta))
-                    {
-                        cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        return Ok(Some(d.clone()));
-                    }
-                    let mut d = Directory {
-                        path: path.to_string_lossy().into(),
-                        agent: (*agent).into(),
-                        mtime: mtime(&meta),
-                        dirs: Arc::default(),
-                        files: Arc::default(),
-                        dirty: true,
-                    };
-                    listings.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    for entry in fs::read_dir(path)? {
-                        let entry = entry?;
-                        let ty = entry.file_type()?;
-                        let p = entry.path();
-                        if ty.is_dir() {
-                            Arc::make_mut(&mut d.dirs)
-                                .push(entry.file_name().to_string_lossy().into());
-                        } else if ty.is_file() && a.freshness_content(&p) {
-                            Arc::make_mut(&mut d.files)
-                                .push(entry.file_name().to_string_lossy().into());
-                        }
-                    }
-                    Ok(Some(d))
+                                store::stamp_present(owner, &Path::new(&d.path).join(name))
+                            }
+                        })
+                        .collect();
+                    Ok(Some((d, files)))
                 })
                 .collect()
         });
@@ -183,7 +162,7 @@ pub(crate) fn scan(c: &Connection, force: bool) -> Result<Census> {
         // Each result carries its agent; failures retain a named root error below.
         for ((agent, path), result) in inputs.into_iter().zip(batch) {
             match result {
-                Ok(Some(d)) => {
+                Ok(Some((d, files))) => {
                     let a = ADAPTERS
                         .iter()
                         .find(|a| a.name() == d.agent)
@@ -199,16 +178,7 @@ pub(crate) fn scan(c: &Connection, force: bool) -> Result<Census> {
                             },
                         )
                     }));
-                    files.extend(d.files.iter().map(|p| {
-                        (
-                            a,
-                            if p.is_empty() {
-                                PathBuf::from(&d.path)
-                            } else {
-                                Path::new(&d.path).join(p)
-                            },
-                        )
-                    }));
+                    stamps.extend(files);
                     directories.push(d);
                 }
                 Ok(None) => {}
@@ -223,19 +193,10 @@ pub(crate) fn scan(c: &Connection, force: bool) -> Result<Census> {
             }
         }
     }
-    let listing_ms = started.elapsed().as_secs_f64() * 1000.;
-    let stat_start = Instant::now();
-    let stat_files = files.len();
-    let mut stamps: Vec<_> = STAT_POOL.install(|| {
-        files
-            .par_iter()
-            .filter_map(|(a, path)| store::stamp_present(a, path))
-            .collect()
-    });
-    let stat_ms = stat_start.elapsed().as_secs_f64() * 1000.;
+    let stat_ms = started.elapsed().as_secs_f64() * 1000.;
     // Directory errors must not license deletion of an unseen subtree.
     stamps.extend(issues);
-    stamps.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+    STAT_POOL.install(|| stamps.par_sort_unstable_by(|a, b| a.path.cmp(&b.path)));
     stamps.dedup_by(|a, b| a.path == b.path);
     let names: HashSet<_> = directories.iter().map(|d| d.path.as_str()).collect();
     let removed = cached
@@ -244,7 +205,7 @@ pub(crate) fn scan(c: &Connection, force: bool) -> Result<Census> {
         .cloned()
         .collect();
     let directories = directories.into_iter().filter(|d| d.dirty).collect();
-    Ok(Census {
+    Census {
         stamps,
         directories,
         removed,
@@ -252,8 +213,71 @@ pub(crate) fn scan(c: &Connection, force: bool) -> Result<Census> {
         stat_ms,
         listed_directories: listings.into_inner(),
         cached_directories: cache_hits.into_inner(),
-        stat_files,
-    })
+        stat_files: stat_files.into_inner(),
+    }
+}
+/// The current listing of one freshness root or directory: reused while its mtime
+/// is unchanged, otherwise read again.
+fn directory(
+    cached: &HashMap<String, Directory>,
+    agent: &str,
+    path: &Path,
+    listings: &std::sync::atomic::AtomicUsize,
+    cache_hits: &std::sync::atomic::AtomicUsize,
+) -> Result<Option<Directory>> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if registry::stat_proves_absent(path, &e) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if registry::metadata_is_link(&meta) {
+        return Ok(None);
+    }
+    let a = ADAPTERS.iter().find(|a| a.name() == agent).unwrap();
+    if meta.is_file() {
+        return Ok(Some(Directory {
+            path: path.to_string_lossy().into(),
+            agent: agent.into(),
+            mtime: mtime(&meta),
+            dirs: Arc::default(),
+            files: Arc::new(if a.freshness_content(path) {
+                vec![String::new()]
+            } else {
+                vec![]
+            }),
+            dirty: true,
+        }));
+    }
+    if !meta.is_dir() {
+        return Ok(None);
+    }
+    if let Some(d) = cached
+        .get(path.to_string_lossy().as_ref())
+        .filter(|d| d.mtime == mtime(&meta))
+    {
+        cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Ok(Some(d.clone()));
+    }
+    let mut d = Directory {
+        path: path.to_string_lossy().into(),
+        agent: agent.into(),
+        mtime: mtime(&meta),
+        dirs: Arc::default(),
+        files: Arc::default(),
+        dirty: true,
+    };
+    listings.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let p = entry.path();
+        if ty.is_dir() {
+            Arc::make_mut(&mut d.dirs).push(entry.file_name().to_string_lossy().into());
+        } else if ty.is_file() && a.freshness_content(&p) {
+            Arc::make_mut(&mut d.files).push(entry.file_name().to_string_lossy().into());
+        }
+    }
+    Ok(Some(d))
 }
 pub(crate) fn save(tx: &Transaction<'_>, census: &Census) -> Result<()> {
     for path in &census.removed {
@@ -271,28 +295,38 @@ pub(crate) fn save(tx: &Transaction<'_>, census: &Census) -> Result<()> {
     }
     Ok(())
 }
+type Fingerprint = (String, u64, i64, String);
+/// The index's fingerprint of every file source, in path order.
+fn indexed(c: &Connection) -> Result<Vec<Fingerprint>> {
+    let mut old = c.prepare("SELECT path,size,mtime_ns,change_token FROM sources ORDER BY path")?;
+    let rows = old.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let row: Fingerprint = row?;
+        if !row.0.starts_with('@') && !row.0.starts_with("token:") {
+            out.push(row);
+        }
+    }
+    Ok(out)
+}
 pub fn pending(root: &DataRoot) -> Result<Pending> {
     let start = Instant::now();
     let c = store::reader(root)?;
     let read_ms = start.elapsed().as_secs_f64() * 1000.;
-    let census = scan(&c, false)?;
-    let mut old = c.prepare("SELECT path,size,mtime_ns,change_token FROM sources ORDER BY path")?;
-    let mut rows = old.query([])?;
+    let listing = Instant::now();
+    let cached = cached_directories(&c)?;
+    let listing_ms = listing.elapsed().as_secs_f64() * 1000.;
+    // The walk is syscall-bound; the index's fingerprints are read meanwhile.
+    let (census, old) =
+        STAT_POOL.install(|| rayon::join(move || walk(cached, listing_ms), move || indexed(&c)));
     let (mut next, mut changed) = (0, 0);
-    while let Some(row) = rows.next()? {
-        let path = row.get_ref(0)?.as_str()?;
-        if path.starts_with('@') || path.starts_with("token:") {
-            continue;
-        }
-        while next < census.stamps.len() && census.stamps[next].path.as_str() < path {
+    for (path, size, mtime_ns, token) in &old? {
+        while next < census.stamps.len() && census.stamps[next].path < *path {
             changed += 1;
             next += 1;
         }
-        if let Some(stamp) = census.stamps.get(next).filter(|s| s.path == path) {
-            if stamp.size != row.get::<_, u64>(1)?
-                || stamp.mtime_ns != row.get::<_, i64>(2)?
-                || stamp.token != row.get_ref(3)?.as_str()?
-            {
+        if let Some(stamp) = census.stamps.get(next).filter(|s| s.path == *path) {
+            if stamp.size != *size || stamp.mtime_ns != *mtime_ns || stamp.token != *token {
                 changed += 1;
             }
             next += 1;

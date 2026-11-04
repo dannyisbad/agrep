@@ -1,5 +1,97 @@
 # 0.5.0 keyword engine
 
+## Census: one walk per directory level, index fingerprints read meanwhile
+
+A measured checkpoint, **not SPEC §9 acceptance**. Timed from exec to exit on the owner's live history (`AGREP_QUERY_TIMING`, 40 fresh `error` processes while the stores changed at their ordinary rate): exec to `main` 7 ms, the keyword search ended at 24–26 ms, and the census thread at 31 ms (read 2, cached listings and directory stats 8, 11,432 source stats 14, sort and comparison 6.4), so the command waited 4.5–5.5 ms for it. Fast commands are census-bound: `around`, `chats` and `rare` spend 18–27 ms more with the census than with `--no-auto`. Spawning the detached worker cost 0.3 ms (lock 0.03, log 0.02, `posix_spawn` 0.25), and a command running beside a six-hour refresh took 39–48 ms against 40 ms on a quiet index, so neither was the critical path.
+
+- **One walk.** Each directory's sources are stat'ed in the same parallel task that confirmed (or relisted) the directory, instead of after the whole tree, which removes a separate pass and the sequential path building between them.
+- **Overlap.** The index's fingerprints (11,432 `sources` rows, about 3 ms) are read on the stat pool while the walk runs, and the stamps are sorted in parallel.
+- **Same answer.** Every source and directory is still stat'ed; a new test checks, after each of an append, a same-bytes rewrite, a new file, a new directory, a removed file, a removed directory and a non-source file, that the census counts exactly the sources whose fingerprint differs from a fresh full build's (it also passes on the previous census).
+
+In one process on the same index (load 4–9; [evidence](measurements/census-eng3.json)) the census went from 24–28.5 ms to 20–22.6 ms: cached listings 2.4–2.6 ms, walk 15–17 ms, comparison 2.2–2.8 ms. A bare parallel `lstat` of the same 13,990 paths takes 10–11.7 ms with 8 workers (8.1 ms with 4, 11.9 ms with 12; 32–38 ms sequentially), so about 5 ms of the walk is above the syscall floor. Rejected: `fstatat` relative to each opened directory (21–24 ms for the same paths), four walk workers (20–32 ms, noisier), and starting the worker from the census thread (count and status 3–5% slower in a twelve-pair run, since the refresh then runs beside the rest of the query).
+
+Sixteen ABBA pairs of fresh processes on the live history, both binaries on one index with normal census and detached refresh (median load 4 / 5 / 6); outputs identical:
+
+| Case | Previous head (82868206) p50 / p95 ms | This change p50 / p95 ms | Head ÷ new |
+|---|---:|---:|---:|
+| `agrep __census` | 35.7 / 38.0 | 32.1 / 34.1 | 1.11× |
+| `error` | 40.1 / 84.2 | 35.7 / 329.7 | 1.12× |
+| `around <first session> 0` | 36.8 / 39.1 | 32.9 / 34.8 | 1.12× |
+| `chats` | 45.2 / 52.6 | 41.3 / 43.5 | 1.09× |
+| `zzperfnever_7f91c44` | 36.3 / 39.8 | 31.8 / 36.2 | 1.14× |
+| `-E release.*workflow` | 39.0 / 45.8 | 35.8 / 38.0 | 1.09× |
+| `error -c` | 51.9 / 66.3 | 52.7 / 68.5 | 0.98× |
+| `status` | 43.9 / 47.0 | 44.9 / 48.3 | 0.98× |
+| `release workflow` | 56.3 / 60.2 | 55.7 / 60.1 | 1.01× |
+
+Query-bound cases are unchanged (the census already ended before their query). Both `error` p95s are single samples of sixteen; their cause was not isolated. Remaining: the stat syscalls themselves (10–11 ms with 8 workers) and process start (7 ms, about 1.5 ms of it the system frameworks); an exact census below that needs an OS change journal.
+
+## FTS segments: one per refresh, merged by the detached worker
+
+A measured checkpoint, **not SPEC §9 acceptance**. FTS5 writes its pending terms into a new segment whenever a write's rowid is not above the previous write's and at every statement savepoint, which each row statement with a trigger opens. Refresh interleaved FTS writes with such statements (row upserts, visibility changes, the dictionary's trigger inserts), so it added about one segment per written row; FTS5's own merges (`automerge=4`, `crisismerge=16`) ran inside refreshes and never caught up. Over a six-hour replay of the owner's history the previous head held 32 prose, 102 tool and 13 lexicon segments on average (at most 49 / 143 / 21). Lookups seek every segment for each term, and tool queries look up hundreds of expanded words, so after that replay its queries ran 2.5–8× slower than the same index merged to one segment per table.
+
+### What changed
+
+- **One segment per refresh.** Row writes record each touched FTS row's state at the start and end of the transaction; after the canonical replay the net change is written once, in rowid order (delete if it was indexed, then insert the row's stored text if it is), with no other statement in between. New dictionary words are inserted in one statement, so their lexicon rows share one segment too, and the scratch word batch is discarded with `delete-all` before any savepoint, so it never becomes a segment. `hashsize` is 8 MiB after the first build: in the replay no refresh added more than one segment to any table, including the largest step (14.8 MB appended to 68 sources).
+- **Refreshes never merge** (`automerge=0`).
+- **`__work merge`** runs after `refresh`, and after an explicit `index` or `reindex`. With `usermerge=2`, FTS5 `merge` steps merge any level holding two segments into the next, so each refresh's segment carries upward like a binary counter and the large segment is rewritten only when a carry reaches its level. The first build leaves that segment at level 1, so early carries rewrite it often and then ever less often, each rewrite raising its level (in the replay below: after steps 1, 5, 9 and 21 for prose and 1, 8, 16 and 34 for tools). When more than 5 segments remain, the table is merged into one with negative `merge` steps (in the replay: tools once, the lexicon once). Every step writes at most 500 output pages (20–40 ms) in its own transaction under the writer lock: readers never wait, and a foreground writer waits for one step at most.
+
+A test fails on the previous head (a fixture refresh took the tables from 1 / 1 / 1 to 13 / 13 / 1 segments): every refresh adds at most one segment per table, the refreshed index's vocabularies and dictionary equal a fresh build's, and `__work merge` leaves at most 5 segments with the same contents.
+
+### Choosing the cap
+
+The cost of segments was measured on copies of a replay index that only accumulated segments (one binary, `--no-auto`, each copy against itself merged to one segment per table; [evidence](measurements/fts-segments-eng3.json)): with 3 segments per table `json` / `count` / `tool_release` took 1.05 / 1.18 / 1.13× the merged time, with 5 segments 1.13 / 1.28 / 1.20×, with 9 segments 1.24 / 1.45 / 1.38×. A large-segment rewrite costs 2.9 s for prose, 5.2 s for tools and 0.24 s for the lexicon. Replaying which refreshes added a segment to each table 40 times over (2,920 refreshes) through the level merges and a cap:
+
+| Cap (segments per table) | Merge work | Large rewrites | Mean / max segments |
+|---:|---:|---:|---|
+| 1 (merge everything every refresh) | 22,622 s | 8,080 | 1.00 / 1 |
+| 3 | 3,239 s | 1,155 | 2.29 / 3 |
+| 4 | 1,527 s | 542 | 2.86 / 4 |
+| **5** | **758 s** | **266** | **3.41 / 5** |
+| 6 | 400 s | 136 | 3.94 / 6 |
+| none | 103 s | 26 | 5.52 / 11 |
+
+Each step up halves the merge work and adds about half a segment. At 5, merge work is about 0.26 s per refresh, roughly what the refresh itself saves (below), so total background work stays where it was while every table keeps at most 5 segments, about 1.1× the merged lookup cost on average; 4 doubles the merge work for half a segment.
+
+### Replay of the owner's history
+
+An APFS clone of the owner's stores, with the 135 sources written in its last six hours cut back to six hours earlier and appended back by their line timestamps in 73 steps of 5 minutes (102 MB). Each binary built its own index of the cut state, then refreshed after every step, alternating order; this change also ran `__work merge`. Every step, exit and load is in the [report](measurements/fts-segments-eng3.json); median load 6 / 10 / 10.
+
+| | Previous head (1a1e0bcc) | This change |
+|---|---:|---:|
+| Refresh p50 / p95 | 2,392 / 4,179 ms | 2,108 / 3,647 ms |
+| Refresh total (72 refreshes) | 184.0 s | 159.6 s (faster in 69 of 72) |
+| Merge total | (inside refresh) | 28.8 s; p50 17 ms, 8 steps over 1 s |
+| Prose / tool / lexicon segments, mean | 32.0 / 102.4 / 13.0 | 3.1 / 3.1 / 3.3 |
+| Prose / tool / lexicon segments, max | 49 / 143 / 21 | 5 / 5 / 5 |
+
+The 28.8 s include the early carries into the large segments. The previous head's index was also 285 MB larger at the end (2.78 against 2.49 GB).
+
+### Queries after the replay
+
+Ten ABBA pairs of fresh processes per case, each binary on its own replayed index, `--no-auto`. With normal census both pay the same 37 ms census, so ratios are slightly lower (`error -c` 6.53×, `release workflow` 3.83×, `recall` 2.37×); both runs are in the report. Outputs are identical except `status`, which reports each index's path, refresh time and size.
+
+| Case | Previous head p50 / p95 ms | This change p50 / p95 ms | Head ÷ new |
+|---|---:|---:|---:|
+| `release workflow` | 226.0 / 303.3 | 53.3 / 145.0 | 4.24× |
+| natural question | 210.7 / 259.1 | 58.3 / 146.3 | 3.62× |
+| `release workflow --json` | 219.8 / 229.0 | 50.6 / 52.9 | 4.35× |
+| `release workflow -l` | 354.0 / 391.8 | 90.3 / 124.6 | 3.92× |
+| `error -c` | 344.6 / 348.8 | 44.0 / 46.3 | 7.83× |
+| `error --who tool --json` | 235.5 / 264.3 | 80.5 / 118.6 | 2.93× |
+| `release workflow --who tool` | 334.4 / 337.1 | 57.9 / 59.3 | 5.77× |
+| `recall release workflow` | 429.6 / 469.4 | 174.0 / 214.1 | 2.47× |
+| `pack …` | 128.2 / 130.0 | 102.2 / 104.0 | 1.25× |
+| `error --chat <largest> -c` | 451.3 / 649.6 | 152.0 / 563.6 | 2.97× |
+| `error -c --agent codex --since 14d` | 439.2 / 449.6 | 143.1 / 147.8 | 3.07× |
+| pi caller: `error -c` | 461.5 / 467.8 | 162.2 / 170.1 | 2.85× |
+| Codex caller: `release workflow --json` | 227.9 / 245.6 | 57.8 / 63.5 | 3.95× |
+| `error` | 29.8 / 42.5 | 28.3 / 95.7 | 1.05× |
+| `hi` | 73.5 / 210.9 | 73.4 / 264.7 | 1.00× |
+| `chats` / `around` / `status` | 28.6 / 11.5 / 36.9 | 28.4 / 11.4 / 37.5 | ≈1.0× |
+
+Cases with one short or common term barely touch the text index; their p95 outliers are single samples at load 6–8.
+
 ## Caller exclusion: indexed probes and a seeking session walk
 
 A measured checkpoint, **not SPEC §9 acceptance**. Inside an agent shell every search resolves the caller and counts the rows it withholds. Three costs dominated, measured in-process on the owner's history:

@@ -32,7 +32,7 @@ The native graph uses private `parser_graph` pages keyed by source and hash buck
 
 `Results.timings` adds aggregate `plan_ms`, `sqlite_ms`, `hydrate_ms`, `score_ms`, and `total_ms` for retrieval diagnostics; no source text or identifiers are included.
 
-`freshness::Pending` additionally reports numeric `read_ms`, `listing_ms`, `stat_ms`, and `comparison_ms`. They partition its stat-only census time; `comparison_ms` includes remaining sorting and fingerprint comparison work.
+`freshness::Pending` additionally reports numeric `read_ms`, `listing_ms`, `stat_ms`, and `comparison_ms`. They partition its stat-only census time: opening the reader, reading the cached directory listings, the walk (each directory's stat or relisting together with its sources' stats; the index's fingerprints are read meanwhile), and the remaining sorting and fingerprint comparison.
 
 `Hit.meta_marker` is serialized as `meta` only when true. The `--no-meta` query policy checks structured tool-call lineage, preserves ordinary control rows, and retains one marked row when it is the only observed evidence. Counts with this policy are rejected. Unknown command wrappers remain eligible.
 

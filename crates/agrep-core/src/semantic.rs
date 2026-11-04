@@ -138,6 +138,9 @@ pub fn drain(root: &DataRoot, explicit: bool) -> Result<usize> {
     }
     Ok(total)
 }
+/// Scans of fewer vectors than this stay on one thread; at owner scale the scan is
+/// split across the Rayon pool.
+const PARALLEL_SCAN_ROWS: usize = 32_768;
 struct VectorScan {
     names: Vec<String>,
     /// (block, slot, upper bound, exact cosine) in descending bound order.
@@ -151,25 +154,33 @@ impl VectorScan {
         let started = std::time::Instant::now();
         let (q, scale) = semantic_store::quantize(vector)?;
         let total_rows = blocks.iter().map(|b| b.rows).sum();
+        // A small scan runs on the calling thread rather than waiting for pool workers.
+        let parallel = total_rows >= PARALLEL_SCAN_ROWS;
+        let scan = |(b, block): (usize, &semantic_store::Block)| {
+            block
+                .candidates(&q, scale, vector, semantic_policy::FLOOR as f32)
+                .into_iter()
+                .map(move |(slot, upper, exact)| (b, slot, upper, exact))
+        };
         let mut candidates: Vec<_> = {
             let _span = crate::semantic_profile::span("vector_scan");
-            blocks
-                .par_iter()
-                .enumerate()
-                .flat_map_iter(|(b, block)| {
-                    block
-                        .candidates(&q, scale, vector, semantic_policy::FLOOR as f32)
-                        .into_iter()
-                        .map(move |(slot, upper, exact)| (b, slot, upper, exact))
-                })
-                .collect()
+            if parallel {
+                blocks.par_iter().enumerate().flat_map_iter(scan).collect()
+            } else {
+                blocks.iter().enumerate().flat_map(scan).collect()
+            }
         };
         let scan_ms = started.elapsed().as_secs_f64() * 1000.;
         {
             let _span = crate::semantic_profile::span("vector_sort");
-            candidates.par_sort_unstable_by(|a, b| {
+            let order = |a: &(usize, usize, f32, f32), b: &(usize, usize, f32, f32)| {
                 b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1))
-            });
+            };
+            if parallel {
+                candidates.par_sort_unstable_by(order);
+            } else {
+                candidates.sort_unstable_by(order);
+            }
         }
         if crate::semantic_profile::timing_enabled() {
             eprintln!(

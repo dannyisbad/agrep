@@ -15,7 +15,8 @@ agrep setup
 [Standalone binaries](https://github.com/dannyisbad/agrep/releases) need neither
 Python nor Node. Wheels bundle the binary; npm downloads its version's binary
 from GitHub and verifies the SHA-256 pinned in the package. Linux glibc 2.28+,
-macOS 11+, and Windows: x64 and arm64.
+macOS 11+, and Windows: x64 and arm64. Linux and Windows arm64 need ARMv8.2-A
+with FP16 (Raspberry Pi 5, Graviton2 and later; not Raspberry Pi 3/4 or Graviton1).
 
 Five commands to remember:
 

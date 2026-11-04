@@ -330,29 +330,34 @@ pub fn block_list(c: &Connection) -> Result<Vec<(String, usize)>> {
         .collect::<rusqlite::Result<_>>()?;
     Ok(values)
 }
+/// Fewer blocks than this open on the calling thread: handing a few opens to the
+/// Rayon pool costs more than the opens, and waits for a worker to be scheduled.
+const PARALLEL_OPENS: usize = 32;
 pub fn open_blocks(root: &DataRoot, listed: Vec<(String, usize)>) -> Result<Vec<Block>> {
     use rayon::prelude::*;
-    listed
-        .into_par_iter()
-        .map(|(name, rows)| {
-            if name.len() != 70
-                || !name.ends_with(".q8f16")
-                || !name[..64].bytes().all(|b| b.is_ascii_hexdigit())
-            {
-                bail!("invalid semantic block name");
-            }
-            let f = File::open(root.path().join("vectors").join(&name))
-                .context("read semantic vector block")?;
-            if f.metadata()?.len() as usize != rows * RECORD {
-                bail!("invalid semantic vector block length");
-            }
-            // Published blocks are immutable and remain valid while any SQLite reader uses them.
-            let map = unsafe { memmap2::MmapOptions::new().map(&f)? };
-            #[cfg(unix)]
-            let _ = map.advise(memmap2::Advice::WillNeed);
-            Ok(Block { name, map, rows })
-        })
-        .collect()
+    let open = |(name, rows): (String, usize)| {
+        if name.len() != 70
+            || !name.ends_with(".q8f16")
+            || !name[..64].bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            bail!("invalid semantic block name");
+        }
+        let f = File::open(root.path().join("vectors").join(&name))
+            .context("read semantic vector block")?;
+        if f.metadata()?.len() as usize != rows * RECORD {
+            bail!("invalid semantic vector block length");
+        }
+        // Published blocks are immutable and remain valid while any SQLite reader uses them.
+        let map = unsafe { memmap2::MmapOptions::new().map(&f)? };
+        #[cfg(unix)]
+        let _ = map.advise(memmap2::Advice::WillNeed);
+        Ok(Block { name, map, rows })
+    };
+    if listed.len() < PARALLEL_OPENS {
+        listed.into_iter().map(open).collect()
+    } else {
+        listed.into_par_iter().map(open).collect()
+    }
 }
 pub fn blocks(root: &DataRoot, c: &Connection) -> Result<Vec<Block>> {
     open_blocks(root, block_list(c)?)

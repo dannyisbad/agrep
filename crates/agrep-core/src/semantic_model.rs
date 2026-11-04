@@ -2,6 +2,7 @@
 use crate::{
     data::DataRoot,
     semantic_bert::{checkpoint_name, Config, MappedWeights, ModernBert},
+    semantic_tokenizer::{self, TextTokenizer},
 };
 use anyhow::{anyhow, bail, Context, Result};
 use candle_core::{DType, Device, IndexOp, Tensor};
@@ -12,7 +13,6 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
 };
-use tokenizers::{Tokenizer, TruncationParams};
 use unicode_normalization::UnicodeNormalization;
 
 pub const MODEL_ID: &str = "granite-embedding-small-english-r2";
@@ -189,8 +189,9 @@ fn conversion_matches(path: &Path, source: &Verified) -> bool {
         "weights-f32.safetensors",
         "weights-f16.safetensors",
         "tokenizer-compact.json",
+        "tokenizer-query.bin",
     ];
-    if record.version != 1
+    if record.version != 2
         || record.source != *source
         || record
             .output
@@ -248,13 +249,20 @@ fn convert_weights(path: &Path) -> Result<()> {
         path.join(name).metadata()?.len(),
         digest(&path.join(name))?,
     ));
+    let name = "tokenizer-query.bin";
+    semantic_tokenizer::write_query(&path.join("tokenizer.json"), &path.join(name))?;
+    files.push((
+        name,
+        path.join(name).metadata()?.len(),
+        digest(&path.join(name))?,
+    ));
     let tuples: Vec<_> = files.iter().map(|(n, b, h)| (*n, *b, h.as_str())).collect();
     let output = stamps(path, &tuples)?;
     if stamps(path, &FILES)? != source {
         bail!("model changed during weight conversion");
     }
     let record = Converted {
-        version: 1,
+        version: 2,
         source,
         output,
     };
@@ -443,58 +451,8 @@ pub fn provision_at(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The tokenizer `Tokenizer::from_file` builds, without its buffered untagged pass
-/// over the whole model: the BPE model goes straight through its own deserializer,
-/// and the remaining fields go through the steps of the library's own visitor.
-fn load_tokenizer(path: &Path) -> Result<Tokenizer> {
-    use tokenizers::{
-        models::bpe::BPE, AddedToken, DecoderWrapper, ModelWrapper, NormalizerWrapper,
-        PaddingParams, PostProcessorWrapper, PreTokenizerWrapper, TokenizerBuilder,
-    };
-    #[derive(serde::Deserialize)]
-    struct Parts {
-        version: Option<String>,
-        truncation: Option<TruncationParams>,
-        padding: Option<PaddingParams>,
-        // Recorded ids only feed the library's mismatch warnings.
-        #[serde(default)]
-        added_tokens: Vec<AddedToken>,
-        normalizer: Option<NormalizerWrapper>,
-        pre_tokenizer: Option<PreTokenizerWrapper>,
-        model: BPE,
-        decoder: Option<DecoderWrapper>,
-        post_processor: Option<PostProcessorWrapper>,
-    }
-    let parts: Parts = serde_json::from_slice(&fs::read(path)?)?;
-    if parts.version.as_deref().is_some_and(|v| v != "1.0") {
-        bail!("unknown tokenizer version");
-    }
-    let mut tokenizer = TokenizerBuilder::new()
-        .with_truncation(parts.truncation)
-        .with_padding(parts.padding)
-        .with_normalizer(parts.normalizer)
-        .with_pre_tokenizer(parts.pre_tokenizer)
-        .with_model(ModelWrapper::BPE(parts.model))
-        .with_decoder(parts.decoder)
-        .with_post_processor(parts.post_processor)
-        .build()
-        .map_err(|e| anyhow!("{e}"))?;
-    tokenizer.add_tokens(&parts.added_tokens);
-    Ok(Tokenizer::from(tokenizer))
-}
-
-/// Whether the query loader rebuilds exactly the tokenizer `Tokenizer::from_file`
-/// reads from `path`, compared through the library's own serialization.
-#[doc(hidden)]
-pub fn tokenizer_parity(path: &Path) -> Result<bool> {
-    let reference = Tokenizer::from_file(path).map_err(|e| anyhow!("{e}"))?;
-    let loaded = load_tokenizer(path)?;
-    let text = |t: &Tokenizer| t.to_string(false).map_err(|e| anyhow!("{e}"));
-    Ok(text(&reference)? == text(&loaded)?)
-}
-
 pub struct Embedder {
-    tok: Tokenizer,
+    tok: TextTokenizer,
     model: ModernBert,
     device: Device,
     token_budget: usize,
@@ -558,17 +516,22 @@ impl Embedder {
             let tokenizer = scope.spawn(|| -> Result<_> {
                 let _span = crate::semantic_profile::span("tokenizer_load");
                 let start = std::time::Instant::now();
-                let mut tok = load_tokenizer(&path.join(if converted {
-                    "tokenizer-compact.json"
+                // Explicit provisioning writes the query tables beside the other
+                // converted files; bulk embedding builds the library's model.
+                let mut tok = if query && converted {
+                    TextTokenizer::Query(Box::new(semantic_tokenizer::load_query(
+                        &path.join("tokenizer-query.bin"),
+                    )?))
                 } else {
-                    "tokenizer.json"
-                }))?;
-                tok.with_truncation(Some(TruncationParams {
-                    max_length: 1024,
-                    ..Default::default()
-                }))
-                .map_err(|e| anyhow!("{e}"))?;
-                tok.with_padding(None);
+                    TextTokenizer::Library(Box::new(semantic_tokenizer::load(&path.join(
+                        if converted {
+                            "tokenizer-compact.json"
+                        } else {
+                            "tokenizer.json"
+                        },
+                    ))?))
+                };
+                tok.window(1024)?;
                 Ok((tok, start.elapsed().as_secs_f64() * 1000.))
             });
             let start = std::time::Instant::now();
@@ -660,21 +623,11 @@ impl Embedder {
         if !(2..=1024).contains(&limit) {
             bail!("token limit must be 2..=1024");
         }
-        self.tok
-            .with_truncation(Some(TruncationParams {
-                max_length: limit,
-                ..Default::default()
-            }))
-            .map_err(|e| anyhow!("{e}"))?;
+        self.tok.window(limit)?;
         Ok(self)
     }
     pub fn token_ids(&self, text: &str) -> Result<Vec<u32>> {
-        Ok(self
-            .tok
-            .encode(text, true)
-            .map_err(|e| anyhow!("{e}"))?
-            .get_ids()
-            .to_vec())
+        self.tok.ids(text)
     }
     /// Scheduling-only sweep for the standalone performance harness.
     pub fn with_batch_tokens(mut self, tokens: usize) -> Result<Self> {
@@ -857,75 +810,6 @@ mod tests {
         assert!(!directory(&root).exists());
     }
     #[test]
-    fn direct_tokenizer_loading_rebuilds_the_library_tokenizer() {
-        // A byte-level BPE in the pinned file's shape: every byte symbol, a few
-        // merges, special and normalized non-special added tokens, NFC and a
-        // CLS/SEP template.
-        let mut alphabet: Vec<char> = tokenizers::pre_tokenizers::byte_level::ByteLevel::alphabet()
-            .into_iter()
-            .collect();
-        alphabet.sort();
-        let mut vocab = serde_json::Map::new();
-        vocab.insert("[CLS]".into(), 0.into());
-        vocab.insert("[SEP]".into(), 1.into());
-        for c in &alphabet {
-            vocab.insert(c.to_string(), (vocab.len() as u32).into());
-        }
-        let merges = [
-            ("Ġ", "t"),
-            ("h", "e"),
-            ("Ġt", "he"),
-            ("l", "o"),
-            ("Ġ", "lo"),
-        ];
-        for (a, b) in merges {
-            vocab.insert(format!("{a}{b}"), (vocab.len() as u32).into());
-        }
-        let spaces = vocab.len() as u32;
-        vocab.insert("ĠĠ".into(), spaces.into());
-        let special = |id: u32, content: &str| serde_json::json!({"id":id,"content":content,"single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true});
-        let byte_level = serde_json::json!({"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true});
-        let file = serde_json::json!({
-            "version":"1.0","truncation":null,"padding":null,
-            "added_tokens":[special(0,"[CLS]"),special(1,"[SEP]"),
-                {"id":spaces,"content":"  ","single_word":false,"lstrip":false,"rstrip":false,"normalized":true,"special":false}],
-            "normalizer":{"type":"NFC"},
-            "pre_tokenizer":byte_level,
-            "post_processor":{"type":"TemplateProcessing",
-                "single":[{"SpecialToken":{"id":"[CLS]","type_id":0}},{"Sequence":{"id":"A","type_id":0}},{"SpecialToken":{"id":"[SEP]","type_id":0}}],
-                "pair":[{"SpecialToken":{"id":"[CLS]","type_id":0}},{"Sequence":{"id":"A","type_id":0}},{"SpecialToken":{"id":"[SEP]","type_id":0}},{"Sequence":{"id":"B","type_id":0}},{"SpecialToken":{"id":"[SEP]","type_id":0}}],
-                "special_tokens":{"[CLS]":{"id":"[CLS]","ids":[0],"tokens":["[CLS]"]},"[SEP]":{"id":"[SEP]","ids":[1],"tokens":["[SEP]"]}}},
-            "decoder":byte_level,
-            "model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,
-                "fuse_unk":false,"byte_fallback":false,"ignore_merges":false,"vocab":vocab,
-                "merges":merges.iter().map(|(a, b)| [a, b]).collect::<Vec<_>>()},
-        });
-        let t = tempfile::tempdir().unwrap();
-        let path = t.path().join("tokenizer.json");
-        fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
-        assert!(tokenizer_parity(&path).unwrap());
-        let reference = Tokenizer::from_file(&path).unwrap();
-        let loaded = load_tokenizer(&path).unwrap();
-        for text in [
-            "the hello",
-            "  two  spaces [SEP] inside",
-            "e\u{301}t\u{e9} [CLS]",
-            "",
-        ] {
-            let (a, b) = (
-                reference.encode(text, true).unwrap(),
-                loaded.encode(text, true).unwrap(),
-            );
-            assert_eq!(a.get_ids(), b.get_ids(), "{text:?}");
-            assert_eq!(a.get_tokens(), b.get_tokens(), "{text:?}");
-            assert_eq!(a.get_offsets(), b.get_offsets(), "{text:?}");
-        }
-        let mut other = file.clone();
-        other["version"] = "2.0".into();
-        fs::write(&path, serde_json::to_vec(&other).unwrap()).unwrap();
-        assert!(load_tokenizer(&path).is_err());
-    }
-    #[test]
     fn batching_separates_long_rows_without_changing_the_window() {
         let ids: Vec<_> = [8, 8, 32, 32, 1024, 1024]
             .into_iter()
@@ -954,12 +838,13 @@ mod tests {
             ("weights-f32.safetensors", 3, "a"),
             ("weights-f16.safetensors", 3, "b"),
             ("tokenizer-compact.json", 3, "c"),
+            ("tokenizer-query.bin", 3, "d"),
         ];
         for (name, _, _) in outputs {
             fs::write(t.path().join(name), b"123").unwrap();
         }
         let record = Converted {
-            version: 1,
+            version: 2,
             source: stamps(t.path(), &inputs).unwrap(),
             output: stamps(t.path(), &outputs).unwrap(),
         };
@@ -970,11 +855,29 @@ mod tests {
         .unwrap();
         let source = stamps(t.path(), &inputs).unwrap();
         assert!(conversion_matches(t.path(), &source));
+        // A first-format record, without query tokenizer tables, is converted again.
+        let old = Converted {
+            version: 1,
+            source: stamps(t.path(), &inputs).unwrap(),
+            output: stamps(t.path(), &outputs[..3]).unwrap(),
+        };
+        fs::write(
+            t.path().join("converted.json"),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        assert!(!conversion_matches(t.path(), &source));
+        fs::write(
+            t.path().join("converted.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        assert!(conversion_matches(t.path(), &source));
         fs::write(t.path().join("weights-f32.safetensors"), b"changed").unwrap();
         assert!(!conversion_matches(t.path(), &source));
         fs::write(t.path().join("weights-f32.safetensors"), b"123").unwrap();
         let record = Converted {
-            version: 1,
+            version: 2,
             source: stamps(t.path(), &inputs).unwrap(),
             output: stamps(t.path(), &outputs).unwrap(),
         };
