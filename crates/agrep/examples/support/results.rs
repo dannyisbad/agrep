@@ -50,6 +50,21 @@ pub fn evidence(stdout: &[u8], stderr: &[u8]) -> Value {
     parsed
 }
 
+/// The statistics file 0.5's `index` and `reindex` write to the data root; stdout carries
+/// 0.4.9's human report.
+pub const INDEX_STATS: &str = "index-stats.json";
+
+/// `evidence` with the fields of an index run's statistics file: the phase timings and
+/// counts that the first stdout line held before the report replaced it.
+pub fn with_index_stats(mut evidence: Value, stats: &[u8]) -> Value {
+    if let Ok(Value::Object(fields)) = serde_json::from_slice::<Value>(stats) {
+        for (key, value) in fields {
+            evidence[key] = value;
+        }
+    }
+    evidence
+}
+
 /// Every timed sample must prove its expected result, not merely exit quickly.
 pub fn valid_result(name: &str, evidence: &Value) -> bool {
     if matches!(name, "rare" | "compact_rare" | "rare_filtered") {

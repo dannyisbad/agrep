@@ -113,12 +113,24 @@ pub fn run(deep: bool, fix: bool, no_semantic: bool, json_output: bool) -> Resul
                 "action needed"
             }
         );
+        // A failed check names its cause, as 0.4.9's rows did.
         for check in &checks {
-            println!(
-                "{}: {}",
-                check["check"].as_str().unwrap_or("check"),
-                check["state"].as_str().unwrap_or("unknown")
-            );
+            let state = check["state"].as_str().unwrap_or("unknown");
+            let detail = match &check["detail"] {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Array(items) => items
+                    .iter()
+                    .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_owned))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+                _ => String::new(),
+            };
+            let name = check["check"].as_str().unwrap_or("check");
+            if state == "failed" && !detail.is_empty() {
+                println!("{name}: {state} - {}", agrep_core::render::safe(&detail));
+            } else {
+                println!("{name}: {state}");
+            }
         }
         for repair in &repaired {
             println!("repaired: {repair}");

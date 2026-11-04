@@ -92,6 +92,7 @@ fn invoke(
         });
     #[cfg(not(unix))]
     let load: Option<Vec<f64>> = None;
+    let begun = std::time::SystemTime::now();
     let t = Instant::now();
     let out = process::command(
         bin,
@@ -106,6 +107,14 @@ fn invoke(
     let ms = t.elapsed().as_secs_f64() * 1000.;
     let rc = out.status.code().unwrap_or(2);
     let mut parsed = results::evidence(&out.stdout, &out.stderr);
+    let stats = data.join(results::INDEX_STATS);
+    if args.first() == Some(&"index")
+        && std::fs::metadata(&stats)
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t >= begun)
+    {
+        parsed = results::with_index_stats(parsed, &std::fs::read(&stats)?);
+    }
     parsed["bench_load_averages"] = json!(load);
     Ok((ms, rc, parsed))
 }

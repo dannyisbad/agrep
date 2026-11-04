@@ -48,7 +48,7 @@ fn setup_yes_preserves_archive_optout_and_doctor_repairs_only_enrollment() {
     let root = DataRoot(t.path().join("data"));
     let enrolled = root.config().unwrap().enrollment;
     fs::write(t.path().join("home/.pi/agent/AGENTS.md"), "user text\n").unwrap();
-    ok(&t, &["doctor", "--fix", "--json"]);
+    ok(&t, &["doctor", "--fix"]);
     assert!(!root.config().unwrap().archive.enabled);
     assert_eq!(enrolled.len(), root.config().unwrap().enrollment.len());
     assert!(
@@ -293,6 +293,6 @@ fn doctor_creates_an_index_in_an_initialized_empty_root() {
     let t = home();
     let root = DataRoot::open(t.path().join("data"), true).unwrap();
     assert!(!root.db().exists());
-    ok(&t, &["doctor", "--fix", "--json"]);
+    ok(&t, &["doctor", "--fix"]);
     assert!(root.db().is_file());
 }

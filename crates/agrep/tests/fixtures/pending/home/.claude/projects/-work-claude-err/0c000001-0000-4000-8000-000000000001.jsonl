@@ -1,0 +1,2 @@
+{"type": "user", "uuid": "u1", "parentUuid": null, "sessionId": "0c000001-0000-4000-8000-000000000001", "cwd": "/work/claude-err", "timestamp": "2026-10-11T12:01:00.000Z", "message": {"role": "user", "content": "deploy the service"}}
+{"type": "assistant", "uuid": "a1", "parentUuid": "u1", "sessionId": "0c000001-0000-4000-8000-000000000001", "cwd": "/work/claude-err", "timestamp": "2026-10-11T12:02:00.000Z", "isApiErrorMessage": true, "message": {"role": "assistant", "model": "<synthetic>", "content": [{"type": "text", "text": "API Error: 529 overloaded, retry later"}]}}

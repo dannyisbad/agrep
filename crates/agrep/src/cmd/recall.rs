@@ -105,11 +105,20 @@ fn family_key(h: &Hit, per_session: bool) -> &str {
 fn scatter(h: &Hit) -> bool {
     h.matched == "all-terms" || h.matched == "content-terms"
 }
-/// 0.4.9's `_meta_row` from stored provenance: machinery roles and spawned task prompts.
+/// 0.4.9's `_meta_row`: a proven ~meta row, or stored provenance alone.
 fn meta_row(h: &Hit) -> bool {
-    h.meta_marker
-        || matches!(h.who.as_str(), "harness" | "synthetic")
-        || (h.who == "subagent" && h.turn == 0)
+    h.meta_marker || agrep_core::query::meta_role(&h.who, h.turn)
+}
+/// 0.4.9's candidates for one query (py/recall.py:983-994, 2025-2035): each family's best
+/// row in rank order, its session's under `per_session`, then lived evidence before ~meta.
+fn heads(hits: Vec<Hit>, per_session: bool) -> Vec<Hit> {
+    let mut seen = HashSet::new();
+    let mut heads: Vec<Hit> = hits
+        .into_iter()
+        .filter(|h| seen.insert(family_key(h, per_session).to_owned()))
+        .collect();
+    heads.sort_by_key(meta_row);
+    heads
 }
 /// 0.4.9's recall under `--no-meta` selected from heads, not rows: the best row of each
 /// of up to `max(target, 40)` families (chats under `per_session`) from the prose lane,
@@ -668,29 +677,72 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
     {
         bail!("invalid result handle");
     }
+    let queries: Vec<String> = if pack {
+        a.query
+            .iter()
+            .map(|q| q.trim().to_owned())
+            .filter(|q| !q.is_empty())
+            .collect()
+    } else {
+        Some(a.query.join(" ").trim().to_owned())
+            .filter(|q| !q.is_empty())
+            .into_iter()
+            .collect()
+    };
+    let request = caller::Request {
+        include_self: a.scope.include_self,
+        no_self: a.scope.no_self,
+        waived: a.scope.chat.is_some().then_some("chat-filter"),
+    };
+    // 0.4.9's usage and handle errors, in its order and each with its `--json` record
+    // (py/recall.py:1809-1977): the time bounds are read before the index refreshes.
+    let stop = |engine: &str, error: (&str, Option<&str>)| -> Result<i32> {
+        if a.json {
+            let query = if pack {
+                json!(queries)
+            } else {
+                json!(queries.first().map_or("", String::as_str))
+            };
+            super::usage::stopped(None, query, engine, error, request, no_auto)?;
+        }
+        Ok(2)
+    };
+    if queries.is_empty() || a.query.iter().any(|q| q.trim().is_empty()) {
+        let prog = if pack { "pack" } else { "recall" };
+        eprintln!(
+            "query arguments must not be empty (searching the word itself: agrep search \"{prog}\")"
+        );
+        return stop("query:error", ("empty-query", None));
+    }
+    if a.semantic && a.lexical {
+        eprintln!("-s and --lexical are contradictory; pick one");
+        return stop("query:error", ("conflicting-modes", None));
+    }
+    let who_tool = a.scope.no_who.is_none()
+        && a.scope
+            .who
+            .as_deref()
+            .map(agrep_core::coverage::speakers)
+            .and_then(Result::ok)
+            .as_deref()
+            == Some("tool");
+    if a.semantic && who_tool {
+        eprintln!("-s cannot search --who tool: tool rows are not embedded; use --lexical");
+        return stop("query:error", ("unsupported-speaker", None));
+    }
+    let mut filters = match a.scope.filters() {
+        Ok(f) => f,
+        Err(e) => {
+            if let Some(error) = super::usage::recorded(&e) {
+                stop("query:error", error)?;
+            }
+            return Err(e);
+        }
+    };
+    agrep_core::coverage::validate(&mut filters)?;
     if a.semantic && !semantic::installed(&agrep_core::data::DataRoot::discover()?) {
         eprintln!("semantic model not installed: run agrep setup");
         return Ok(2);
-    }
-    if a.hits == Some(0) {
-        bail!("--hits must be at least 1")
-    }
-    if a.budget > 0 && a.budget < 64 {
-        bail!("a finite --budget must be at least 64 bytes")
-    }
-    if a.json && a.budget > 0 && a.budget < 2048 {
-        bail!("a finite JSON --budget must be at least 2048 bytes")
-    }
-    if a.json && a.probe {
-        bail!("--probe emits a pointer line and cannot be combined with --json")
-    }
-    let queries = if pack {
-        a.query.clone()
-    } else {
-        vec![a.query.join(" ")]
-    };
-    if queries.iter().any(|q| q.trim().is_empty()) {
-        bail!("a nonempty search pattern is required")
     }
     let target = if a.probe {
         1
@@ -735,27 +787,19 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
         identity.disclose(a.scope.no_self, true);
     }
     let caller = Caller::resolve(&c, identity)?;
-    let request = caller::Request {
-        include_self: a.scope.include_self,
-        no_self: a.scope.no_self,
-        waived: a.scope.chat.is_some().then_some("chat-filter"),
-    };
     let policy = caller.policy(request);
     let mut excluded = None;
-    let mut filters = a.scope.filters()?;
-    agrep_core::coverage::validate(&mut filters)?;
     let tools_only = filters.who.as_deref() == Some("tool");
     let coverage = agrep_core::coverage::dimensions(&c, &filters)?;
     if let Some(chat) = filters
         .chat
-        .as_ref()
+        .clone()
         .filter(|_| !queries.iter().any(|q| handles::is_handle(q)))
     {
-        let ids = handles::SessionIndex::load(&c)?.candidates(&c, chat)?;
-        if ids.len() != 1 {
-            bail!("chat is missing or ambiguous")
-        }
-        filters.chat = Some(ids[0].clone())
+        let Some(session) = super::usage::chat(&c, &chat)? else {
+            return stop("query:error", ("chat-unresolved", None));
+        };
+        filters.chat = Some(session)
     }
     let direct_filters: Vec<_> = [
         ("--chat", filters.chat.is_some()),
@@ -784,7 +828,17 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
     let mut deepen = Vec::new();
     for query in &queries {
         if handles::is_handle(query) {
-            let w = evidence::load(&c, &Request::new(query, None, Some(a.context as i64)))?;
+            let w = match evidence::load(&c, &Request::new(query, None, Some(a.context as i64))) {
+                Ok(w) => w,
+                Err(e) => {
+                    let Some(failure) = e.downcast_ref::<evidence::HandleError>() else {
+                        return Err(e);
+                    };
+                    let reason = render::safe(&failure.to_string());
+                    eprintln!("{reason}");
+                    return stop("handle", (failure.code, Some(&reason)));
+                }
+            };
             // 0.4.9 printed each way the served turn differs from the cited one, JSON or not,
             // and carried them as `served` (py/recall.py:1941-1946, 2898-2902).
             for note in &w.notes {
@@ -812,7 +866,9 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
             } else if let Some(r) = row {
                 (r.text.clone(), r.who.clone(), r.ts)
             } else {
-                bail!("handle has no indexed row")
+                let reason = "handle has no indexed row";
+                eprintln!("{reason}");
+                return stop("handle", ("stale-result-handle", Some(reason)));
             };
             if override_filters && filter_note.is_none() {
                 filter_note = Some(handle_filter_note(&direct_filters, &filters, &w, ts));
@@ -1034,10 +1090,19 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
         totals_exact &= r.total_basis == "exact" && meaning.is_empty();
         known_sessions.extend(r.hits.iter().chain(meaning).map(|h| h.session.clone()));
         // A --no-meta bucket already holds every head 0.4.9 selected from.
-        deepen.push(
-            (meta.is_none() && depth < options.limit && r.hits.len() == depth).then_some(options),
-        );
-        buckets.push(r.hits);
+        let deeper =
+            (meta.is_none() && depth < options.limit && r.hits.len() == depth).then_some(options);
+        // A cut page's ~meta heads wait for the full page, which can hold more lived ones.
+        let mut hits = if meta.is_some() {
+            r.hits
+        } else {
+            heads(r.hits, per_session)
+        };
+        if deeper.is_some() {
+            hits.truncate(hits.iter().position(meta_row).unwrap_or(hits.len()));
+        }
+        deepen.push(deeper);
+        buckets.push(hits);
     }
     // 0.4.9's JSON note for a keyword lane that fell back to its any-order tiers
     // (py/recall.py:2379-2382, 2916-2917).
@@ -1079,6 +1144,7 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
                 bucket.extend(meaning.iter().cloned());
                 bucket.sort_by_key(|h| {
                     (
+                        meta_row(h),
                         scatter(h),
                         if h.matched == "semantic" {
                             1
@@ -1094,7 +1160,8 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
         let selected =
             select_deepening(&mut buckets, &mut deepen, target, per_session, |options| {
                 let _span = agrep_core::semantic_profile::span("keyword");
-                Ok(caller::search(&c, &options, &caller, include_self, a.scope.no_self)?.hits)
+                let hits = caller::search(&c, &options, &caller, include_self, a.scope.no_self)?;
+                Ok(heads(hits.hits, per_session))
             })?;
         reserve(selected, &meanings, target, per_session)
     };

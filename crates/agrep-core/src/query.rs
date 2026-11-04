@@ -155,6 +155,21 @@ pub fn weight(who: &str) -> f64 {
         _ => 0.5,
     }
 }
+/// 0.4.9's `_META_SCALE` (py/search.py:1222): every ranked tier scales a row whose
+/// provenance is tooling about history rather than history by this factor.
+const META_SCALE: f64 = 0.45;
+/// 0.4.9's `_meta_row` from stored provenance (py/search.py:1227-1238): machinery roles
+/// and a subagent's first turn, which is its spawned task prompt.
+pub fn meta_role(who: &str, turn: i64) -> bool {
+    matches!(who, "harness" | "synthetic") || (who == "subagent" && turn == 0)
+}
+fn meta_scale(meta: bool) -> f64 {
+    if meta {
+        META_SCALE
+    } else {
+        1.
+    }
+}
 /// 0.4.9's speaker weight and source scale, which its score multiplies separately.
 fn speaker(who: &str) -> (f64, f64) {
     match who {
@@ -167,11 +182,11 @@ fn speaker(who: &str) -> (f64, f64) {
         _ => (0.5, 1.),
     }
 }
-/// A row's score from its match strength, recency and boundary factor, multiplied and
-/// rounded to four places in 0.4.9's order.
-fn score(strength: f64, rec: f64, who: &str, factor: f64) -> f64 {
+/// A row's score from its match strength, recency, boundary factor and meta scale,
+/// multiplied and rounded to four places in 0.4.9's order (py/search.py:1874-1876).
+fn score(strength: f64, rec: f64, who: &str, factor: f64, meta: bool) -> f64 {
     let (w, s) = speaker(who);
-    crate::window::round4(strength * rec * w * factor * s)
+    crate::window::round4(strength * rec * w * factor * s * meta_scale(meta))
 }
 pub fn recency(ts: i64, now: i64) -> f64 {
     let days = (now - ts).max(0) as f64 / 86_400_000.;
@@ -181,10 +196,8 @@ pub fn recency(ts: i64, now: i64) -> f64 {
 /// (py/search.py:1817-1876, 1938-1942), while the cosine ranks the row.
 pub fn meaning_score(h: &Hit, now: i64) -> f64 {
     let rec = recency(h.ts, now).max(if h.who == "user" { 0.35 } else { 0. });
-    let meta =
-        matches!(h.who.as_str(), "harness" | "synthetic") || (h.who == "subagent" && h.turn == 0);
     let (w, s) = speaker(&h.who);
-    window::round4(rec * w * s * if meta { 0.45 } else { 1. })
+    window::round4(rec * w * s * meta_scale(meta_role(&h.who, h.turn)))
 }
 /// The ranked (rounded) score a row can reach when its raw score is at most `ceiling`.
 /// The margin covers products formed in another order than the score's.
@@ -598,6 +611,14 @@ fn matches_once(pattern: &str) -> bool {
                 .any(|before| before.properties().minimum_len().is_some_and(|n| n > 0))
     })
 }
+/// Why `pattern` is no regular expression, read as written, as 0.4.9 compiled the query
+/// before searching (py/search.py:7532-7538). The search compiles it inside a group, which
+/// would accept a pattern such as `a)(b`.
+pub fn regex_error(pattern: &str) -> Option<String> {
+    fancy_regex::Regex::new(pattern)
+        .err()
+        .map(|e| e.to_string())
+}
 impl Matcher {
     fn new(o: &Options, c: &Connection) -> Result<Self> {
         let terms: Vec<Vec<String>> = boundary_rank::query_tokens(&o.pattern)
@@ -815,11 +836,14 @@ impl Matcher {
         &self,
         text: &str,
         who: &str,
+        turn: i64,
         ts: i64,
         now: i64,
         cutoff: Option<&Cutoff>,
     ) -> Result<Option<Scored>> {
         let rec = recency(ts, now).max(if who == "user" { 0.35 } else { 0. });
+        // The explicit `--coverage` lane scored its rows without it, as 0.4.9's did.
+        let meta = !self.coverage_lane && meta_role(who, turn);
         if let Some(re) = &self.explicit {
             let Some(found) = re.find(text)? else {
                 return Ok(None);
@@ -840,7 +864,7 @@ impl Matcher {
             let strength = window::strength(n, best, self.explicit_chars);
             return Ok(Some(Scored {
                 tier: 0,
-                score: score(strength, rec.max(0.5), who, 1.),
+                score: score(strength, rec.max(0.5), who, 1., meta),
                 class: "explicit",
                 snippet: snip.text,
                 span: Some(span),
@@ -906,13 +930,13 @@ impl Matcher {
             let strength = self.phrase_strength(&row, &snip, &view);
             let (w, s) = speaker(who);
             // Boundary factors never exceed one, so this is the row's best score.
-            if cutoff.is_some_and(|c| c.excludes(0, strength * rec * w * s)) {
+            if cutoff.is_some_and(|c| c.excludes(0, strength * rec * w * s * meta_scale(meta))) {
                 return Ok(Some(Scored::bare(0, "unscored")));
             }
             let (factor, class) = self.phrase_boundary(&row, &snip, &view)?;
             return Ok(Some(Scored {
                 tier: 0,
-                score: score(strength, rec, who, factor),
+                score: score(strength, rec, who, factor, meta),
                 class,
                 snippet: snip.text,
                 span: Some(anchor),
@@ -941,7 +965,7 @@ impl Matcher {
             let near = window::proximity(&snip.text, &selected, &b.qualities, self.query_chars);
             return Ok(Some(Scored {
                 tier: 1,
-                score: score(phrase.max(near), rec, who, b.factor),
+                score: score(phrase.max(near), rec, who, b.factor, meta),
                 class: b.match_class,
                 span: spans
                     .iter()
@@ -970,13 +994,15 @@ impl Matcher {
             // without a boundary factor.
             let total = self.idf.iter().sum::<f64>();
             let coverage = window::round4(found_weight / if total == 0. { 1. } else { total });
-            if cutoff.is_some_and(|c| c.excludes(2, coverage * rec * weight(who))) {
+            if cutoff
+                .is_some_and(|c| c.excludes(2, coverage * rec * weight(who) * meta_scale(meta)))
+            {
                 return Ok(Some(Scored::bare(2, "unscored")));
             }
             let anchor = anchor();
             return Ok(Some(Scored {
                 tier: 2,
-                score: score(coverage, rec, who, 1.),
+                score: score(coverage, rec, who, 1., meta),
                 class: "",
                 snippet: Snip::new(text, anchor.as_slice()).text,
                 span: anchor,
@@ -2959,13 +2985,15 @@ fn search_pass(
                 let Some(r) = row else { break };
                 let who: String = r.get(5)?;
                 let ts: i64 = r.get(8)?;
+                let turn: i64 = r.get(4)?;
                 if !o.exact && o.limit > 0 && result.hits.len() >= o.limit && o.sort == "score" {
                     let mut ceiling = weight(&who)
                         * if m.explicit.is_some() {
                             recency(ts, now).max(0.5)
                         } else {
                             recency(ts, now).max(if who == "user" { 0.35 } else { 0. })
-                        };
+                        }
+                        * meta_scale(!m.coverage_lane && meta_role(&who, turn));
                     if partial {
                         let id: i64 = r.get(0)?;
                         let total = m.idf.iter().sum::<f64>();
@@ -2978,7 +3006,7 @@ fn search_pass(
                         ceiling = ceiling.min(bound);
                     }
                     let session: String = r.get(1)?;
-                    if Cutoff::of(&result.hits[o.limit - 1], o.chats, ts, &session, r.get(4)?)
+                    if Cutoff::of(&result.hits[o.limit - 1], o.chats, ts, &session, turn)
                         .excludes(pass_tier, ceiling)
                     {
                         result.total_basis = "floor".into();
@@ -3014,12 +3042,12 @@ fn search_pass(
                         o.chats,
                         ts,
                         &session,
-                        r.get(4)?,
+                        turn,
                     ))
                 } else {
                     None
                 };
-                let evaluated = m.evaluate(&text, &who, ts, now, cutoff.as_ref())?;
+                let evaluated = m.evaluate(&text, &who, turn, ts, now, cutoff.as_ref())?;
                 result.timings.score_ms += score_started.elapsed().as_secs_f64() * 1000.;
                 let Some(scored) = evaluated else {
                     continue;
@@ -3056,7 +3084,6 @@ fn search_pass(
                     continue;
                 }
                 let session: String = r.get(1)?;
-                let turn = r.get(4)?;
                 if !o.chats && o.limit > 0 && result.hits.len() >= o.limit {
                     let ranked = Hit {
                         session: session.clone(),
@@ -3107,6 +3134,7 @@ fn search_pass(
                     caller.agent == r.get::<_, String>(2).unwrap_or_default()
                         && caller.session == session
                 });
+                let meta_marker = !m.coverage_lane && meta_role(&who, turn);
                 let h = Hit {
                     session,
                     agent: r.get(2)?,
@@ -3130,7 +3158,7 @@ fn search_pass(
                     boundary_class: scored.class.into(),
                     handle,
                     self_marker,
-                    meta_marker: false,
+                    meta_marker,
                     sem_weak: false,
                     rowid: r.get(0)?,
                     tier,
@@ -3331,7 +3359,7 @@ mod window_tests {
         if partial {
             m.terms = content_terms(pattern);
         }
-        m.evaluate(text, "tool", 0, 0, None).unwrap().unwrap()
+        m.evaluate(text, "tool", 1, 0, 0, None).unwrap().unwrap()
     }
     // Expected spans were produced by agrep 0.4.9's own matchers: the `[\W_]*` phrase
     // search, `console.insensitive_span` with and without `_keyword_term_specs` variants,

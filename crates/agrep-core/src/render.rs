@@ -408,14 +408,7 @@ pub fn emit_semantic(
             );
         }
     } else if s.compact {
-        let mut ordered = r.hits.clone();
-        if s.requested.is_none() {
-            let mut seen = std::collections::HashSet::new();
-            let (front, tail): (Vec<_>, Vec<_>) = ordered
-                .into_iter()
-                .partition(|h| seen.insert((h.agent.clone(), h.family.clone())));
-            ordered = front.into_iter().chain(tail).collect();
-        }
+        let ordered = diversify(demote_meta(r.hits.clone()));
         let frozen = pages::Frozen {
             records: ordered
                 .iter()
@@ -454,7 +447,7 @@ pub fn emit_semantic(
         }
     } else {
         let mut sessions = Vec::<(&str, Vec<&Hit>)>::new();
-        for hit in &r.hits {
+        for hit in demote_meta(r.hits.iter().collect()) {
             if let Some((_, rows)) = sessions.iter_mut().find(|(id, _)| *id == hit.session) {
                 rows.push(hit)
             } else {
@@ -491,6 +484,45 @@ pub fn emit_semantic(
         eprintln!("{}", completeness_line(r, s, exhaustible));
     }
     Ok(())
+}
+/// 0.4.9's `_demote_meta`: ~meta rows sink below lived rows, each side keeping its order.
+fn demote_meta<T: std::borrow::Borrow<Hit>>(hits: Vec<T>) -> Vec<T> {
+    let (lived, meta): (Vec<T>, Vec<T>) = hits.into_iter().partition(|h| !h.borrow().meta_marker);
+    lived.into_iter().chain(meta).collect()
+}
+/// 0.4.9's compact order (py/search.py:5856-5884, py/compact.py:160-193): ~meta rows sunk,
+/// then each quality lane led by one row per family, meaning rows after the first three
+/// aligned phrase rows, and ~meta rows kept below lived ones.
+fn diversify(hits: Vec<Hit>) -> Vec<Hit> {
+    let one_lane = |rows: Vec<Hit>| -> Vec<Hit> {
+        let mut seen = std::collections::HashSet::new();
+        let (head, tail): (Vec<_>, Vec<_>) = rows.into_iter().partition(|h| {
+            !h.family.is_empty() && seen.insert((h.agent.clone(), h.family.clone()))
+        });
+        head.into_iter().chain(tail).collect()
+    };
+    let (meaning, keyword): (Vec<_>, Vec<_>) =
+        hits.into_iter().partition(|h| h.matched == "semantic");
+    let (all_terms, phrase): (Vec<_>, Vec<_>) = keyword
+        .into_iter()
+        .partition(|h| matches!(h.matched.as_str(), "all-terms" | "content-terms"));
+    let (phrase, meaning, all_terms) = (one_lane(phrase), one_lane(meaning), one_lane(all_terms));
+    let ordered = if meaning.is_empty() {
+        phrase.into_iter().chain(all_terms).collect()
+    } else {
+        let (mut aligned, interior): (Vec<_>, Vec<_>) = phrase
+            .into_iter()
+            .partition(|h| h.boundary_class != "interior");
+        let rest = aligned.split_off(aligned.len().min(3));
+        aligned
+            .into_iter()
+            .chain(meaning)
+            .chain(rest)
+            .chain(interior)
+            .chain(all_terms)
+            .collect()
+    };
+    demote_meta(ordered)
 }
 /// The JSON surface: one `agrep-meta` line, then one line per hit.
 fn json_lines(

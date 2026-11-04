@@ -268,7 +268,7 @@ fn doctor_reports_and_fixes_source_parse_errors() {
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(run(&t, &["audit", "--strict"]).status.code(), Some(2));
     fs::remove_file(bad).unwrap();
-    ok(run(&t, &["doctor", "--fix", "--json"]));
+    ok(run(&t, &["doctor", "--fix"]));
 }
 #[test]
 fn empty_diagnostics_do_not_create_data_root() {
@@ -350,6 +350,89 @@ fn run_preserves_argv_cwd_status_and_liveness() {
         )
     );
     assert!(!t.path().join("data/runs").exists());
+}
+// Expected argv is what agrep 0.4.9's `run` passed the agent (cli.py:1786-1813): unknown
+// flags pass through in order, `--cwd` counts anywhere before a `--`, and words after a
+// `--` pass verbatim, `--` itself kept unless it came first; argparse kept a second `--`
+// right after the first, which 0.4.9 then dropped.
+#[cfg(unix)]
+#[test]
+fn run_passes_unknown_flags_through_as_0_4_9() {
+    let t = fixture();
+    fake_agent(
+        &t,
+        "codex",
+        "pwd > \"$OUTPUT\"; for a in \"$@\"; do printf '[%s]\\n' \"$a\" >> \"$OUTPUT\"; done",
+    );
+    let here = t.path().join("project alpha").canonicalize().unwrap();
+    let elsewhere = t.path().join("home").canonicalize().unwrap();
+    let (here, elsewhere) = (here.to_str().unwrap(), elsewhere.to_str().unwrap());
+    let attached = format!("--cwd={elsewhere}");
+    let verbatim = format!("[--cwd]\n[{elsewhere}]\n[-h]\n");
+    for (args, cwd, passed) in [
+        (vec!["--bogus-flag"], here, "[--bogus-flag]\n"),
+        (
+            vec!["-p", "hi there", "-x"],
+            here,
+            "[-p]\n[hi there]\n[-x]\n",
+        ),
+        (
+            vec!["--model", "o3", "--cwd", elsewhere],
+            elsewhere,
+            "[--model]\n[o3]\n",
+        ),
+        (
+            vec!["--model", "o3", attached.as_str()],
+            elsewhere,
+            "[--model]\n[o3]\n",
+        ),
+        (
+            vec!["--", "--cwd", elsewhere, "-h"],
+            here,
+            verbatim.as_str(),
+        ),
+        (
+            vec!["--bogus", "--", "--x"],
+            here,
+            "[--bogus]\n[--]\n[--x]\n",
+        ),
+        (vec!["--", "--"], here, ""),
+        (vec!["--", "--", "--"], here, "[--]\n"),
+        (vec!["--", "--", "x"], here, "[x]\n"),
+    ] {
+        let out = launch_cmd(&t)
+            .current_dir(here)
+            .args(["run", "codex"])
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(t.path().join("argv.txt")).unwrap(),
+            format!("{cwd}\n{passed}"),
+            "{args:?}"
+        );
+    }
+    let help = launch_cmd(&t)
+        .args(["run", "codex", "--model", "-h"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout)
+        .contains("\nUsage: agrep run [-h] [--cwd DIR] AGENT [-- AGENT_ARGS...]\n"));
+    let missing = launch_cmd(&t)
+        .args(["run", "codex", "--model", "o3", "--cwd"])
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&missing.stderr),
+        "agrep run: argument --cwd: expected one argument\n"
+    );
 }
 #[cfg(unix)]
 #[test]
@@ -639,17 +722,15 @@ fn integration_drift_and_corrupt_database_are_diagnosed() {
     .unwrap();
     ok(run(&t, &["doctor", "--json"]));
     fs::write(t.path().join("data/index.db"), b"not a sqlite database").unwrap();
-    let out = run(&t, &["doctor", "--fix", "--json"]);
+    let out = run(&t, &["doctor", "--fix"]);
     assert_eq!(out.status.code(), Some(2));
     assert_eq!(
         fs::read(t.path().join("data/index.db")).unwrap(),
         b"not a sqlite database"
     );
-    assert!(records(&out)[0]["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|r| r["check"] == "repair" && r["state"] == "not_checked"));
+    assert!(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|l| l == "repair: not_checked"));
 }
 
 #[test]
@@ -937,7 +1018,7 @@ fn doctor_rebuilds_corrupt_index_only_after_terminal_consent() {
         .env("HOME", t.path().join("home"))
         .env("AGREP_HOME", t.path().join("home"))
         .env("AGREP_DATA_DIR", t.path().join("data"))
-        .args(["doctor", "--fix", "--json"])
+        .args(["doctor", "--fix"])
         .stdin(Stdio::from(slave))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -945,7 +1026,9 @@ fn doctor_rebuilds_corrupt_index_only_after_terminal_consent() {
         .unwrap();
     master.write_all(b"y\n").unwrap();
     let output = ok(child.wait_with_output().unwrap());
-    assert_eq!(records(&output)[0]["status"]["index"]["state"], "ready");
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|l| l == "repaired: rebuilt index; corrupt database retained"));
     let backup = fs::read_dir(t.path().join("data"))
         .unwrap()
         .map(|e| e.unwrap().path())

@@ -29,9 +29,6 @@ pub fn speakers(value: &str) -> Result<String> {
     Ok(out.join(","))
 }
 pub fn validate(f: &mut Filters) -> Result<()> {
-    if f.model_soft && f.model.is_none() {
-        bail!("--soft requires --model")
-    }
     for (name, value) in [
         ("--agent", &f.agent),
         ("--project", &f.project),
@@ -140,10 +137,94 @@ pub fn dimensions(c: &Connection, f: &Filters) -> Result<Value> {
                 || (matches!(dimension, "agent" | "who") && value.split(',').any(|a| a == v))
         });
         if !found {
-            absent.push(json!({"flag":flag,"dimension":dimension,"value":value,"indexed_values":values.len(),"known":values.iter().take(6).collect::<Vec<_>>(),"known_complete":values.len()<=6}));
+            let known = if values.len() <= KNOWN_SHOWN {
+                values.iter().collect()
+            } else {
+                nearest(value, &values)
+            };
+            let complete = known.len() == values.len();
+            absent.push(json!({"flag":flag,"dimension":dimension,"value":value,"indexed_values":values.len(),"known":known,"known_complete":complete}));
         }
     }
     Ok(json!({"empty_dimensions":absent,"checked":true}))
+}
+const KNOWN_SHOWN: usize = 6;
+/// 0.4.9's `_nearest_values` (py/surface_policy.py:869-875): the values a typo most likely
+/// meant, by difflib similarity of the case-folded strings, ties by value.
+fn nearest<'a>(value: &str, values: &'a [String]) -> Vec<&'a String> {
+    let folded: Vec<char> = crate::unicode_v16::case_fold(value).chars().collect();
+    let mut ranked: Vec<(f64, &String)> = values
+        .iter()
+        .map(|v| {
+            let other: Vec<char> = crate::unicode_v16::case_fold(v).chars().collect();
+            (similarity(&folded, &other), v)
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    ranked
+        .into_iter()
+        .take(KNOWN_SHOWN)
+        .map(|(_, v)| v)
+        .collect()
+}
+/// Python's `difflib.SequenceMatcher(None, a, b).ratio()`, autojunk included: blocks are
+/// chosen exactly as `find_longest_match` chooses them, since the choice changes the total.
+fn similarity(a: &[char], b: &[char]) -> f64 {
+    use std::collections::HashMap;
+    let mut b2j: HashMap<char, Vec<usize>> = HashMap::new();
+    for (j, c) in b.iter().enumerate() {
+        b2j.entry(*c).or_default().push(j);
+    }
+    if b.len() >= 200 {
+        let popular = b.len() / 100 + 1;
+        b2j.retain(|_, at| at.len() <= popular);
+    }
+    let longest = |alo: usize, ahi: usize, blo: usize, bhi: usize| {
+        let (mut i0, mut j0, mut size) = (alo, blo, 0);
+        let mut run: HashMap<usize, usize> = HashMap::new();
+        for (i, c) in a.iter().enumerate().take(ahi).skip(alo) {
+            let mut next = HashMap::new();
+            for &j in b2j.get(c).map(Vec::as_slice).unwrap_or_default() {
+                if j < blo {
+                    continue;
+                }
+                if j >= bhi {
+                    break;
+                }
+                let k = j.checked_sub(1).and_then(|p| run.get(&p)).unwrap_or(&0) + 1;
+                next.insert(j, k);
+                if k > size {
+                    (i0, j0, size) = (i + 1 - k, j + 1 - k, k);
+                }
+            }
+            run = next;
+        }
+        while i0 > alo && j0 > blo && a[i0 - 1] == b[j0 - 1] {
+            (i0, j0, size) = (i0 - 1, j0 - 1, size + 1);
+        }
+        while i0 + size < ahi && j0 + size < bhi && a[i0 + size] == b[j0 + size] {
+            size += 1;
+        }
+        (i0, j0, size)
+    };
+    let mut matches = 0;
+    let mut queue = vec![(0, a.len(), 0, b.len())];
+    while let Some((alo, ahi, blo, bhi)) = queue.pop() {
+        let (i, j, k) = longest(alo, ahi, blo, bhi);
+        if k > 0 {
+            matches += k;
+            if alo < i && blo < j {
+                queue.push((alo, i, blo, j));
+            }
+            if i + k < ahi && j + k < bhi {
+                queue.push((i + k, ahi, j + k, bhi));
+            }
+        }
+    }
+    match a.len() + b.len() {
+        0 => 1.0,
+        total => 2.0 * matches as f64 / total as f64,
+    }
 }
 /// 0.4.9's `empty_dimension_line` (py/surface_policy.py:896-910).
 pub fn disclose(coverage: &Value) {
@@ -192,5 +273,85 @@ mod tests {
     fn speaker_alias_is_canonical() {
         assert_eq!(speakers("you,agent").unwrap(), "user,agent");
         assert!(speakers("user,").is_err());
+    }
+    // Expected values are 0.4.9's own `_nearest_values` and difflib under Python 3.14.
+    #[test]
+    fn closest_values_rank_as_0_4_9() {
+        let owned = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let chars = |s: &str| s.chars().collect::<Vec<_>>();
+        let long = format!("{}{}/x", "ab".repeat(60), "c".repeat(90));
+        let qc = format!("q{}", "c".repeat(199));
+        assert_eq!(similarity(&chars("ccc"), &chars(&long)), 0.0);
+        assert_eq!(similarity(&chars("qc"), &chars(&qc)), 0.019801980198019802);
+        assert_eq!(
+            similarity(&chars("claude-opus5"), &chars("claude-opus-5")),
+            0.96
+        );
+        assert_eq!(similarity(&[], &[]), 1.0);
+        let mut models: Vec<String> = (0..40).map(|i| format!("model-{i}")).collect();
+        models.push("claude-opus-5".into());
+        assert_eq!(
+            nearest("claude-opus5", &models),
+            [
+                "claude-opus-5",
+                "model-5",
+                "model-15",
+                "model-25",
+                "model-35",
+                "model-0"
+            ]
+        );
+        let projects = owned(&[
+            "/work/alpha",
+            "/work/beta",
+            "/work/legacy",
+            "/work/upstream",
+            "/home/u/Straße",
+            "/home/u/STRASSE-old",
+            "/srv/gamma",
+            "/srv/delta",
+        ]);
+        assert_eq!(
+            nearest("strasse", &projects),
+            [
+                "/home/u/Straße",
+                "/home/u/STRASSE-old",
+                "/work/upstream",
+                "/srv/delta",
+                "/srv/gamma",
+                "/work/beta"
+            ]
+        );
+        let ties = owned(&["bca", "acb", "cab", "abc", "bac", "cba", "zzz"]);
+        assert_eq!(
+            nearest("CBA", &ties),
+            ["cba", "acb", "bac", "bca", "cab", "abc"]
+        );
+        let mut junk = owned(&["a", "b", "d", "e", "f", "g"]);
+        junk.push(long.clone());
+        assert_eq!(
+            nearest("ccc", &junk),
+            [
+                &"a".to_string(),
+                &long,
+                &"b".into(),
+                &"d".into(),
+                &"e".into(),
+                &"f".into()
+            ]
+        );
+        let mut extended = owned(&["qz", "zz", "yy", "xx", "ww", "vv"]);
+        extended.push(qc.clone());
+        assert_eq!(
+            nearest("qc", &extended),
+            [
+                &"qz".to_string(),
+                &qc,
+                &"vv".into(),
+                &"ww".into(),
+                &"xx".into(),
+                &"yy".into()
+            ]
+        );
     }
 }

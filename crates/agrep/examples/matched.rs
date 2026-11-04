@@ -314,6 +314,7 @@ impl Bench {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let load = load_average();
+        let begun = std::time::SystemTime::now();
         let start = Instant::now();
         let mut child = command
             .spawn()
@@ -351,12 +352,23 @@ impl Bench {
             true
         };
         let ms = if index { millis(start) } else { closed_ms };
+        let mut evidence = results::evidence(&out.stdout, &out.stderr);
+        if index && lane.role == Role::Candidate {
+            // Only this run's file counts: an index that failed early leaves the last one.
+            let stats = lane.data.join(results::INDEX_STATS);
+            if fs::metadata(&stats)
+                .and_then(|m| m.modified())
+                .is_ok_and(|t| t >= begun)
+            {
+                evidence = results::with_index_stats(evidence, &fs::read(&stats)?);
+            }
+        }
         Ok(Sample {
             ms,
             exit_ms,
             exit,
             settled,
-            evidence: results::evidence(&out.stdout, &out.stderr),
+            evidence,
             load,
             stdout: out.stdout,
             stderr: out.stderr,
@@ -647,7 +659,7 @@ fn summary(evidence: &Value) -> Value {
             value[format!("semantic_{key}")] = json!(n);
         }
     }
-    // An index run prints its phase timings: the only way to see where a hosted
+    // An index run records its phase timings: the only way to see where a hosted
     // runner spends a slow build.
     if let Some(fields) = evidence.as_object() {
         for (key, number) in fields {

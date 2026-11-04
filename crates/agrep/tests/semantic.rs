@@ -25,7 +25,7 @@ fn missing_model_is_one_line_exit_two_and_hybrid_stays_lexical() {
     store::writer(&r).unwrap();
     let out = run(
         &t,
-        &["--no-auto", "search", "-s", "database migration failure"],
+        &["search", "--no-auto", "-s", "database migration failure"],
     );
     assert_eq!(out.status.code(), Some(2));
     assert_eq!(
@@ -33,7 +33,7 @@ fn missing_model_is_one_line_exit_two_and_hybrid_stays_lexical() {
         "semantic model not installed: run agrep setup\n"
     );
     assert!(out.stdout.is_empty());
-    let out = run(&t, &["--no-auto", "search", "database migration failure"]);
+    let out = run(&t, &["search", "--no-auto", "database migration failure"]);
     assert!(!String::from_utf8_lossy(&out.stderr).contains("semantic"));
     assert!(!t.path().join("model").exists());
 }
@@ -74,7 +74,7 @@ fn partial_semantic_zero_exits_one_and_reports_numbers() {
     assert_eq!(meta["semantic_coverage"]["total"], 1);
     let out = run(
         &t,
-        &["--no-auto", "search", "-s", "database migration failure"],
+        &["search", "--no-auto", "-s", "database migration failure"],
     );
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("semantic 0/1 rows"));
@@ -120,7 +120,7 @@ fn optional_model_failure_keeps_a_completed_keyword_answer() {
             .set_len(size)
             .unwrap();
     }
-    let out = run(&t, &["--no-auto", "search", "database migration failure"]);
+    let out = run(&t, &["search", "--no-auto", "database migration failure"]);
     assert_eq!(
         out.status.code(),
         Some(0),
@@ -179,7 +179,7 @@ fn compact_profile_machine_surfaces_never_start_the_meaning_lane() {
             .unwrap();
     }
     let query = "database migration failure";
-    let json = run(&t, &["--no-auto", "search", "--json", query]);
+    let json = run(&t, &["search", "--no-auto", "--json", query]);
     let lines: Vec<serde_json::Value> = String::from_utf8_lossy(&json.stdout)
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
@@ -189,7 +189,7 @@ fn compact_profile_machine_surfaces_never_start_the_meaning_lane() {
     assert_eq!(lines[0]["semantic_coverage"], serde_json::Value::Null);
     assert!(lines[0].get("semantic_partial").is_none());
     assert!(lines[1].get("sem_score").is_none());
-    let listing = run(&t, &["--no-auto", "search", "-l", query]);
+    let listing = run(&t, &["search", "--no-auto", "-l", query]);
     let listing = String::from_utf8_lossy(&listing.stdout).into_owned();
     assert!(
         listing.starts_with("pi · fixture  [@") && listing.contains(" · 1 hit · "),
@@ -197,9 +197,9 @@ fn compact_profile_machine_surfaces_never_start_the_meaning_lane() {
     );
     for out in [
         json,
-        run(&t, &["--no-auto", "search", "-l", query]),
-        run(&t, &["--no-auto", "search", "--flat", query]),
-        run(&t, &["--no-auto", "search", "-c", query]),
+        run(&t, &["search", "--no-auto", "-l", query]),
+        run(&t, &["search", "--no-auto", "--flat", query]),
+        run(&t, &["search", "--no-auto", "-c", query]),
     ] {
         assert_eq!(out.status.code(), Some(0));
         assert!(

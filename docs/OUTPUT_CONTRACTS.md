@@ -137,8 +137,10 @@ content and requires explicit `--force` to replace an existing file.
 ## Explicit rebuilds and optional meaning failures
 
 `reindex --full` rebuilds derived rows, invalidates every vector reference and
-queues visible rows for embedding. Index/reindex JSON contains public statistics,
-without internal lock-coordination fields.
+queues visible rows for embedding. `index` and `reindex` print 0.4.9's human report
+(message and session counts, the refresh's time and phases, and the setup pointer
+while no agent is enrolled) and write the refresh's public statistics, with the
+time each lock file blocked the command, to `index-stats.json` in the data root.
 
 Only a missing model quietly disables automatic meaning retrieval. Any failure
 from an installed model is disclosed once on stderr and written to the diagnostic

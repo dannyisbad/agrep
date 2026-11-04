@@ -1,0 +1,3 @@
+{"type": "session", "id": "0b000001-0000-7000-8000-000000000001", "version": 3, "cwd": "/work/fam", "timestamp": "2026-10-09T12:00:00.000Z"}
+{"type": "message", "id": "0b000", "parentId": null, "message": {"role": "user", "content": [{"type": "text", "text": "coordinate the audit"}]}, "timestamp": "2026-10-09T12:01:00.000Z"}
+{"type": "message", "id": "0b001", "parentId": "0b000", "message": {"role": "assistant", "content": [{"type": "text", "text": "Started the audit helper."}], "model": "m", "provider": "p", "stopReason": "end_turn"}, "timestamp": "2026-10-09T12:02:00.000Z"}

@@ -32,6 +32,12 @@ impl Coverage {
     pub fn partial(&self) -> bool {
         self.embedded < self.total
     }
+    /// 0.4.9's `semantic_coverage_notice(.., suppress_trivial=True)` firing
+    /// (py/surface_policy.py:2835-2872): partial past the live-update tail, under 99% of
+    /// the rows embedded.
+    pub fn gap(&self) -> bool {
+        self.partial() && (self.embedded as f64) < self.total as f64 * 0.99
+    }
 }
 pub fn has_schema(c: &Connection) -> Result<bool> {
     Ok(c.query_row(
@@ -372,6 +378,19 @@ pub fn blocks(root: &DataRoot, c: &Connection) -> Result<Vec<Block>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Cases are 0.4.9's own (py/test_surface_policy.py:807-821) and its silent `-s` on the
+    // 24-row meaning fixture: complete coverage and a churn-sized lag say nothing; a
+    // rebuild or a small corpus missing over a quarter of its rows is a gap.
+    #[test]
+    fn coverage_names_a_gap_as_0_4_9() {
+        let gap = |embedded, total| Coverage { embedded, total }.gap();
+        assert!(!gap(24, 24));
+        assert!(!gap(0, 0));
+        assert!(!gap(46358, 46421));
+        assert!(gap(4, 7200));
+        assert!(gap(20, 28));
+        assert!(gap(0, 1));
+    }
     #[test]
     fn parallel_block_mapping_preserves_order_and_validates_paths() {
         let (_t, r) = root();

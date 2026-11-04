@@ -272,6 +272,18 @@ impl Request<'_> {
         !self.include_self
             && (self.no_self || (caller.identity.agent_context && self.waived.is_none()))
     }
+    /// The disclosure of a command that stopped before it resolved its caller, as
+    /// 0.4.9's `_machine_fields` gave it on an early error (py/search.py:7441-7450).
+    pub fn unresolved(&self, agent_context: bool) -> serde_json::Value {
+        let reason = if self.include_self {
+            "explicit-include"
+        } else if self.no_self || (agent_context && self.waived.is_none()) {
+            "caller-unresolved"
+        } else {
+            self.waived.unwrap_or("machine-surface")
+        };
+        serde_json::json!({"active": false, "reason": reason})
+    }
 }
 /// The caller rows one surface withholds (0.4.9's `SelfExclusion`).
 pub struct Policy<'a> {
@@ -421,10 +433,11 @@ impl Policy<'_> {
                     });
                 }
                 let mut tally = Withheld::default();
-                for h in found.hits.iter().filter(|h| {
-                    !(matches!(h.who.as_str(), "harness" | "synthetic")
-                        || (h.who == "subagent" && h.turn == 0))
-                }) {
+                for h in found
+                    .hits
+                    .iter()
+                    .filter(|h| !query::meta_role(&h.who, h.turn))
+                {
                     if h.who == "tool" {
                         tally.tools += 1;
                     } else {

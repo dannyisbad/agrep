@@ -285,6 +285,68 @@ fn chats_json_names_chats_by_shortest_prefix_as_0_4_9() {
         &[],
     ));
 }
+// 0.4.9 bounded a chat by its timed turns alone (agrep-core cache.rs `aggregate_sessions`):
+// expected values are its sessions.jsonl golden for the codex fixture and its chats output.
+#[test]
+fn chat_bounds_ignore_tool_calls_and_untimed_turns_as_0_4_9() {
+    let t = TempDir::new().unwrap();
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let bounds = |h: &Path, d: &Path, session: &str| {
+        let rows = values(&ok(cli(h, d, &["chats", "--side", "--json"], &[])));
+        let row = rows
+            .iter()
+            .find(|r| r["session"] == session)
+            .unwrap_or_else(|| panic!("{session} is not listed"));
+        (
+            row["first_ts"].as_i64().unwrap(),
+            row["last_ts"].as_i64().unwrap(),
+        )
+    };
+    let (h, d) = (t.path().join("codex"), t.path().join("codex-data"));
+    copy(&fixtures.join("codex/home"), &h);
+    ok(cli(&h, &d, &["index"], &[]));
+    assert_eq!(
+        bounds(&h, &d, "01990001-0002-7000-8000-000000000002"),
+        (1767358800000, 1767358800000)
+    );
+    let rollout = h.join(".codex/sessions/2026/01/02/rollout-2026-01-02T10-00-00-22222222-2222-4222-8222-222222222222.jsonl");
+    let mut body = fs::read_to_string(&rollout).unwrap();
+    body.push_str(concat!(
+        r#"{"type":"response_item","timestamp":"2026-01-02T10:05:00.000Z","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":\"late call\"}","call_id":"late_call","status":"completed"}}"#,
+        "\n",
+        r#"{"type":"response_item","timestamp":"2026-01-02T10:05:01.000Z","payload":{"type":"function_call_output","call_id":"late_call","output":"late output"}}"#,
+        "\n"
+    ));
+    fs::write(&rollout, body).unwrap();
+    ok(cli(&h, &d, &["index"], &[]));
+    assert_eq!(
+        bounds(&h, &d, "22222222-2222-4222-8222-222222222222"),
+        (1767348001000, 1767348060000)
+    );
+    let (h, d) = (t.path().join("tools"), t.path().join("tools-data"));
+    copy(&fixtures.join("around_tools/home"), &h);
+    let untimed = [
+        r#"{"type":"session","id":"0eee0000-0000-7000-8000-000000000002","version":3,"cwd":"/work/tools"}"#,
+        r#"{"type":"message","id":"u0","parentId":null,"message":{"role":"user","content":[{"type":"text","text":"first prompt has no clock"}]}}"#,
+        r#"{"type":"message","id":"a0","parentId":"u0","message":{"role":"assistant","model":"m","provider":"p","stopReason":"end_turn","content":[{"type":"text","text":"first answer"}]}}"#,
+        r#"{"type":"message","id":"u1","parentId":"a0","timestamp":"2026-10-02T12:00:05.000Z","message":{"role":"user","content":[{"type":"text","text":"second prompt has a clock"}]}}"#,
+        r#"{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-10-02T12:00:06.000Z","message":{"role":"assistant","model":"m","provider":"p","stopReason":"end_turn","content":[{"type":"text","text":"second answer"}]}}"#,
+    ];
+    fs::write(
+        h.join(".pi/agent/sessions/-work-tools/2026-10-02T12-00-00-000Z_0eee0000-0000-7000-8000-000000000002.jsonl"),
+        untimed.join("\n") + "\n",
+    )
+    .unwrap();
+    ok(cli(&h, &d, &["index"], &[]));
+    assert_eq!(
+        bounds(&h, &d, "0fff0000-0000-7000-8000-000000000001"),
+        (1790856001000, 1790856020000)
+    );
+    assert_eq!(
+        bounds(&h, &d, "0eee0000-0000-7000-8000-000000000002"),
+        (1790942405000, 1790942405000)
+    );
+}
 #[test]
 fn handle_rescue_clamp_and_tool_identity() {
     let (_t, h, d) = pi();
@@ -631,6 +693,109 @@ fn no_auto_reads_with_results_say_history_may_be_stale_as_0_4_9() {
         let o = ok(cli(&h, &d, args, &[]));
         assert_eq!(values(&o)[0]["freshness"], expected, "{args:?}");
     }
+}
+// Expected items are agrep 0.4.9's `summary pending --json` on this fixture, recorded in
+// tests/fixtures/pending/expected.json: one chat per root or side-chat signal.
+#[test]
+fn pending_signals_match_0_4_9() {
+    let t = TempDir::new().unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pending");
+    let (h, d) = (t.path().join("h"), t.path().join("d"));
+    copy(&fixture.join("home"), &h);
+    ok(cli(&h, &d, &["index"], &[]));
+    let args = ["summary", "pending", "--json", "--since", "2026-09-01"];
+    let keep = [
+        "project",
+        "status",
+        "confidence",
+        "source",
+        "turn",
+        "signals",
+        "evidence",
+        "items",
+        "caveats",
+        "handle",
+        "evidence_session",
+    ];
+    let mut got: Vec<Value> = values(&ok(cli(&h, &d, &args, &[])))
+        .into_iter()
+        .filter(|r| r["kind"] == "pending")
+        .map(|r| {
+            Value::Object(
+                keep.iter()
+                    .filter_map(|k| r.get(*k).map(|v| (k.to_string(), v.clone())))
+                    .collect(),
+            )
+        })
+        .collect();
+    got.sort_by(|a, b| a["project"].as_str().cmp(&b["project"].as_str()));
+    let expected: Value =
+        serde_json::from_str(&fs::read_to_string(fixture.join("expected.json")).unwrap()).unwrap();
+    assert_eq!(Value::Array(got), expected);
+}
+// Expected output is agrep 0.4.9's on the pi fixture (py/around.py:245-251,762-772): around's
+// metadata carries no freshness; a record after the rows says when they may be stale.
+#[test]
+fn around_freshness_record_matches_0_4_9() {
+    let (_t, h, d) = pi();
+    let unchecked = serde_json::json!({"state":"unchecked","failing":false,"checked":false,
+        "may_be_stale":true});
+    let rows = values(&ok(cli(
+        &h,
+        &d,
+        &["around", "01930000", "1", "--json"],
+        &[],
+    )));
+    assert!(rows[0].get("freshness").is_none());
+    assert_eq!(
+        (rows.len(), &rows[3]["kind"]),
+        (4, &serde_json::json!("msg"))
+    );
+    let rows = values(&ok(cli(
+        &h,
+        &d,
+        &["around", "01930000", "1", "--json", "--no-auto"],
+        &[],
+    )));
+    assert!(rows[0].get("freshness").is_none());
+    assert_eq!(rows.len(), 5);
+    assert_eq!(
+        rows[4],
+        serde_json::json!({"kind":"agrep-meta","freshness":unchecked})
+    );
+    let text = ok(cli(&h, &d, &["around", "01930000", "1", "--no-auto"], &[]));
+    assert_eq!(String::from_utf8(text.stderr).unwrap(), "");
+    let args = [
+        "around",
+        "01930000",
+        "1",
+        "--json",
+        "--who",
+        "subagent",
+        "--no-auto",
+    ];
+    let miss = cli(&h, &d, &args, &[]);
+    assert_eq!(miss.status.code(), Some(2));
+    assert_eq!(values(&miss)[0]["freshness"], unchecked);
+    // 0.5 also counts changed sources awaiting refresh on that record.
+    let root = agrep_core::data::DataRoot::open(&d, false).unwrap();
+    let _work = root.work_lock(true).unwrap().unwrap();
+    let source = h.join(".pi/agent/sessions/-work-alpha/2026-01-02T03-04-05-000Z_01930000-0000-7000-8000-000000000001.jsonl");
+    let mut body = fs::read_to_string(&source).unwrap();
+    body.push_str(r#"{"type":"message","id":"late","parentId":null,"timestamp":"2026-01-02T03:10:00.000Z","message":{"role":"user","content":[{"type":"text","text":"a later turn"}]}}"#);
+    body.push('\n');
+    fs::write(&source, body).unwrap();
+    let rows = values(&ok(cli(
+        &h,
+        &d,
+        &["around", "01930000", "1", "--json"],
+        &[],
+    )));
+    assert_eq!(
+        rows.last().unwrap()["freshness"],
+        serde_json::json!({"state":"no-known-failure","failing":false,"checked":true,
+            "pending_sources":1})
+    );
 }
 // Expected text is agrep 0.4.9's on this fixture: the empty-search line counts one
 // message per user-side row and names its matcher, chats lists short handles and
@@ -1185,7 +1350,10 @@ fn text_caps_filters_and_color_are_explicit() {
         ],
         &[],
     ));
-    assert!(values(&user).iter().skip(1).all(|v| v["who"] == "user"));
+    assert!(values(&user)
+        .iter()
+        .filter(|v| v["kind"] != "agrep-meta")
+        .all(|v| v["who"] == "user"));
     let missing = cli(
         &h,
         &d,
@@ -1485,4 +1653,728 @@ fn recall_content_fallback_admits_and_scores_as_0_4_9() {
         }
         assert!(hits.iter().all(|h| h["matched"] == "content-terms"));
     }
+}
+/// Lived rows next to the three kinds 0.4.9 scaled as tooling about history: a harness row
+/// (by the corpus's harness policy), a synthetic row (a `<synthetic>` model) and a
+/// subagent's first turn, with a later subagent turn that stays lived.
+fn meta_chats(home: &Path) {
+    let now = chrono::Utc::now().timestamp();
+    let at = |t0: i64, s: i64| {
+        chrono::DateTime::from_timestamp(t0 + s, 0)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S.000Z")
+            .to_string()
+    };
+    let write = |path: std::path::PathBuf, records: Vec<Value>| {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            path,
+            records.iter().map(|r| format!("{r}\n")).collect::<String>(),
+        )
+        .unwrap();
+    };
+    let pi = |dir: &str,
+              id: &str,
+              days: i64,
+              cwd: &str,
+              user: &str,
+              reply: &str,
+              model: Option<&str>| {
+        let t0 = now - days * 86_400;
+        let mut lines = vec![
+            serde_json::json!({"type":"session","id":id,"version":3,"cwd":cwd,"timestamp":at(t0, 0)}),
+        ];
+        let mut parent = Value::Null;
+        if let Some(model) = model {
+            lines.push(serde_json::json!({"type":"model_change","id":"m0","parentId":null,"timestamp":at(t0, 0),"provider":"anthropic","modelId":model}));
+            parent = serde_json::json!("m0");
+        }
+        lines.push(serde_json::json!({"type":"message","id":"u0","parentId":parent,"timestamp":at(t0, 1),"message":{"role":"user","content":[{"type":"text","text":user}],"timestamp":at(t0, 1)}}));
+        lines.push(serde_json::json!({"type":"message","id":"a0","parentId":"u0","timestamp":at(t0, 2),"message":{"role":"assistant","model":"pi/sonnet-5","provider":"anthropic","stopReason":"end_turn","timestamp":at(t0, 2),"content":[{"type":"text","text":reply}]}}));
+        let name = format!("{}_{id}.jsonl", at(t0, 0).replace([':', '.'], "-"));
+        write(home.join(".pi/agent/sessions").join(dir).join(name), lines);
+    };
+    pi("-work-vault", "01970000-0000-7000-8000-00000000a001", 30, "/work/vault", "how do we rotate the signing keys for the release pipeline?", "Rotate the signing keys by generating a new pair, publishing the public key and retiring the old one.", None);
+    pi(
+        "-work-vault",
+        "01970000-0000-7000-8000-00000000a002",
+        1,
+        "/work/vault",
+        "maintenance bot: rotate the signing keys on schedule",
+        "Scheduled rotation queued.",
+        Some("<synthetic>"),
+    );
+    pi(
+        "-work-bench",
+        "01970000-0000-7000-8000-00000000a003",
+        1,
+        "/work/bench",
+        "benchmark task: rotate the signing keys and report the timing",
+        "Rotated the signing keys in 2.1s.",
+        None,
+    );
+    let main = "11111111-2222-4333-8444-555555555555";
+    let project = home.join(".claude/projects/-work-app");
+    let t0 = now - 2 * 86_400;
+    write(
+        project.join(format!("{main}.jsonl")),
+        vec![
+            serde_json::json!({"sessionId":main,"cwd":"/work/app","version":"2.1.0","type":"user","userType":"external","uuid":"m0","parentUuid":null,"timestamp":at(t0, 1),"message":{"role":"user","content":"audit the release tooling before friday"}}),
+            serde_json::json!({"sessionId":main,"cwd":"/work/app","version":"2.1.0","type":"assistant","uuid":"m1","parentUuid":"m0","timestamp":at(t0, 2),"message":{"role":"assistant","model":"claude-fable-5","content":[{"type":"text","text":"I will ask a subagent how we rotate the signing keys."}]}}),
+        ],
+    );
+    let t1 = now - 86_400 + 600;
+    let side = |uuid: &str, parent: Value, s: i64, role: &str, text: &str| {
+        let mut r = serde_json::json!({"sessionId":main,"cwd":"/work/app","version":"2.1.0","agentId":"a0123456789abcdef","isSidechain":true,"type":role,"uuid":uuid,"parentUuid":parent,"timestamp":at(t1, s),"message":{"role":role,"content":[{"type":"text","text":text}]}});
+        if role == "assistant" {
+            r["message"]["model"] = serde_json::json!("claude-fable-5");
+        }
+        r
+    };
+    write(
+        project
+            .join(main)
+            .join("subagents/agent-a0123456789abcdef.jsonl"),
+        vec![
+            side(
+                "s0",
+                Value::Null,
+                1,
+                "user",
+                "Find out how we rotate the signing keys and list the steps.",
+            ),
+            side(
+                "s1",
+                serde_json::json!("s0"),
+                2,
+                "assistant",
+                "The release job calls scripts/keys.sh, which writes the new pair.",
+            ),
+            side(
+                "s2",
+                serde_json::json!("s1"),
+                3,
+                "user",
+                "also check how staging should rotate the signing keys",
+            ),
+            side(
+                "s3",
+                serde_json::json!("s2"),
+                4,
+                "assistant",
+                "Staging reuses the same script with its own vault path.",
+            ),
+        ],
+    );
+}
+// Expected rows are agrep 0.4.9's output on this fixture: every tier scales a harness or
+// synthetic row and a subagent's first turn by 0.45 (py/search.py:1222-1238, 1871-1876);
+// recall and pack take each family's best row and rank lived rows before ~meta ones
+// (py/recall.py:983-994, 2025-2035); grouped pages sink and mark ~meta rows
+// (py/search.py:5507-5516, 5608-5645); compact pages compose as py/compact.py:160-442
+// does. Scores allow one unit of drift for the seconds the run takes.
+#[test]
+fn meta_rows_scale_sink_and_mark_as_0_4_9() {
+    let t = TempDir::new().unwrap();
+    let (h, d) = (t.path().join("h"), t.path().join("d"));
+    meta_chats(&h);
+    ok(cli(&h, &d, &["index"], &[]));
+    fs::write(d.join("harness_prefixes.txt"), "benchmark task:\n").unwrap();
+    ok(cli(&h, &d, &["index"], &[]));
+    let rows = |args: &[&str]| -> Vec<(String, i64, String, f64, String)> {
+        let out = ok(cli(&h, &d, args, &[]));
+        let text = String::from_utf8(out.stdout).unwrap();
+        let hits: Vec<Value> = if args.contains(&"recall") || args.contains(&"pack") {
+            serde_json::from_str::<Value>(&text).unwrap()["hits"]
+                .as_array()
+                .unwrap()
+                .clone()
+        } else {
+            text.lines()
+                .skip(1)
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect()
+        };
+        hits.iter()
+            .map(|v| {
+                let session = v["session"].as_str().unwrap();
+                (
+                    session[session.len() - 6..].to_owned(),
+                    v["turn"].as_i64().unwrap(),
+                    v["who"].as_str().unwrap_or_default().to_owned(),
+                    v["score"].as_f64().unwrap(),
+                    v["matched"].as_str().unwrap_or("phrase").to_owned(),
+                )
+            })
+            .collect()
+    };
+    let phrase = "rotate the signing keys";
+    let terms = "signing keys rotate";
+    let content = "how often should we rotate signing certificates";
+    // Each row: session tail, turn, speaker (search surfaces), score and match lane.
+    type Row = (&'static str, i64, &'static str, f64, &'static str);
+    let cases: [(&[&str], &[Row]); 6] = [
+        (
+            &[phrase, "--json"],
+            &[
+                ("555555", 0, "agent", 0.315, "phrase"),
+                ("abcdef", 1, "subagent", 0.2991, "phrase"),
+                ("00a001", 0, "user", 0.1522, "phrase"),
+                ("abcdef", 0, "subagent", 0.1346, "phrase"),
+                ("00a001", 0, "agent", 0.0788, "phrase"),
+                ("00a002", 0, "synthetic", 0.0559, "phrase"),
+                ("00a003", 0, "harness", 0.0559, "phrase"),
+                ("00a003", 0, "agent", 0.3783, "all-terms"),
+            ],
+        ),
+        (
+            &[terms, "--json"],
+            &[
+                ("555555", 0, "agent", 0.6301, "all-terms"),
+                ("abcdef", 1, "subagent", 0.5981, "all-terms"),
+                ("00a003", 0, "agent", 0.3775, "all-terms"),
+                ("00a001", 0, "user", 0.3043, "all-terms"),
+                ("abcdef", 0, "subagent", 0.2692, "all-terms"),
+                ("00a001", 0, "agent", 0.1575, "all-terms"),
+                ("00a002", 0, "synthetic", 0.1117, "all-terms"),
+                ("00a003", 0, "harness", 0.1117, "all-terms"),
+            ],
+        ),
+        (
+            &[phrase, "-l", "--json"],
+            &[
+                ("555555", 0, "agent", 0.315, "phrase"),
+                ("abcdef", 1, "subagent", 0.2991, "phrase"),
+                ("00a003", 0, "agent", 0.3783, "all-terms"),
+                ("00a001", 0, "user", 0.1522, "phrase"),
+                ("00a002", 0, "synthetic", 0.0559, "phrase"),
+            ],
+        ),
+        (
+            &["recall", phrase, "--json"],
+            &[
+                ("555555", 0, "", 0.315, "phrase"),
+                ("00a001", 0, "", 0.1522, "phrase"),
+                ("00a002", 0, "", 0.0559, "phrase"),
+                ("00a003", 0, "", 0.0559, "phrase"),
+            ],
+        ),
+        (
+            &["recall", content, "--json"],
+            &[
+                ("00a003", 0, "", 0.189, "content-terms"),
+                ("555555", 0, "", 0.1799, "content-terms"),
+                ("00a001", 0, "", 0.0869, "content-terms"),
+                ("00a002", 0, "", 0.0319, "content-terms"),
+            ],
+        ),
+        (
+            &["pack", phrase, terms, "--json"],
+            &[
+                ("555555", 0, "", 0.315, "phrase"),
+                ("00a003", 0, "", 0.3775, "all-terms"),
+                ("00a001", 0, "", 0.1522, "phrase"),
+                ("00a002", 0, "", 0.1117, "all-terms"),
+            ],
+        ),
+    ];
+    for (args, expected) in cases {
+        let got = rows(args);
+        assert_eq!(got.len(), expected.len(), "{args:?}: {got:?}");
+        for (row, want) in got.iter().zip(expected) {
+            assert_eq!(
+                (row.0.as_str(), row.1, row.2.as_str(), row.4.as_str()),
+                (want.0, want.1, want.2, want.4),
+                "{args:?}: {got:?}"
+            );
+            assert!((row.3 - want.3).abs() <= 1.0001e-4, "{args:?}: {got:?}");
+        }
+    }
+    let plain = |out: Output| {
+        let text = String::from_utf8(out.stdout).unwrap();
+        let mut plain = String::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                chars.by_ref().find(|&c| c == 'm');
+            } else {
+                plain.push(c);
+            }
+        }
+        plain
+    };
+    let grouped = plain(ok(cli(&h, &d, &[phrase, "--color", "always"], &[])));
+    let heads: Vec<&str> = grouped
+        .lines()
+        .filter_map(|l| l.split("  @").nth(1))
+        .map(|l| l.split(' ').next().unwrap())
+        .collect();
+    assert_eq!(
+        heads,
+        [
+            "11111111:0.de2e",
+            "agent-a0:1.34cd",
+            "01970000-0000-7000-8000-00000000a001:0.76ad",
+            "01970000-0000-7000-8000-00000000a003:0.bedb",
+            "01970000-0000-7000-8000-00000000a002:0.3e1a"
+        ]
+    );
+    let turns: Vec<&str> = grouped.lines().filter(|l| l.starts_with("     ")).collect();
+    assert_eq!(
+        turns,
+        [
+            "     0 → I will ask a subagent how we rotate the signing keys.",
+            "     1 ⇒ also check how staging should rotate the signing keys",
+            "     0 ⇒ Find out how we rotate the signing keys and list the steps. ~meta",
+            "     0 › how do we rotate the signing keys for the release pipeline?",
+            "     0 → Rotate the signing keys by generating a new pair, publishing the public key and retiring the old one.",
+            "     0 → Rotated the signing keys in 2.1s.",
+            "     0 › benchmark task: rotate the signing keys and report the timing ~meta",
+            "     0 › maintenance bot: rotate the signing keys on schedule ~meta",
+        ]
+    );
+    let recall = plain(ok(cli(&h, &d, &["recall", phrase], &[])));
+    let marked: Vec<&str> = recall
+        .lines()
+        .filter(|l| l.starts_with("── @") && l.ends_with(" · ~meta"))
+        .map(|l| &l["── @".len()..l.find(" · ").unwrap()])
+        .collect();
+    assert_eq!(
+        marked,
+        [
+            "01970000-0000-7000-8000-00000000a002:0.3e1a",
+            "01970000-0000-7000-8000-00000000a003:0.62c4"
+        ]
+    );
+    let a001 = "01970000-0000-7000-8000-00000000a001:0.76ad";
+    let a003 = "01970000-0000-7000-8000-00000000a003:0.bedb";
+    for (query, expected) in [
+        (phrase, ["11111111:0.de2e", a001, "agent-a0:1.34cd", a003]),
+        (terms, ["11111111:0.de2e", a003, a001, "agent-a0:1.34cd"]),
+        (content, [a003, "11111111:0.de2e", a001, "agent-a0:1.34cd"]),
+    ] {
+        let page = plain(ok(cli(&h, &d, &[query], &[("AGREP_PROFILE", "compact")])));
+        let handles: Vec<&str> = page.lines().map(|l| &l[1..l.find(' ').unwrap()]).collect();
+        assert_eq!(handles, expected, "{query}: {page}");
+    }
+}
+
+// Expected exit codes and stderr lines are agrep 0.4.9's for the same commands on the pi
+// fixture: an option another makes inert, an impossible window and a bad bound are refused
+// by name, with a command that drops the refused option (py/surface_policy.py:943-1219,
+// py/search.py:1102-1120, 7262-7373, py/recall.py:1682-1703, py/around.py:808-860).
+#[test]
+fn usage_errors_exit_and_read_as_0_4_9() {
+    let (_t, h, d) = pi();
+    let cases: &[(&[&str], i32, &str)] = &[
+        (&["retry", "-l", "-c"], 2, "agrep: -l cannot be combined with -c, which prints one number; run: agrep search retry -c"),
+        (&["retry", "-l", "--count-by-tier"], 2, "agrep: -l cannot be combined with --count-by-tier, which prints one number per tier; run: agrep search retry --count-by-tier"),
+        (&["retry", "--json", "-c"], 2, "agrep: --json cannot be combined with -c, which prints one number; run: agrep search retry -c"),
+        (&["retry", "--json", "--count-by-tier"], 2, "agrep: --json cannot be combined with --count-by-tier, which prints one number per tier; run: agrep search retry --count-by-tier"),
+        (&["retry", "-n", "5", "-c"], 2, "agrep: -n cannot be combined with -c, which prints one number; run: agrep search retry -c"),
+        (&["retry", "-n", "5", "--count-by-tier"], 2, "agrep: -n cannot be combined with --count-by-tier, which prints one number per tier; run: agrep search retry --count-by-tier"),
+        (&["retry", "--sort", "time", "-c"], 2, "agrep: --sort cannot be combined with -c, which prints one number; run: agrep search retry -c"),
+        (&["retry", "--sort", "score", "--count-by-tier"], 2, "agrep: --sort cannot be combined with --count-by-tier, which prints one number per tier; run: agrep search retry --count-by-tier"),
+        (&["retry", "--flat", "-c"], 2, "agrep: --flat cannot be combined with -c, which prints one number; run: agrep search retry -c"),
+        (&["retry", "--flat", "--count-by-tier"], 2, "agrep: --flat cannot be combined with --count-by-tier, which prints one number per tier; run: agrep search retry --count-by-tier"),
+        (&["retry", "--flat", "--json"], 2, "agrep: --flat cannot be combined with --json, which already writes one machine row per hit; run: agrep search retry --json"),
+        (&["retry", "--flat", "-l"], 2, "agrep: --flat cannot be combined with -l, which lists matching chats, one line each; run: agrep search retry -l"),
+        (&["retry", "--classic", "-c"], 2, "agrep: --classic cannot be combined with -c, which prints one number; run: agrep search retry -c"),
+        (&["retry", "--classic", "--json"], 2, "agrep: --classic cannot be combined with --json, which already writes one machine row per hit; run: agrep search retry --json"),
+        (&["retry", "--classic", "--flat"], 2, "agrep: --classic cannot be combined with --flat, which writes one tab-separated row per hit; run: agrep search retry --flat"),
+        (&["retry", "--classic", "-l"], 2, "agrep: --classic cannot be combined with -l, which lists matching chats, one line each; run: agrep search retry -l"),
+        (&["retry", "--soft"], 2, "agrep: --soft has no effect without --model; run: agrep search retry"),
+        (&["search", "two words", "--model-soft", "--soft", "-c"], 2, "agrep: --soft has no effect without --model; run: agrep search 'two words' -c"),
+        (&["retry", "-lic"], 2, "agrep: -l cannot be combined with -c, which prints one number; run: agrep search retry -ic"),
+        (&["retry", "--chats", "--count"], 2, "agrep: -l cannot be combined with -c, which prints one number; run: agrep search retry --count"),
+        (&["retry", "-cin3", "--max=5", "-n", "8"], 2, "agrep: -n cannot be combined with -c, which prints one number; run: agrep search retry -ci"),
+        (&["--no-auto", "retry", "--color", "never", "-lc"], 2, "agrep: -l cannot be combined with -c, which prints one number; run: agrep search --no-auto retry --color never -c"),
+        (&["retry", "--classic", "--json", "-l", "-c"], 2, "agrep: -l cannot be combined with -c, which prints one number; run: agrep search retry -c"),
+        (&["it's", "--flat", "--json", "-l"], 2, "agrep: --flat cannot be combined with --json, which already writes one machine row per hit; run: agrep search 'it'\"'\"'s' --json -l"),
+        (&["--more", "abc", "-c"], 2, "agrep: -c/--count-by-tier cannot be combined with --more"),
+        (&["--more", "abc", "--flat"], 2, "agrep: --more continues a frozen compact page; --flat freezes none - rerun the query with --flat -n 80 for a bounded larger page"),
+        (&["--more", "abc", "retry"], 2, "agrep: --more cannot be combined with search, filter, or output options"),
+        (&["--more", "abc", "--sort", "score"], 2, "invalid continuation handle"),
+        (&["search"], 2, "empty pattern - add a word or phrase to search (a word that is also a command searches with: agrep search \"search\")"),
+        (&["recall", "retry", "--all-side-chats", "--no-side"], 0, ""),
+        (&["retry", "-c", "--count-by-tier"], 2, "agrep: -c and --count-by-tier are mutually exclusive"),
+        (&["retry", "--count-by-tier", "-E"], 2, "agrep: --count-by-tier requires the default keyword matcher; drop -s/-E/-w"),
+        (&["retry", "--count-by-tier", "-w"], 2, "agrep: --count-by-tier requires the default keyword matcher; drop -s/-E/-w"),
+        (&["retry", "--count-by-tier", "-s"], 2, "agrep: --count-by-tier requires the default keyword matcher; drop -s/-E/-w"),
+        (&["retry", "-E", "-w"], 2, "agrep: search matcher modes are mutually exclusive"),
+        (&["retry", "-s", "-E"], 2, "agrep: search matcher modes are mutually exclusive"),
+        (&["retry", "-s", "--lexical"], 2, "agrep: -s and --lexical are contradictory; pick one"),
+        (&["retry", "-c", "-s"], 2, "agrep: -c cannot be combined with --semantic; semantic totals are bounded"),
+        (&["retry", "-c", "--no-meta"], 2, "agrep: --no-meta cannot narrow -c/--count-by-tier; machine counts keep grep parity"),
+        (&["retry", "--agent", "nosuch"], 2, "unknown agent 'nosuch' - valid: claude, codex, opencode, antigravity, agy, kimi, cline, gemini, crush, cursor, pi, omp"),
+        (&["chats", "--agent=PI"], 2, "unknown agent 'PI' - valid: claude, codex, opencode, antigravity, agy, kimi, cline, gemini, crush, cursor, pi, omp"),
+        (&["retry", "--coverage", "--json"], 2, "agrep: --coverage cannot be combined with -c/--count-by-tier/-l/--json/--flat"),
+        (&["retry", "--coverage", "-l"], 2, "agrep: --coverage cannot be combined with -c/--count-by-tier/-l/--json/--flat"),
+        (&["retry", "--coverage", "-E"], 2, "agrep: --coverage pins the coverage lane; drop the other matcher mode"),
+        (&["retry", "--coverage", "--lexical"], 2, "agrep: --coverage pins the coverage lane; drop the other matcher mode"),
+        (&["retry", "-s", "--who", "tool"], 2, "agrep: --semantic cannot search --who tool because tool rows are not embedded; use --lexical"),
+        (&["retry", "-s", "--sort", "position"], 2, "agrep: --sort position is undefined for semantic candidates; use score or time"),
+        (&["retry", "--all-side-chats"], 2, "agrep: --all-side-chats requires --semantic"),
+        (&["recall", "retry", "--hits", "2", "--probe"], 2, "agrep recall: --hits cannot be combined with --probe, which prints one pointer line; run: agrep recall retry --probe"),
+        (&["pack", "retry", "two", "--hits=2", "--probe"], 2, "agrep pack: --hits cannot be combined with --probe, which prints one pointer line; run: agrep pack retry two --probe"),
+        (&["recall", "retry", "--hits", "0", "--probe"], 2, "agrep recall: --hits must be at least 1"),
+        (&["recall", "retry", "--probe", "--json"], 2, "agrep recall: --probe emits a pointer line and cannot be combined with --json"),
+        (&["recall", "retry", "--soft"], 2, "agrep recall: --soft has no effect without --model; run: agrep recall retry"),
+        (&["doctor", "--fix", "--json"], 2, "agrep doctor: --fix cannot be combined with --json, which prints one machine report; run: agrep doctor --json"),
+        (&["doctor", "--deep", "--fix", "--json"], 2, "agrep doctor: --fix cannot be combined with --json, which prints one machine report; run: agrep doctor --deep --json"),
+        (&["tail", "--events", "done", "--snapshot"], 2, "agrep tail: --events cannot be combined with --snapshot, which prints current session state once, not an event stream; run: agrep tail --snapshot"),
+        (&["around", "@01930000:2.18ba", "--max-chars", "100", "--full"], 2, "agrep around: --max-chars cannot be combined with --full, which uncaps indexed message text; run: agrep around @01930000:2.18ba --full"),
+        (&["around", "@01930000:2.18ba", "--max-chars", "4000", "--full"], 2, "agrep around: --max-chars cannot be combined with --full, which uncaps indexed message text; run: agrep around @01930000:2.18ba --full"),
+        (&["around", "@01930000:2.18ba", "--tool-output", "100", "--no-tools"], 2, "agrep around: --tool-output cannot be combined with --no-tools, which hides tool-call lines; run: agrep around @01930000:2.18ba --no-tools"),
+        (&["around", "@01930000:2.18ba", "--max-chars", "10", "--tool-output", "5", "--full", "--no-tools"], 2, "agrep around: --max-chars cannot be combined with --full, which uncaps indexed message text; run: agrep around @01930000:2.18ba --full --no-tools"),
+        (&["around", "@01930000:2.18ba", "--whole", "-C", "2"], 2, "agrep around: --whole reads the whole chat; drop -C N (or write -C all)"),
+        (&["around", "@01930000:2.18ba", "-C", "0", "--whole", "--json"], 2, "agrep around: --whole reads the whole chat; drop -C N (or write -C all)"),
+        (&["around", "@01930000:2.18ba", "-C", "-1", "--json"], 2, "agrep around: --context must be 0 or greater"),
+        (&["around", "@01930000:2.18ba", "-C", "abc"], 2, "agrep around: argument -C/--context/--radius: expected an integer or 'all', got 'abc'"),
+        (&["around", "@01930000:2.18ba", "--no-tools", "--who", "tool"], 1, "no tool messages or events in turns 2-2 of 01930000"),
+        (&["retry", "--since", "2025-01-02", "--until", "2025-01-01"], 2, "empty time window: --since 2025-01-02 is at or after --until 2025-01-01, so [since, until) selects no time at all - swap them for the range between them"),
+        (&["retry", "--since", "2025-01-01", "--until", "2025-01-01", "-c"], 2, "empty time window: --since 2025-01-01 and --until 2025-01-01 name the same instant, and [since, until) excludes its end, so it selects no time at all - use --until 2025-01-02 for the whole of 2025-01-01"),
+        (&["retry", "--since", "1d", "--until", "1d"], 2, "empty time window: --since 1d and --until 1d name the same instant, and [since, until) excludes its end, so it selects no time at all - give --until a later moment"),
+        (&["recall", "retry", "--since", "2025-01-02", "--until", "2025-01-01"], 2, "empty time window: --since 2025-01-02 is at or after --until 2025-01-01, so [since, until) selects no time at all - swap them for the range between them"),
+        (&["pack", "retry", "--since", "2025-01-02", "--before", "2025-01-01"], 2, "empty time window: --since 2025-01-02 is at or after --until 2025-01-01, so [since, until) selects no time at all - swap them for the range between them"),
+        (&["chats", "--since", "3d", "--until", "3d"], 2, "empty time window: --since 3d and --until 3d name the same instant, and [since, until) excludes its end, so it selects no time at all - give --until a later moment"),
+        (&["summary", "--since", "2025-01-02", "--until", "2025-01-02"], 2, "empty time window: --since 2025-01-02 and --until 2025-01-02 name the same instant, and [since, until) excludes its end, so it selects no time at all - use --until 2025-01-03 for the whole of 2025-01-02"),
+        (&["retry", "--since", "2025-01-01T00:00:00Z"], 2, "bad time '2025-01-01T00:00:00Z' - use 7d / 24h / 2w / 30m, YYYY-MM-DD or YYYY-MM-DDTHH:MM"),
+        (&["retry", "--since", "1.5h"], 2, "bad time '1.5h' - use 7d / 24h / 2w / 30m, YYYY-MM-DD or YYYY-MM-DDTHH:MM"),
+        (&["retry", "--since", "500ms"], 2, "bad time '500ms' - use 7d / 24h / 2w / 30m, YYYY-MM-DD or YYYY-MM-DDTHH:MM"),
+        (&["retry", "--since", " 7 D ", "-c"], 1, ""),
+        (&["summary", "--since", "2030-01-01"], 1, "0 projects, 0 chats since 2030-01-01, most active first · estimated active time with a 20m idle cap, side chats folded into their family"),
+    ];
+    for (args, code, stderr) in cases {
+        let o = cli(&h, &d, args, &[]);
+        assert_eq!(
+            (
+                o.status.code(),
+                String::from_utf8_lossy(&o.stderr).trim_end()
+            ),
+            (Some(*code), *stderr),
+            "{args:?}"
+        );
+        if *code == 2 {
+            assert!(o.stdout.is_empty(), "{args:?}");
+        }
+    }
+    // Absolute bounds are local wall time, with a space or `T` before the time.
+    #[cfg(unix)]
+    {
+        let east = [("TZ", "America/New_York")];
+        for (args, code, stdout) in [
+            (vec!["retry", "--since", "2026-01-01T22:05", "-c"], 1, "0\n"),
+            (vec!["retry", "--until", "2026-01-01 22:05", "-c"], 0, "3\n"),
+        ] {
+            let o = cli(&h, &d, &args, &east);
+            assert_eq!(
+                (o.status.code(), o.stdout.as_slice()),
+                (Some(code), stdout.as_bytes())
+            );
+        }
+        let summary = cli(
+            &h,
+            &d,
+            &["summary", "time", "--since", "2026-01-01", "--json"],
+            &east,
+        );
+        assert_eq!(
+            values(&summary)[0]["window"]["since_ts"],
+            1_767_243_600_000_i64
+        );
+    }
+}
+
+// Expected values are agrep 0.4.9's output on this fixture: a chat whose only user record
+// is a synthetic sidecar mirror has no turn, so 0.4.9 neither listed it nor searched its
+// tool calls, and both appear once a real turn arrives (py/corpusdb.py:2221-2234).
+#[test]
+fn chats_without_turns_stay_unlisted_and_unsearched_as_0_4_9() {
+    let t = TempDir::new().unwrap();
+    let (h, d) = (t.path().join("h"), t.path().join("d"));
+    let (alpha, beta) = (
+        "01970000-0000-7000-8000-000000000001",
+        "01970000-0000-7000-8000-000000000002",
+    );
+    let write = |id: &str, day: u32, cwd: &str, records: &[Value]| {
+        let dir = h
+            .join(".pi/agent/sessions")
+            .join(cwd.trim_start_matches('/').replace('/', "-"));
+        fs::create_dir_all(&dir).unwrap();
+        let ts = |n: usize| format!("2026-10-{day:02}T12:00:{n:02}.000Z");
+        let mut lines = vec![
+            serde_json::json!({"type":"session","id":id,"version":3,"cwd":cwd,"timestamp":ts(0)}),
+        ];
+        let mut parent = Value::Null;
+        for (n, record) in records.iter().enumerate() {
+            let mut message = record.clone();
+            let rid = message["id"].take();
+            message["timestamp"] = ts(n + 1).into();
+            lines.push(serde_json::json!({"type":"message","id":rid,"parentId":parent,"timestamp":ts(n + 1),"message":message}));
+            parent = rid;
+        }
+        let body: Vec<String> = lines.iter().map(Value::to_string).collect();
+        fs::write(
+            dir.join(format!("2026-10-{day:02}T12-00-00-000Z_{id}.jsonl")),
+            body.join("\n") + "\n",
+        )
+        .unwrap();
+    };
+    let call = |n: usize, command: &str| {
+        [
+            serde_json::json!({"id":format!("a{n}"),"role":"assistant","model":"pi/sonnet-5","provider":"anthropic","stopReason":"toolUse","content":[{"type":"toolCall","id":format!("tc{n}"),"name":"bash","arguments":{"command":command}}]}),
+            serde_json::json!({"id":format!("r{n}"),"role":"toolResult","toolCallId":format!("tc{n}"),"toolName":"bash","isError":false,"content":[{"type":"text","text":format!("{command}: found")}]}),
+        ]
+    };
+    let user = |n: usize, text: &str| serde_json::json!({"id":format!("u{n}"),"role":"user","content":[{"type":"text","text":text}]});
+    write(
+        alpha,
+        1,
+        "/work/alpha",
+        &[
+            &[user(0, "find the needle")][..],
+            &call(0, "grep needle src"),
+        ]
+        .concat(),
+    );
+    let mut mirror = user(0, "mirror of a watched chat");
+    mirror["synthetic"] = true.into();
+    let sidecar = [&[mirror][..], &call(0, "grep needle docs")].concat();
+    write(beta, 2, "/work/beta", &sidecar);
+    ok(cli(&h, &d, &["index"], &[]));
+    let listed = |o: Output| -> Vec<Value> {
+        values(&o)[1..]
+            .iter()
+            .map(|r| r["session"].clone())
+            .collect()
+    };
+    let alpha_tool =
+        format!("{alpha}\tpi\talpha\t0\ttool\tbash: grep needle src grep needle src: found\n");
+    assert_eq!(listed(ok(cli(&h, &d, &["chats", "--json"], &[]))), [alpha]);
+    let tools = ok(cli(&h, &d, &["needle", "--who", "tool"], &[]));
+    assert_eq!(String::from_utf8(tools.stdout).unwrap(), alpha_tool);
+    assert_eq!(ok(cli(&h, &d, &["needle", "-c"], &[])).stdout, b"2\n");
+    assert_eq!(cli(&h, &d, &["around", beta], &[]).status.code(), Some(2));
+    let status = values(&ok(cli(&h, &d, &["status", "--json"], &[])));
+    assert_eq!(status[0]["index"]["counts"]["sessions"], 1);
+    assert_eq!(status[0]["index"]["counts"]["tools"], 1);
+    let answer = serde_json::json!({"id":"a1","role":"assistant","model":"pi/sonnet-5","provider":"anthropic","stopReason":"end_turn","content":[{"type":"text","text":"a real answer"}]});
+    write(
+        beta,
+        2,
+        "/work/beta",
+        &[&sidecar[..], &[user(1, "now a real question"), answer]].concat(),
+    );
+    ok(cli(&h, &d, &["index"], &[]));
+    assert_eq!(
+        listed(ok(cli(&h, &d, &["chats", "--json"], &[]))),
+        [beta, alpha]
+    );
+    let tools = ok(cli(&h, &d, &["needle", "--who", "tool"], &[]));
+    assert_eq!(
+        String::from_utf8(tools.stdout).unwrap(),
+        format!("{beta}\tpi\tbeta\t0\ttool\tbash: grep needle docs grep needle docs: found\n{alpha_tool}")
+    );
+}
+
+// Expected values are agrep 0.4.9's `chats --side --json` on the codex fixture: a chat's
+// latest handle claimed its last row by turn, then time, then insertion, tool rows
+// included, so a call timed after the reply is the claim (py/search.py:8624-8662). Session
+// prefixes differ by design (PORTING.md), so only the turn and digest are compared.
+#[test]
+fn chats_latest_handle_claims_the_last_row_as_0_4_9() {
+    let t = TempDir::new().unwrap();
+    let (h, d) = (t.path().join("h"), t.path().join("d"));
+    copy(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex/home"),
+        &h,
+    );
+    ok(cli(&h, &d, &["index"], &[]));
+    let rows = values(&ok(cli(
+        &h,
+        &d,
+        &["chats", "--side", "--json", "-n", "50"],
+        &[],
+    )));
+    let mut claims: Vec<(String, String)> = rows[1..]
+        .iter()
+        .map(|r| {
+            let handle = r["latest_handle"].as_str().unwrap();
+            (
+                r["session"].as_str().unwrap().to_owned(),
+                handle.split_once(':').unwrap().1.to_owned(),
+            )
+        })
+        .collect();
+    claims.sort();
+    let expected: Vec<(String, String)> = [
+        ("01990001-0002-7000-8000-000000000002", "0.5a5e"),
+        ("01990002-0002-7000-8000-000000000002", "0.ca74"),
+        ("01990003-0003-7000-8000-000000000003", "1.b260"),
+        ("22222222-2222-4222-8222-222222222222", "1.fc20"),
+        ("33333333-3333-4333-8333-333333333333", "1.fadf"),
+    ]
+    .iter()
+    .map(|(s, c)| (s.to_string(), c.to_string()))
+    .collect();
+    assert_eq!(claims, expected);
+}
+// Expected lines are agrep 0.4.9's `index` and `reindex` reports on the pi fixture, times
+// masked, less the lines about files 0.5 does not write (crates/agrep-cli/src/main.rs:
+// 6245-6251, 7580-7615, reindex.py:72-85, 280-334). The statistics 0.5 printed instead
+// stay in the data root.
+#[test]
+fn index_reports_as_0_4_9_and_keeps_its_statistics() {
+    let t = TempDir::new().unwrap();
+    let (h, d) = (t.path().join("h"), t.path().join("d"));
+    copy(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/home"),
+        &h,
+    );
+    let times = regex::Regex::new(r"\d+(\.\d)?(ms|s)\b").unwrap();
+    let run = |args: &[&str]| {
+        let o = ok(cli(&h, &d, args, &[]));
+        (
+            times
+                .replace_all(&String::from_utf8(o.stdout).unwrap(), "T")
+                .into_owned(),
+            String::from_utf8(o.stderr).unwrap(),
+        )
+    };
+    let stats = || -> Value {
+        serde_json::from_slice(&fs::read(d.join("index-stats.json")).unwrap()).unwrap()
+    };
+    let hint = "  next: `agrep setup` - teach your agents to search this history\n";
+    let indexed = format!(
+        "=== indexing transcripts ===\n  indexed 8 messages across 5 sessions (T)\n  phases: census T · parse T · write T · bounds T · stats T\n{hint}"
+    );
+    assert_eq!(
+        run(&["index"]),
+        (
+            indexed.clone(),
+            "building the search db (a first build can take a while on a large history) …\n".into()
+        )
+    );
+    assert_eq!(
+        (stats()["sources"].clone(), stats()["parsed"].clone()),
+        (5.into(), 5.into())
+    );
+    let unchanged = "=== indexing transcripts ===\n  unchanged since last index (8 messages); skipped ingest + writes (T)\n  phases: census T\n";
+    assert_eq!(run(&["index"]), (unchanged.into(), String::new()));
+    assert_eq!(stats()["parsed"], 0);
+    assert!(stats()["census_ms"].is_number() && stats()["after_refresh_ms"].is_number());
+    assert_eq!(
+        run(&["reindex"]),
+        (
+            format!("\n=== ingest transcripts ===\n{}  (T)\n\n=== semantic embeddings (optional; not installed) ===\n  skipped without launching a worker; keyword search is ready. Enable it with `agrep setup`.\n\n  reindex complete in T.\n", &indexed["=== indexing transcripts ===\n".len()..]),
+            "refreshing the search db …\n".into()
+        )
+    );
+    // Enrollment retires the pointer, as 0.4.9's teach.json did.
+    ok(cli(
+        &h,
+        &d,
+        &["setup", "--yes", "--no-semantic", "--no-archive"],
+        &[],
+    ));
+    let source = fs::read_dir(h.join(".pi/agent/sessions/-work-alpha"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut body = fs::read_to_string(&source).unwrap();
+    body.push('\n');
+    fs::write(&source, body).unwrap();
+    let (stdout, _) = run(&["index", "--full"]);
+    assert_eq!(stdout, indexed.replace(hint, ""));
+}
+// Expected records and lines are agrep 0.4.9's for these usage errors on this fixture
+// (py/search.py:7502-7621, py/recall.py:1785-1975), less `corpus_age_s`, which 0.5 does
+// not publish. A bad regex and a stale handle carry 0.5's own reason, the line stderr
+// prints (PORTING.md).
+#[test]
+fn usage_errors_write_0_4_9_json_records() {
+    use serde_json::json;
+    let (t, h, d) = pi();
+    let floor = json!({"shown":0,"total":0,"total_basis":"floor","unit":"row","truncated":true,"action_unavailable_reason":"the query did not produce a result set"});
+    let unfiltered = json!({"empty_dimensions":[],"checked":false,"reason":"the query returned before the index was filtered"});
+    let fresh = json!({"state":"no-known-failure","failing":false,"checked":true});
+    let machine = json!({"active":false,"reason":"machine-surface"});
+    let chat = json!({"active":false,"reason":"chat-filter"});
+    let search = |query: &str, error: Value, exclusion: &Value| json!({"kind":"agrep-meta","query":query,"engine":"query:error","hits":[],"error":error,"self_exclusion":exclusion,"completeness":floor,"filter_coverage":unfiltered,"freshness":fresh,"semantic_coverage":null});
+    let recall = |query: Value, engine: &str, error: Value, exclusion: &Value| json!({"query":query,"engine":engine,"hits":[],"error":error,"self_exclusion":exclusion,"filter_coverage":unfiltered,"freshness":fresh,"semantic_coverage":null});
+    let window = "empty time window: --since 2026-02-01 is at or after --until 2026-01-01, so [since, until) selects no time at all - swap them for the range between them";
+    let bad_time = "bad time 'garbage' - use 7d / 24h / 2w / 30m, YYYY-MM-DD or YYYY-MM-DDTHH:MM";
+    let no_chat = "no session matches 'nosuchchat' - ids come from `agrep <pattern> --json`.";
+    let empty = |query: Value| {
+        recall(
+            query,
+            "query:error",
+            json!({"code":"empty-query"}),
+            &machine,
+        )
+    };
+    let cases: Vec<(&[&str], Value, &str)> = vec![
+        (&["--json"], search("", json!({"code":"empty-query"}), &machine), "empty pattern - add a word or phrase to search (a word that is also a command searches with: agrep search \"search\")"),
+        (&["search", "--json", "--since", "garbage", "retry"], search("retry", json!({"code":"invalid-time-filter"}), &machine), bad_time),
+        (&["search", "--json", "--since", "2026-02-01", "--until", "2026-01-01", "retry"], search("retry", json!({"code":"empty-time-window","reason":window}), &machine), window),
+        (&["search", "--json", "--chat", "nosuchchat", "retry"], search("retry", json!({"code":"chat-unresolved"}), &chat), no_chat),
+        (&["recall", "--json", ""], empty(json!("")), "query arguments must not be empty (searching the word itself: agrep search \"recall\")"),
+        (&["pack", "--json", "", "retry"], empty(json!(["retry"])), "query arguments must not be empty (searching the word itself: agrep search \"pack\")"),
+        (&["recall", "--json", "-s", "--lexical", "retry"], recall(json!("retry"), "query:error", json!({"code":"conflicting-modes"}), &machine), "-s and --lexical are contradictory; pick one"),
+        (&["recall", "--json", "-s", "--who", "tool", "retry"], recall(json!("retry"), "query:error", json!({"code":"unsupported-speaker"}), &machine), "-s cannot search --who tool: tool rows are not embedded; use --lexical"),
+        (&["recall", "--json", "--since", "garbage", "retry"], recall(json!("retry"), "query:error", json!({"code":"invalid-time-filter"}), &machine), bad_time),
+        (&["pack", "--json", "retry", "--since", "2026-02-01", "--until", "2026-01-01"], recall(json!(["retry"]), "query:error", json!({"code":"empty-time-window","reason":window}), &machine), window),
+        (&["recall", "--json", "--chat", "nosuchchat", "retry"], recall(json!("retry"), "query:error", json!({"code":"chat-unresolved"}), &chat), no_chat),
+    ];
+    for (args, expected, line) in cases {
+        let o = cli(&h, &d, args, &[]);
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&o.stdout).unwrap(),
+            expected,
+            "{args:?}"
+        );
+        assert_eq!(
+            String::from_utf8(o.stderr).unwrap(),
+            format!("{line}\n"),
+            "{args:?}"
+        );
+    }
+    let o = cli(&h, &d, &["search", "--json", "-E", "a)(b"], &[]);
+    let line = String::from_utf8(o.stderr).unwrap();
+    let reason = line.trim_end().strip_prefix("bad regex: ").unwrap();
+    assert_eq!((o.status.code(), line.lines().count()), (Some(2), 1));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&o.stdout).unwrap(),
+        search(
+            "a)(b",
+            json!({"code":"invalid-regex","reason":reason}),
+            &machine
+        )
+    );
+    let o = cli(&h, &d, &["recall", "--json", "@01930000:99.18ba"], &[]);
+    let line = String::from_utf8(o.stderr).unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&o.stdout).unwrap(),
+        recall(
+            json!("@01930000:99.18ba"),
+            "handle",
+            json!({"code":"stale-result-handle","reason":line.trim_end()}),
+            &machine
+        )
+    );
+    // The bounds are read before the first index is built, as in 0.4.9.
+    let unbuilt = t.path().join("unbuilt");
+    let o = cli(
+        &h,
+        &unbuilt,
+        &["search", "--json", "--since", "garbage", "retry"],
+        &[],
+    );
+    assert_eq!(o.status.code(), Some(2));
+    assert!(!unbuilt.join("index.db").exists());
 }

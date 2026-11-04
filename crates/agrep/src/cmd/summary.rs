@@ -1,4 +1,4 @@
-use crate::{date, ready, Summary};
+use crate::{cmd::usage, ready, Summary};
 use agrep_core::{
     briefing as b, handles::SessionIndex, history as h, query::Filters, render, store, surface,
 };
@@ -86,21 +86,6 @@ fn noun(n: usize, word: &str) -> String {
         if n == 1 { "" } else { "s" }
     )
 }
-/// The wording 0.4.9 gave a side chat's own signal (py/summary.py:1901-1952).
-fn side_signal(signal: &str) -> String {
-    match signal {
-        "no captured reply to the last turn" => {
-            "side chat has no captured reply to its last turn".into()
-        }
-        "reply ended before the turn's last tool call" => {
-            "side chat's reply ended before its last tool call".into()
-        }
-        _ => match signal.strip_prefix("last todo list") {
-            Some(rest) => format!("side chat todo list{rest}"),
-            None => format!("side chat's {signal}"),
-        },
-    }
-}
 /// 0.4.9's open-item line (py/summary.py:2355-2369).
 fn pending_line(item: &Value, indent: &str) -> String {
     let text = |key: &str| item[key].as_str().unwrap_or_default();
@@ -155,8 +140,13 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
     let (root, census) = ready(no_auto)?;
     let c = store::reader(&root)?;
     let all = h::sessions(&c)?;
-    let until_arg = args.until.as_deref().map(date).transpose()?;
-    let until = until_arg.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+    let now = chrono::Utc::now().timestamp_millis();
+    let until_arg = args
+        .until
+        .as_deref()
+        .map(|u| usage::date(u, now))
+        .transpose()?;
+    let until = until_arg.unwrap_or(now);
     if args.group.is_some() && args.mode.as_deref() != Some("time") {
         bail!("--group requires summary time")
     }
@@ -168,13 +158,13 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
     let max = args.max.unwrap_or(5);
     let since_text = args.since.as_deref().unwrap_or("7d");
     let since = if let Some(since) = args.since.as_deref() {
-        date(since)?
+        usage::date(since, now)?
     } else {
         until - 7 * 86400000
     };
-    if since >= until {
-        bail!("--since must be before --until")
-    };
+    if let (Some(since_arg), Some(until_arg)) = (args.since.as_deref(), args.until.as_deref()) {
+        usage::window(since_arg, since, until_arg, until)?;
+    }
     let cap = duration(&args.idle_cap)?;
     let filters = Filters {
         project: args.project.clone(),
@@ -344,22 +334,7 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
                     if delivered {
                         continue;
                     }
-                    if let Some(mut i) = b::pending(&c, side, rows, events)? {
-                        if !matches!(
-                            i["status"].as_str(),
-                            Some("agent_work_incomplete" | "todo_open" | "unknown")
-                        ) {
-                            continue;
-                        }
-                        let signals: Vec<String> = i["signals"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .filter_map(Value::as_str)
-                            .map(side_signal)
-                            .collect();
-                        i["signals"] = json!(signals);
-                        i["source"] = json!("side-chat");
+                    if let Some(mut i) = b::side_pending(&c, side, rows, events)? {
                         i["evidence_session"] = json!(side.id);
                         i["session"] = json!(s.id);
                         i["project"] = json!(h::project_leaf(&s.project));

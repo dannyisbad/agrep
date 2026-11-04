@@ -98,80 +98,287 @@ fn re(pattern: &'static str) -> regex::Regex {
         .or_insert_with(|| regex::Regex::new(pattern).expect("constant regex"))
         .clone()
 }
-fn prose(s: &str) -> String {
-    let s = re(r"(?s)```.*?```").replace_all(s, "");
-    let s = re(r"`[^`\n]*`").replace_all(&s, "");
-    s.lines()
-        .filter(|s| !s.trim_start().starts_with('>'))
-        .collect::<Vec<_>>()
-        .join("\n")
+/// Python's `str.splitlines()`.
+fn splitlines(s: &str) -> Vec<&str> {
+    let mut out = vec![];
+    let mut start = 0;
+    let mut chars = s.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        if matches!(
+            c,
+            '\n' | '\r'
+                | '\x0b'
+                | '\x0c'
+                | '\x1c'
+                | '\x1d'
+                | '\x1e'
+                | '\u{85}'
+                | '\u{2028}'
+                | '\u{2029}'
+        ) {
+            out.push(&s[start..at]);
+            start = at + c.len_utf8();
+            if c == '\r' && chars.peek().is_some_and(|(_, next)| *next == '\n') {
+                chars.next();
+                start += 1;
+            }
+        }
+    }
+    if start < s.len() {
+        out.push(&s[start..]);
+    }
+    out
 }
-fn section(s: &str) -> Option<Vec<String>> {
-    let text = prose(s);
-    let lines: Vec<_> = text.lines().collect();
+/// Unicode 16 format characters (`Cf`), which Python's `repr` escapes.
+const FORMAT: [(u32, u32); 21] = [
+    (0xAD, 0xAD),
+    (0x600, 0x605),
+    (0x61C, 0x61C),
+    (0x6DD, 0x6DD),
+    (0x70F, 0x70F),
+    (0x890, 0x891),
+    (0x8E2, 0x8E2),
+    (0x180E, 0x180E),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x2064),
+    (0x2066, 0x206F),
+    (0xFEFF, 0xFEFF),
+    (0xFFF9, 0xFFFB),
+    (0x110BD, 0x110BD),
+    (0x110CD, 0x110CD),
+    (0x13430, 0x1343F),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0001, 0xE0001),
+    (0xE0020, 0xE007F),
+];
+/// Python's `repr()` of a string; unassigned code points print as themselves.
+pub fn repr(s: &str) -> String {
+    let quote = if s.contains('\'') && !s.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
+    let printable = |c: char| {
+        let cp = c as u32;
+        !(c.is_control()
+            || crate::unicode_v16::is_space(c)
+            || FORMAT.iter().any(|(lo, hi)| (*lo..=*hi).contains(&cp))
+            || (0xE000..=0xF8FF).contains(&cp)
+            || cp >= 0xF0000)
+    };
+    let mut out = String::from(quote);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            _ if c == quote => {
+                out.push('\\');
+                out.push(c)
+            }
+            _ if c < ' ' || c == '\x7f' => out.push_str(&format!("\\x{:02x}", c as u32)),
+            _ if c.is_ascii() || printable(c) => out.push(c),
+            _ if (c as u32) <= 0xFF => out.push_str(&format!("\\x{:02x}", c as u32)),
+            _ if (c as u32) <= 0xFFFF => out.push_str(&format!("\\u{:04x}", c as u32)),
+            _ => out.push_str(&format!("\\U{:08x}", c as u32)),
+        }
+    }
+    out.push(quote);
+    out
+}
+fn one_line(s: &str) -> String {
+    history::one_line(s, usize::MAX)
+}
+/// 0.4.9's `_prose` (py/summary.py:595-600): a reply without code, quotes or links.
+fn prose(reply: &str) -> String {
+    let text = re(r"(?s)```.*?```").replace_all(reply, " ");
+    let text = re(r"`[^`\n]*`").replace_all(&text, " ");
+    let text = splitlines(&text)
+        .into_iter()
+        .filter(|line| !line.trim_start().starts_with('>'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    re(r"https?://\S+").replace_all(&text, " ").into_owned()
+}
+/// 0.4.9's `_final_sentence` (py/summary.py:603-609).
+fn final_sentence(prose: &str) -> String {
+    let Some(paragraph) = re(r"\n\s*\n")
+        .split(prose)
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .last()
+    else {
+        return String::new();
+    };
+    let tail = one_line(&re(r"[*_~#>]+").replace_all(paragraph, " "));
+    // Python splits at `(?<=[.!?])\s+`; one_line leaves single spaces.
+    let mut last = "";
+    let mut start = 0;
+    let mut previous = ' ';
+    for (at, c) in tail.char_indices() {
+        if c == ' ' && matches!(previous, '.' | '!' | '?') {
+            if !tail[start..at].trim().is_empty() {
+                last = &tail[start..at];
+            }
+            start = at + 1;
+        }
+        previous = c;
+    }
+    if !tail[start..].trim().is_empty() {
+        last = &tail[start..];
+    }
+    last.trim().to_owned()
+}
+/// 0.4.9's `_direct_request` (py/summary.py:612-622): the final sentence when it asks the
+/// human something.
+fn direct_request(reply: &str) -> Option<String> {
+    let sentence = final_sentence(&prose(reply));
+    let asks = sentence.ends_with('?')
+        && re(r"(?i)\b(should i|shall i|do you want|would you like|which|what do you|what would you|can you|could you|please confirm|your call|confirm|choose|prefer|do you|are you|is it ok|ok to|may i|want me to|how should|where should|tell me)\b").is_match(&sentence);
+    (asks
+        || re(r"(?i)\b(please confirm|awaiting your|waiting for your|waiting on you|your call)\b")
+            .is_match(&sentence))
+    .then_some(sentence)
+}
+/// 0.4.9's `_courtesy`: a short sign-off with no substance of its own.
+fn courtesy(block: &str) -> bool {
+    block.chars().count() <= 200
+        && re(r"(?i)\b(let me know|tell me|say the word|happy to|glad to|feel free|if you(?:'d| would)? (?:like|want|prefer|need)|want me to|i can (?:also|then|take)|just (?:say|ask)|shout|ping me)\b").is_match(block)
+}
+/// 0.4.9's `_open_section_items` (py/summary.py:625-664): (heading, open items, closed
+/// count) for a next-steps style section ending one reply block.
+fn section(block: &str) -> Option<(String, Vec<String>, usize)> {
+    let text = prose(block);
+    let lines = splitlines(&text);
     let heading = re(
-        r"(?i)^\s*(?:#+\s*)?(?:\*\*|__)?\s*(next steps?|remaining(?: work| items?| tasks?| steps?)?|follow[- ]?ups?|to[- ]?dos?|open items?|outstanding(?: work| items?| tasks?)?|still to do|left to do|what'?s left)\s*:?(?:\*\*|__)?\s*:?\s*$",
+        r"(?i)^\s*(?:#+\s*)?(?:\*\*|__)?\s*(next steps?|remaining(?: work| items?| tasks?| steps?)?|follow[- ]?ups?|to[- ]?dos?|open items?|outstanding(?: work| items?| tasks?)?|still to do|left to do|what'?s left)\s*:?\s*(?:\*\*|__)?\s*:?\s*$",
     );
-    let start = lines.iter().rposition(|l| heading.is_match(l))?;
+    let at = lines.iter().rposition(|line| heading.is_match(line))?;
+    let name = heading.captures(lines[at])?[1].to_lowercase();
     let bullet = re(r"^\s*(?:[-*+•]|\d+[.)])\s+(.*\S)\s*$");
-    let closed =
-        re(r"(?i)^\[[x✓✔]\]|^~~.*~~$|(?:done|completed|cancelled|canceled|skipped)\)?\.?$");
-    let courtesy = re(r"(?i)let me know|happy to|feel free|say the word");
-    let mut items = vec![];
-    for line in &lines[start + 1..] {
+    let mut bullets: Vec<String> = vec![];
+    let mut trailing: Vec<String> = vec![];
+    for line in &lines[at + 1..] {
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(m) = bullet.captures(line) {
-            let item = &m[1];
-            if !closed.is_match(item) && !re(r"(?i)^(none|nothing|n/a|all done)\b").is_match(item) {
-                items.push(item.trim_start_matches("[ ]").trim().to_string());
-            }
-        } else if !courtesy.is_match(line) {
+        match bullet.captures(line) {
+            Some(m) if trailing.is_empty() => bullets.push(m[1].trim().to_owned()),
+            _ if !bullets.is_empty() => trailing.push(line.trim().to_owned()),
+            _ => {}
+        }
+    }
+    let last = bullets.last_mut()?;
+    // Python splits the last bullet once at `(?<=[.!?])\s+(?=\S)`: a sign-off written on its line.
+    let chars: Vec<(usize, char)> = last.char_indices().collect();
+    let cut = (1..chars.len()).find_map(|i| {
+        if !matches!(chars[i - 1].1, '.' | '!' | '?') || !chars[i].1.is_whitespace() {
             return None;
         }
+        let end = (i..chars.len()).find(|j| !chars[*j].1.is_whitespace())?;
+        Some((chars[i].0, chars[end].0))
+    });
+    let mut rest = vec![];
+    if let Some((head, tail)) = cut {
+        rest.push(last[tail..].to_owned());
+        last.truncate(head);
     }
-    if items.is_empty() {
-        None
-    } else {
-        Some(items)
+    rest.extend(trailing);
+    let tail = rest.join(" ");
+    if !tail.is_empty() && !courtesy(&tail) {
+        return None;
     }
-}
-fn block_section(reply: &str, shape: &ReplyShape) -> Option<(Vec<String>, Option<String>)> {
-    let chars: Vec<_> = reply.chars().collect();
-    let mut blocks = vec![];
-    let mut at = 0;
-    for offset in &shape.breaks {
-        let end = (*offset as usize).min(chars.len());
-        if end >= at {
-            blocks.push(chars[at..end].iter().collect::<String>());
-            at = (end + 1).min(chars.len());
+    let checked = re(r"^\[[xX✓✔]\]");
+    let done = re(
+        r"(?i)(?:^~~.*~~$)|(?:\((?:done|completed|cancelled|canceled|skipped)\)\s*$)|(?:[-:—]\s*(?:done|completed|cancelled|canceled|skipped)\.?\s*$)",
+    );
+    let none = re(
+        r"(?i)^(?:(?:none|nothing)(?: else| more| further| remaining| left| open| outstanding| pending| for now| so far| at (?:the|this) (?:moment|time|point)| at present)?|n/?a|all done|no(?:thing)? (?:open|remaining|outstanding|further|more|pending)\b.*)\.?$",
+    );
+    let mut open = vec![];
+    let mut closed = 0;
+    for item in &bullets {
+        if checked.is_match(item) || done.is_match(item) {
+            closed += 1;
+            continue;
+        }
+        let item = re(r"^\[\s\]").replace(item, "");
+        let item = one_line(&re(r"[*_~#>]+").replace_all(item.trim(), " "));
+        if !item.is_empty() && !none.is_match(&item) {
+            open.push(item);
         }
     }
-    blocks.push(chars[at..].iter().collect());
-    if !shape.end.is_empty() {
-        blocks.push(shape.end.clone());
-    }
-    for (index, block) in blocks.iter().enumerate().rev() {
-        if let Some(items) = section(block) {
-            if index + 1 == blocks.len() {
-                return Some((items, None));
-            }
-            let joins = &shape.worked[index.min(shape.worked.len())..];
-            if joins.contains(&1) {
+    Some((name, open, closed))
+}
+const WORKED_YES: u8 = 1;
+const WORKED_UNKNOWN: u8 = 2;
+/// 0.4.9's `_open_section` (py/summary.py:674-705): the open section the reply ends on, with
+/// the caveat a later block earns it.
+fn open_section(
+    blocks: &[String],
+    worked: &[u8],
+) -> Option<(String, Vec<String>, usize, Option<String>)> {
+    for index in (0..blocks.len()).rev() {
+        let Some((heading, open, closed)) = section(&blocks[index]) else {
+            continue;
+        };
+        if index + 1 == blocks.len() {
+            return Some((heading, open, closed, None));
+        }
+        let joins = blocks.len() - 1 - index;
+        let mut later_joins: Vec<u8> = worked.iter().skip(index).take(joins).copied().collect();
+        later_joins.resize(joins, WORKED_UNKNOWN);
+        if later_joins.contains(&WORKED_YES) {
+            return None;
+        }
+        let later: Vec<&String> = blocks[index + 1..]
+            .iter()
+            .filter(|b| !b.trim().is_empty())
+            .collect();
+        let substantive = later.iter().find(|b| !courtesy(b));
+        let quote = |block: &str| repr(&one_line(block).chars().take(80).collect::<String>());
+        let caveat = if later.is_empty() {
+            None
+        } else if later_joins.contains(&WORKED_UNKNOWN) {
+            if substantive.is_some() {
                 return None;
             }
-            let later = blocks[index + 1..].join(" ");
-            return Some((
-                items,
-                Some(format!(
-                    "a later reply block may report this done: {}",
-                    history::one_line(&later, 160)
-                )),
-            ));
-        }
+            Some(format!(
+                "whether work followed this list is not recorded; a later block: {}",
+                quote(later[0])
+            ))
+        } else {
+            substantive.map(|b| format!("a later reply block may report this done: {}", quote(b)))
+        };
+        return Some((heading, open, closed, caveat));
     }
     None
+}
+/// 0.4.9's `_blocks` (py/summary.py:433-444): a reply split at the joining spaces the ingest
+/// recorded, blank blocks dropped.
+fn blocks(reply: &str, breaks: &[u32]) -> Vec<String> {
+    if reply.is_empty() {
+        return vec![];
+    }
+    let chars: Vec<char> = reply.chars().collect();
+    let mut out: Vec<String> = vec![];
+    let mut start = 0;
+    for offset in breaks.iter().map(|o| *o as usize) {
+        if start <= offset && offset < chars.len() && chars[offset] == ' ' {
+            out.push(chars[start..offset].iter().collect());
+            start = offset + 1;
+        }
+    }
+    out.push(chars[start..].iter().collect());
+    out.retain(|b| !b.trim().is_empty());
+    if out.is_empty() {
+        vec![reply.to_owned()]
+    } else {
+        out
+    }
 }
 #[derive(Clone, Default)]
 struct Task {
@@ -593,54 +800,402 @@ fn terminal_reply(
     combined.joins = combined.breaks.len() as u32;
     Ok((text, combined))
 }
+/// What `_terminal` (py/summary.py:711-727) reads for a turn: the text to classify, its
+/// blocks, and why its ending is missing.
+struct Terminal {
+    text: String,
+    blocks: Vec<String>,
+    worked: Vec<u8>,
+    missing: Option<&'static str>,
+}
+fn terminal(c: &Connection, s: &Session, rows: &[Row], last: &Row) -> Result<Terminal> {
+    let (reply, shape) = terminal_reply(c, s, rows, last)?;
+    let mut parts = blocks(&reply, &shape.breaks);
+    if !shape.end.is_empty() {
+        parts.push(shape.end.clone());
+        return Ok(Terminal {
+            text: shape.end,
+            blocks: parts,
+            worked: shape.worked,
+            missing: shape.end_cut.then_some("reply capped at index time; its final block ran past 8,000 chars, so a list above its ending was not indexed"),
+        });
+    }
+    let missing = (reply.chars().count() > 64_000 && reply.ends_with('…'))
+        .then_some("reply capped at index time; ending not indexed");
+    Ok(Terminal {
+        text: reply,
+        blocks: parts,
+        worked: shape.worked,
+        missing,
+    })
+}
+fn name(e: &Value) -> &str {
+    e["name"].as_str().unwrap_or_default()
+}
+fn named<'a>(e: &'a Value, fallback: &'a str) -> &'a str {
+    Some(name(e)).filter(|n| !n.is_empty()).unwrap_or(fallback)
+}
+/// Python's `max(events, key=(ts, i))`: the latest, the last recorded on a tie.
+fn newest<'a>(events: impl Iterator<Item = &'a Value>) -> Option<&'a Value> {
+    events.max_by_key(|e| e["ts"].as_i64().unwrap_or(0))
+}
+/// 0.4.9's `_question_head` (py/summary.py:1215-1239): what a parked question tool asked.
+fn question_head(event: &Value) -> String {
+    let raw = event["input"].as_str().unwrap_or_default();
+    let payload = serde_json::from_str::<Value>(raw).ok();
+    if let Some(payload) = payload.as_ref().filter(|p| p.is_object()) {
+        if let Some(questions) = payload["questions"].as_array() {
+            if let Some(q) = questions.iter().find_map(|q| q["question"].as_str()) {
+                return one_line(q);
+            }
+        }
+        for key in ["question", "plan", "prompt", "message"] {
+            if let Some(text) = payload[key].as_str().filter(|t| !t.trim().is_empty()) {
+                return one_line(text);
+            }
+        }
+    }
+    for pattern in [
+        r#""question"\s*:\s*"((?:[^"\\]|\\.)*)"#,
+        r#""plan"\s*:\s*"((?:[^"\\]|\\.)*)"#,
+    ] {
+        if let Some(found) = re(pattern)
+            .captures(raw)
+            .filter(|m| !m[1].trim().is_empty())
+        {
+            // `_json_fragment`: the input cap may have cut the string mid-escape.
+            let body = &found[1];
+            let ends: Vec<usize> = body
+                .char_indices()
+                .map(|(at, _)| at)
+                .chain([body.len()])
+                .collect();
+            let decoded = ends.iter().rev().take(6).find_map(|end| {
+                serde_json::from_str::<String>(&format!("\"{}\"", &body[..*end])).ok()
+            });
+            return one_line(&decoded.unwrap_or_else(|| body.to_owned()));
+        }
+    }
+    if payload.is_none() && raw.trim_start().starts_with(['{', '[']) {
+        return if name(event) == "ExitPlanMode" {
+            "presented a plan"
+        } else {
+            "asked a question"
+        }
+        .into();
+    }
+    one_line(raw)
+}
+/// 0.4.9's `_api_error` (py/summary.py:1265-1288): the error a Claude turn stopped on.
+fn api_error(s: &Session, later: &[&Value], reply: &str) -> Option<String> {
+    if s.agent != "claude" || reply.is_empty() {
+        return None;
+    }
+    let event = newest(later.iter().copied())?;
+    if event["kind"] != "control" || name(event) != "api_error" {
+        return None;
+    }
+    let text = event["input"].as_str().unwrap_or_default();
+    let length = text.chars().count();
+    let chars = event["input_chars"].as_u64().unwrap_or(0) as usize;
+    let (head, ends) = if text.ends_with('…') && chars >= length {
+        let head = one_line(&text.chars().take(length - 1).collect::<String>());
+        let reply_chars: Vec<char> = reply.chars().collect();
+        let split = reply_chars.len().saturating_sub(chars);
+        let tail: String = reply_chars[split..].iter().collect();
+        let ends = reply_chars.len() >= chars
+            && (split == 0 || reply_chars[split - 1].is_whitespace())
+            && one_line(&tail).starts_with(&head);
+        (head, ends)
+    } else {
+        let head = one_line(text);
+        let flat = one_line(reply);
+        let ends = flat == head || flat.ends_with(&format!(" {head}"));
+        (head, ends)
+    };
+    (!head.is_empty() && ends).then(|| one_line(text))
+}
+/// 0.4.9's `_trailing_call` (py/summary.py:1378-1387): the turn's latest work call when no
+/// reply followed it.
+fn trailing_call<'a>(later: &[&'a Value]) -> Option<&'a Value> {
+    let latest = newest(later.iter().copied().filter(|e| {
+        let name = name(e);
+        e["kind"] == "tool"
+            && !(name.to_lowercase().contains("todo")
+                || name.to_lowercase().contains("update_plan")
+                || matches!(name, "TaskCreate" | "TaskUpdate" | "TaskList")
+                || name.eq_ignore_ascii_case("yield"))
+    }))?;
+    let after_reply = latest["meta"]
+        .as_str()
+        .unwrap_or_default()
+        .split_whitespace()
+        .find_map(|part| {
+            part.split_once('=')
+                .filter(|(key, _)| *key == "after_reply")
+        })
+        .is_some_and(|(_, value)| value == "1");
+    after_reply.then_some(latest)
+}
+#[derive(Default)]
+struct Record {
+    status: &'static str,
+    confidence: Option<&'static str>,
+    signals: Vec<String>,
+    evidence: String,
+    items: Vec<String>,
+    caveats: Vec<String>,
+}
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+fn last_turn(rows: &[Row]) -> Option<&Row> {
+    rows.iter().rev().find(|r| is_turn(rows, r))
+}
+/// 0.4.9's `_classify_root` (py/summary.py:1291-1371): why a root chat still needs the human.
+fn classify_root(
+    c: &Connection,
+    s: &Session,
+    rows: &[Row],
+    events: &[Value],
+    last: &Row,
+) -> Result<Option<Record>> {
+    let t = terminal(c, s, rows, last)?;
+    let reply = t.text.as_str();
+    let later: Vec<&Value> = events
+        .iter()
+        .filter(|e| last.ts <= 0 || e["ts"].as_i64().unwrap_or(0) >= last.ts)
+        .collect();
+    let mut r = Record::default();
+    if let Some(question) =
+        newest(later.iter().copied().filter(|e| e["kind"] == "tool")).filter(|e| {
+            re(r"(?i)^(?:AskUserQuestion|ExitPlanMode|ask|request_user_input|question)$")
+                .is_match(name(e))
+                && e["ok"].is_null()
+                && e["output"].as_str().unwrap_or_default().trim().is_empty()
+        })
+    {
+        r.status = "waiting_on_user";
+        r.signals = vec![format!("{} awaits your answer", name(question))];
+        r.evidence = question_head(question);
+        return Ok(Some(r));
+    }
+    if let Some(error) = api_error(s, &later, reply) {
+        r.status = "agent_work_incomplete";
+        r.signals = vec!["final reply is an API error".into()];
+        r.evidence = error;
+        return Ok(Some(r));
+    }
+    if let Some(request) = Some(reply)
+        .filter(|r| !r.is_empty())
+        .and_then(direct_request)
+    {
+        r.status = "waiting_on_user";
+        r.signals = vec!["final reply asks you something".into()];
+        r.evidence = request;
+        return Ok(Some(r));
+    }
+    if let Some((heading, open, closed, later_block)) = Some(reply)
+        .filter(|r| !r.is_empty())
+        .and_then(|_| open_section(&t.blocks, &t.worked))
+        .filter(|section| !section.1.is_empty())
+    {
+        let done = if closed > 0 {
+            format!(" ({closed} done)")
+        } else {
+            String::new()
+        };
+        r.status = "open_next_steps";
+        r.signals = vec![format!(
+            "{heading} section lists {} open item{}{done}",
+            open.len(),
+            plural(open.len())
+        )];
+        r.evidence = open[0].clone();
+        r.items = open;
+        if let Some(caveat) = later_block {
+            r.confidence = Some("medium");
+            r.caveats = vec![caveat];
+        }
+        return Ok(Some(r));
+    }
+    let failed = later
+        .iter()
+        .rev()
+        .find(|e| e["kind"] == "tool" && e["ok"] == false);
+    let stopped = later.iter().rev().find(|e| {
+        e["kind"] == "control" && re(r"(?i)interrupt|abort|cancel|stop").is_match(name(e))
+    });
+    let failed_signal = failed.map(|e| format!("latest tool failed ({})", named(e, "tool")));
+    let stopped_signal = stopped.map(|e| format!("turn {}", named(e, "stopped")));
+    if reply.is_empty() {
+        r.signals = vec!["no captured reply to the last turn".into()];
+        r.signals.extend(failed_signal);
+        r.signals.extend(stopped_signal);
+        if last.ts <= 0 {
+            r.status = "unknown";
+            r.signals.push("last turn has no timestamp".into());
+            r.evidence = one_line(&last.text);
+        } else {
+            r.status = "agent_work_incomplete";
+            r.evidence = one_line(
+                failed
+                    .map(|e| e["output"].as_str().unwrap_or_default())
+                    .unwrap_or(&last.text),
+            );
+        }
+        return Ok(Some(r));
+    }
+    let (open, unknown) = todos(events);
+    r.caveats = unknown.into_iter().collect();
+    if !open.is_empty() {
+        r.status = "todo_open";
+        r.signals = vec![format!(
+            "last todo list has {} open item{}",
+            open.len(),
+            plural(open.len())
+        )];
+        r.evidence = open[0].clone();
+        r.items = open;
+        return Ok(Some(r));
+    }
+    if let Some(trailing) = trailing_call(&later) {
+        r.status = "agent_work_incomplete";
+        r.signals = vec![format!(
+            "reply ended before the turn's last tool call ({})",
+            named(trailing, "tool")
+        )];
+        r.signals.extend(failed_signal);
+        r.signals.extend(stopped_signal);
+        r.evidence = final_sentence(&prose(reply));
+        return Ok(Some(r));
+    }
+    if let Some(missing) = t.missing {
+        r.status = "unknown";
+        r.signals = vec![missing.into()];
+        r.evidence = final_sentence(&prose(reply));
+        return Ok(Some(r));
+    }
+    if !r.caveats.is_empty() {
+        r.status = "unknown";
+        r.signals = r.caveats.clone();
+        r.evidence = one_line(&last.text);
+        return Ok(Some(r));
+    }
+    Ok(None)
+}
+/// The body of 0.4.9's `_classify_side` (py/summary.py:1901-1951) once its family checks
+/// passed: why a side chat's open work still needs the human.
+fn classify_side(
+    c: &Connection,
+    s: &Session,
+    rows: &[Row],
+    events: &[Value],
+    last: &Row,
+) -> Result<Option<Record>> {
+    if last.ts <= 0 {
+        return Ok(None);
+    }
+    let t = terminal(c, s, rows, last)?;
+    let later: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["ts"].as_i64().unwrap_or(0) >= last.ts)
+        .collect();
+    let mut r = Record {
+        status: "agent_work_incomplete",
+        ..Default::default()
+    };
+    if t.text.is_empty() {
+        r.signals = vec!["side chat has no captured reply to its last turn".into()];
+        if let Some(failed) = later
+            .iter()
+            .rev()
+            .find(|e| e["kind"] == "tool" && e["ok"] == false)
+        {
+            r.signals
+                .push(format!("latest tool failed ({})", named(failed, "tool")));
+        }
+        r.evidence = one_line(&last.text);
+        return Ok(Some(r));
+    }
+    if let Some(error) = api_error(s, &later, &t.text) {
+        r.signals = vec!["side chat's final reply is an API error".into()];
+        r.evidence = error;
+        return Ok(Some(r));
+    }
+    let (open, unknown) = todos(events);
+    r.caveats = unknown.into_iter().collect();
+    if !open.is_empty() {
+        r.status = "todo_open";
+        r.signals = vec![format!(
+            "side chat todo list has {} open item{}",
+            open.len(),
+            plural(open.len())
+        )];
+        r.evidence = open[0].clone();
+        r.items = open;
+        return Ok(Some(r));
+    }
+    if let Some(trailing) = trailing_call(&later) {
+        r.signals = vec![format!(
+            "side chat's reply ended before its last tool call ({})",
+            named(trailing, "tool")
+        )];
+        r.evidence = final_sentence(&prose(&t.text));
+        return Ok(Some(r));
+    }
+    r.status = "unknown";
+    if let Some(missing) = t.missing {
+        r.signals = vec![format!("side chat's {missing}")];
+        r.evidence = final_sentence(&prose(&t.text));
+        return Ok(Some(r));
+    }
+    if !r.caveats.is_empty() {
+        r.signals = r
+            .caveats
+            .iter()
+            .map(|c| format!("side chat's {c}"))
+            .collect();
+        r.evidence = one_line(&last.text);
+        return Ok(Some(r));
+    }
+    Ok(None)
+}
+/// 0.4.9's `_pending_item` (py/summary.py:1955-1993) for one chat's classification.
+fn item(s: &Session, last: &Row, r: Record, source: &str) -> Value {
+    let confidence = r.confidence.unwrap_or(match r.status {
+        "waiting_on_user" | "open_next_steps" => "high",
+        "agent_work_incomplete" | "todo_open" => "medium",
+        _ => "low",
+    });
+    json!({"kind":"pending","status":r.status,"confidence":confidence,"project":history::project_leaf(&s.project),"project_label":s.project,"agent":s.agent,"session":s.id,"session_handle":history::target(&s.id),"last_ts":s.last_ts,"turn":last.turn,"handle":history::handle(&s.id,last),"source":source,"signals":r.signals,"evidence":r.evidence.chars().take(240).collect::<String>(),"items":r.items,"first_text":s.title,"caveats":r.caveats})
+}
 pub fn pending(
     c: &Connection,
     s: &Session,
     rows: &[Row],
     events: &[Value],
 ) -> Result<Option<Value>> {
-    let Some(last) = rows.iter().rev().find(|r| is_turn(rows, r)) else {
+    let Some(last) = last_turn(rows) else {
         return Ok(None);
     };
-    let (reply, shape) = terminal_reply(c, s, rows, last)?;
-    let text = if shape.end.is_empty() {
-        reply.as_str()
-    } else {
-        shape.end.as_str()
-    };
-    let tail = prose(text);
-    let final_sentence = tail.trim().rsplit(['\n']).next().unwrap_or("");
-    let mut status = "";
-    let mut confidence = "medium";
-    let mut evidence = String::new();
-    let todo_signal: String;
-    let mut signals = vec![];
-    let mut items = vec![];
-    let mut caveats = vec![];
-    let later: Vec<_> = events
-        .iter()
-        .filter(|e| e["ts"].as_i64().unwrap_or(0) >= last.ts)
-        .collect();
-    if let Some(e)=later.iter().rev().find(|e|e["name"].as_str().is_some_and(|n|matches!(n,"AskUserQuestion"|"ExitPlanMode"|"ask"|"question"|"request_user_input"))&&e["output"].as_str().unwrap_or("").is_empty()){
-        status="waiting_on_user";confidence="high";evidence=e["input"].as_str().unwrap_or("").into();signals.push("question tool awaits your answer");
-    }else if later.iter().any(|e|e["name"]=="api_error"){
-        status="agent_work_incomplete";evidence=text.into();signals.push("final reply is an API error");
-    }else if (final_sentence.ends_with('?')&&re(r"(?i)should i|shall i|do you want|would you like|can you|could you|please confirm|which|prefer|want me to|how should|where should").is_match(final_sentence))||re(r"(?i)please confirm|awaiting your|waiting for your|waiting on you|your call").is_match(final_sentence){
-        status="waiting_on_user";confidence="high";evidence=final_sentence.into();signals.push("final reply asks you something");
-    }else if let Some((open,caveat))=block_section(&reply,&shape){status="open_next_steps";confidence=if caveat.is_some(){"medium"}else{"high"};evidence=open[0].clone();items=open;signals.push("final reply lists open next steps");if let Some(c)=caveat{caveats.push(c);}
-    }else if reply.is_empty(){status=if last.ts>0{"agent_work_incomplete"}else{"unknown"};confidence=if last.ts>0{"medium"}else{"low"};evidence=last.text.clone();signals.push("no captured reply to the last turn");
-    }else{
-        let (open,unknown)=todos(events);if !open.is_empty(){status="todo_open";evidence=open[0].clone();todo_signal=format!("last todo list has {} open item{}",open.len(),if open.len()==1{""}else{"s"});signals.push(todo_signal.as_str());items=open;}
-        else if later.iter().any(|e|e["meta"].as_str().unwrap_or("").split_whitespace().any(|m|m=="after_reply=1")){status="agent_work_incomplete";evidence=final_sentence.into();signals.push("reply ended before the turn's last tool call");}
-        else if let Some(reason)=unknown{status="unknown";confidence="low";evidence=final_sentence.into();caveats.push(reason);}
-        else if shape.end_cut{status="unknown";confidence="low";evidence=final_sentence.into();caveats.push("reply ending was capped; omitted items cannot be classified".into());}
-    }
-    if status.is_empty() {
+    Ok(classify_root(c, s, rows, events, last)?.map(|r| item(s, last, r, "root")))
+}
+/// A side chat's pending item, worded for its root's briefing.
+pub fn side_pending(
+    c: &Connection,
+    s: &Session,
+    rows: &[Row],
+    events: &[Value],
+) -> Result<Option<Value>> {
+    let Some(last) = last_turn(rows) else {
         return Ok(None);
-    }
-    Ok(Some(
-        json!({"kind":"pending","status":status,"confidence":confidence,"project":history::project_leaf(&s.project),"project_label":s.project,"agent":s.agent,"session":s.id,"session_handle":history::target(&s.id),"last_ts":s.last_ts,"turn":last.turn,"handle":history::handle(&s.id,last),"source":"root","signals":signals,"evidence":history::one_line(&evidence,240),"items":items,"first_text":s.title,"caveats":caveats}),
-    ))
+    };
+    Ok(classify_side(c, s, rows, events, last)?.map(|r| item(s, last, r, "side-chat")))
 }
 
 pub fn returned(rows: &[Row], events: &[Value]) -> bool {
@@ -727,16 +1282,45 @@ mod tests {
         failed["ok"] = json!(false);
         assert_eq!(todos(&[init, failed]).0, vec!["compile", "test"]);
     }
+    // Expected values are 0.4.9's own helpers in py/summary.py.
     #[test]
     fn completed_checklists_and_later_work_do_not_reopen() {
-        assert!(section("Next steps:\n- [x] done\n- None").is_none());
+        assert_eq!(
+            section("Next steps:\n- [x] done\n- None"),
+            Some(("next steps".into(), vec![], 1))
+        );
         let text = "Next steps:\n- run tests All tests passed.";
-        let shape = ReplyShape {
-            breaks: vec![23],
-            worked: vec![1],
-            ..Default::default()
-        };
-        assert!(block_section(text, &shape).is_none());
+        let parts = blocks(text, &[23]);
+        assert_eq!(parts, ["Next steps:\n- run tests", "All tests passed."]);
+        assert!(open_section(&parts, &[1]).is_none());
+        assert_eq!(
+            section("## Follow-ups\n- check `x` (done)\n- [ ] wire the CLI. Let me know if you want more."),
+            Some(("follow-ups".into(), vec!["wire the CLI.".into()], 1))
+        );
+        assert_eq!(
+            final_sentence(&prose(
+                "Done.\n\nSee https://x.y/z?a=1 for **details**. Shall we ship it?"
+            )),
+            "Shall we ship it?"
+        );
+        let asked = |input: &str, name: &str| question_head(&json!({"input":input,"name":name}));
+        assert_eq!(
+            asked(
+                r#"{"questions":[{"question":"Pick one?"}]}"#,
+                "AskUserQuestion"
+            ),
+            "Pick one?"
+        );
+        assert_eq!(
+            asked(r#"{"plan": "step one\nstep tw"#, "ExitPlanMode"),
+            "step one step tw"
+        );
+        assert_eq!(asked(r#"{"x": 1"#, "ExitPlanMode"), "presented a plan");
+        assert_eq!(
+            repr("I'll check the 'legacy' schema \"before\" that."),
+            r#"'I\'ll check the \'legacy\' schema "before" that.'"#
+        );
+        assert_eq!(repr("it's\u{200d}\u{a0}é"), r#""it's\u200d\xa0é""#);
     }
     #[test]
     fn interval_union_counts_overlap_once() {

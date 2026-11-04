@@ -122,6 +122,44 @@ pub fn latest(c: &Connection, s: &Session) -> Result<Option<Row>> {
         None
     })
 }
+/// The row a chat's latest handle claims, as 0.4.9's `_chat_latest_claims` picked it
+/// (py/search.py:8624-8662): the last nonempty row by turn, then time, then insertion,
+/// where a searched tool row followed every row of its turn, so a call timed after the
+/// reply is the claim.
+pub fn latest_claim(c: &Connection, s: &Session, tools: bool) -> Result<Option<Row>> {
+    let prose = latest(c, s)?;
+    if !tools {
+        return Ok(prose);
+    }
+    let mut q = c.prepare_cached("SELECT position,ts,text,source,turn FROM tools WHERE session=?1 AND agent=?2 AND visible=1 AND length(text)>0 ORDER BY position DESC,ts DESC,id DESC LIMIT 1")?;
+    let tool = q
+        .query_map(params![s.id, s.agent], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+                r.get(3)?,
+                r.get(4)?,
+            ))
+        })?
+        .next()
+        .transpose()?
+        .map(|(turn, ts, text, source, source_turn)| {
+            Ok::<_, anyhow::Error>(Row {
+                turn,
+                who: "tool".into(),
+                ts,
+                text: store::decode("tools", text)?,
+                source,
+                source_turn,
+            })
+        })
+        .transpose()?;
+    Ok(match (prose, tool) {
+        (Some(p), Some(t)) if (p.turn, p.ts) > (t.turn, t.ts) => Some(p),
+        (prose, tool) => tool.or(prose),
+    })
+}
 pub fn turn_count(c: &Connection, s: &Session) -> Result<i64> {
     Ok(c.query_row(
         "SELECT count(DISTINCT position) FROM prose WHERE session=?1 AND agent=?2 AND visible=1",

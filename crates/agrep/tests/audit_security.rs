@@ -37,8 +37,9 @@ fn fixture() -> TempDir {
     let dir = t.path().join("home/.pi/agent/sessions/project");
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("session.jsonl"),format!("{}\n{}\n",json!({"type":"session","id":"secure-session","version":3,"cwd":t.path()}),json!({"type":"message","id":"m1","parentId":null,"timestamp":"2026-10-29T10:01:00Z","message":{"role":"user","content":[{"type":"text","text":"database migration failure"}]}}))).unwrap();
-    let out = ok(&t, &["index"]);
-    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    ok(&t, &["index"]);
+    let value: Value =
+        serde_json::from_slice(&fs::read(t.path().join("data/index-stats.json")).unwrap()).unwrap();
     assert!(value.get("skipped_lock").is_none());
     t
 }
@@ -135,8 +136,8 @@ fn full_reindex_clears_vector_references_and_queues_every_visible_row() {
     let c = store::writer(&root).unwrap();
     c.execute_batch("INSERT INTO semantic_refs SELECT id,digest,digest FROM prose; INSERT INTO semantic_blocks VALUES('old',1); INSERT INTO semantic_chunks SELECT digest,0,'old',0 FROM prose LIMIT 1; DELETE FROM semantic_queue;").unwrap();
     drop(c);
-    let out = ok(&t, &["reindex", "--full"]);
-    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    ok(&t, &["reindex", "--full"]);
+    let value: Value = serde_json::from_slice(&fs::read(root.index_stats()).unwrap()).unwrap();
     assert!(value.get("skipped_lock").is_none());
     let c = store::reader(&root).unwrap();
     assert_eq!(agrep_core::semantic::coverage(&c).unwrap().embedded, 0);
@@ -206,21 +207,29 @@ fn doctor_preserves_edited_extensions_and_hook_json_layout() {
         .path()
         .join("home/.pi/agent/extensions/agrep-postcompact.ts");
     fs::write(&extension, b"user edits").unwrap();
-    let out = command(&t)
-        .args(["doctor", "--fix", "--json"])
-        .output()
-        .unwrap();
+    let out = command(&t).args(["doctor", "--fix"]).output().unwrap();
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stdout).contains("file has user edits"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The failed repair names its cause, as 0.4.9's doctor rows did.
+    let failed = stdout
+        .lines()
+        .find(|l| l.starts_with("integration_repair: failed - "))
+        .unwrap_or_else(|| panic!("{stdout}"));
+    assert!(
+        failed.contains(&extension.display().to_string()),
+        "{failed}"
+    );
     assert_eq!(fs::read(&extension).unwrap(), b"user edits");
     fs::remove_file(&extension).unwrap();
-    ok(&t, &["doctor", "--fix", "--json"]);
+    ok(&t, &["doctor", "--fix"]);
     assert!(extension.exists());
     ok(&t, &["remove"]);
     assert_eq!(fs::read_to_string(settings).unwrap(), original);
 }
+// `index` runs the post-index hook itself, after the refresh, so the hook's output exists
+// once it exits.
 #[test]
-fn ordinary_index_spawns_and_drains_detached_work() {
+fn index_runs_the_post_index_hook_before_it_exits() {
     let t = fixture();
     let output = t.path().join("hook-done");
     let hook = if cfg!(windows) {
@@ -231,16 +240,8 @@ fn ordinary_index_spawns_and_drains_detached_work() {
     ok(&t, &["set", "post_index", &hook]);
     fs::write(t.path().join("home/.pi/agent/sessions/project/second.jsonl"),format!("{}\n{}\n",json!({"type":"session","id":"second-session","version":3,"cwd":t.path()}),json!({"type":"message","id":"m2","parentId":null,"timestamp":"2026-10-29T10:02:00Z","message":{"role":"user","content":[{"type":"text","text":"new background input"}]}}))).unwrap();
     ok(&t, &["index"]);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while !output.exists() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "detached work did not execute"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    assert!(fs::read_to_string(&output).unwrap().starts_with("done"));
     let root = DataRoot(t.path().join("data"));
-    let _lock = root.work_lock(true).unwrap();
     let c = store::reader(&root).unwrap();
     assert_eq!(
         c.query_row(
@@ -251,7 +252,6 @@ fn ordinary_index_spawns_and_drains_detached_work() {
         .unwrap(),
         0
     );
-    assert!(fs::read_to_string(output).unwrap().starts_with("done"));
 }
 #[test]
 fn native_resume_rejects_options_and_relative_working_directories() {

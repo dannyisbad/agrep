@@ -25,6 +25,10 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   uses, which folds tiers into one score, where 0.4.9 took it tier-first: one chat ranking
   serves both, and they differ only for a chat whose best phrase row scores below one of
   its all-terms rows.
+- A one- or two-character query scales harness and synthetic rows and a subagent's first
+  turn by 0.45 like any other query, where 0.4.9's fast path for such a query without
+  filters left ASCII rows unscaled: 0.4.9 scaled the same rows once a filter sent that
+  query down its ordinary path, so its order depended on whether a filter was given.
 - A tool event keeps only its trimmed search text, so `--tool-output` and JSON
   `input`/`output` lack the surrounding whitespace 0.4.9 stored separately, and
   `[+N indexed chars]` counts the trimmed output: the index stores one text per event.
@@ -65,6 +69,15 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   chats would cost the same full count.
 - Compact pages offer no `agrep --deeper` broader rerun: 0.5 drops the hidden `--deeper`
   replay; the larger `-n` rerun stays.
+- A bad `-E` pattern is reported with 0.5's regex engine's message (`bad regex: Parsing
+  error at position 1: Opening parenthesis without closing parenthesis`, also the JSON
+  record's `reason`) where 0.4.9 quoted Python's `re` (`missing ), unterminated subpattern
+  at position 0`): 0.5 has no Python.
+- A recall or pack handle that names no turn prints 0.5's handle message (`result handle
+  is stale: turn 99 is outside chat turns 0-2; rerun the search for a current handle`),
+  also the JSON record's `reason`, under 0.4.9's codes: 0.5 handles carry a content
+  digest, and the message says which part no longer resolves where 0.4.9's said only that
+  no session matched.
 
 ## Caller exclusion, truncation flags and terminal quoting
 
@@ -92,6 +105,44 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   daemon, diagnostics-tier, warning and build-identity keys are gone with that machinery.
 - A bare `agrep` runs `status` rather than 0.4.9's welcome page of recent chats and example
   commands: one status page serves both, and `agrep chats` lists the recent chats.
+
+## Around, summary and usage errors
+
+- Sources changed since the last refresh appear as `pending_sources` on around's trailing
+  freshness record, with no stderr line, where 0.4.9 printed an `index-behind` record with
+  `changed_stores` and `serving the last-good index (N stores changed)`: 0.5 refreshes
+  them in the background as it answers, so the count is the whole story, as in search,
+  recall and chats. Under `AGREP_DATA_READONLY` the record says `unchecked`: 0.5 skips
+  the source check when it may not write.
+
+## Command line and help
+
+- Help pages and argument errors use clap's layout and wording (`Usage:`, `-h, --help  Print
+  help`, `error: unexpected argument '--x' found`) instead of argparse's: 0.5 parses every
+  command with one clap parser. Each page keeps 0.4.9's descriptions, option text, examples
+  and exit lines wherever the command behaves the same; the refusals 0.4.9 worded itself
+  (option gates, time windows, `--more`) keep their wording; and every argument error still
+  exits 2, as 0.4.9's did.
+- `status`, `resume`, `ui` and `serve` also accept `--no-auto`, which 0.4.9 refused with
+  exit 2: in 0.5 each of them checks the agent stores for changes itself, as search does,
+  where 0.4.9 left that to its daemon. `index --semantic` is new: it downloads the model if
+  needed and embeds every row before exiting.
+- search's `--strict-semantic` and reindex's `--max-new` are gone (exit 2): the first was
+  a compatibility alias that changed nothing, since `-s` already exits 2 when meaning is
+  unavailable, and the second bounded the 0.4.9 daemon's background embedding passes,
+  which 0.5's background worker replaces with fixed batches.
+
+## Index and reindex
+
+- `index` prints 0.4.9's report without the lines about files 0.5 does not keep (the
+  per-agent parse lines, the `-> messages.jsonl` target, and the `replies.jsonl` and
+  event-stream lines with their counts), and its phases are 0.5's: census, parse, write,
+  bounds and stats, or only the census for an unchanged pass. The statistics object 0.5
+  printed before is written to `index-stats.json` in the data root: 0.5 keeps one SQLite
+  database instead of those files.
+- `reindex` prints that report under 0.4.9's `=== ingest transcripts ===` stage, without
+  its `(rust)` label or its `no new messages since last index` shortcut: 0.5's reindex
+  always reparses every source, so it always has an index to report.
 
 ## Integrations and archive port
 

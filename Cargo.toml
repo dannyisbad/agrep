@@ -13,7 +13,7 @@ anyhow = "1"
 rayon = "1"
 chrono = "0.4"
 flate2 = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "wrap_help"] }
 sha2 = "0.11"
 unicode-normalization = "=0.1.24"
 unicode-segmentation = "=1.12.0"

@@ -507,3 +507,29 @@ fn statistics_are_the_upper_median_and_nearest_rank_p95() {
     assert_eq!(matched::median(&[]), None);
     assert_eq!(matched::p95(&[]), None);
 }
+
+#[test]
+fn an_index_run_keeps_its_phases_from_its_statistics_file() {
+    let stdout = "=== indexing transcripts ===\n  indexed 8 messages across 5 sessions (40ms)\n  phases: census 1ms · parse 2ms\n";
+    let report = results::evidence(stdout.as_bytes(), b"");
+    assert!(report.get("census_ms").is_none());
+    let merged = results::with_index_stats(
+        report,
+        br#"{"sources":5,"parsed":5,"changed_rows":20,"census_ms":1.5,"parse_ms":2.25}"#,
+    );
+    assert_eq!(
+        [
+            &merged["sources"],
+            &merged["changed_rows"],
+            &merged["census_ms"],
+            &merged["parse_ms"]
+        ],
+        [&json!(5), &json!(20), &json!(1.5), &json!(2.25)]
+    );
+    assert_eq!(merged["bench_stdout_bytes"], stdout.len());
+    assert_eq!(results::INDEX_STATS, "index-stats.json");
+    assert_eq!(
+        results::with_index_stats(json!({"stdout_bytes":1}), b"=== not json"),
+        json!({"stdout_bytes":1})
+    );
+}

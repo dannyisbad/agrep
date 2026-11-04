@@ -32,10 +32,6 @@ fn follow(
     events: Option<String>,
     snapshot: bool,
 ) -> Result<i32> {
-    ensure!(
-        !snapshot || events.is_none(),
-        "--events cannot be combined with --snapshot"
-    );
     let mut agents = vec![];
     for a in &agent {
         for a in a.split(',').filter(|s| !s.trim().is_empty()) {

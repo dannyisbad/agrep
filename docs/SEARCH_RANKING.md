@@ -77,7 +77,13 @@ S = round(T * R * W * B, 4)
   recency floor.
 - `W` is the speaker/source prior. User prose leads; agent and subagent prose
   follow; tool output, recaps, control, synthetic, and harness rows are
-  progressively downweighted.
+  progressively downweighted. Rows about tooling rather than history (harness
+  and synthetic rows, and a subagent's first turn, which is its spawned task
+  prompt) take a further 0.45 in every tier and in a meaning row's score; the
+  explicit `--coverage` lane does not apply it. Such rows carry `~meta`: grouped
+  classic pages and compact pages show them below lived rows, and recall and pack
+  rank each query's lived family heads before them. A row proven to follow a
+  history command keeps its score; `--no-meta` drops it.
 - `B` is the boundary factor below. It is a penalty only: `0 <= B <= 1`. It is
   graded on the snippet with every `…` replaced by a neighbouring character, so
   a cut never looks like a word edge: a phrase row takes the best factor over
@@ -251,14 +257,20 @@ caps that request at 200 chats. Without `-n` a search fetches the ranked top 40.
 
 A compact page:
 
+- orders rows as 0.4.9 did: `~meta` rows last, and within each quality lane
+  (phrase, meaning, all terms) one row per conversation family before the rest;
+  meaning rows follow the first three phrase rows that are not interior matches;
 - shows at most 16 lines (fewer when `-n` asks for fewer);
 - after four rows, stops at a 3,584-byte budget; if at least four valid matches
   exist, the best four still render, with lines shortened to share the budget;
 - shows one row per session turn (one per handle for tool rows) and, without
   `-n`, at most three rows per conversation family and two tool rows (four when
   every row is a tool row);
-- without `-n`, skips rows scoring below 35% of the page leader after the first
-  four;
+- without `-n`, after the first four rows, stops at a row of the leader's lane
+  scoring below 35% of the leader, and a phrase-led page stops at its first
+  all-terms row unless an earlier row was deferred;
+- without `-n`, keeps room on the first page for the two best all-terms rows,
+  dropping its last phrase rows if the page would overflow;
 - marks lower-quality rows with `~substr` or `~all`, and meaning rows with
   `~semantic (meaning match)`.
 

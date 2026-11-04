@@ -14,16 +14,10 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
     }
     let (root, census) = ready(no_auto)?;
     let c = store::reader(&root)?;
+    let tools = root.config()?.tools;
     let all = h::sessions(&c)?;
     let mut filters = args.scope.filters()?;
     h::validate_filters(&filters)?;
-    if filters
-        .since
-        .zip(filters.until)
-        .is_some_and(|(s, u)| s >= u)
-    {
-        bail!("--since must be before --until")
-    }
     let pattern = args.pattern.join(" ");
     if args.pattern.len() == 1 && pattern.starts_with('@') && pattern.contains(':') {
         agrep_core::handles::parse(&pattern)?;
@@ -75,7 +69,7 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
             count_by_tier: false,
             content: false,
             chats: true,
-            tools: root.config()?.tools,
+            tools,
             filters: filters.clone(),
         };
         // Content heads come from outside the withheld rows, so a chat's head can sit
@@ -208,7 +202,7 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
         )
     };
     for s in &selected {
-        let latest = h::latest(&c, s)?;
+        let latest = h::latest_claim(&c, s, tools)?;
         let latest_handle = latest.as_ref().map(|r| short(&h::handle(&s.id, r), &s.id));
         let turns = h::turn_count(&c, s)?;
         let hit = hits

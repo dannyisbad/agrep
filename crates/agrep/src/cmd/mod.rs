@@ -20,6 +20,7 @@ pub mod status;
 pub mod summary;
 pub mod tail;
 pub mod ui;
+pub mod usage;
 pub mod why;
 pub mod work;
 

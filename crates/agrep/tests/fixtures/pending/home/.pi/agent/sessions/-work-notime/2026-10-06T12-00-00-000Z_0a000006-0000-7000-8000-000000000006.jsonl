@@ -1,0 +1,4 @@
+{"type": "session", "id": "0a000006-0000-7000-8000-000000000006", "version": 3, "cwd": "/work/notime", "timestamp": "2026-10-06T12:00:00.000Z"}
+{"type": "message", "id": "m0", "parentId": null, "message": {"role": "user", "content": [{"type": "text", "text": "first question"}]}, "timestamp": "2026-10-06T12:01:00.000Z"}
+{"type": "message", "id": "m1", "parentId": "m0", "message": {"role": "assistant", "content": [{"type": "text", "text": "first answer."}], "model": "m", "provider": "p", "stopReason": "end_turn"}, "timestamp": "2026-10-06T12:02:00.000Z"}
+{"type": "message", "id": "m2", "parentId": "m1", "message": {"role": "user", "content": [{"type": "text", "text": "second question without a clock"}]}}

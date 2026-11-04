@@ -4,17 +4,29 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::{fs, path::Path};
-/// Bytes and files under `path`, without following links.
+/// Bytes and files under `path`, without following links. Background workers and SQLite
+/// create and delete files in the data root while this walks it, so an entry gone by the
+/// time it is examined counts as absent.
 pub fn disk_usage(path: &Path) -> Result<(u64, u64)> {
-    let m = fs::symlink_metadata(path)?;
+    let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    let m = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if gone(&e) => return Ok((0, 0)),
+        Err(e) => return Err(e.into()),
+    };
     if m.file_type().is_symlink() {
         return Ok((0, 0));
     }
     if m.is_file() {
         return Ok((m.len(), 1));
     }
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(e) if gone(&e) => return Ok((0, 0)),
+        Err(e) => return Err(e.into()),
+    };
     let (mut bytes, mut files) = (0, 0);
-    for e in fs::read_dir(path)? {
+    for e in entries {
         let (b, f) = disk_usage(&e?.path())?;
         (bytes, files) = (bytes + b, files + f);
     }
@@ -178,4 +190,27 @@ pub fn source_path(key: &str, agent: &str) -> String {
         }
     }
     key.into()
+}
+
+#[cfg(test)]
+mod tests {
+    // `status` failed with ENOENT when a merge worker's last SQLite connection deleted
+    // index.db-wal between the walk listing the data root and examining the entry.
+    #[test]
+    fn an_entry_removed_after_the_listing_counts_as_absent() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(t.path().join("index.db"), b"12345").unwrap();
+        std::fs::write(t.path().join("index.db-wal"), b"123").unwrap();
+        let listed: Vec<_> = std::fs::read_dir(t.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        std::fs::remove_file(t.path().join("index.db-wal")).unwrap();
+        let usage = listed
+            .iter()
+            .map(|p| super::disk_usage(p).unwrap())
+            .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+        assert_eq!(usage, (5, 1));
+        assert_eq!(super::disk_usage(t.path()).unwrap(), (5, 1));
+    }
 }

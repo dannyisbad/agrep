@@ -5,31 +5,53 @@ use agrep_core::{
     render::{self, Style},
     semantic, store,
 };
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::io::IsTerminal;
 pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
     let _query_span = agrep_core::semantic_profile::span("query_total");
     let query_start = std::time::Instant::now();
     let timing = agrep_core::semantic_profile::timing_enabled();
     let pattern = s.pattern.join(" ");
+    let request = caller::Request {
+        include_self: s.scope.include_self,
+        no_self: s.scope.no_self,
+        waived: s.scope.chat.is_some().then_some("chat-filter"),
+    };
+    // 0.4.9's usage errors, in its order and each with its `--json` record
+    // (py/search.py:7522-7621): the time bounds are read before the index refreshes.
+    let stop = |error: (&str, Option<&str>)| -> Result<i32> {
+        if s.json {
+            let unit = if s.chats { "chat" } else { "row" };
+            let query = serde_json::json!(pattern.trim());
+            super::usage::stopped(Some(unit), query, "query:error", error, request, no_auto)?;
+        }
+        Ok(2)
+    };
+    if pattern.trim().is_empty() {
+        // `agrep search` also lands here when a bare `agrep <word>` consumed a command word.
+        eprintln!("empty pattern - add a word or phrase to search (a word that is also a command searches with: agrep search \"search\")");
+        return stop(("empty-query", None));
+    }
+    if s.regex {
+        if let Some(reason) = agrep_core::query::regex_error(pattern.trim()) {
+            eprintln!("bad regex: {reason}");
+            return stop(("invalid-regex", Some(&reason)));
+        }
+    }
+    let mut f = match s.scope.filters() {
+        Ok(f) => f,
+        Err(e) => {
+            if let Some(error) = super::usage::recorded(&e) {
+                stop(error)?;
+            }
+            return Err(e);
+        }
+    };
+    agrep_core::coverage::validate(&mut f)?;
     // 0.4.9's `profile_wants` (py/search.py:7375-7381): the compact page, and with it the
     // automatic meaning lane, serves only the default row surface.
     let compact_page =
         compact(s.classic) && !(s.json || s.flat || s.chats || s.count || s.count_by_tier);
-    if s.coverage
-        && (s.json
-            || s.flat
-            || s.count
-            || s.count_by_tier
-            || s.chats
-            || s.semantic
-            || s.lexical
-            || s.regex
-            || s.word
-            || s.sort != "score")
-    {
-        bail!("--coverage requires a default keyword score query without machine output");
-    }
     if s.semantic && !semantic::installed(&agrep_core::data::DataRoot::discover()?) {
         eprintln!("semantic model not installed: run agrep setup");
         return Ok(2);
@@ -57,21 +79,20 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
         ready(no_auto)?
     };
     let c = store::reader(&root)?;
-    let mut f = s.scope.filters()?;
-    agrep_core::coverage::validate(&mut f)?;
     let coverage = agrep_core::coverage::dimensions(&c, &f)?;
     if let Some(chat) = &f.chat {
-        let candidates = agrep_core::handles::SessionIndex::load(&c)?.candidates(&c, chat)?;
-        if candidates.len() != 1 {
-            bail!("chat is missing or ambiguous");
-        }
-        f.chat = Some(candidates[0].clone());
+        let Some(session) = super::usage::chat(&c, chat)? else {
+            return stop(("chat-unresolved", None));
+        };
+        f.chat = Some(session);
     }
     let identity = caller::Identity::detect();
     if !s.json && !s.scope.include_self && (s.scope.no_self || identity.agent_context) {
         identity.disclose(s.scope.no_self, false);
     }
     let caller = caller::Caller::resolve(&c, identity)?;
+    // 0.4.9's default page outside the compact profile (py/search.py:7398-7399).
+    let default_rows = if s.semantic && !compact_page { 10 } else { 40 };
     let options = Options {
         pattern: pattern.clone(),
         regex: s.regex,
@@ -80,7 +101,7 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
         limit: if s.count || s.count_by_tier {
             0
         } else {
-            s.max.unwrap_or(40)
+            s.max.unwrap_or(default_rows)
         },
         exact: s.count || s.count_by_tier || s.max == Some(0),
         count_only: s.count || s.count_by_tier,
@@ -198,15 +219,7 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
             }
         }
     } else {
-        (
-            keyword,
-            if s.coverage {
-                Some(semantic::coverage(&c)?)
-            } else {
-                None
-            },
-            true,
-        )
+        (keyword, None, true)
     };
     if timing {
         eprintln!("{}", serde_json::json!({"keyword_ms":keyword_ms}));
@@ -277,7 +290,12 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
             .collect()
     };
     let coverage_hits = if s.coverage {
-        let mut recovered = agrep_core::query::coverage(&c, &options)?;
+        // 0.4.9 ranked the coverage lane by coverage whatever --sort said.
+        let ranked = Options {
+            sort: "score".into(),
+            ..options.clone()
+        };
+        let mut recovered = agrep_core::query::coverage(&c, &ranked)?;
         recovered.hits.retain(|h| {
             !result.hits.iter().any(|old| {
                 old.agent == h.agent
@@ -331,7 +349,7 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
         Vec::new()
     };
     let exhaustible = !s.semantic && !result.hits.iter().any(|h| h.matched == "semantic");
-    let current = s.max.unwrap_or(40);
+    let current = s.max.unwrap_or(default_rows);
     let larger = match s.max {
         Some(0) => None,
         _ if s.json => [80, 160, 200].into_iter().find(|&n| current < n),
@@ -392,11 +410,15 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
             ))?;
         }
     }
-    if !s.json {
-        if let Some(coverage) = &semantic_coverage {
-            if s.semantic || s.coverage || coverage.partial() {
-                eprintln!("semantic {}/{} rows", coverage.embedded, coverage.total);
-            }
+    // 0.4.9 named a coverage gap on a miss, and on a page of hits only in its terminal
+    // footer or a compact page (py/search.py:8121-8126, 8381-8387, 8482-8485).
+    if let Some(coverage) = semantic_coverage.as_ref().filter(|c| c.gap()) {
+        if !s.json
+            && !s.count
+            && !s.count_by_tier
+            && (result.hits.is_empty() || compact_page || std::io::stderr().is_terminal())
+        {
+            eprintln!("semantic {}/{} rows", coverage.embedded, coverage.total);
         }
     }
     // 0.4.9 let an empty filter dimension's line stand alone as the zero's explanation.
@@ -442,7 +464,9 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
 pub(crate) fn more(handle: &str) -> Result<i32> {
     let root = agrep_core::data::DataRoot::discover()?;
     root.validate(false)?;
-    let frozen = agrep_core::pages::load(&root, handle)?;
+    // 0.4.9 logged a continuation's refusal as the bare line (py/search.py:7325-7327).
+    let frozen = agrep_core::pages::load(&root, handle)
+        .map_err(|e| super::usage::refusal("", format!("{e:#}")))?;
     let page = agrep_core::pages::select(frozen);
     let more = agrep_core::pages::save(&root, &page.remainder)?;
     agrep_core::surface::write(&page.text)?;

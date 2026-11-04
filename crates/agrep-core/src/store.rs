@@ -538,7 +538,8 @@ fn refresh_inner(
         return Ok(info);
     }
     if first {
-        eprintln!("agrep: indexing {} source files…", stamps.len());
+        // 0.4.9's notice (py/indexd_runtime.py:944-946): the size is unknown here.
+        eprintln!("building the search db (a first build can take a while on a large history) …");
     }
     let mut active: HashSet<String> = stamps
         .iter()
@@ -723,6 +724,11 @@ fn refresh_inner(
         )
     };
     let mut changes = Changes::default();
+    let turnless_before = if first {
+        HashSet::new()
+    } else {
+        turnless(&tx, "event_sessions", "session")?
+    };
     let mut canonical_sessions = HashSet::new();
     let mut fast_sessions = HashSet::new();
     let mut forced_sessions = HashSet::new();
@@ -905,6 +911,7 @@ fn refresh_inner(
         &mut changes,
         first,
     )?;
+    settle_turnless(&tx, &turnless_before, &mut changes, first)?;
     info.canonical_ms = phase.elapsed().as_secs_f64() * 1000.;
     changes.fts.apply(&tx)?;
     let presence = if first { build_fts(&tx)? } else { None };
@@ -937,13 +944,8 @@ fn refresh_inner(
         tx.execute("INSERT INTO state(key,value) SELECT 'tools_count',count(*) FROM tools WHERE visible=1 ON CONFLICT(key) DO UPDATE SET value=excluded.value",[])?;
     }
     info.stats_ms = phase.elapsed().as_secs_f64() * 1000.;
-    if first || rebuild {
-        tx.execute("DELETE FROM sessions WHERE NOT EXISTS(SELECT 1 FROM prose p INDEXED BY prose_session WHERE p.agent=sessions.agent AND p.session=sessions.id) AND NOT EXISTS(SELECT 1 FROM tools p WHERE p.agent=sessions.agent AND p.session=sessions.id)",[])?;
-    } else {
-        for (agent, session) in &canonical_sessions {
-            tx.prepare_cached("DELETE FROM sessions WHERE agent=?1 AND id=?2 AND NOT EXISTS(SELECT 1 FROM prose p INDEXED BY prose_session WHERE p.agent=?1 AND p.session=?2) AND NOT EXISTS(SELECT 1 FROM tools p WHERE p.agent=?1 AND p.session=?2)")?.execute(params![agent, session])?;
-        }
-    }
+    // 0.4.9 listed a chat only through its turns (py/corpusdb.py:2221-2234).
+    tx.execute("DELETE FROM sessions WHERE NOT EXISTS(SELECT 1 FROM prose p INDEXED BY prose_session WHERE p.agent=sessions.agent AND p.session=sessions.id)",[])?;
     tx.execute("INSERT INTO state VALUES('refreshed',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[chrono::Utc::now().timestamp_millis().to_string()])?;
     if scope.is_none() {
         tx.execute("INSERT INTO state VALUES('harness',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[policy_digest])?;
@@ -1277,7 +1279,65 @@ fn set_visibility(
     Ok(())
 }
 fn refresh_session_bounds(tx: &Transaction<'_>, agent: &str, session: &str) -> Result<()> {
-    tx.prepare_cached("UPDATE sessions SET first_ts=coalesce((SELECT min(ts) FROM (SELECT ts FROM prose WHERE agent=?1 AND session=?2 AND visible=1 UNION ALL SELECT ts FROM tools WHERE agent=?1 AND session=?2 AND visible=1)),0),last_ts=coalesce((SELECT max(ts) FROM (SELECT ts FROM prose WHERE agent=?1 AND session=?2 AND visible=1 UNION ALL SELECT ts FROM tools WHERE agent=?1 AND session=?2 AND visible=1)),0),title=coalesce((SELECT substr(CAST(text AS TEXT),1,CASE WHEN instr(CAST(text AS TEXT),char(10))>0 THEN min(160,instr(CAST(text AS TEXT),char(10))-1) ELSE 160 END) FROM prose WHERE agent=?1 AND session=?2 AND visible=1 AND who!='agent' ORDER BY position,id LIMIT 1),'') WHERE agent=?1 AND id=?2")?.execute(params![agent,session])?;
+    // 0.4.9 bounded a chat by its turns alone: a tool row never moves first_ts/last_ts,
+    // and a turn without a timestamp (0) is skipped rather than taken as the minimum.
+    tx.prepare_cached("UPDATE sessions SET first_ts=coalesce((SELECT min(ts) FROM prose WHERE agent=?1 AND session=?2 AND visible=1 AND ts>0),0),last_ts=coalesce((SELECT max(ts) FROM prose WHERE agent=?1 AND session=?2 AND visible=1 AND ts>0),0),title=coalesce((SELECT substr(CAST(text AS TEXT),1,CASE WHEN instr(CAST(text AS TEXT),char(10))>0 THEN min(160,instr(CAST(text AS TEXT),char(10))-1) ELSE 160 END) FROM prose WHERE agent=?1 AND session=?2 AND visible=1 AND who!='agent' ORDER BY position,id LIMIT 1),'') WHERE agent=?1 AND id=?2")?.execute(params![agent,session])?;
+    Ok(())
+}
+/// Chats in `table` (with its session id in `column`) that hold no turn.
+fn turnless(tx: &Transaction<'_>, table: &str, column: &str) -> Result<HashSet<(String, String)>> {
+    let sql = format!("SELECT agent,{column} FROM {table} t WHERE NOT EXISTS(SELECT 1 FROM prose p INDEXED BY prose_session WHERE p.session=t.{column} AND p.agent=t.agent)");
+    let found = tx
+        .prepare(&sql)?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(found)
+}
+/// 0.4.9 searched a chat's tool calls only beside its turns, under its first turn's project
+/// (py/corpusdb.py:2221-2234): a listed chat without a turn has its calls hidden, and a
+/// chat that was turnless when this refresh began shows its calls again once a turn
+/// arrives, one copy per call id as in canonicalize.
+fn settle_turnless(
+    tx: &Transaction<'_>,
+    before: &HashSet<(String, String)>,
+    changes: &mut Changes,
+    bulk: bool,
+) -> Result<()> {
+    let hidden = turnless(tx, "sessions", "id")?;
+    let turned = before
+        .iter()
+        .filter(|s| !hidden.contains(*s))
+        .filter_map(|(agent, session)| {
+            tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM prose p INDEXED BY prose_session WHERE p.session=?2 AND p.agent=?1)")
+                .and_then(|mut q| q.query_row(params![agent, session], |r| r.get::<_, bool>(0)))
+                .map(|turns| turns.then(|| (agent.clone(), session.clone())))
+                .transpose()
+        })
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for ((agent, session), turns) in hidden
+        .iter()
+        .map(|s| (s, false))
+        .chain(turned.iter().map(|s| (s, true)))
+    {
+        let tools:Vec<(i64,i64,bool,String)>=tx.prepare_cached("SELECT t.id,t.position,t.visible,t.extra FROM tools t JOIN sources s ON s.rowid=t.source WHERE t.agent=?1 AND t.session=?2 ORDER BY s.path,t.id")?.query_map(params![agent,session],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
+        let mut seen = HashSet::new();
+        for (id, position, visible, key) in tools {
+            let retained = turns && (key.is_empty() || seen.insert(key));
+            set_visibility(
+                tx,
+                "tools",
+                id,
+                (visible, position),
+                (retained, position),
+                changes,
+                bulk,
+            )?;
+        }
+        if turns {
+            tx.prepare_cached("INSERT OR IGNORE INTO symbols(value) SELECT project FROM sessions WHERE agent=?1 AND id=?2")?.execute(params![agent, session])?;
+            tx.prepare_cached("UPDATE event_rows SET project_key=(SELECT y.id FROM symbols y JOIN sessions s ON y.value=s.project WHERE s.agent=?1 AND s.id=?2) WHERE active=1 AND session_key=(SELECT id FROM event_sessions WHERE agent=?1 AND session=?2)")?.execute(params![agent, session])?;
+        }
+    }
     Ok(())
 }
 /// Keep source contributions for incremental recovery, but index only the canonical replay.
@@ -1791,8 +1851,8 @@ fn replace(
             };
             let entry = initial_bounds.entry(&m.session).or_insert_with(|| {
                 (
-                    m.ts,
-                    m.ts,
+                    0,
+                    0,
                     title_turn,
                     if title_turn == u32::MAX {
                         String::new()
@@ -1807,8 +1867,10 @@ fn replace(
                     },
                 )
             });
-            entry.0 = entry.0.min(m.ts);
-            entry.1 = entry.1.max(m.ts);
+            if m.ts > 0 {
+                entry.0 = if entry.0 > 0 { entry.0.min(m.ts) } else { m.ts };
+                entry.1 = entry.1.max(m.ts);
+            }
             if title_turn < entry.2 {
                 entry.2 = title_turn;
                 entry.3 = m
@@ -1820,16 +1882,6 @@ fn replace(
                     .take(160)
                     .collect();
             }
-        }
-        for e in &s.events {
-            if e.kind == "control" {
-                continue;
-            }
-            let entry = initial_bounds
-                .entry(&e.session)
-                .or_insert_with(|| (e.ts, e.ts, u32::MAX, String::new()));
-            entry.0 = entry.0.min(e.ts);
-            entry.1 = entry.1.max(e.ts);
         }
     }
     let session_last: HashMap<&str, usize> = s
@@ -2013,7 +2065,7 @@ fn replace(
             changes,
         )?;
         if !bulk || !meta.contains_key(e.session.as_str()) {
-            tx.prepare_cached("INSERT INTO sessions(agent,id,project,parent,family,side,title,first_ts,last_ts) VALUES(?1,?2,?3,'',?2,0,'',?4,?4) ON CONFLICT(agent,id) DO UPDATE SET first_ts=min(first_ts,?4),last_ts=max(last_ts,?4)")?.execute(params![e.agent,e.session,project,e.ts])?;
+            tx.prepare_cached("INSERT INTO sessions(agent,id,project,parent,family,side,title,first_ts,last_ts) VALUES(?1,?2,?3,'',?2,0,'',0,0) ON CONFLICT(agent,id) DO NOTHING")?.execute(params![e.agent,e.session,project])?;
         }
     }
     bulk_rows.flush(tx, 0, changes)?;
@@ -2085,7 +2137,7 @@ fn session(tx: &Transaction<'_>, m: &Message, cwd: &str) -> Result<()> {
     } else {
         m.parent.as_ref()
     };
-    tx.prepare_cached("INSERT INTO sessions(agent,id,project,parent,family,side,title,first_ts,last_ts) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8) ON CONFLICT(agent,id) DO UPDATE SET project=?3,parent=?4,side=?6,first_ts=MIN(first_ts,?8),last_ts=MAX(last_ts,?8),title=CASE WHEN ?9=0 THEN ?7 ELSE title END")?.execute(params![m.agent,m.session.as_ref(),m.project.as_ref(),m.parent.as_ref(),family,m.side,title,m.ts,m.turn])?;
+    tx.prepare_cached("INSERT INTO sessions(agent,id,project,parent,family,side,title,first_ts,last_ts) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8) ON CONFLICT(agent,id) DO UPDATE SET project=?3,parent=?4,side=?6,first_ts=CASE WHEN ?8=0 THEN first_ts WHEN first_ts=0 THEN ?8 ELSE MIN(first_ts,?8) END,last_ts=MAX(last_ts,?8),title=CASE WHEN ?9=0 THEN ?7 ELSE title END")?.execute(params![m.agent,m.session.as_ref(),m.project.as_ref(),m.parent.as_ref(),family,m.side,title,m.ts.max(0),m.turn])?;
     tx.prepare_cached("UPDATE sessions SET cwd=?3 WHERE agent=?1 AND id=?2 AND ?3!=''")?
         .execute(params![m.agent, m.session.as_ref(), cwd])?;
     Ok(())

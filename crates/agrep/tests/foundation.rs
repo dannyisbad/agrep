@@ -26,6 +26,7 @@ fn cli(home: &Path, data: &Path, args: &[&str]) -> Output {
         .output()
         .expect("built agrep executable is required")
 }
+#[track_caller]
 fn ok(out: Output) -> Output {
     assert!(
         out.status.success(),
@@ -33,6 +34,11 @@ fn ok(out: Output) -> Output {
         String::from_utf8_lossy(&out.stderr)
     );
     out
+}
+/// Runs `index` and returns the statistics it records in the data root.
+fn indexed(home: &Path, data: &Path) -> Value {
+    ok(cli(home, data, &["index"]));
+    serde_json::from_slice(&fs::read(data.join("index-stats.json")).unwrap()).unwrap()
 }
 // Rebuild invariants concern row counts. Status also reports physical disk use and
 // refresh timestamps, which are expected to change when the same rows are rebuilt.
@@ -214,8 +220,7 @@ fn incremental_changes_and_last_good() {
         .unwrap(),
         1
     );
-    let unchanged_error = ok(cli(&h, &d, &["index"]));
-    let unchanged_error: Value = serde_json::from_slice(&unchanged_error.stdout).unwrap();
+    let unchanged_error = indexed(&h, &d);
     assert_eq!(unchanged_error["parsed"], 0);
     fs::remove_file(path).unwrap();
     ok(cli(&h, &d, &["index"]));
@@ -326,7 +331,7 @@ fn search_contracts() {
         serde_json::json!([])
     );
     for args in [
-        vec!["--no-auto", "search", "release", "-c"],
+        vec!["search", "--no-auto", "release", "-c"],
         vec!["--no-auto", "release", "-c"],
     ] {
         assert_eq!(
@@ -336,6 +341,11 @@ fn search_contracts() {
             "3"
         );
     }
+    // As in 0.4.9, a leading option starts a bare search, so a command word after it is
+    // searched for: "search release" occurs nowhere.
+    let leading = cli(&h, &d, &["--no-auto", "search", "release", "-c"]);
+    assert_eq!(leading.status.code(), Some(2));
+    assert_eq!(String::from_utf8(leading.stdout).unwrap(), "0\n");
     let tiers = ok(cli(&h, &d, &["release", "--count-by-tier"]));
     let tiers = String::from_utf8(tiers.stdout).unwrap();
     assert_eq!(tiers.split_whitespace().count(), 5);
@@ -924,10 +934,10 @@ fn failed_source_does_not_mark_or_reparse_its_valid_sibling() {
         .unwrap()
     };
     assert_eq!(errors(), 1);
-    let unchanged: Value = serde_json::from_slice(&ok(cli(&h, &d, &["index"])).stdout).unwrap();
+    let unchanged = indexed(&h, &d);
     assert_eq!(unchanged["parsed"], 0);
     fs::write(&good, body.replace("first marker", "changed marker")).unwrap();
-    let changed: Value = serde_json::from_slice(&ok(cli(&h, &d, &["index"])).stdout).unwrap();
+    let changed = indexed(&h, &d);
     assert_eq!(changed["parsed"], 1);
     assert_eq!(errors(), 1);
     assert_eq!(cli(&h, &d, &["changed", "-c"]).status.code(), Some(0));
@@ -2036,8 +2046,7 @@ fn appended_jsonl_matches_full_parsing_for_each_high_churn_adapter() {
         ok(cli(&h, &d, &["index"]));
         for record in &tail {
             write_records(&path, std::slice::from_ref(record), true);
-            let out = ok(cli(&h, &d, &["index"]));
-            let info: Value = serde_json::from_slice(&out.stdout).unwrap();
+            let info = indexed(&h, &d);
             assert_eq!(info["resumed_sources"], 1, "{agent}: {info}");
             if full.exists() {
                 fs::remove_dir_all(&full).unwrap();
@@ -2074,8 +2083,7 @@ fn pi_branch_switches_replay_persisted_nodes_and_match_full_parse() {
             ],
             true,
         );
-        let out = ok(cli(&h, &d, &["index"]));
-        let info: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let info = indexed(&h, &d);
         assert!(info["bytes_read"].as_u64().unwrap() < 20_000);
         if full.exists() {
             fs::remove_dir_all(&full).unwrap();
@@ -2218,7 +2226,7 @@ fn append_parsing_is_bounded_and_rewrites_are_detected() {
         ],
         true,
     );
-    let info: Value = serde_json::from_slice(&ok(cli(&h, &d, &["index"])).stdout).unwrap();
+    let info = indexed(&h, &d);
     assert_eq!(info["resumed_sources"], 1);
     assert!(info["bytes_parsed"].as_u64().unwrap() < 20_000, "{info}");
     let mut bytes = fs::read(&path).unwrap();
@@ -2226,7 +2234,7 @@ fn append_parsing_is_bounded_and_rewrites_are_detected() {
     let at = bytes[middle..].iter().position(|b| *b == b'x').unwrap() + middle;
     bytes[at] = b'y';
     fs::write(&path, &bytes).unwrap();
-    let info: Value = serde_json::from_slice(&ok(cli(&h, &d, &["index"])).stdout).unwrap();
+    let info = indexed(&h, &d);
     assert_eq!(info["resumed_sources"], 0);
     assert!(info["bytes_read"].as_u64().unwrap() >= bytes.len() as u64);
     let mut bytes = fs::read(&path).unwrap();
@@ -2241,13 +2249,13 @@ fn append_parsing_is_bounded_and_rewrites_are_detected() {
         ],
         true,
     );
-    let info: Value = serde_json::from_slice(&ok(cli(&h, &d, &["index"])).stdout).unwrap();
+    let info = indexed(&h, &d);
     assert_eq!(
         info["resumed_sources"], 0,
         "interior rewrite plus append must not pass edge guards"
     );
     transcript(&h, &["rewritten prompt"]);
-    let info: Value = serde_json::from_slice(&ok(cli(&h, &d, &["index"])).stdout).unwrap();
+    let info = indexed(&h, &d);
     assert_eq!(info["resumed_sources"], 0);
     assert_eq!(
         canonical_rows(&d)
@@ -2499,7 +2507,7 @@ fn metadata_only_jsonl_change_reuses_verified_cursor() {
     ok(cli(&h, &d, &["index"]));
     let bytes = fs::read(&p).unwrap();
     fs::write(&p, bytes).unwrap();
-    let info: Value = serde_json::from_slice(&ok(cli(&h, &d, &["index"])).stdout).unwrap();
+    let info = indexed(&h, &d);
     assert_eq!(info["resumed_sources"], 1);
     assert_eq!(info["bytes_parsed"], 0);
     assert_eq!(info["changed_rows"], 0);
@@ -2514,7 +2522,9 @@ fn selective_tool_stream_keeps_exact_winners_across_tiers_and_folded_filters() {
     let path = home.join(".pi/agent/sessions/test/selective.jsonl");
     let mut rows =
         vec![json!({"type":"session","id":"selective-tool-stream","version":3,"cwd":"/work/test"})];
-    let mut parent = Value::Null;
+    // A chat is indexed through its turns, so the calls follow one.
+    rows.push(json!({"type":"message","id":"u0","parentId":null,"timestamp":"2023-01-01T12:00:00Z","message":{"role":"user","content":[{"type":"text","text":"inspect the stream"}]}}));
+    let mut parent = json!("u0");
     for i in 0..8192 {
         let ts = if i < 512 {
             "2026-10-29T12:00:00Z"
@@ -2732,7 +2742,9 @@ fn no_meta_filters_the_page_0_4_9_fetched() {
         let path = home.join(".pi/agent/sessions/test/meta-page.jsonl");
         let mut records =
             vec![json!({"type":"session","id":"meta-page","version":3,"cwd":"/work/test"})];
-        let mut parent = String::new();
+        // A chat is indexed through its turns, so the calls follow one.
+        records.push(json!({"type":"message","id":"u0","parentId":null,"timestamp":"2024-01-01T00:00:00Z","message":{"role":"user","content":[{"type":"text","text":"start the session"}]}}));
+        let mut parent = String::from("u0");
         for i in 0..=meta_rows {
             let call = format!("call-{i}");
             let result = format!("result-{i}");
@@ -2861,9 +2873,23 @@ fn explicit_coverage_is_separate_and_identifiers_keep_grep_semantics() {
     assert!(agrep_core::query::search(&c, &o).unwrap().hits.is_empty());
     let output = cli(&home, &data, &["--coverage", "specific useful missing"]);
     assert_ne!(output.status.code(), Some(2));
-    assert!(String::from_utf8(output.stderr)
-        .unwrap()
-        .contains("coverage lane (forced)"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("coverage lane (forced)"));
+    // 0.4.9 ranked the coverage lane by coverage whatever --sort said.
+    for sort in ["time", "position"] {
+        let sorted = cli(
+            &home,
+            &data,
+            &["--coverage", "specific useful missing", "--sort", sort],
+        );
+        assert_eq!(
+            (sorted.status.code(), sorted.stdout, sorted.stderr),
+            (
+                output.status.code(),
+                output.stdout.clone(),
+                output.stderr.clone()
+            )
+        );
+    }
 }
 
 #[test]

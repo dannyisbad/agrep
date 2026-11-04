@@ -30,6 +30,7 @@ and fail instead of taking a lock or writing.
 | `vectors/<sha256>.q8f16` | immutable embedding blocks referenced from `index.db` |
 | `model/granite-embedding-small-english-r2/` | the pinned embedding model (`AGREP_MODEL_DIR` overrides) |
 | `config.json` | `tools`, `embeddings`, `post_index`, archive policy, board view, integration enrollment |
+| `index-stats.json` | the last `index` or `reindex` run's refresh phases, counts and lock waits, one JSON object |
 | `harness_prefixes.txt` | optional user-written harness prompt prefixes |
 | `archive/` | opt-in source archive: `catalog.db`, `blobs/<sha256>.gz`, `archive.lock` |
 | `log/agrep.log` | worker stderr and semantic failures; rotated to `agrep.log.1` at 1 MiB |

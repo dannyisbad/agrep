@@ -1,0 +1,147 @@
+[
+ {
+  "project": "ask",
+  "status": "waiting_on_user",
+  "confidence": "high",
+  "source": "root",
+  "turn": 0,
+  "signals": [
+   "ask awaits your answer"
+  ],
+  "evidence": "Which database should we use?",
+  "items": [],
+  "handle": "@0a000001:0.2fcc"
+ },
+ {
+  "project": "asks",
+  "status": "waiting_on_user",
+  "confidence": "high",
+  "source": "root",
+  "turn": 0,
+  "signals": [
+   "final reply asks you something"
+  ],
+  "evidence": "Should I push it to origin?",
+  "items": [],
+  "handle": "@0a000005:0.41be"
+ },
+ {
+  "project": "claude-err",
+  "status": "agent_work_incomplete",
+  "confidence": "medium",
+  "source": "root",
+  "turn": 0,
+  "signals": [
+   "final reply is an API error"
+  ],
+  "evidence": "API Error: 529 overloaded, retry later",
+  "items": [],
+  "handle": "@0c000001:0.e6be"
+ },
+ {
+  "project": "failed",
+  "status": "agent_work_incomplete",
+  "confidence": "medium",
+  "source": "root",
+  "turn": 0,
+  "signals": [
+   "no captured reply to the last turn",
+   "latest tool failed (bash)"
+  ],
+  "evidence": "make: *** error 2",
+  "items": [],
+  "handle": "@0a000003:0.6075"
+ },
+ {
+  "project": "fam",
+  "status": "agent_work_incomplete",
+  "confidence": "medium",
+  "source": "side-chat",
+  "turn": 0,
+  "signals": [
+   "side chat's reply ended before its last tool call (bash)"
+  ],
+  "evidence": "Checking the rest now.",
+  "items": [],
+  "handle": "@0b000002:0.1b5e",
+  "evidence_session": "0b000002-0000-7000-8000-000000000002"
+ },
+ {
+  "project": "fam2",
+  "status": "agent_work_incomplete",
+  "confidence": "medium",
+  "source": "side-chat",
+  "turn": 0,
+  "signals": [
+   "side chat has no captured reply to its last turn",
+   "latest tool failed (bash)"
+  ],
+  "evidence": "apply the fixes",
+  "items": [],
+  "handle": "@0b000004:0.524b",
+  "evidence_session": "0b000004-0000-7000-8000-000000000004"
+ },
+ {
+  "project": "later",
+  "status": "open_next_steps",
+  "confidence": "medium",
+  "source": "root",
+  "turn": 0,
+  "signals": [
+   "remaining section lists 2 open items"
+  ],
+  "evidence": "migrate the users table",
+  "items": [
+   "migrate the users table",
+   "drop the old index"
+  ],
+  "caveats": [
+   "a later reply block may report this done: 'I\\'ll check the \\'legacy\\' schema \"before\" that.'"
+  ],
+  "handle": "@0a000007:0.b399"
+ },
+ {
+  "project": "notime",
+  "status": "unknown",
+  "confidence": "low",
+  "source": "root",
+  "turn": 1,
+  "signals": [
+   "no captured reply to the last turn",
+   "last turn has no timestamp"
+  ],
+  "evidence": "second question without a clock",
+  "items": [],
+  "handle": "@0a000006:1.4792"
+ },
+ {
+  "project": "steps",
+  "status": "open_next_steps",
+  "confidence": "high",
+  "source": "root",
+  "turn": 0,
+  "signals": [
+   "next steps section lists 2 open items (2 done)"
+  ],
+  "evidence": "run the benchmark",
+  "items": [
+   "run the benchmark",
+   "update the changelog"
+  ],
+  "handle": "@0a000002:0.b71a"
+ },
+ {
+  "project": "trailing",
+  "status": "agent_work_incomplete",
+  "confidence": "medium",
+  "source": "root",
+  "turn": 0,
+  "signals": [
+   "reply ended before the turn's last tool call (bash)",
+   "latest tool failed (bash)"
+  ],
+  "evidence": "Running the tests now.",
+  "items": [],
+  "handle": "@0a000004:0.a085"
+ }
+]

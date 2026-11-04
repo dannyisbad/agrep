@@ -453,6 +453,7 @@ fn resolve_scan(
         })?;
         for row in rows {
             let mut h = row?;
+            h.meta_marker = crate::query::meta_role(&h.who, h.turn);
             if !matches_filters(&h, o)
                 || (o.filters.no_meta && crate::history_meta::is_meta(c, &h, &o.pattern)?)
             {

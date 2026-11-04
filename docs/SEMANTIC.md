@@ -89,7 +89,9 @@ when coverage is partial.
 - Coverage is the trigger-maintained `semantic_ref_count` over the visible prose rows. A
   row counts once every chunk is published. Partial coverage is a number
   (`semantic N/M rows` on stderr; `semantic_coverage` with `indexed`, `total`,
-  `pending`, `fraction`, `complete` and `order` in JSON), never an error.
+  `pending`, `fraction`, `complete` and `order` in JSON), never an error. As in 0.4.9,
+  stderr names it only below 99% of the rows embedded, and on a page of hits only on a
+  terminal or a compact page; a miss always names it.
 - The scan quantizes the query to int8 and takes int8 dot products with SIMD (AVX2 on
   x86_64, NEON with or without the dot-product extension on aarch64). A Cauchy-Schwarz
   bound covers both quantization errors; each row whose bound reaches the floor gets its

@@ -402,7 +402,7 @@ fn invocations(c: &Connection, calls: Vec<Call>) -> Result<Vec<Invocation>> {
 /// How deep 0.4.9 fetched a `--no-meta` page before dropping its ~meta rows.
 pub(crate) const ROWS_PER_QUERY: usize = 40;
 pub(crate) fn is_meta(c: &Connection, h: &Hit, query: &str) -> Result<bool> {
-    if matches!(h.who.as_str(), "harness" | "synthetic") || (h.who == "subagent" && h.turn == 0) {
+    if crate::query::meta_role(&h.who, h.turn) {
         return Ok(true);
     }
     if h.who == "tool" {

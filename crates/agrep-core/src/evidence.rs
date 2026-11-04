@@ -74,6 +74,23 @@ impl Request {
         }
     }
 }
+/// A result handle that names no turn to serve, with 0.4.9's machine code for why
+/// (py/recall.py:1870-1937): `result-handle-unresolved`, `stale-result-handle` or
+/// `content-ambiguous`.
+#[derive(Debug)]
+pub struct HandleError {
+    pub code: &'static str,
+    message: String,
+}
+impl std::fmt::Display for HandleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for HandleError {}
+pub fn handle_error(code: &'static str, message: String) -> anyhow::Error {
+    HandleError { code, message }.into()
+}
 pub fn load(c: &Connection, request: &Request) -> Result<Window> {
     load_in(c, &SessionIndex::load(c)?, request)
 }
@@ -98,7 +115,10 @@ fn load_in(c: &Connection, index: &SessionIndex, request: &Request) -> Result<Wi
     };
     let candidates = index.candidates(c, &target)?;
     if candidates.is_empty() {
-        bail!("no indexed session matches {target}; rerun the search for a current handle")
+        return Err(handle_error(
+            "result-handle-unresolved",
+            format!("no indexed session matches {target}; rerun the search for a current handle"),
+        ));
     }
     let session = if candidates.len() == 1 {
         candidates[0].clone()
@@ -113,10 +133,13 @@ fn load_in(c: &Connection, index: &SessionIndex, request: &Request) -> Result<Wi
             .cloned()
             .collect();
         if holders.len() != 1 {
-            bail!(
-                "result handle session is ambiguous: {}",
-                candidates.join(", ")
-            )
+            return Err(handle_error(
+                "result-handle-unresolved",
+                format!(
+                    "result handle session is ambiguous: {}",
+                    candidates.join(", ")
+                ),
+            ));
         }
         holders[0].clone()
     } else {
@@ -134,7 +157,7 @@ fn load_in(c: &Connection, index: &SessionIndex, request: &Request) -> Result<Wi
     let mut notes = Vec::new();
     if center != requested {
         if request.exact {
-            bail!("result handle is stale: turn {requested} is outside chat turns {first}-{last}; rerun the search for a current handle")
+            return Err(handle_error("stale-result-handle", format!("result handle is stale: turn {requested} is outside chat turns {first}-{last}; rerun the search for a current handle")));
         }
         notes.push(json!({"kind":"turn_clamped","requested":requested,"served":center,"note":format!("turn {requested} clamped to {center} (chat has turns {first}-{last})")}));
     }
@@ -150,7 +173,7 @@ fn load_in(c: &Connection, index: &SessionIndex, request: &Request) -> Result<Wi
                     }
                 }
                 // py/surface_policy.py:2385-2393 names both causes rather than asserting one.
-                match holders.len(){0=>bail!("result handle no longer names the cited content; rerun the search for a current handle"),1=>{center=holders[0];notes.push(json!({"kind":"content_moved","requested":requested,"served":center,"note":format!("handle digest matches turn {center}, not turn {requested} - either the session was renumbered since the handle was minted, or the digest is wrong; verify the content before citing it")}));},_=>bail!("handle content is ambiguous in session {}: turns {}; rerun the search for a current handle",SessionIndex::default().target(&session),holders.iter().map(i64::to_string).collect::<Vec<_>>().join(", "))}
+                match holders.len(){0=>return Err(handle_error("stale-result-handle","result handle no longer names the cited content; rerun the search for a current handle".into())),1=>{center=holders[0];notes.push(json!({"kind":"content_moved","requested":requested,"served":center,"note":format!("handle digest matches turn {center}, not turn {requested} - either the session was renumbered since the handle was minted, or the digest is wrong; verify the content before citing it")}));},_=>return Err(handle_error("content-ambiguous",format!("handle content is ambiguous in session {}: turns {}; rerun the search for a current handle",SessionIndex::default().target(&session),holders.iter().map(i64::to_string).collect::<Vec<_>>().join(", "))))}
             }
         }
     }
@@ -532,8 +555,6 @@ pub struct Display {
     pub tool_output: usize,
     pub who: Option<String>,
     pub color: bool,
-    pub checked: bool,
-    pub pending_sources: usize,
 }
 /// 0.4.9's `_cap`: the first `limit` characters, cut back to their last space when it
 /// falls in the window Python's `cut[limit - 200:]` names, and a marker counting the
@@ -1637,7 +1658,6 @@ pub fn render(w: &Window, d: &Display) -> Result<Rendered> {
             },
             None,
         );
-        meta["freshness"] = crate::render::freshness(d.checked, d.pending_sources);
         if !w.notes.is_empty() {
             meta["served"] = json!({"served_as_requested":false,"divergences":w.notes});
         }

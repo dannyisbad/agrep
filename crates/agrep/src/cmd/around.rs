@@ -3,35 +3,31 @@ use agrep_core::{
     evidence::{self, Display, Rendered, Request},
     store, surface,
 };
-use anyhow::{bail, Result};
+use anyhow::Result;
+use serde_json::{json, Value};
 use std::io::IsTerminal;
+/// 0.4.9's around freshness record (py/around.py:245-251,762-772): the rows may be stale
+/// when nothing checked the sources, and 0.5 also counts changed sources awaiting refresh.
+fn stale_record(checked: bool, pending_sources: usize) -> Option<Value> {
+    if !checked {
+        Some(json!({"state":"unchecked","failing":false,"checked":false,"may_be_stale":true}))
+    } else if pending_sources > 0 {
+        Some(agrep_core::render::freshness(true, pending_sources))
+    } else {
+        None
+    }
+}
 pub(crate) fn run(mut a: Around, no_auto: bool, color: &str) -> Result<i32> {
     let result = (|| {
         if let Some(who) = &a.who {
             a.who = Some(agrep_core::coverage::speakers(who)?);
         }
         let exact = agrep_core::handles::is_handle(&a.session);
-        let radius = if a.whole || a.context.as_deref() == Some("all") {
-            None
-        } else {
-            let n = a
-                .context
-                .as_deref()
-                .map(str::parse::<i64>)
-                .transpose()?
-                .unwrap_or(if exact { 0 } else { 4 });
-            if n < 0 {
-                bail!("--context must be 0 or greater")
-            }
-            Some(n)
+        let radius = match a.context.as_deref() {
+            _ if a.whole => None,
+            Some(context) => crate::cmd::usage::radius(context)?,
+            None => Some(if exact { 0 } else { 4 }),
         };
-        if a.no_tools
-            && a.who
-                .as_deref()
-                .is_some_and(|w| w.split(',').any(|s| s == "tool"))
-        {
-            bail!("--no-tools conflicts with --who tool")
-        }
         let (root, census) = ready(no_auto)?;
         let c = store::reader(&root)?;
         let w = evidence::load(&c, &Request::new(&a.session, a.turn, radius))?;
@@ -47,8 +43,6 @@ pub(crate) fn run(mut a: Around, no_auto: bool, color: &str) -> Result<i32> {
                     agrep_core::caller::Identity::detect(),
                 )?,
                 json: a.json,
-                checked,
-                pending_sources,
                 full: a.full,
                 max_chars: a.max_chars.unwrap_or(4000),
                 explicit_max_chars: a.max_chars.is_some(),
@@ -68,6 +62,15 @@ pub(crate) fn run(mut a: Around, no_auto: bool, color: &str) -> Result<i32> {
         match rendered {
             Rendered::Page { text, tools } => {
                 surface::write(&text)?;
+                if let Some(record) = a
+                    .json
+                    .then(|| stale_record(checked, pending_sources))
+                    .flatten()
+                {
+                    surface::line(&agrep_core::json_output::to_string(
+                        &json!({"kind":"agrep-meta","freshness":record}),
+                    )?)?;
+                }
                 // 0.4.9's `_warn_if_oversized`: a large pull names the lever that shrinks it.
                 if text.len() >= 30_000 {
                     let cheaper = if radius.is_none() {
@@ -91,9 +94,9 @@ pub(crate) fn run(mut a: Around, no_auto: bool, color: &str) -> Result<i32> {
             // 0.4.9's `_miss`: an unchecked absence is unverified, not a clean miss.
             Rendered::Miss { reason, scope } => {
                 if a.json {
-                    let mut row = serde_json::json!({"kind":"agrep-meta","miss":{"code":"no-speaker-match","reason":reason,"scope":scope}});
-                    if !checked {
-                        row["freshness"] = agrep_core::render::freshness(checked, pending_sources);
+                    let mut row = json!({"kind":"agrep-meta","miss":{"code":"no-speaker-match","reason":reason,"scope":scope}});
+                    if let Some(record) = stale_record(checked, pending_sources) {
+                        row["freshness"] = record;
                     }
                     surface::line(&agrep_core::json_output::to_string(&row)?)?;
                 } else if checked {
@@ -108,7 +111,7 @@ pub(crate) fn run(mut a: Around, no_auto: bool, color: &str) -> Result<i32> {
     match result {
         Err(e) if a.json => {
             surface::line(&agrep_core::json_output::to_string(
-                &serde_json::json!({"kind":"agrep-meta","error":{"code":"window-unavailable","reason":format!("{e:#}")}}),
+                &json!({"kind":"agrep-meta","error":{"code":"window-unavailable","reason":format!("{e:#}")}}),
             )?)?;
             Ok(2)
         }

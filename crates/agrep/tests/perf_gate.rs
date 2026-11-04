@@ -241,6 +241,15 @@ fn evidence_counts_rows_hits_counts_and_meaning_matches() {
     let empty = results::evidence(b"", b"keyword: 0 matching rows\n");
     assert!(!results::valid_result("release", &empty));
     assert!(!results::valid_result("status", &empty));
+    let index = results::with_index_stats(
+        results::evidence(b"=== indexing transcripts ===\n", b""),
+        br#"{"parsed":3,"census_ms":1.5}"#,
+    );
+    assert_eq!(
+        (index["parsed"].clone(), index["census_ms"].clone()),
+        (json!(3), json!(1.5))
+    );
+    assert_eq!(results::INDEX_STATS, "index-stats.json");
 }
 
 #[test]

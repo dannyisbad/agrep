@@ -247,6 +247,10 @@ impl DataRoot {
     pub fn db(&self) -> PathBuf {
         self.0.join("index.db")
     }
+    /// The last explicit index or reindex's statistics, one JSON object.
+    pub fn index_stats(&self) -> PathBuf {
+        self.0.join("index-stats.json")
+    }
     pub fn config(&self) -> Result<Config> {
         match fs::read(self.0.join("config.json")) {
             Ok(v) => Ok(serde_json::from_slice(&v).context("invalid config.json")?),

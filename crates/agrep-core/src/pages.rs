@@ -36,11 +36,39 @@ pub struct Page {
     pub text: String,
     pub remainder: Frozen,
 }
-/// 0.4.9's compact page budget (`compact.DEFAULT_BYTE_BUDGET`), and the rows a page shows
-/// before that budget can end it (`MIN_PAGE_HITS`).
+/// 0.4.9's compact page budget (`compact.DEFAULT_BYTE_BUDGET`), the rows a page shows
+/// before that budget or a quality drop can end it (`MIN_PAGE_HITS`), the rows a page
+/// shows without an explicit `-n` (`MAX_PAGE_HITS`) and with one (`MAX_FROZEN_HITS`), a
+/// family's rows per page (`FAMILY_PAGE_CAP`), the bag-of-words rows a first page keeps
+/// room for (`TERMS_RESERVE`) and the share of the leader's score below which its lane
+/// ends the page (`SCORE_DROP_RATIO`).
 const BUDGET: usize = 3584;
 const MIN_ROWS: usize = 4;
+const MAX_ROWS: usize = 16;
+const MAX_REQUESTED: usize = 40;
+const FAMILY_CAP: usize = 3;
+const TERMS_RESERVE: usize = 2;
+const SCORE_DROP: f64 = 0.35;
+/// 0.4.9's compact quality lane: a meaning row, a bag-of-words row, or a phrase row.
+fn lane(r: &Record) -> &'static str {
+    match r.lane.as_str() {
+        "semantic" => "semantic",
+        "all-terms" | "content-terms" => "all",
+        _ => "phrase",
+    }
+}
+/// 0.4.9's `_compose_page` (py/compact.py:310-442): rows in frozen order, a repeated turn
+/// or a family past its cap deferred behind the continuation. Past the minimum, the byte
+/// budget ends the page, as do a phrase-led page's first bag-of-words row when nothing was
+/// deferred and a row of the leader's lane scoring below its share of the leader's score.
+/// A first page then keeps room for the best bag-of-words rows.
 pub fn select(mut frozen: Frozen) -> Page {
+    let spread = !frozen.chat_scoped;
+    let diversify = spread && frozen.requested.is_none();
+    let row_cap = match frozen.requested.filter(|n| *n > 0) {
+        Some(n) => n.min(MAX_REQUESTED),
+        None => MAX_ROWS,
+    };
     let mut selected = Vec::new();
     let mut used = 0;
     let mut counts = HashMap::<String, usize>::new();
@@ -51,33 +79,73 @@ pub fn select(mut frozen: Frozen) -> Page {
     };
     let mut tools = 0;
     let mut identities = std::collections::HashSet::new();
-    let first_score = frozen.records.first().map(|r| r.score).unwrap_or(0.);
+    let mut leader: Option<(&str, f64)> = None;
+    let mut deferred = false;
     for (i, r) in frozen.records.iter().enumerate() {
-        if !frozen.chat_scoped && !r.identity.is_empty() && identities.contains(&r.identity) {
-            continue;
-        }
-        if frozen.requested.is_none() && r.tool && tools >= tool_cap {
-            continue;
-        }
-        let count = counts.entry(r.family.clone()).or_default();
-        if frozen.requested.is_none() && !frozen.chat_scoped && *count >= 3 {
-            continue;
-        }
-        if selected.len() >= frozen.requested.filter(|n| *n > 0).unwrap_or(16).min(16) {
+        if selected.len() >= row_cap {
             break;
         }
-        if selected.len() >= MIN_ROWS && used + r.line.len() + 1 > BUDGET {
-            break;
-        }
-        if frozen.requested.is_none() && selected.len() >= MIN_ROWS && r.score < first_score * 0.35
+        if (spread && !r.identity.is_empty() && identities.contains(&r.identity))
+            || (frozen.requested.is_none() && r.tool && tools >= tool_cap)
+            || (diversify && counts.get(&r.family).copied().unwrap_or(0) >= FAMILY_CAP)
         {
+            deferred = true;
             continue;
+        }
+        let lane = lane(r);
+        let (leader_lane, leader_score) = *leader.get_or_insert((lane, r.score));
+        if selected.len() >= MIN_ROWS
+            && (used + r.line.len() + 1 > BUDGET
+                || (diversify && leader_lane == "phrase" && lane == "all" && !deferred)
+                || (diversify && lane == leader_lane && r.score < leader_score * SCORE_DROP))
+        {
+            break;
         }
         used += r.line.len() + 1;
         selected.push(i);
-        *count += 1;
+        *counts.entry(r.family.clone()).or_default() += 1;
         tools += usize::from(r.tool);
         identities.insert(r.identity.clone());
+    }
+    if frozen.shown == 0 && frozen.requested.is_none() {
+        // 0.4.9's `_reserve_terms_rows`: queries quoted back regrow the phrase lane, so
+        // the direct answer still shows the top bag-of-words rows.
+        let mut need = TERMS_RESERVE.saturating_sub(
+            selected
+                .iter()
+                .filter(|&&i| lane(&frozen.records[i]) == "all")
+                .count(),
+        );
+        for (i, r) in frozen.records.iter().enumerate() {
+            if need == 0 {
+                break;
+            }
+            if selected.contains(&i)
+                || lane(r) != "all"
+                || (spread
+                    && ((!r.identity.is_empty() && identities.contains(&r.identity))
+                        || counts.get(&r.family).copied().unwrap_or(0) >= FAMILY_CAP))
+            {
+                continue;
+            }
+            used += r.line.len() + 1;
+            selected.push(i);
+            *counts.entry(r.family.clone()).or_default() += 1;
+            identities.insert(r.identity.clone());
+            need -= 1;
+        }
+        while selected.len() > MAX_ROWS || (used > BUDGET && selected.len() > MIN_ROWS) {
+            // Displaced phrase rows defer to the continuation like cap overflow.
+            let Some(victim) = selected
+                .iter()
+                .rposition(|&i| lane(&frozen.records[i]) == "phrase")
+            else {
+                break;
+            };
+            used -= frozen.records[selected[victim]].line.len() + 1;
+            selected.remove(victim);
+        }
+        selected.sort_unstable();
     }
     let lines: Vec<&str> = selected
         .iter()
@@ -229,6 +297,38 @@ pub fn footer(f: &Frozen, more: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 0.4.9's `_compose_page` caps an explicit -n at MAX_FROZEN_HITS and any other page
+    // at MAX_PAGE_HITS (py/compact.py:327-332).
+    #[test]
+    fn an_explicit_row_request_reaches_forty_rows() {
+        let rows = |requested| {
+            let records = (0..48)
+                .map(|i| super::Record {
+                    line: format!("@s{i}:1.abcd row {i}"),
+                    family: format!("f{i}"),
+                    score: 1.0,
+                    lane: "phrase".into(),
+                    tool: false,
+                    identity: format!("s{i}:1"),
+                })
+                .collect();
+            let frozen = super::Frozen {
+                records,
+                query: "row".into(),
+                total: 48,
+                exact: true,
+                shown: 0,
+                requested,
+                chat_scoped: false,
+                full_argv: vec![],
+                exhaustible: true,
+            };
+            super::select(frozen).text.lines().count()
+        };
+        assert_eq!(rows(Some(30)), 30);
+        assert_eq!(rows(Some(64)), 40);
+        assert_eq!(rows(None), 16);
+    }
     #[test]
     fn overrunning_rows_share_the_budget_and_short_rows_stay_whole() {
         let short = "@short:1 kept whole".to_owned();
