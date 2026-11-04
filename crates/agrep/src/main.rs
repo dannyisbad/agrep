@@ -2,6 +2,11 @@ mod cmd;
 use agrep_core::{data::DataRoot, query::Filters, render, semantic, store};
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
+// On hosted Windows runners the allocation-heavy index phases (parsing, page
+// packing) ran 2-3x slower than the same work on macOS under the system heap.
+#[cfg(windows)]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[derive(Parser)]
 #[command(
     version,

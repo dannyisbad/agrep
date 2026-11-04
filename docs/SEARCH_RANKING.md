@@ -32,37 +32,68 @@ identifier-shaped grep. Plumbing surfaces (`--flat`, piped TSV, `--json`, `-l`,
 expression. Those explicit modes bypass boundary ranking. `--sort time` uses
 recency instead of the default score order.
 
+## Hit snippets
+
+A hit's snippet is its match with 80 characters on each side, whitespace runs
+collapsed to one space and `…` marking each cut (0.4.9's window). The match is
+the phrase's first occurrence; a lone word's first occurrence aligned at both
+ends, else its first of the best boundary quality; an explicit pattern's first
+match. An all-terms row places a window at each term's occurrence chosen the
+same way (with its singular/plural spellings), merges windows that touch, and
+joins the rest with a space. A content-fallback row places one window at the
+earliest occurrence of a found term. Recall, pack and tool handles name the
+same match.
+
 ## Default score order
 
 For row output, lane order is lexicographic: phrase, all-terms, then content
 fallback. Within a lane, the relevance score is:
 
 ```text
-S = T * R * W * B
+S = round(T * R * W * B, 4)
 ```
 
-- `T` is match tightness and repetition. For the tightest matching span,
-  `tight = min(1, query_characters / span_characters)`, and `n` occurrences
-  contribute `T = tight * (1 - 0.5^n)`. All-terms rows measure coverage and
-  spread from the same best-aligned occurrence selected for `B`. If any selected
-  occurrence has only one or no aligned edge, its quality removes the adjacency
-  bonus down to the `0.5` proximity floor; an interior fragment cannot earn a
-  near-phrase score merely because it sits beside another query term.
+- `T` is match tightness and repetition **inside the hit's snippet**. The phrase
+  (tokens joined by `[\W_]*`) is counted there and nowhere else: its `n`
+  non-overlapping matches give `T = tight * (1 - 0.5^n)`, with
+  `tight = min(1, query_characters / shortest_match_characters)` and characters
+  counted as the snippet shows them. Repetitions elsewhere in a long reply, or a
+  tighter match outside the snippet, do not count; a match spread over a
+  whitespace run counts as its collapsed width. Matches are found on the same
+  NFKC case-folded text as eligibility, so where that folding and 0.4.9's
+  case-insensitive matching agree (ASCII and most Unicode text) the counts are
+  0.4.9's. An all-terms row takes the larger
+  of that phrase strength over its stitched snippet and its proximity: the share
+  of terms the boundary scorer finds in the snippet times
+  `0.5 + 0.5 * min(1, query_characters / spread) * scale`, where `spread` covers
+  the selected occurrences plus 80 for each `…` between them and `scale` is the
+  least of `max(0, 2q - 1)` over their qualities. An interior fragment therefore
+  cannot earn a near-phrase score merely because it sits beside another term.
+  `-w` counts its whole-word pattern in the snippet; `-E` counts its matches with
+  no tightness, `T = 1 - 0.5^n`.
 - `R = 0.5^(age_days / 14)`. Human prompts retain a floor above the fresh
   recap/tool score ceilings. Explicit `-w` and `-E` searches also retain a
   recency floor.
 - `W` is the speaker/source prior. User prose leads; agent and subagent prose
   follow; tool output, recaps, control, synthetic, and harness rows are
   progressively downweighted.
-- `B` is the boundary factor below. It is a penalty only: `0 <= B <= 1`.
+- `B` is the boundary factor below. It is a penalty only: `0 <= B <= 1`. It is
+  graded on the snippet with every `…` replaced by a neighbouring character, so
+  a cut never looks like a word edge: a phrase row takes the best factor over
+  its snippet's matches (the shorter match on equal factors), an all-terms row
+  grades its stitched snippet.
 
-Final ties are deterministic by timestamp, session, turn, and speaker. Because
-`B` can never raise a score, an unseen candidate can safely be bounded with
-`B = 1`; broad candidate walks may therefore stop once their score ceiling
-cannot enter the requested page.
+The product is rounded to four decimal places, ties to even on its exact binary
+value (Python's `round`). Rows compare by that rounded score, then by
+timestamp (newer first), session, turn and speaker, so two rows whose scores
+differ only past the fourth place rank by time. Because `B` can never raise a
+score, an unseen candidate can safely be bounded with `B = 1`; a broad
+candidate walk skips a block or row only when its rounded ceiling is below the
+page's last score, or equal to it and the time/position order cannot favour it.
 
 Session-head views (`-l` and content-ranked `chats`) choose the best row per
-session by a lane-folded score instead of row output's lane-first key:
+session by a lane-folded score instead of row output's lane-first key, then by
+lane, time and position:
 
 ```text
 S_view = S * L, where L = 1.0 (phrase), 0.7 (all terms), 0.5 (content fallback)
@@ -70,6 +101,10 @@ S_view = S * L, where L = 1.0 (phrase), 0.7 (all terms), 0.5 (content fallback)
 
 This lets strong human prose represent a chat ahead of a weak phrase found in
 tool output without changing ordinary row-search ordering.
+
+The content fallback keeps its own score (IDF-weighted coverage, proximity and
+boundary over the whole row); only its snippet, rounding and order follow the
+rules above.
 
 ## Code-aware boundary factor
 

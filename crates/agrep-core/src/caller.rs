@@ -115,8 +115,19 @@ pub struct Caller {
     pub live_members: Vec<String>,
     pub boundary: Option<i64>,
     pub resolved: bool,
+    /// The read snapshot's session ids for hit handles, loaded by the first search.
+    #[serde(skip)]
+    pub(crate) sessions: std::sync::OnceLock<handles::SessionIndex>,
 }
 impl Caller {
+    /// The session index of `c`, the snapshot this command reads, loaded once.
+    pub fn sessions(&self, c: &Connection) -> Result<&handles::SessionIndex> {
+        if let Some(index) = self.sessions.get() {
+            return Ok(index);
+        }
+        let index = handles::SessionIndex::load(c)?;
+        Ok(self.sessions.get_or_init(|| index))
+    }
     pub fn resolve(c: &Connection, identity: Identity) -> Result<Self> {
         let mut out = Self {
             identity,
@@ -191,10 +202,294 @@ impl Caller {
         out.resolved = true;
         Ok(out)
     }
-    pub fn metadata(&self, include_self: bool, no_self: bool) -> serde_json::Value {
-        let requested = !include_self && (no_self || self.identity.agent_context);
-        let active = requested && self.resolved;
-        serde_json::json!({"active":active,"reason":if include_self{"explicit-include"}else if !requested{"machine-surface"}else if !self.resolved{"caller-unresolved"}else if no_self{"forced"}else{"window"},"identity":self.identity.reason,"scope":if no_self{"family"}else{"window"},"session":self.identity.session,"from_turn":self.boundary.unwrap_or(0),"excluded_hits":null,"excluded_hits_known":false})
+    /// 0.4.9's `calling_self_exclusion` for one surface: the caller rows it withholds, or
+    /// `None` when it withholds nothing.
+    pub fn policy(&self, request: Request<'_>) -> Option<Policy<'_>> {
+        if !request.requested(self) {
+            return None;
+        }
+        self.identity.session.as_ref()?;
+        if request.no_self {
+            return Some(Policy {
+                caller: self,
+                window: None,
+            });
+        }
+        self.resolved.then(|| Policy {
+            caller: self,
+            window: Some(self.boundary.unwrap_or(0)),
+        })
+    }
+    /// 0.4.9's `self_exclusion_disclosure`: the applied policy, or why there is none.
+    pub fn metadata(
+        &self,
+        request: Request<'_>,
+        excluded_hits: Option<usize>,
+    ) -> serde_json::Value {
+        if let Some(policy) = self.policy(request) {
+            return policy.disclosure(excluded_hits);
+        }
+        let reason = if request.include_self {
+            "explicit-include"
+        } else if request.requested(self) {
+            if self.identity.session.is_some() {
+                "window-unresolved"
+            } else {
+                &self.identity.reason
+            }
+        } else {
+            request.waived.unwrap_or("machine-surface")
+        };
+        serde_json::json!({"active": false, "reason": reason})
+    }
+}
+/// What one surface asks of caller exclusion, as each 0.4.9 command decided it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Request<'a> {
+    pub include_self: bool,
+    pub no_self: bool,
+    /// Why the surface skips automatic exclusion, such as `chat-filter` for one named chat.
+    pub waived: Option<&'a str>,
+}
+impl Request<'_> {
+    fn requested(&self, caller: &Caller) -> bool {
+        !self.include_self
+            && (self.no_self || (caller.identity.agent_context && self.waived.is_none()))
+    }
+}
+/// The caller rows one surface withholds (0.4.9's `SelfExclusion`).
+pub struct Policy<'a> {
+    caller: &'a Caller,
+    /// The caller transcript's first withheld turn; `None` withholds whole sessions.
+    window: Option<i64>,
+}
+impl Policy<'_> {
+    fn session(&self) -> &str {
+        if self.caller.resolved {
+            &self.caller.session
+        } else {
+            self.caller.identity.session.as_deref().unwrap_or_default()
+        }
+    }
+    pub fn disclosure(&self, excluded_hits: Option<usize>) -> serde_json::Value {
+        let mut out = serde_json::json!({
+            "active": true,
+            "reason": if self.window.is_some() { "window" } else { "forced" },
+            "scope": if self.window.is_some() {
+                "current-window"
+            } else if self.caller.resolved {
+                "session-family"
+            } else {
+                "session"
+            },
+            "session": self.session(),
+            "excluded_hits": excluded_hits,
+            "excluded_hits_known": excluded_hits.is_some(),
+            "identity": self.caller.identity.reason,
+        });
+        if let Some(turn) = self.window {
+            out["from_turn"] = turn.into();
+        }
+        out
+    }
+    /// 0.4.9's `self_exclusion_notice` for withheld rows or chats; silent at zero.
+    pub fn notice(&self, dropped: usize, noun: &str) -> Option<String> {
+        (dropped > 0).then(|| {
+            format!(
+                "excluded {} {noun}{} from {}",
+                crate::surface::number(dropped),
+                if dropped == 1 { "" } else { "s" },
+                if self.window.is_some() {
+                    "the current window"
+                } else if self.caller.resolved {
+                    "this session family"
+                } else {
+                    "this session"
+                }
+            )
+        })
+    }
+    /// 0.4.9's `_self_exclusion_match_keys` count: the rows of `o` this policy withheld,
+    /// read only inside the withheld sessions, with the caller's own transcript from its
+    /// window onward. `chat` narrows the sessions as a `--chat` prefix does. Unknown past
+    /// eight sessions, where 0.4.9 stopped probing.
+    pub fn withheld(
+        &self,
+        c: &Connection,
+        o: &Options,
+        chat: Option<&str>,
+    ) -> Result<Option<Withheld>> {
+        let caller = self.caller;
+        let mut sessions = vec![self.session().to_owned()];
+        let members = if self.window.is_some() {
+            &caller.live_members
+        } else {
+            &caller.members
+        };
+        sessions.extend(
+            members
+                .iter()
+                .filter(|s| s.as_str() != self.session())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .cloned(),
+        );
+        if let Some(prefix) = chat.map(str::to_lowercase) {
+            sessions.retain(|s| s.to_lowercase().starts_with(&prefix));
+        }
+        if sessions.len() > 8 {
+            return Ok(None);
+        }
+        // `chat` holds an exact session id here, and its LIKE reaches the session
+        // indexes only when case-sensitive; that is what keeps these probes cheap.
+        let indexed = !o.filters.model_soft;
+        if indexed {
+            c.execute_batch("PRAGMA case_sensitive_like=ON")?;
+        }
+        let counted = self.count(c, o, &sessions);
+        if indexed {
+            c.execute_batch("PRAGMA case_sensitive_like=OFF")?;
+        }
+        counted.map(Some)
+    }
+    fn count(&self, c: &Connection, o: &Options, sessions: &[String]) -> Result<Withheld> {
+        let caller = self.caller;
+        let mut withheld = Withheld::default();
+        for session in sessions {
+            let from = self.window.filter(|_| session == &caller.session);
+            let mut scoped = o.clone();
+            scoped.limit = 0;
+            scoped.exact = true;
+            scoped.chats = false;
+            scoped.sort = "time".into();
+            scoped.filters.caller = None;
+            scoped.filters.no_side = false;
+            scoped.filters.no_meta = false;
+            scoped.filters.chat = Some(session.clone());
+            if caller.resolved
+                && o.filters.agent.as_deref().is_none_or(|agents| {
+                    agents
+                        .split(',')
+                        .any(|a| a.trim().eq_ignore_ascii_case(&caller.agent))
+                })
+            {
+                scoped.filters.agent = Some(caller.agent.clone());
+            }
+            // Whether rows before the window share its time range and must be subtracted.
+            let mut overlap = false;
+            if let Some(from) = from {
+                // Every row of the window is at least as new as its oldest row, so this
+                // keeps the probe on the window instead of the whole transcript.
+                let (start, last_before) = c.query_row(
+                    "SELECT (SELECT min(ts) FROM (SELECT min(ts) AS ts FROM prose WHERE visible=1 AND session=?1 AND position>=?2 UNION ALL SELECT min(ts) FROM tools WHERE visible=1 AND session=?1 AND position>=?2)), (SELECT max(ts) FROM (SELECT max(ts) AS ts FROM prose WHERE visible=1 AND session=?1 AND position<?2 UNION ALL SELECT max(ts) FROM tools WHERE visible=1 AND session=?1 AND position<?2))",
+                    rusqlite::params![session, from],
+                    |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)),
+                )?;
+                let Some(start) = start else {
+                    continue;
+                };
+                overlap = last_before.is_some_and(|ts| ts >= start);
+                scoped.filters.since = Some(scoped.filters.since.map_or(start, |s| s.max(start)));
+            }
+            let before = from
+                .filter(|&from| from > 0)
+                .map(|from| query::CallerFilter {
+                    agent: caller.agent.clone(),
+                    session: session.clone(),
+                    family: caller.root.clone(),
+                    exclude_from_turn: Some(from),
+                    exclude_family: false,
+                    excluded_sessions: vec![],
+                });
+            // Counts skip hit hydration. Rows are read only where a count cannot tell
+            // what 0.4.9 kept: tooling roles under --no-meta, or a session id another
+            // one extends, which the prefix filter would also match.
+            let rows = o.filters.no_meta
+                || c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sessions WHERE id LIKE ?1 ESCAPE '\\' AND id<>?2)",
+                    rusqlite::params![
+                        format!(
+                            "{}%",
+                            session
+                                .replace('\\', "\\\\")
+                                .replace('%', "\\%")
+                                .replace('_', "\\_")
+                        ),
+                        session
+                    ],
+                    |r| r.get::<_, bool>(0),
+                )?;
+            let tally = |content: bool| -> Result<Withheld> {
+                let mut probe = scoped.clone();
+                probe.content = content;
+                probe.count_only = !rows;
+                probe.count_by_tier = !rows;
+                if rows {
+                    let mut tally = Withheld::default();
+                    for h in query::search(c, &probe)?.hits.iter().filter(|h| {
+                        &h.session == session
+                            && from.is_none_or(|from| h.turn >= from)
+                            // 0.4.9's probes dropped only rows its `_meta_row` stored as tooling.
+                            && !(o.filters.no_meta
+                                && (matches!(h.who.as_str(), "harness" | "synthetic")
+                                    || (h.who == "subagent" && h.turn == 0)))
+                    }) {
+                        if h.who == "tool" {
+                            tally.tools += 1;
+                        } else {
+                            tally.prose += 1;
+                        }
+                    }
+                    return Ok(tally);
+                }
+                let all = query::search(c, &probe)?;
+                let mut tally = Withheld {
+                    prose: all.total - all.tool_rows,
+                    tools: all.tool_rows,
+                };
+                if let Some(before) = before.as_ref().filter(|_| overlap) {
+                    probe.filters.caller = Some(before.clone());
+                    let early = query::search(c, &probe)?;
+                    tally.prose = tally.prose.saturating_sub(early.total - early.tool_rows);
+                    tally.tools = tally.tools.saturating_sub(early.tool_rows);
+                }
+                Ok(tally)
+            };
+            let mut found = tally(false)?;
+            if found.total() == 0 && o.content {
+                // 0.4.9 probed the whole transcript: related-term rows stood in only when
+                // no turn of it matched exactly, including turns before the window.
+                let matched_earlier = match &before {
+                    Some(before) => {
+                        let mut earlier = scoped.clone();
+                        earlier.content = false;
+                        earlier.count_only = true;
+                        earlier.count_by_tier = true;
+                        earlier.filters.since = o.filters.since;
+                        earlier.filters.caller = Some(before.clone());
+                        query::search(c, &earlier)?.total > 0
+                    }
+                    None => false,
+                };
+                if !matched_earlier {
+                    found = tally(true)?;
+                }
+            }
+            withheld.prose += found.prose;
+            withheld.tools += found.tools;
+        }
+        Ok(withheld)
+    }
+}
+/// Matching rows a policy withheld, by 0.4.9's two keyword lanes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Withheld {
+    pub prose: usize,
+    pub tools: usize,
+}
+impl Withheld {
+    pub fn total(self) -> usize {
+        self.prose + self.tools
     }
 }
 /// Attach caller identity before either retrieval lane ranks or counts rows.
@@ -229,7 +524,7 @@ pub fn search(
 ) -> Result<Results> {
     let options = options(o, caller, include_self, no_self);
     let mut result = query::search(c, &options)?;
-    decorate(c, &mut result, caller, &options)?;
+    decorate(c, &mut result, caller)?;
     Ok(result)
 }
 /// Session-list surfaces use the same native row predicate as retrieval.
@@ -270,50 +565,187 @@ pub fn excludes(
         },
     )
 }
+#[cfg(test)]
+mod disclosure {
+    use super::*;
+    const S1: &str = "11111111-1111-4111-8111-111111111111";
+    const U: &str = "99999999-9999-4999-8999-999999999999";
+    fn caller(
+        session: Option<&str>,
+        reason: &str,
+        resolved: bool,
+        boundary: Option<i64>,
+    ) -> Caller {
+        Caller {
+            identity: Identity {
+                session: session.map(str::to_owned),
+                reason: reason.into(),
+                agent_context: true,
+                published_sessions: vec![],
+            },
+            session: if resolved {
+                session.unwrap_or_default().into()
+            } else {
+                String::new()
+            },
+            agent: "pi".into(),
+            root: session.unwrap_or_default().into(),
+            resolved,
+            boundary,
+            ..Caller::default()
+        }
+    }
+    fn shown(value: serde_json::Value) -> String {
+        crate::json_output::to_string(&value).unwrap()
+    }
+    // Expected strings are agrep 0.4.9's `surface_policy.self_exclusion_disclosure` for the
+    // matching `SelfExclusion`/`CallingFamily` or inactive reason, serialized compactly.
+    #[test]
+    fn disclosures_match_0_4_9() {
+        let automatic = Request::default();
+        let forced = Request {
+            no_self: true,
+            ..Request::default()
+        };
+        for (caller, request, excluded, expected) in [
+            (
+                caller(Some(S1), "pi", true, Some(3)),
+                automatic,
+                None,
+                r#"{"active":true,"reason":"window","scope":"current-window","session":"11111111-1111-4111-8111-111111111111","excluded_hits":null,"excluded_hits_known":false,"identity":"pi","from_turn":3}"#,
+            ),
+            (
+                caller(Some(S1), "codex", true, None),
+                automatic,
+                None,
+                r#"{"active":true,"reason":"window","scope":"current-window","session":"11111111-1111-4111-8111-111111111111","excluded_hits":null,"excluded_hits_known":false,"identity":"codex","from_turn":0}"#,
+            ),
+            (
+                caller(Some(S1), "claude", true, Some(3)),
+                forced,
+                None,
+                r#"{"active":true,"reason":"forced","scope":"session-family","session":"11111111-1111-4111-8111-111111111111","excluded_hits":null,"excluded_hits_known":false,"identity":"claude"}"#,
+            ),
+            (
+                caller(Some(U), "pi", false, None),
+                forced,
+                None,
+                r#"{"active":true,"reason":"forced","scope":"session","session":"99999999-9999-4999-8999-999999999999","excluded_hits":null,"excluded_hits_known":false,"identity":"pi"}"#,
+            ),
+            (
+                caller(Some(S1), "corroborated", true, Some(5)),
+                automatic,
+                Some(4),
+                r#"{"active":true,"reason":"window","scope":"current-window","session":"11111111-1111-4111-8111-111111111111","excluded_hits":4,"excluded_hits_known":true,"identity":"corroborated","from_turn":5}"#,
+            ),
+            (
+                caller(Some(S1), "pi-process", true, None),
+                automatic,
+                Some(0),
+                r#"{"active":true,"reason":"window","scope":"current-window","session":"11111111-1111-4111-8111-111111111111","excluded_hits":0,"excluded_hits_known":true,"identity":"pi-process","from_turn":0}"#,
+            ),
+            (
+                caller(Some(S1), "pi", true, Some(3)),
+                Request {
+                    include_self: true,
+                    ..automatic
+                },
+                None,
+                r#"{"active":false,"reason":"explicit-include"}"#,
+            ),
+            (
+                caller(Some(S1), "pi", true, Some(3)),
+                Request {
+                    waived: Some("chat-filter"),
+                    ..automatic
+                },
+                None,
+                r#"{"active":false,"reason":"chat-filter"}"#,
+            ),
+            (
+                caller(Some(U), "pi", false, None),
+                automatic,
+                None,
+                r#"{"active":false,"reason":"window-unresolved"}"#,
+            ),
+            (
+                caller(None, "identity-conflict", false, None),
+                automatic,
+                None,
+                r#"{"active":false,"reason":"identity-conflict"}"#,
+            ),
+            (
+                caller(None, "caller-unresolved", false, None),
+                forced,
+                None,
+                r#"{"active":false,"reason":"caller-unresolved"}"#,
+            ),
+        ] {
+            assert_eq!(shown(caller.metadata(request, excluded)), expected);
+        }
+        let mut outside = caller(None, "caller-unresolved", false, None);
+        outside.identity.agent_context = false;
+        assert_eq!(
+            shown(outside.metadata(Request::default(), None)),
+            r#"{"active":false,"reason":"machine-surface"}"#
+        );
+    }
+    // 0.4.9's `self_exclusion_notice` wording for hits and chats in each scope.
+    #[test]
+    fn notices_match_0_4_9() {
+        let window = caller(Some(S1), "pi", true, Some(3));
+        let policy = window.policy(Request::default()).unwrap();
+        assert_eq!(policy.notice(0, "hit"), None);
+        assert_eq!(
+            policy.notice(1, "hit").unwrap(),
+            "excluded 1 hit from the current window"
+        );
+        assert_eq!(
+            policy.notice(1234, "hit").unwrap(),
+            "excluded 1,234 hits from the current window"
+        );
+        let family = window
+            .policy(Request {
+                no_self: true,
+                ..Request::default()
+            })
+            .unwrap();
+        assert_eq!(
+            family.notice(2, "chat").unwrap(),
+            "excluded 2 chats from this session family"
+        );
+        let unindexed = caller(Some(U), "pi", false, None);
+        let session = unindexed
+            .policy(Request {
+                no_self: true,
+                ..Request::default()
+            })
+            .unwrap();
+        assert_eq!(
+            session.notice(3, "hit").unwrap(),
+            "excluded 3 hits from this session"
+        );
+    }
+}
 /// Presentation-only decoration: caller exclusions already ran before ranking.
 pub fn decorate_semantic(c: &Connection, result: &mut Results, caller: &Caller) -> Result<()> {
-    let index = handles::SessionIndex::load(c)?;
+    let index = caller.sessions(c)?;
     for h in &mut result.hits {
         h.self_marker = caller.resolved && h.agent == caller.agent && h.session == caller.session;
         h.handle = index.mint(&h.session, h.turn, &h.text);
     }
     Ok(())
 }
-fn decorate(c: &Connection, result: &mut Results, caller: &Caller, o: &Options) -> Result<()> {
+fn decorate(c: &Connection, result: &mut Results, caller: &Caller) -> Result<()> {
     if result.hits.is_empty() {
         return Ok(());
     }
-    let explicit = if o.regex || o.word {
-        let pattern = if o.word {
-            format!(r"\b(?:{})\b", regex::escape(&o.pattern))
-        } else {
-            o.pattern.clone()
-        };
-        Some(
-            fancy_regex::RegexBuilder::new(&format!("(?i:{pattern})"))
-                .backtrack_limit(100_000)
-                .build()?,
-        )
-    } else {
-        None
-    };
-    let spans = MatchSpans::new(&o.pattern);
-    let index = handles::SessionIndex::load(c)?;
+    let index = caller.sessions(c)?;
     for h in &mut result.hits {
         h.self_marker = caller.resolved && h.agent == caller.agent && h.session == caller.session;
         h.handle = index.mint(&h.session, h.turn, &h.text);
         if h.who == "tool" {
-            let matched = if let Some(matcher) = &explicit {
-                matcher.find(&h.text)?.map(|m| {
-                    (
-                        h.text[..m.start()].chars().count(),
-                        h.text[..m.end()].chars().count(),
-                    )
-                })
-            } else {
-                spans.find(&h.text, &h.matched)
-            };
-            if let Some((start, end)) = matched.filter(|(a, b)| b > a) {
+            if let Some((start, end)) = h.span.filter(|(a, b)| b > a) {
                 h.handle += &format!(
                     "~{}:{start}-{end}",
                     handles::event_id(&h.session, h.ts, &h.text)
@@ -322,183 +754,6 @@ fn decorate(c: &Connection, result: &mut Results, caller: &Caller, o: &Options) 
         }
     }
     Ok(())
-}
-/// Where 0.4.9 placed a keyword hit's match (`_match_span`), in characters: the first
-/// separator-flexible phrase match; a lone word's best-aligned occurrence; for all
-/// terms, the earliest of each term's best-aligned occurrence; for content terms, the
-/// earliest occurrence of any.
-struct MatchSpans {
-    words: Vec<String>,
-    phrase: Option<regex::Regex>,
-    terms: Vec<(String, Vec<String>)>,
-    content: Vec<String>,
-}
-impl MatchSpans {
-    fn new(pattern: &str) -> Self {
-        let words: Vec<String> = pattern
-            .split(|c: char| crate::evidence::py_space(c) || c == '-' || c == '_')
-            .filter(|word| !word.is_empty())
-            .map(str::to_owned)
-            .collect();
-        let phrase = (words.len() > 1)
-            .then(|| {
-                let joined: Vec<String> = words.iter().map(|w| regex::escape(w)).collect();
-                regex::Regex::new(&format!("(?i){}", joined.join(r"[\W_]*"))).ok()
-            })
-            .flatten();
-        let mut terms: Vec<(String, Vec<String>)> = Vec::new();
-        for word in &words {
-            let variants = crate::boundary_rank::term_variants(word);
-            if !variants.is_empty() && !terms.iter().any(|(_, seen)| *seen == variants) {
-                terms.push((word.clone(), variants));
-            }
-        }
-        let mut content: Vec<String> = Vec::new();
-        for term in crate::evidence::content_terms(pattern) {
-            let term = term.to_lowercase();
-            if !content.contains(&term) {
-                content.push(term);
-            }
-        }
-        Self {
-            words,
-            phrase,
-            terms,
-            content,
-        }
-    }
-    fn find(&self, text: &str, matched: &str) -> Option<(usize, usize)> {
-        let low = text.to_lowercase();
-        let terms = || {
-            self.terms
-                .iter()
-                .filter_map(|(word, variants)| insensitive_span(text, &low, word, variants))
-                .min()
-        };
-        match matched {
-            "phrase" if self.words.len() == 1 => {
-                insensitive_span(text, &low, &self.words[0], &self.words)
-            }
-            // The engine's phrase tier and this pattern agree; terms cover any drift.
-            "phrase" => self
-                .phrase
-                .as_ref()
-                .and_then(|phrase| phrase.find(text))
-                .map(|m| {
-                    (
-                        text[..m.start()].chars().count(),
-                        text[..m.end()].chars().count(),
-                    )
-                })
-                .or_else(terms),
-            "content-terms" => {
-                let found = self
-                    .content
-                    .iter()
-                    .filter_map(|term| low.find(term.as_str()).map(|at| (at, term)))
-                    .min_by_key(|(at, _)| *at)?;
-                let start = low[..found.0].chars().count();
-                Some(original_span(text, start, start + found.1.chars().count()))
-            }
-            _ => terms(),
-        }
-    }
-}
-/// 0.4.9's `insensitive_span`: of the occurrences of any spelling in the lowercased text,
-/// the first with the best boundary quality, as original characters.
-fn insensitive_span(
-    text: &str,
-    low: &str,
-    word: &str,
-    spellings: &[String],
-) -> Option<(usize, usize)> {
-    let chars: Vec<char> = text.chars().collect();
-    let mut first = None;
-    let mut best = None;
-    let mut best_quality = -1.0;
-    for spelling in spellings {
-        let needle = spelling.to_lowercase();
-        let Some(width) = needle.chars().next().map(char::len_utf8) else {
-            continue;
-        };
-        let mut from = 0;
-        while let Some(at) = low[from..].find(&needle).map(|at| from + at) {
-            let start = low[..at].chars().count();
-            let span = original_span(text, start, start + needle.chars().count());
-            first.get_or_insert(span);
-            let quality = (f64::from(u8::from(boundary(&chars, span.0)))
-                + f64::from(u8::from(boundary(&chars, span.1))))
-                / 2.0;
-            if quality > best_quality {
-                (best, best_quality) = (Some(span), quality);
-                if quality == 1.0 {
-                    return best;
-                }
-            }
-            from = at + low[at..].chars().next().map_or(width, char::len_utf8);
-        }
-    }
-    if first.is_none() {
-        let m = regex::Regex::new(&format!("(?i){}", regex::escape(word)))
-            .ok()?
-            .find(text)?;
-        return Some((
-            text[..m.start()].chars().count(),
-            text[..m.end()].chars().count(),
-        ));
-    }
-    best.or(first)
-}
-/// 0.4.9's `_ascii_boundary`: whether a word boundary falls before character `at`.
-fn boundary(chars: &[char], at: usize) -> bool {
-    if at == 0 || at == chars.len() {
-        return true;
-    }
-    let (left, right) = (chars[at - 1], chars[at]);
-    if right == '\''
-        && at + 1 < chars.len()
-        && left.is_alphabetic()
-        && chars[at + 1].is_alphabetic()
-    {
-        return false;
-    }
-    if left == '\'' && at >= 2 && chars[at - 2].is_alphabetic() && right.is_alphabetic() {
-        return false;
-    }
-    if !left.is_alphanumeric() || !right.is_alphanumeric() {
-        return true;
-    }
-    if left.is_lowercase() && right.is_uppercase() {
-        return true;
-    }
-    if left.is_uppercase()
-        && right.is_uppercase()
-        && at + 1 < chars.len()
-        && chars[at + 1].is_lowercase()
-    {
-        return true;
-    }
-    (left.is_alphabetic() && right.is_numeric()) || (left.is_numeric() && right.is_alphabetic())
-}
-/// The original characters covering characters `start..end` of `text.to_lowercase()`,
-/// which can be longer than `text` (0.4.9's `original_span_for_lowered`).
-fn original_span(text: &str, start: usize, end: usize) -> (usize, usize) {
-    let mut lowered = 0;
-    let mut from = None;
-    for (index, c) in text.chars().enumerate() {
-        let next = lowered + c.to_lowercase().count();
-        if from.is_none() && start < next {
-            from = Some(index);
-        }
-        if let Some(from) = from {
-            if end <= next {
-                return (from, index + 1);
-            }
-        }
-        lowered = next;
-    }
-    let n = text.chars().count();
-    (from.unwrap_or(n), n)
 }
 fn publication_root() -> PathBuf {
     if let Some(p) = std::env::var_os("AGREP_CALLER_PUBLICATION_DIR") {
@@ -653,20 +908,5 @@ mod tests {
         let id = Identity::from_env(&env);
         assert!(id.session.is_none());
         assert_eq!(id.reason, "identity-conflict");
-    }
-    // Expected spans were produced by agrep 0.4.9's own matchers: the `[\W_]*` phrase
-    // search, `console.insensitive_span` with and without `_keyword_term_specs` variants,
-    // and `corpusdb.content`'s earliest lowered occurrence.
-    #[test]
-    fn tool_hit_spans_follow_0_4_9_match_spans() {
-        let text = "bash [failed]: ./run-migration --step 3\nERROR copper falcon migration timeout; copper-falcon_migration";
-        let span = |query: &str, tier: &str| MatchSpans::new(query).find(text, tier);
-        assert_eq!(span("copper falcon migration", "phrase"), Some((46, 69)));
-        assert_eq!(
-            span("falcon migrations copper", "all-terms"),
-            Some((21, 30))
-        );
-        assert_eq!(span("migration", "phrase"), Some((21, 30)));
-        assert_eq!(span("timeout copper", "content-terms"), Some((46, 52)));
     }
 }

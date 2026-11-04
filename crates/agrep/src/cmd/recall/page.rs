@@ -1067,7 +1067,7 @@ pub(super) fn text(page: &Page, color: bool) -> Result<String> {
                     tcap,
                     &evidence::expand_command(target, t.turn, "agent"),
                 );
-                if reply.source_chars > reply.text.chars().count() {
+                if reply.reply_truncated() {
                     body += &format!(
                         " [source truncated at ingest; original reply {} chars]",
                         surface::number(reply.source_chars)
@@ -1259,7 +1259,7 @@ pub(super) fn json(page: &Page, envelope: &mut Value) -> Result<String> {
                 let mut row = json!({"kind":"msg","session":w.session,"project":w.project,"turn":t.turn,"who":who,"ts":t.ts,"text":capped,"omitted_chars":omitted});
                 if let Some(reply) = reply {
                     row["reply_chars"] = json!(reply.source_chars);
-                    row["reply_truncated"] = json!(reply.source_chars > reply.text.chars().count());
+                    row["reply_truncated"] = json!(reply.reply_truncated());
                 }
                 rows.push(row);
             }

@@ -233,6 +233,29 @@ pub fn normalize_token(token: &str) -> String {
         return token.to_ascii_lowercase();
     }
     let mut out = Vec::with_capacity(token.len());
+    fold(token, &mut out, |_, _| {});
+    String::from_utf8(out).expect("normalized clusters preserve UTF-8")
+}
+
+/// `normalize_token(text)` with the source of each non-ASCII cluster: its folded byte
+/// range and original byte range, in order. Every other byte folds one for one.
+pub(crate) fn normalize_mapped(text: &str) -> (String, Vec<[usize; 4]>) {
+    let mut out = Vec::with_capacity(text.len());
+    let mut clusters: Vec<[usize; 4]> = Vec::new();
+    fold(text, &mut out, |folded, original| {
+        clusters.push([folded.start, folded.end, original.start, original.end])
+    });
+    (
+        String::from_utf8(out).expect("normalized clusters preserve UTF-8"),
+        clusters,
+    )
+}
+
+fn fold(
+    token: &str,
+    out: &mut Vec<u8>,
+    mut cluster: impl FnMut(std::ops::Range<usize>, std::ops::Range<usize>),
+) {
     let mut at = 0;
     while at < token.len() {
         // Leave the final ASCII character with the Unicode tail: an attachment
@@ -286,12 +309,13 @@ pub fn normalize_token(token: &str) -> String {
         if original.is_ascii() {
             out.extend(original.bytes().map(|b| b.to_ascii_lowercase()));
         } else {
+            let start = out.len();
             let compatible: String = original.nfkc().collect();
             out.extend_from_slice(unicode_v16::case_fold(&compatible).as_bytes());
+            cluster(start..out.len(), at..end);
         }
         at = end;
     }
-    String::from_utf8(out).expect("normalized clusters preserve UTF-8")
 }
 
 pub fn term_variants(token: &str) -> Vec<String> {
@@ -419,6 +443,10 @@ pub fn cold_prior(token: &str) -> f64 {
 }
 
 impl PreparedQuery {
+    /// How many query tokens it grades (tokens that fold to nothing are dropped).
+    pub(crate) fn len(&self) -> usize {
+        self.terms.len()
+    }
     pub(crate) fn evaluate_compact(
         &self,
         text: &str,

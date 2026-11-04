@@ -1,0 +1,608 @@
+[
+ {
+  "args": [
+   "flaky",
+   "-n",
+   "0"
+  ],
+  "rows": [
+   {
+    "turn": 3,
+    "who": "user",
+    "score": 0.875,
+    "snippet": "xflakyx and yflakyy then the flaky one at last",
+    "matched": "phrase"
+   },
+   {
+    "turn": 17,
+    "who": "user",
+    "score": 0.75,
+    "snippet": "our flakyWindows cache and the flaky-windows build",
+    "matched": "phrase"
+   },
+   {
+    "turn": 0,
+    "who": "agent",
+    "score": 0.7,
+    "snippet": "flaky windows flaky windows flaky windows keep failing",
+    "matched": "phrase"
+   },
+   {
+    "turn": 2,
+    "who": "agent",
+    "score": 0.7,
+    "snippet": "flaky flaky, still flaky after the retry",
+    "matched": "phrase"
+   },
+   {
+    "turn": 4,
+    "who": "agent",
+    "score": 0.6,
+    "snippet": "It is Flaky… maybe the cache; flaky—again",
+    "matched": "phrase"
+   },
+   {
+    "turn": 1,
+    "who": "user",
+    "score": 0.5,
+    "snippet": "cache misses on windows; also flaky",
+    "matched": "phrase"
+   },
+   {
+    "turn": 0,
+    "who": "user",
+    "score": 0.5,
+    "snippet": "windows are flaky on the cache runner",
+    "matched": "phrase"
+   },
+   {
+    "turn": 0,
+    "who": "user",
+    "score": 0.5,
+    "snippet": "flaky test in ci again",
+    "matched": "phrase"
+   },
+   {
+    "turn": 1,
+    "who": "agent",
+    "score": 0.4,
+    "snippet": "the flaky windows cache is fixed",
+    "matched": "phrase"
+   },
+   {
+    "turn": 1,
+    "who": "agent",
+    "score": 0.4,
+    "snippet": "The flaky job retried. Note 0: the quick brown fox jumps over the lazy dog and keeps runn…",
+    "matched": "phrase"
+   }
+  ]
+ },
+ {
+  "args": [
+   "release workflow",
+   "-n",
+   "0"
+  ],
+  "rows": [
+   {
+    "turn": 15,
+    "who": "user",
+    "score": 0.7031,
+    "snippet": "release workflow and release workflow",
+    "matched": "phrase"
+   },
+   {
+    "turn": 6,
+    "who": "agent",
+    "score": 0.7,
+    "snippet": "release-workflow release_workflow releaseWorkflow all match",
+    "matched": "phrase"
+   },
+   {
+    "turn": 5,
+    "who": "user",
+    "score": 0.4688,
+    "snippet": "the release workflow failed twice",
+    "matched": "phrase"
+   },
+   {
+    "turn": 10,
+    "who": "user",
+    "score": 0.4167,
+    "snippet": "café notes: the release — workflow ✓ done, naïve fix",
+    "matched": "phrase"
+   },
+   {
+    "turn": 7,
+    "who": "agent",
+    "score": 0.375,
+    "snippet": "…quick brown fox jumps over the lazy dog and keeps running past the old mill the release workflow broke the quick brown fox jumps over the lazy dog and keeps running past the ol…",
+    "matched": "phrase"
+   },
+   {
+    "turn": 14,
+    "who": "agent",
+    "score": 0.3333,
+    "snippet": "release / workflow, then the quick brown fox jumps over the lazy dog and keeps running past the ol…",
+    "matched": "phrase"
+   },
+   {
+    "turn": 9,
+    "who": "agent",
+    "score": 0.64,
+    "snippet": "the workflow for this release is green",
+    "matched": "all-terms"
+   },
+   {
+    "turn": 8,
+    "who": "user",
+    "score": 0.5223,
+    "snippet": "workflow first the quick brown fox jumps over the lazy dog and keeps running past the ol… …jumps over the lazy dog and keeps running past the old mill and much later the release",
+    "matched": "all-terms"
+   },
+   {
+    "turn": 11,
+    "who": "agent",
+    "score": 0.4178,
+    "snippet": "release--------------------------------------------------------------------------------… …--------------------------------------------------------------------------------workflow",
+    "matched": "all-terms"
+   }
+  ]
+ },
+ {
+  "args": [
+   "abcde fghij",
+   "-n",
+   "0"
+  ],
+  "rows": [
+   {
+    "turn": 12,
+    "who": "user",
+    "score": 0.4688,
+    "snippet": "abcde----------fghij abcde----------fghij abcde----------fghij abcde----------fghij",
+    "matched": "phrase"
+   },
+   {
+    "turn": 13,
+    "who": "agent",
+    "score": 0.3636,
+    "snippet": "abcde fghij the quick brown fox jumps over the lazy dog and keeps running past the old mill…",
+    "matched": "phrase"
+   }
+  ]
+ },
+ {
+  "args": [
+   "flaky",
+   "-w",
+   "-n",
+   "0"
+  ],
+  "rows": [
+   {
+    "turn": 0,
+    "who": "agent",
+    "score": 0.7,
+    "snippet": "flaky windows flaky windows flaky windows keep failing",
+    "matched": "phrase"
+   },
+   {
+    "turn": 2,
+    "who": "agent",
+    "score": 0.7,
+    "snippet": "flaky flaky, still flaky after the retry",
+    "matched": "phrase"
+   },
+   {
+    "turn": 4,
+    "who": "agent",
+    "score": 0.6,
+    "snippet": "It is Flaky… maybe the cache; flaky—again",
+    "matched": "phrase"
+   },
+   {
+    "turn": 1,
+    "who": "user",
+    "score": 0.5,
+    "snippet": "cache misses on windows; also flaky",
+    "matched": "phrase"
+   },
+   {
+    "turn": 0,
+    "who": "user",
+    "score": 0.5,
+    "snippet": "windows are flaky on the cache runner",
+    "matched": "phrase"
+   },
+   {
+    "turn": 17,
+    "who": "user",
+    "score": 0.5,
+    "snippet": "our flakyWindows cache and the flaky-windows build",
+    "matched": "phrase"
+   },
+   {
+    "turn": 3,
+    "who": "user",
+    "score": 0.5,
+    "snippet": "xflakyx and yflakyy then the flaky one at last",
+    "matched": "phrase"
+   },
+   {
+    "turn": 0,
+    "who": "user",
+    "score": 0.5,
+    "snippet": "flaky test in ci again",
+    "matched": "phrase"
+   },
+   {
+    "turn": 1,
+    "who": "agent",
+    "score": 0.4,
+    "snippet": "the flaky windows cache is fixed",
+    "matched": "phrase"
+   },
+   {
+    "turn": 1,
+    "who": "agent",
+    "score": 0.4,
+    "snippet": "The flaky job retried. Note 0: the quick brown fox jumps over the lazy dog and keeps runn…",
+    "matched": "phrase"
+   }
+  ]
+ },
+ {
+  "args": [
+   "-E",
+   "rel.ase",
+   "-n",
+   "0"
+  ],
+  "rows": [
+   {
+    "turn": 15,
+    "who": "user",
+    "score": 0.75,
+    "snippet": "release workflow and release workflow",
+    "matched": "phrase"
+   },
+   {
+    "turn": 6,
+    "who": "agent",
+    "score": 0.7,
+    "snippet": "release-workflow release_workflow releaseWorkflow all match",
+    "matched": "phrase"
+   },
+   {
+    "turn": 10,
+    "who": "user",
+    "score": 0.5,
+    "snippet": "café notes: the release — workflow ✓ done, naïve fix",
+    "matched": "phrase"
+   },
+   {
+    "turn": 8,
+    "who": "user",
+    "score": 0.5,
+    "snippet": "…jumps over the lazy dog and keeps running past the old mill and much later the release",
+    "matched": "phrase"
+   },
+   {
+    "turn": 5,
+    "who": "user",
+    "score": 0.5,
+    "snippet": "the release workflow failed twice",
+    "matched": "phrase"
+   },
+   {
+    "turn": 14,
+    "who": "agent",
+    "score": 0.4,
+    "snippet": "release / workflow, then the quick brown fox jumps over the lazy dog and keeps running …",
+    "matched": "phrase"
+   },
+   {
+    "turn": 11,
+    "who": "agent",
+    "score": 0.4,
+    "snippet": "release--------------------------------------------------------------------------------…",
+    "matched": "phrase"
+   },
+   {
+    "turn": 9,
+    "who": "agent",
+    "score": 0.4,
+    "snippet": "the workflow for this release is green",
+    "matched": "phrase"
+   },
+   {
+    "turn": 7,
+    "who": "agent",
+    "score": 0.4,
+    "snippet": "…quick brown fox jumps over the lazy dog and keeps running past the old mill the release workflow broke the quick brown fox jumps over the lazy dog and keeps running pa…",
+    "matched": "phrase"
+   }
+  ]
+ },
+ {
+  "args": [
+   "release workflow",
+   "-l",
+   "-n",
+   "0"
+  ],
+  "rows": [
+   {
+    "turn": 15,
+    "who": "user",
+    "score": 0.7031,
+    "snippet": "release workflow and release workflow",
+    "matched": "phrase"
+   }
+  ]
+ },
+ {
+  "args": [
+   "flaky windows",
+   "-n",
+   "0"
+  ],
+  "rows": [
+   {
+    "turn": 17,
+    "who": "user",
+    "score": 0.75,
+    "snippet": "our flakyWindows cache and the flaky-windows build",
+    "matched": "phrase"
+   },
+   {
+    "turn": 0,
+    "who": "agent",
+    "score": 0.6462,
+    "snippet": "flaky windows flaky windows flaky windows keep failing",
+    "matched": "phrase"
+   },
+   {
+    "turn": 1,
+    "who": "agent",
+    "score": 0.3692,
+    "snippet": "the flaky windows cache is fixed",
+    "matched": "phrase"
+   },
+   {
+    "turn": 0,
+    "who": "user",
+    "score": 0.8529,
+    "snippet": "windows are flaky on the cache runner",
+    "matched": "all-terms"
+   },
+   {
+    "turn": 1,
+    "who": "user",
+    "score": 0.8158,
+    "snippet": "cache misses on windows; also flaky",
+    "matched": "all-terms"
+   }
+  ]
+ },
+ {
+  "args": [
+   "flaky windows",
+   "-l",
+   "-n",
+   "0"
+  ],
+  "rows": [
+   {
+    "turn": 17,
+    "who": "user",
+    "score": 0.75,
+    "snippet": "our flakyWindows cache and the flaky-windows build",
+    "matched": "phrase"
+   },
+   {
+    "turn": 0,
+    "who": "agent",
+    "score": 0.6462,
+    "snippet": "flaky windows flaky windows flaky windows keep failing",
+    "matched": "phrase"
+   },
+   {
+    "turn": 0,
+    "who": "user",
+    "score": 0.8529,
+    "snippet": "windows are flaky on the cache runner",
+    "matched": "all-terms"
+   }
+  ]
+ },
+ {
+  "args": [
+   "flaky windows cache",
+   "-n",
+   "0"
+  ],
+  "rows": [
+   {
+    "turn": 17,
+    "who": "user",
+    "score": 0.4722,
+    "snippet": "our flakyWindows cache and the flaky-windows build",
+    "matched": "phrase"
+   },
+   {
+    "turn": 1,
+    "who": "agent",
+    "score": 0.3579,
+    "snippet": "the flaky windows cache is fixed",
+    "matched": "phrase"
+   },
+   {
+    "turn": 0,
+    "who": "user",
+    "score": 0.7833,
+    "snippet": "windows are flaky on the cache runner",
+    "matched": "all-terms"
+   },
+   {
+    "turn": 1,
+    "who": "user",
+    "score": 0.7429,
+    "snippet": "cache misses on windows; also flaky",
+    "matched": "all-terms"
+   }
+  ]
+ },
+ {
+  "args": [
+   "ci",
+   "-n",
+   "0"
+  ],
+  "rows": [
+   {
+    "turn": 16,
+    "who": "agent",
+    "score": 0.75,
+    "snippet": "Fixed the CI cache: the ci job and CIcache now pass; ci",
+    "matched": "phrase"
+   },
+   {
+    "turn": 0,
+    "who": "user",
+    "score": 0.5,
+    "snippet": "flaky test in ci again",
+    "matched": "phrase"
+   }
+  ]
+ },
+ {
+  "args": [
+   "windows cache",
+   "-n",
+   "3"
+  ],
+  "rows": [
+   {
+    "turn": 17,
+    "who": "user",
+    "score": 0.4615,
+    "snippet": "our flakyWindows cache and the flaky-windows build",
+    "matched": "phrase"
+   },
+   {
+    "turn": 1,
+    "who": "agent",
+    "score": 0.3692,
+    "snippet": "the flaky windows cache is fixed",
+    "matched": "phrase"
+   },
+   {
+    "turn": 1,
+    "who": "user",
+    "score": 0.7609,
+    "snippet": "cache misses on windows; also flaky",
+    "matched": "all-terms"
+   }
+  ]
+ },
+ {
+  "args": [
+   "flaky",
+   "-n",
+   "2"
+  ],
+  "rows": [
+   {
+    "turn": 3,
+    "who": "user",
+    "score": 0.875,
+    "snippet": "xflakyx and yflakyy then the flaky one at last",
+    "matched": "phrase"
+   },
+   {
+    "turn": 17,
+    "who": "user",
+    "score": 0.75,
+    "snippet": "our flakyWindows cache and the flaky-windows build",
+    "matched": "phrase"
+   }
+  ]
+ },
+ {
+  "args": [
+   "release workflow",
+   "--sort",
+   "time",
+   "-n",
+   "0"
+  ],
+  "rows": [
+   {
+    "turn": 15,
+    "who": "user",
+    "score": 0.7031,
+    "snippet": "release workflow and release workflow",
+    "matched": "phrase"
+   },
+   {
+    "turn": 14,
+    "who": "agent",
+    "score": 0.3333,
+    "snippet": "release / workflow, then the quick brown fox jumps over the lazy dog and keeps running past the ol…",
+    "matched": "phrase"
+   },
+   {
+    "turn": 11,
+    "who": "agent",
+    "score": 0.4178,
+    "snippet": "release--------------------------------------------------------------------------------… …--------------------------------------------------------------------------------workflow",
+    "matched": "all-terms"
+   },
+   {
+    "turn": 10,
+    "who": "user",
+    "score": 0.4167,
+    "snippet": "café notes: the release — workflow ✓ done, naïve fix",
+    "matched": "phrase"
+   },
+   {
+    "turn": 9,
+    "who": "agent",
+    "score": 0.64,
+    "snippet": "the workflow for this release is green",
+    "matched": "all-terms"
+   },
+   {
+    "turn": 8,
+    "who": "user",
+    "score": 0.5223,
+    "snippet": "workflow first the quick brown fox jumps over the lazy dog and keeps running past the ol… …jumps over the lazy dog and keeps running past the old mill and much later the release",
+    "matched": "all-terms"
+   },
+   {
+    "turn": 7,
+    "who": "agent",
+    "score": 0.375,
+    "snippet": "…quick brown fox jumps over the lazy dog and keeps running past the old mill the release workflow broke the quick brown fox jumps over the lazy dog and keeps running past the ol…",
+    "matched": "phrase"
+   },
+   {
+    "turn": 6,
+    "who": "agent",
+    "score": 0.7,
+    "snippet": "release-workflow release_workflow releaseWorkflow all match",
+    "matched": "phrase"
+   },
+   {
+    "turn": 5,
+    "who": "user",
+    "score": 0.4688,
+    "snippet": "the release workflow failed twice",
+    "matched": "phrase"
+   }
+  ]
+ }
+]

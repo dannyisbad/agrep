@@ -58,8 +58,13 @@ pub fn plain(s: &str) -> bool {
 /// Distinct indexed session ids in byte order. In that order, an id's longest
 /// common prefix with any other id is the one it shares with a neighbor, and
 /// every id with a given prefix is contiguous.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct SessionIndex(Vec<String>);
+impl std::fmt::Debug for SessionIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SessionIndex").field(&self.0.len()).finish()
+    }
+}
 impl From<Vec<String>> for SessionIndex {
     fn from(mut ids: Vec<String>) -> Self {
         ids.sort_unstable();
@@ -69,7 +74,8 @@ impl From<Vec<String>> for SessionIndex {
 }
 impl SessionIndex {
     pub fn load(c: &Connection) -> Result<Self> {
-        Ok(c.prepare("SELECT DISTINCT id FROM sessions")?
+        // Sorting and deduplicating here spares SQLite a temporary DISTINCT index.
+        Ok(c.prepare_cached("SELECT id FROM sessions")?
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<Vec<String>>>()?
             .into())

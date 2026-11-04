@@ -45,18 +45,30 @@ pub fn is_terminal_format(char: char) -> bool {
         0xe0020..=0xe007f)
 }
 
+/// 0.4.9's `terminal_safe`: C0, DEL, C1 and the other format, surrogate and line or
+/// paragraph separator characters print as `\uXXXX` (`\UXXXXXXXX` past the BMP), except
+/// the two joiners ordinary text needs. Multiline text keeps newlines and expands tabs.
 pub fn safe(value: &str, multiline: bool) -> String {
-    value
-        .chars()
-        .map(|c| {
-            if (c.is_control() && !(multiline && (c == '\n' || c == '\t'))) || is_terminal_format(c)
-            {
-                ' '
-            } else {
-                c
+    use std::fmt::Write;
+    if value.bytes().all(|b| (b' '..=b'~').contains(&b)) {
+        return value.to_owned();
+    }
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\n' if multiline => out.push('\n'),
+            '\t' if multiline => out.push_str("    "),
+            '\u{200c}' | '\u{200d}' => out.push(c),
+            _ if (c.is_control() || is_terminal_format(c)) && (c as u32) > 0xffff => {
+                write!(out, "\\U{:08x}", c as u32).expect("writing to a String cannot fail")
             }
-        })
-        .collect()
+            _ if c.is_control() || is_terminal_format(c) => {
+                write!(out, "\\u{:04x}", c as u32).expect("writing to a String cannot fail")
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 pub fn shell(args: &[String]) -> String {
     args.iter()
@@ -101,21 +113,40 @@ pub fn timestamp(ts: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Expected strings are agrep 0.4.9's `surface_policy.terminal_safe` output.
     #[test]
-    fn shared_sanitizer_neutralizes_controls_and_bidi_formats() {
-        for c in [
-            '\u{7f}', '\u{85}', '\u{9b}', '\u{202e}', '\u{2066}', '\u{200b}', '\u{feff}',
+    fn shared_sanitizer_quotes_controls_and_formats_as_0_4_9() {
+        for (input, multiline, expected) in [
+            ("before\u{7f}after", false, r"before\u007fafter"),
+            ("before\u{85}after", false, r"before\u0085after"),
+            ("before\u{9b}after", false, r"before\u009bafter"),
+            ("before\u{202e}after", false, r"before\u202eafter"),
+            ("before\u{2066}after", false, r"before\u2066after"),
+            ("before\u{200b}after", false, r"before\u200bafter"),
+            ("before\u{feff}after", false, r"before\ufeffafter"),
+            ("\u{1b}[31m\nx", false, r"\u001b[31m\u000ax"),
+            ("a\nb\tc\rd", true, "a\nb    c\\u000dd"),
+            ("a\nb\tc", false, r"a\u000ab\u0009c"),
+            ("tag\u{e0061}!", false, r"tag\U000e0061!"),
+            (
+                "emoji\u{200d}\u{200c} ok",
+                false,
+                "emoji\u{200d}\u{200c} ok",
+            ),
+            ("line\u{2028}para\u{2029}", true, r"line\u2028para\u2029"),
+            ("soft\u{ad}hyphen", false, r"soft\u00adhyphen"),
+            ("plain ascii", false, "plain ascii"),
+            ("caf\u{e9} \u{754c}", false, "caf\u{e9} \u{754c}"),
         ] {
-            let input = format!("before{c}after");
-            assert_eq!(safe(&input, false), "before after");
-            assert_eq!(crate::ingest::terminal_safe(&input), safe(&input, false));
+            assert_eq!(safe(input, multiline), expected, "{input:?}");
+            if !multiline {
+                assert_eq!(crate::ingest::terminal_safe(input), expected);
+            }
         }
-        assert_eq!(safe("a\nb\tc", true), "a\nb\tc");
     }
     #[test]
     fn bytes_and_terminal() {
         assert_eq!(prefix("é🙂a", 5), "é");
         assert!(clip("é🙂a", 6).len() <= 6);
-        assert_eq!(safe("\u{1b}[31m\nx", false), " [31m x");
     }
 }

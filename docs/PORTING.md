@@ -36,6 +36,50 @@ Source adapters retain upstream historical formats. This is independent of the r
 
 Native replay copies retain their source contributions in SQLite. Only `visible=1` rows are searchable, and the public turn is `position` (the source-local `turn` stays available for incremental reconciliation). Future around/summary/audit code must use that canonical view for public results; audit can independently recount it instead of trusting cached counts. Deleting a winning source restores another stored contribution without reparsing unchanged files.
 
+## Caller exclusion, truncation flags and terminal quoting
+
+Every JSON `self_exclusion` object is 0.4.9's `self_exclusion_disclosure`: an inactive
+caller is exactly `{"active":false,"reason":...}` (`explicit-include`, `chat-filter`,
+`machine-surface`, `window-unresolved`, the identity's own `caller-unresolved` or
+`identity-conflict`); an active one lists `active, reason, scope` (`current-window`,
+`session-family`, or `session` for a forced, unindexed caller), `session`,
+`excluded_hits`, `excluded_hits_known`, `identity` and, for a window, `from_turn`.
+`caller::Request` carries each command's 0.4.9 trigger and `caller::Policy` is
+0.4.9's `SelfExclusion`. Search and a single recall/pack query count the withheld
+matching rows with scoped keyword queries confined to the withheld sessions (the
+caller transcript from its window's first row onward, plus whole live descendants or
+family members); the main query is untouched. As in 0.4.9 the count is unknown past
+eight sessions, for packs, for results fused with meaning rows, and with `--coverage`.
+Recall counts tool rows only when 0.4.9's prose-first lane would have fallen back to
+tools, and `--no-meta` drops only the stored tooling roles 0.4.9's probes dropped.
+Human search, recall and pack print `excluded N hits from the current window` (or
+`this session family` / `this session`); summary and chats print the chat form after
+their own lines. Chats rank content heads outside the withheld rows and consider only
+matching chats for exclusion, as 0.4.9 did.
+
+Around JSON truncation flags follow 0.4.9's ingest caps: an event is truncated only
+past 800 source characters of input or output, a reply only past 64,000; the scope's
+`source_truncated_*` counts cover the whole loaded window. Recall uses the same reply
+rule. The shared sanitizer is 0.4.9's `terminal_safe` quoting (see SECURITY.md); it
+also covers indexing diagnostics, which 0.4.9's Rust helper quoted with four or five
+hex digits instead of `\U` and also escaped the two joiners.
+
+Intentional 0.4.9 differences: summary, chats and around also carry the disclosure
+(`summary`/`chats` keep `excluded_hits` null because they count chats in
+`self_excluded`, and a bare `chats` listing reports `not-applicable`); `-s` results
+have no exact semantic count, so their `excluded_hits` stays null where 0.4.9 ran
+semantic probes. 0.5 has no automatic over-specification lane, so a compact page
+0.4.9 would have retried keeps its exact count and notice.
+
+Cost on a clone of the owner's index (release, agent-context `--json` search, medians of
+nine runs against `--self`): 10–23 ms for compacted callers with a recent window,
+90–135 ms for a never-compacted caller with 14,000 rows, 125–190 ms for a caller whose
+window started long ago. The probes count without hydrating hits and use the session
+indexes through a case-sensitive LIKE. Reaching a few milliseconds everywhere needs an
+engine scope on exact session and position. Still open: around's human tool lines do
+not yet use 0.4.9's `_tool_line` (whitespace collapse and 120-character cap), and keyword
+snippets keep 0.4.9's raw controls only once the engine's snippet window is ported.
+
 
 ## Integrations and archive port
 

@@ -205,6 +205,7 @@ mod tests {
             let model = ModernBert::load(
                 VarBuilder::from_backend(Box::new(Weights), DType::F32, device.clone()),
                 &config,
+                None,
             )
             .unwrap();
             assert!(!model.uses_arena());

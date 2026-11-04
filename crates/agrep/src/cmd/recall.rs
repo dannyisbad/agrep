@@ -28,6 +28,43 @@ fn weak(h: &Hit) -> bool {
     matches!(h.matched.as_str(), "all-terms" | "content-terms")
         || (h.matched == "semantic" && h.score < 0.84)
 }
+/// Whether 0.4.9's recall read tool rows for a query: its prose lane ran first and fell
+/// back to tools when fewer than `target` chats (families, unless `by_session`) held a
+/// prose match or none of those matches was a phrase. `rows` is the head, `depth` rows
+/// deep, of the same tier-first ranking with tools included; `deeper` reads that many
+/// prose rows when the head cannot decide.
+fn tool_lane(
+    rows: &[Hit],
+    depth: usize,
+    target: usize,
+    by_session: bool,
+    deeper: impl FnOnce(usize) -> Result<Vec<Hit>>,
+) -> Result<bool> {
+    let decide = |rows: &[Hit], complete: bool| {
+        let prose: Vec<_> = rows.iter().filter(|h| h.who != "tool").collect();
+        let chats = prose
+            .iter()
+            .map(|h| (&h.agent, if by_session { &h.session } else { &h.family }))
+            .collect::<HashSet<_>>()
+            .len();
+        let strong = prose.first().is_some_and(|h| h.matched == "phrase");
+        // Phrase rows rank first, so once a weaker row shows none is left unread.
+        let settled = complete || rows.last().is_some_and(|h| h.matched != "phrase");
+        if chats >= target && strong {
+            Some(false)
+        } else if complete || (settled && !strong) {
+            Some(true)
+        } else {
+            None
+        }
+    };
+    if let Some(decided) = decide(rows, rows.len() < depth) {
+        return Ok(decided);
+    }
+    let limit = depth.max(target).saturating_mul(8);
+    let rows = deeper(limit)?;
+    Ok(decide(&rows, rows.len() < limit).unwrap_or(true))
+}
 /// A block's head: handle · agent · project · when · meaning label · provenance marks.
 fn head(h: &Hit) -> String {
     let meaning = if h.matched == "semantic" && h.score < 0.84 {
@@ -421,6 +458,13 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
         identity.disclose(a.scope.no_self);
     }
     let caller = Caller::resolve(&c, identity)?;
+    let request = caller::Request {
+        include_self: a.scope.include_self,
+        no_self: a.scope.no_self,
+        waived: a.scope.chat.is_some().then_some("chat-filter"),
+    };
+    let policy = caller.policy(request);
+    let mut excluded = None;
     let mut filters = a.scope.filters()?;
     agrep_core::coverage::validate(&mut filters)?;
     let coverage = agrep_core::coverage::dimensions(&c, &filters)?;
@@ -607,6 +651,29 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
         } else {
             keyword
         };
+        // 0.4.9 counted withheld rows only for a single keyword query; packs and lanes
+        // fused with meaning results have no exact count.
+        if let Some(policy) = policy
+            .as_ref()
+            .filter(|_| queries.len() == 1 && !a.semantic && !semantic_ran)
+        {
+            if let Some(withheld) = policy.withheld(&c, &options, filters.chat.as_deref())? {
+                let tools = filters.who.is_some()
+                    || filters.no_who.is_some()
+                    || tool_lane(&r.hits, depth, target, a.scope.all_side_chats, |limit| {
+                        let prose = Options {
+                            tools: false,
+                            limit,
+                            ..options.clone()
+                        };
+                        Ok(
+                            caller::search(&c, &prose, &caller, include_self, a.scope.no_self)?
+                                .hits,
+                        )
+                    })?;
+                excluded = Some(withheld.prose + if tools { withheld.tools } else { 0 });
+            }
+        }
         totals_exact &= r.total_basis == "exact";
         known_sessions.extend(r.hits.iter().map(|h| h.session.clone()));
         deepen.push((depth < options.limit && r.hits.len() == depth).then_some(options));
@@ -679,7 +746,15 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
     } else {
         0
     };
+    let notice = policy
+        .as_ref()
+        .zip(excluded)
+        .and_then(|(policy, n)| policy.notice(n, "hit"))
+        .filter(|_| !a.json);
     if a.probe {
+        if let Some(notice) = &notice {
+            eprintln!("{notice}");
+        }
         let confident = blocks
             .iter()
             .find(|b| b.hit.matched == "phrase" || b.hit.matched == "semantic");
@@ -745,7 +820,7 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
     let color = color == "always" || (color == "auto" && std::io::stdout().is_terminal());
     let page = page::Page::new(&blocks, &queries, a.budget);
     if a.json {
-        let mut value = json!({"query":if pack{json!(queries)}else{json!(queries[0])},"engine":"sqlite","hits":[],"semantic_status":{"state":if semantic_failed{"failed"}else if semantic_ran{"complete"}else{"not-run"},"reason":if semantic_failed{Some("retrieval-failed")}else if semantic_ran{None}else{Some(if a.lexical{"--lexical"}else if !semantic::installed(&root){"model-not-installed"}else{"query-ineligible"})}},"self_exclusion":caller.metadata(include_self,a.scope.no_self),"filter_coverage":coverage,"freshness":render::freshness(checked,pending_sources),"semantic_coverage":semantic_coverage});
+        let mut value = json!({"query":if pack{json!(queries)}else{json!(queries[0])},"engine":"sqlite","hits":[],"semantic_status":{"state":if semantic_failed{"failed"}else if semantic_ran{"complete"}else{"not-run"},"reason":if semantic_failed{Some("retrieval-failed")}else if semantic_ran{None}else{Some(if a.lexical{"--lexical"}else if !semantic::installed(&root){"model-not-installed"}else{"query-ineligible"})}},"self_exclusion":caller.metadata(request,excluded),"filter_coverage":coverage,"freshness":render::freshness(checked,pending_sources),"semantic_coverage":semantic_coverage});
         if override_filters {
             value["filter_override"] = json!({"supplied":direct_filters,"reason":"direct-handle"});
         }
@@ -755,6 +830,9 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
         eprintln!("no hits across {n} indexed sessions.");
     } else {
         surface::write(&page::text(&page, color)?)?;
+    }
+    if let Some(notice) = &notice {
+        eprintln!("{notice}");
     }
     Ok(exit)
 }

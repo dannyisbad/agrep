@@ -205,6 +205,81 @@ fn caller_window_applies_to_every_machine_lane() {
         0
     );
 }
+// Expected values are agrep 0.4.9's output on this fixture and caller.
+#[test]
+fn caller_window_counts_withheld_hits_as_0_4_9() {
+    let (_t, h, d) = pi();
+    let caller = [("CODEX_THREAD_ID", "01930000-0000-7000-8000-000000000001")];
+    let rows = values(&ok(cli(&h, &d, &["retry", "--json"], &caller)));
+    assert_eq!(
+        agrep_core::json_output::to_string(&rows[0]["self_exclusion"]).unwrap(),
+        r#"{"active":true,"reason":"window","scope":"current-window","session":"01930000-0000-7000-8000-000000000001","excluded_hits":1,"excluded_hits_known":true,"identity":"codex","from_turn":1}"#
+    );
+    let flat = ok(cli(&h, &d, &["retry", "--flat"], &caller));
+    assert!(String::from_utf8(flat.stderr)
+        .unwrap()
+        .lines()
+        .any(|l| l == "excluded 1 hit from the current window"));
+    let recall = ok(cli(
+        &h,
+        &d,
+        &["recall", "retry", "--lexical", "--json"],
+        &caller,
+    ));
+    let recall: Value = serde_json::from_slice(&recall.stdout).unwrap();
+    assert_eq!(recall["self_exclusion"]["excluded_hits"], 1);
+    let pack = ok(cli(&h, &d, &["pack", "retry", "jitter", "--json"], &caller));
+    let pack: Value = serde_json::from_slice(&pack.stdout).unwrap();
+    assert_eq!(pack["self_exclusion"]["excluded_hits"], Value::Null);
+    assert_eq!(pack["self_exclusion"]["excluded_hits_known"], false);
+    let tool = values(&ok(cli(
+        &h,
+        &d,
+        &["backoff", "--who", "tool", "--json"],
+        &caller,
+    )));
+    assert_eq!(tool[0]["self_exclusion"]["excluded_hits"], 0);
+    let plain = values(&ok(cli(&h, &d, &["retry", "--json"], &[])));
+    assert_eq!(
+        agrep_core::json_output::to_string(&plain[0]["self_exclusion"]).unwrap(),
+        r#"{"active":false,"reason":"machine-surface"}"#
+    );
+}
+// 0.4.9 flagged event output truncated only past the 800-character ingest cap.
+#[test]
+fn around_flags_truncation_only_past_the_ingest_cap() {
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let d = t.path().join("d");
+    let dir = h.join(".pi/agent/sessions/work-cap");
+    fs::create_dir_all(&dir).unwrap();
+    let long = "y".repeat(900);
+    let lines = [
+        serde_json::json!({"type":"session","id":"0aaa0000-0000-7000-8000-000000000001","version":3,"cwd":"/work/cap","timestamp":"2026-10-01T12:00:00.000Z"}),
+        serde_json::json!({"type":"message","id":"u0","parentId":null,"timestamp":"2026-10-01T12:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"show the capfixture output"}]}}),
+        serde_json::json!({"type":"message","id":"a0","parentId":"u0","timestamp":"2026-10-01T12:00:02.000Z","message":{"role":"assistant","model":"m","provider":"p","stopReason":"end_turn","content":[{"type":"toolCall","id":"t1","name":"bash","arguments":{"command":"echo capfixture"}},{"type":"toolCall","id":"t2","name":"bash","arguments":{"command":"echo long"}}]}}),
+        serde_json::json!({"type":"message","id":"r1","parentId":"a0","timestamp":"2026-10-01T12:00:03.000Z","message":{"role":"toolResult","toolCallId":"t1","toolName":"bash","isError":false,"content":[{"type":"text","text":"capfixture done\n"}]}}),
+        serde_json::json!({"type":"message","id":"r2","parentId":"r1","timestamp":"2026-10-01T12:00:04.000Z","message":{"role":"toolResult","toolCallId":"t2","toolName":"bash","isError":false,"content":[{"type":"text","text":long}]}}),
+    ];
+    fs::write(
+        dir.join("2026-10-01T12-00-00-000Z_0aaa0000-0000-7000-8000-000000000001.jsonl"),
+        lines.map(|l| l.to_string()).join("\n") + "\n",
+    )
+    .unwrap();
+    ok(cli(&h, &d, &["index"], &[]));
+    let rows = values(&ok(cli(
+        &h,
+        &d,
+        &["around", "0aaa0000", "0", "--json", "--full"],
+        &[],
+    )));
+    let events: Vec<_> = rows.iter().filter(|r| r["kind"] == "tool").collect();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["output_truncated"], false);
+    assert_eq!(events[1]["output_chars"], 900);
+    assert_eq!(events[1]["output_truncated"], true);
+    assert_eq!(rows[0]["scope"]["truncation"]["source_truncated_events"], 1);
+}
 #[test]
 fn postcompact_stays_before_boundary_and_in_caller() {
     let (_t, h, d) = pi();

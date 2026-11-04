@@ -106,6 +106,12 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
     };
     h::validate_filters(&filters)?;
     let caller = agrep_core::caller::Caller::resolve(&c, agrep_core::caller::Identity::detect())?;
+    let request = agrep_core::caller::Request {
+        include_self: args.include_self,
+        no_self: args.no_self,
+        waived: None,
+    };
+    let policy = caller.policy(request);
     let apply_self = !args.include_self;
     let mut excluded = 0;
     let mut unknown = 0;
@@ -135,7 +141,8 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
                 )
             });
         }
-        if rows.len() != original {
+        // 0.4.9 counted the root chats that lost turns; a side chat's rows fold into its root.
+        if rows.len() != original && !s.side {
             excluded += 1;
         }
         if rows.is_empty() && original > 0 {
@@ -293,7 +300,7 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
     let pending_sources = crate::finish_census(&root, census)?;
     let checked = agrep_core::render::checked(no_auto);
     if args.json {
-        let mut meta = json!({"kind":"agrep-meta","mode":args.mode,"window":{"since":since_text,"since_ts":since,"until":args.until,"until_ts":until},"timezone":chrono::Local::now().format("%Z %z").to_string(),"idle_cap":args.idle_cap,"idle_cap_ms":cap,"metric":"estimated active time","chats":families.len(),"side_chats":side_count,"unknown_timestamp_rows":unknown,"family_dedup_ms":dedup,"self_excluded":excluded,"self_exclusion":caller.metadata(args.include_self,args.no_self),"caveats":caveats,"freshness":render::freshness(checked,pending_sources),"total_estimated_active_ms":total});
+        let mut meta = json!({"kind":"agrep-meta","mode":args.mode,"window":{"since":since_text,"since_ts":since,"until":args.until,"until_ts":until},"timezone":chrono::Local::now().format("%Z %z").to_string(),"idle_cap":args.idle_cap,"idle_cap_ms":cap,"metric":"estimated active time","chats":families.len(),"side_chats":side_count,"unknown_timestamp_rows":unknown,"family_dedup_ms":dedup,"self_excluded":excluded,"self_exclusion":caller.metadata(request,None),"caveats":caveats,"freshness":render::freshness(checked,pending_sources),"total_estimated_active_ms":total});
         if rows.is_empty() {
             meta["hits"] = json!([])
         }
@@ -340,6 +347,9 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
             eprintln!(
                 "{unknown} turns without a usable timestamp excluded from time and turn counts"
             );
+        }
+        if let Some(notice) = policy.and_then(|p| p.notice(excluded, "chat")) {
+            eprintln!("{notice}");
         }
     }
     Ok(if !rows.is_empty() {

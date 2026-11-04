@@ -207,5 +207,56 @@ fn main() -> Result<()> {
     {
         bail!("semantic recall/neighbor gate failed");
     }
+    if args.get(2).is_none_or(|s| s == "cpu") && window == 1024 {
+        query_gate(Path::new(path), &model, &texts, &expected, &ids)?;
+    }
+    Ok(())
+}
+
+/// The query path (mapped converted weights, direct tokenizer loading) embeds each
+/// text alone, as a query is embedded. Its token ids, tokenizer and vectors must
+/// equal the bulk CPU model's exactly, so every bulk gate above applies to it.
+fn query_gate(
+    path: &Path,
+    bulk: &Embedder,
+    texts: &[String],
+    expected: &[Vec<f32>],
+    ids: &[Vec<u32>],
+) -> Result<()> {
+    let mut parity = true;
+    for name in ["tokenizer.json", "tokenizer-compact.json"] {
+        if path.join(name).exists() {
+            parity &= agrep_core::semantic_model::tokenizer_parity(&path.join(name))?;
+        }
+    }
+    let query = Embedder::load_query(path)?;
+    let mut identical = 0;
+    let mut minimum = 1f64;
+    for (i, text) in texts.iter().enumerate() {
+        if query.token_ids(text)? != ids[i] {
+            bail!("query token ids differ at {i}");
+        }
+        let alone = std::slice::from_ref(text);
+        let (fast, single) = (query.embed(alone)?.remove(0), bulk.embed(alone)?.remove(0));
+        identical += usize::from(
+            fast.iter()
+                .map(|x| x.to_bits())
+                .eq(single.iter().map(|x| x.to_bits())),
+        );
+        let dot: f64 = fast
+            .iter()
+            .zip(&expected[i])
+            .map(|(a, b)| *a as f64 * *b as f64)
+            .sum();
+        let norm = |x: &[f32]| x.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+        minimum = minimum.min(dot / (norm(&fast) * norm(&expected[i])));
+    }
+    println!(
+        "{}",
+        json!({"query_mapped":query.mapped(),"query_tokenizer_parity":parity,"query_identical":identical,"query_texts":texts.len(),"query_minimum_cosine":minimum})
+    );
+    if !query.mapped() || !parity || identical != texts.len() || minimum < 0.99999999999 {
+        bail!("query path gate failed");
+    }
     Ok(())
 }

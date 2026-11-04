@@ -1,0 +1,5 @@
+{"type": "session", "id": "other-session", "version": 3, "cwd": "/work/project", "timestamp": "2099-01-01T03:00:00Z"}
+{"type": "message", "id": "m0", "parentId": null, "timestamp": "2099-01-01T03:00:00Z", "message": {"role": "user", "content": "next?"}}
+{"type": "message", "id": "m1", "parentId": "m0", "timestamp": "2099-01-01T03:01:00Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "flaky windows flaky windows flaky windows keep failing"}]}}
+{"type": "message", "id": "m2", "parentId": "m1", "timestamp": "2099-01-01T03:02:00Z", "message": {"role": "user", "content": "cache misses on windows; also flaky"}}
+{"type": "message", "id": "m3", "parentId": "m2", "timestamp": "2099-01-01T03:03:00Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "noted."}]}}

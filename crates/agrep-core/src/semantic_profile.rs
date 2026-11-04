@@ -46,11 +46,23 @@ impl Usage {
     }
 }
 
+/// CPU time of the calling thread; span CPU deltas are otherwise process-wide.
+fn thread_cpu_ms() -> Option<f64> {
+    #[cfg(unix)]
+    unsafe {
+        let mut t: libc::timespec = std::mem::zeroed();
+        if libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) == 0 {
+            return Some(t.tv_sec as f64 * 1000. + t.tv_nsec as f64 / 1e6);
+        }
+    }
+    None
+}
+
 /// Aggregate-only diagnostics: no query, source text, paths, or SQL values.
 pub struct Span {
     name: &'static str,
     start: Instant,
-    usage: Option<Usage>,
+    usage: Option<(Usage, Option<f64>)>,
 }
 
 pub fn span(name: &'static str) -> Span {
@@ -58,20 +70,22 @@ pub fn span(name: &'static str) -> Span {
     Span {
         name,
         start: Instant::now(),
-        usage: timing_enabled().then(Usage::now),
+        usage: timing_enabled().then(|| (Usage::now(), thread_cpu_ms())),
     }
 }
 
 impl Drop for Span {
     fn drop(&mut self) {
-        if let Some(before) = self.usage {
+        if let Some((before, thread_before)) = self.usage {
             let after = Usage::now();
+            let thread_cpu = thread_before.zip(thread_cpu_ms()).map(|(a, b)| b - a);
             eprintln!(
                 "{}",
                 serde_json::json!({
                     "phase":self.name, "wall_ms":self.start.elapsed().as_secs_f64()*1000.,
                 "start_ms":self.start.duration_since(origin()).as_secs_f64()*1000.,
                     "cpu_ms":after.cpu_ms-before.cpu_ms,
+                    "thread_cpu_ms":thread_cpu,
                     "minor_faults":after.minor_faults-before.minor_faults,
                     "major_faults":after.major_faults-before.major_faults,
                     "input_blocks":after.input_blocks-before.input_blocks,

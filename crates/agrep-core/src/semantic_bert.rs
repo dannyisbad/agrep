@@ -9,7 +9,7 @@
 //!
 
 use crate::semantic_profile::stage;
-use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
+use candle_core::{CpuStorage, DType, Device, IndexOp, Layout, Result, Shape, Tensor, D};
 use candle_nn::{embedding, linear_no_bias, ops::softmax, Embedding, Linear, Module, VarBuilder};
 use serde::Deserialize;
 
@@ -21,6 +21,312 @@ fn option(name: &str, default: bool) -> bool {
         Ok("0") => false,
         Ok("1") => true,
         _ => default,
+    }
+}
+
+/// The checkpoint stores the backbone's tensors without the `model.` prefix.
+pub(crate) fn checkpoint_name(name: &str) -> &str {
+    name.strip_prefix("model.").unwrap_or(name)
+}
+
+/// F32 tensors of a converted safetensors file, used where the file is mapped.
+pub(crate) struct MappedWeights {
+    map: Arc<memmap2::Mmap>,
+    tensors: HashMap<String, (Vec<usize>, std::ops::Range<usize>)>,
+}
+
+impl MappedWeights {
+    pub(crate) fn open(path: &std::path::Path) -> Result<Self> {
+        #[derive(Deserialize)]
+        struct Entry {
+            dtype: String,
+            shape: Vec<usize>,
+            data_offsets: [usize; 2],
+        }
+        let invalid = || candle_core::Error::Msg("invalid converted weights".into());
+        if !cfg!(target_endian = "little") {
+            return Err(invalid());
+        }
+        let file = std::fs::File::open(path)?;
+        // Provisioning replaces converted files only by renaming new ones over them,
+        // so a mapping keeps the bytes that were verified when it was opened.
+        let map = unsafe { memmap2::Mmap::map(&file)? };
+        let length = map
+            .get(..8)
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap()) as usize)
+            .ok_or_else(invalid)?;
+        let start = length
+            .checked_add(8)
+            .filter(|s| *s <= map.len())
+            .ok_or_else(invalid)?;
+        let header: HashMap<String, serde_json::Value> =
+            serde_json::from_slice(&map[8..start]).map_err(|_| invalid())?;
+        let mut tensors = HashMap::with_capacity(header.len());
+        for (name, entry) in header {
+            if name == "__metadata__" {
+                continue;
+            }
+            let entry: Entry = serde_json::from_value(entry).map_err(|_| invalid())?;
+            let [begin, end] = entry.data_offsets;
+            let range = start + begin..start + end;
+            let elements = entry.shape.iter().product::<usize>();
+            if entry.dtype != "F32"
+                || begin > end
+                || range.end > map.len()
+                || end - begin != elements * 4
+                || !(map.as_ptr() as usize + range.start).is_multiple_of(4)
+            {
+                return Err(invalid());
+            }
+            tensors.insert(name, (entry.shape, range));
+        }
+        Ok(Self {
+            map: Arc::new(map),
+            tensors,
+        })
+    }
+    #[cfg(unix)]
+    pub(crate) fn mapping(&self) -> &memmap2::Mmap {
+        &self.map
+    }
+    /// Byte ranges of every tensor a query reads, adjacent ones merged. A query
+    /// reads only a few rows of the token embedding table, which is left out.
+    pub(crate) fn query_ranges(&self) -> Vec<std::ops::Range<usize>> {
+        let table = checkpoint_name("model.embeddings.tok_embeddings.weight");
+        let mut ranges: Vec<_> = self
+            .tensors
+            .iter()
+            .filter(|(name, _)| *name != table)
+            .map(|(_, (_, range))| range.clone())
+            .collect();
+        ranges.sort_by_key(|r| r.start);
+        let mut merged: Vec<std::ops::Range<usize>> = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            match merged.last_mut() {
+                Some(last) if last.end == range.start => last.end = range.end,
+                _ => merged.push(range),
+            }
+        }
+        merged
+    }
+    /// Maps the pages of `query_ranges` into this process ahead of inference, so
+    /// its projections run without page faults.
+    pub(crate) fn prefault(&self) {
+        let mut sum = 0u8;
+        for range in self.query_ranges() {
+            #[cfg(target_os = "linux")]
+            if self
+                .map
+                .advise_range(memmap2::Advice::PopulateRead, range.start, range.len())
+                .is_ok()
+            {
+                continue;
+            }
+            for offset in range.step_by(4096) {
+                sum ^= self.map[offset];
+            }
+        }
+        std::hint::black_box(sum);
+    }
+    fn get(&self, vb: &VarBuilder, shape: &[usize]) -> Result<MappedTensor> {
+        let name = format!("{}.weight", vb.prefix());
+        match self.tensors.get(checkpoint_name(&name)) {
+            Some((actual, range)) if actual == shape => Ok(MappedTensor {
+                map: self.map.clone(),
+                range: range.clone(),
+                shape: actual.clone(),
+            }),
+            _ => Err(candle_core::Error::Msg(format!(
+                "converted weights lack {name} {shape:?}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct MappedTensor {
+    map: Arc<memmap2::Mmap>,
+    range: std::ops::Range<usize>,
+    shape: Vec<usize>,
+}
+impl MappedTensor {
+    fn values(&self) -> &[f32] {
+        let bytes = &self.map[self.range.clone()];
+        // `MappedWeights::open` checked the F32 dtype, length and alignment of this
+        // range on a little-endian target; every bit pattern is a valid f32.
+        unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<f32>(), bytes.len() / 4) }
+    }
+}
+
+/// `x · wᵀ` for row-major `x` (m×k) and `w` (n×k), through the same BLAS call
+/// and arguments Candle's CPU matmul uses for `Linear`, so results are identical.
+fn matmul_transposed(x: &[f32], m: usize, k: usize, w: &[f32], n: usize) -> Vec<f32> {
+    let mut out = vec![0f32; m * n];
+    #[cfg(target_os = "macos")]
+    unsafe {
+        unsafe extern "C" {
+            #[link_name = "sgemm_"]
+            fn sgemm(
+                transa: *const std::ffi::c_char,
+                transb: *const std::ffi::c_char,
+                m: *const i32,
+                n: *const i32,
+                k: *const i32,
+                alpha: *const f32,
+                a: *const f32,
+                lda: *const i32,
+                b: *const f32,
+                ldb: *const i32,
+                beta: *const f32,
+                c: *mut f32,
+                ldc: *const i32,
+            );
+        }
+        let (m, n, k) = (m as i32, n as i32, k as i32);
+        sgemm(
+            &(b'T' as std::ffi::c_char),
+            &(b'N' as std::ffi::c_char),
+            &n,
+            &m,
+            &k,
+            &1.,
+            w.as_ptr(),
+            &k,
+            x.as_ptr(),
+            &k,
+            &0.,
+            out.as_mut_ptr(),
+            &n,
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    unsafe {
+        let threads = candle_core::utils::get_num_threads();
+        gemm::gemm(
+            m,
+            n,
+            k,
+            out.as_mut_ptr(),
+            1,
+            n as isize,
+            false,
+            x.as_ptr(),
+            1,
+            k as isize,
+            w.as_ptr(),
+            k as isize,
+            1,
+            0f32,
+            1f32,
+            false,
+            false,
+            false,
+            if threads > 1 {
+                gemm::Parallelism::Rayon(threads)
+            } else {
+                gemm::Parallelism::None
+            },
+        );
+    }
+    out
+}
+
+/// A bias-free linear layer whose weight stays in the mapped file.
+struct MappedLinear(MappedTensor);
+impl candle_core::CustomOp1 for MappedLinear {
+    fn name(&self) -> &'static str {
+        "mapped-linear"
+    }
+    fn cpu_fwd(&self, storage: &CpuStorage, layout: &Layout) -> Result<(CpuStorage, Shape)> {
+        let CpuStorage::F32(values) = storage else {
+            candle_core::bail!("mapped linear requires F32");
+        };
+        let (start, end) = layout.contiguous_offsets().ok_or_else(|| {
+            candle_core::Error::Msg("mapped linear requires contiguous input".into())
+        })?;
+        let (n, k) = (self.0.shape[0], self.0.shape[1]);
+        let mut dims = layout.dims().to_vec();
+        match dims.last_mut() {
+            Some(last) if *last == k => *last = n,
+            _ => candle_core::bail!("mapped linear input width"),
+        }
+        let x = &values[start..end];
+        let out = matmul_transposed(x, x.len() / k, k, self.0.values(), n);
+        Ok((CpuStorage::F32(out), Shape::from(dims)))
+    }
+}
+
+#[derive(Clone)]
+enum Projection {
+    Owned(Linear),
+    Mapped(Arc<MappedLinear>),
+}
+impl Projection {
+    fn load(
+        in_dim: usize,
+        out_dim: usize,
+        vb: VarBuilder,
+        mapped: Option<&MappedWeights>,
+    ) -> Result<Self> {
+        Ok(match mapped {
+            Some(weights) => Self::Mapped(Arc::new(MappedLinear(
+                weights.get(&vb, &[out_dim, in_dim])?,
+            ))),
+            None => Self::Owned(linear_no_bias(in_dim, out_dim, vb)?),
+        })
+    }
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Owned(linear) => xs.apply(linear),
+            Self::Mapped(linear) => xs.contiguous()?.apply_op1_no_bwd(linear.as_ref()),
+        }
+    }
+    fn outputs(&self) -> Result<usize> {
+        match self {
+            Self::Owned(linear) => linear.weight().dim(0),
+            Self::Mapped(linear) => Ok(linear.0.shape[0]),
+        }
+    }
+    #[cfg(target_os = "macos")]
+    fn weight(&self) -> Result<&Tensor> {
+        match self {
+            Self::Owned(linear) => Ok(linear.weight()),
+            Self::Mapped(_) => candle_core::bail!("mapped weights stay on the CPU"),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum Embeddings {
+    Owned(Embedding),
+    Mapped(MappedTensor),
+}
+impl Embeddings {
+    fn forward(&self, ids: &Tensor) -> Result<Tensor> {
+        let table = match self {
+            Self::Owned(embedding) => return ids.apply(embedding),
+            Self::Mapped(table) => table,
+        };
+        let width = table.shape[1];
+        let values = table.values();
+        let mut dims = ids.dims().to_vec();
+        dims.push(width);
+        let indexes = ids.flatten_all()?.to_vec1::<u32>()?;
+        let mut rows = Vec::with_capacity(indexes.len() * width);
+        for id in indexes {
+            let start = id as usize * width;
+            rows.extend_from_slice(values.get(start..start + width).ok_or_else(|| {
+                candle_core::Error::Msg(format!("token id {id} outside the embedding table"))
+            })?);
+        }
+        Tensor::from_vec(rows, dims, ids.device())
+    }
+    #[cfg(target_os = "macos")]
+    fn table(&self) -> Result<&Tensor> {
+        match self {
+            Self::Owned(embedding) => Ok(embedding.embeddings()),
+            Self::Mapped(_) => candle_core::bail!("mapped weights stay on the CPU"),
+        }
     }
 }
 
@@ -119,8 +425,8 @@ impl RotaryEmbedding {
 
 #[derive(Clone)]
 struct ModernBertAttention {
-    qkv: Linear,
-    proj: Linear,
+    qkv: Projection,
+    proj: Projection,
     num_attention_heads: usize,
     attention_head_size: usize,
     rotary_emb: Arc<RotaryEmbedding>,
@@ -133,12 +439,18 @@ impl ModernBertAttention {
         config: &Config,
         rotary_emb: Arc<RotaryEmbedding>,
         metal_attention: Option<Arc<crate::semantic_attention_metal::Attention>>,
+        mapped: Option<&MappedWeights>,
     ) -> Result<Self> {
         let num_attention_heads = config.num_attention_heads;
         let attention_head_size = config.hidden_size / config.num_attention_heads;
 
-        let qkv = linear_no_bias(config.hidden_size, config.hidden_size * 3, vb.pp("Wqkv"))?;
-        let proj = linear_no_bias(config.hidden_size, config.hidden_size, vb.pp("Wo"))?;
+        let qkv = Projection::load(
+            config.hidden_size,
+            config.hidden_size * 3,
+            vb.pp("Wqkv"),
+            mapped,
+        )?;
+        let proj = Projection::load(config.hidden_size, config.hidden_size, vb.pp("Wo"), mapped)?;
 
         Ok(Self {
             qkv,
@@ -248,28 +560,25 @@ impl ModernBertAttention {
 // BLAS is deliberately single-threaded in background workers. Share large
 // projections across that same bounded Rayon pool, preserving each dot product
 // and the input order. Small query matrices avoid scheduling/copy overhead.
-fn projection(xs: &Tensor, linear: &Linear) -> Result<Tensor> {
+fn projection(xs: &Tensor, linear: &Projection) -> Result<Tensor> {
     use rayon::prelude::*;
     if !xs.device().is_cpu() || xs.dtype() != DType::F32 || !xs.is_contiguous() {
-        return xs.apply(linear);
+        return linear.forward(xs);
     }
     let width = xs.dim(D::Minus1)?;
     let rows = xs.elem_count() / width;
     let workers = rayon::current_num_threads();
     if rows < 256 || workers == 1 {
-        return xs.apply(linear);
+        return linear.forward(xs);
     }
     let flat = xs.reshape((rows, width))?;
     let chunk = rows.div_ceil(workers).max(128);
     let parts = (0..rows.div_ceil(chunk))
         .into_par_iter()
-        .map(|i| {
-            flat.narrow(0, i * chunk, chunk.min(rows - i * chunk))?
-                .apply(linear)
-        })
+        .map(|i| linear.forward(&flat.narrow(0, i * chunk, chunk.min(rows - i * chunk))?))
         .collect::<Result<Vec<_>>>()?;
     let mut shape = xs.dims().to_vec();
-    *shape.last_mut().unwrap() = linear.weight().dim(0)?;
+    *shape.last_mut().unwrap() = linear.outputs()?;
     Tensor::cat(&parts, 0)?.reshape(shape)
 }
 
@@ -405,8 +714,8 @@ impl candle_core::CustomOp1 for CpuGeglu {
 
 #[derive(Clone)]
 pub struct ModernBertMLP {
-    wi: Linear,
-    wo: Linear,
+    wi: Projection,
+    wo: Projection,
     metal_geglu: Option<Arc<crate::semantic_metal::Geglu>>,
     vector_erf: bool,
 }
@@ -416,13 +725,20 @@ impl ModernBertMLP {
         vb: VarBuilder,
         config: &Config,
         metal_geglu: Option<Arc<crate::semantic_metal::Geglu>>,
+        mapped: Option<&MappedWeights>,
     ) -> Result<Self> {
-        let wi = linear_no_bias(
+        let wi = Projection::load(
             config.hidden_size,
             config.intermediate_size * 2,
             vb.pp("Wi"),
+            mapped,
         )?;
-        let wo = linear_no_bias(config.intermediate_size, config.hidden_size, vb.pp("Wo"))?;
+        let wo = Projection::load(
+            config.intermediate_size,
+            config.hidden_size,
+            vb.pp("Wo"),
+            mapped,
+        )?;
         Ok(Self {
             wi,
             wo,
@@ -469,9 +785,11 @@ impl ModernBertLayer {
         uses_local_attention: bool,
         metal_geglu: Option<Arc<crate::semantic_metal::Geglu>>,
         metal_attention: Option<Arc<crate::semantic_attention_metal::Attention>>,
+        mapped: Option<&MappedWeights>,
     ) -> Result<Self> {
-        let attn = ModernBertAttention::load(vb.pp("attn"), config, rotary_emb, metal_attention)?;
-        let mlp = ModernBertMLP::load(vb.pp("mlp"), config, metal_geglu)?;
+        let attn =
+            ModernBertAttention::load(vb.pp("attn"), config, rotary_emb, metal_attention, mapped)?;
+        let mlp = ModernBertMLP::load(vb.pp("mlp"), config, metal_geglu, mapped)?;
         let attn_norm = layer_norm_no_bias(
             config.hidden_size,
             config.layer_norm_eps,
@@ -577,7 +895,7 @@ fn get_local_attention_mask(
 // ModernBERT backbone
 #[derive(Clone)]
 pub struct ModernBert {
-    word_embeddings: Embedding,
+    word_embeddings: Embeddings,
     norm: FastNorm,
     layers: Vec<ModernBertLayer>,
     final_norm: FastNorm,
@@ -591,12 +909,27 @@ pub struct ModernBert {
 }
 
 impl ModernBert {
-    pub fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
-        let word_embeddings = embedding(
-            config.vocab_size,
-            config.hidden_size,
-            vb.pp("model.embeddings.tok_embeddings"),
-        )?;
+    /// `mapped` keeps the F32 projection and embedding weights in the mapped
+    /// file (CPU only); otherwise every weight is copied into a tensor.
+    pub(crate) fn load(
+        vb: VarBuilder,
+        config: &Config,
+        mapped: Option<&MappedWeights>,
+    ) -> Result<Self> {
+        if mapped.is_some() && (!vb.device().is_cpu() || vb.dtype() != DType::F32) {
+            candle_core::bail!("mapped weights are F32 CPU weights");
+        }
+        let embeddings = vb.pp("model.embeddings.tok_embeddings");
+        let word_embeddings = match mapped {
+            Some(weights) => Embeddings::Mapped(
+                weights.get(&embeddings, &[config.vocab_size, config.hidden_size])?,
+            ),
+            None => Embeddings::Owned(embedding(
+                config.vocab_size,
+                config.hidden_size,
+                embeddings,
+            )?),
+        };
         let norm = layer_norm_no_bias(
             config.hidden_size,
             config.layer_norm_eps,
@@ -656,6 +989,7 @@ impl ModernBert {
                 layer_uses_local_attention,
                 metal_geglu.clone(),
                 metal_attention.clone(),
+                mapped,
             )?);
         }
 
@@ -677,10 +1011,10 @@ impl ModernBert {
                         .and_then(|l| l.attn_norm.as_ref())
                         .unwrap_or(&final_norm);
                     Ok(Layer {
-                        qkv: View::tensor(l.attn.qkv.weight())?,
-                        projection: View::tensor(l.attn.proj.weight())?,
-                        mlp_in: View::tensor(l.mlp.wi.weight())?,
-                        mlp_out: View::tensor(l.mlp.wo.weight())?,
+                        qkv: View::tensor(l.attn.qkv.weight()?)?,
+                        projection: View::tensor(l.attn.proj.weight()?)?,
+                        mlp_in: View::tensor(l.mlp.wi.weight()?)?,
+                        mlp_out: View::tensor(l.mlp.wo.weight()?)?,
                         mlp_norm: View::tensor(&l.mlp_norm.weight)?,
                         next_norm: View::tensor(&next.weight)?,
                         cosine: View::tensor(&l.attn.rotary_emb.cos)?,
@@ -691,7 +1025,7 @@ impl ModernBert {
                 .collect::<Result<Vec<_>>>()?;
             Some(Arc::new(std::sync::Mutex::new(Arena::new(
                 vb.device(),
-                View::tensor(word_embeddings.embeddings())?,
+                View::tensor(word_embeddings.table()?)?,
                 View::tensor(&norm.weight)?,
                 parts,
                 config.hidden_size,
@@ -779,7 +1113,7 @@ impl ModernBert {
                 ),
             )
         };
-        let mut xs = xs.apply(&self.word_embeddings)?.apply(&self.norm)?;
+        let mut xs = self.word_embeddings.forward(xs)?.apply(&self.norm)?;
         if self.fused_residual {
             // Carry each residual and its pre-normalized view into the next layer.
             // The packed pair consists of two contiguous views of one allocation.
@@ -925,6 +1259,7 @@ mod tests {
             .unwrap();
             let linear = Linear::new(weight, None);
             let expected = input.apply(&linear).unwrap().to_vec2::<f32>().unwrap();
+            let linear = Projection::Owned(linear);
             let actual = pool
                 .install(|| projection(&input, &linear))
                 .unwrap()
@@ -971,5 +1306,149 @@ mod tests {
         for (a, b) in actual.iter().zip(expected) {
             assert!((a - b).abs() < 1e-6);
         }
+    }
+
+    fn fixture_config() -> Config {
+        Config {
+            vocab_size: 11,
+            hidden_size: 32,
+            num_hidden_layers: 3,
+            num_attention_heads: 2,
+            intermediate_size: 48,
+            max_position_embeddings: 512,
+            layer_norm_eps: 1e-5,
+            pad_token_id: 0,
+            global_attn_every_n_layers: 3,
+            global_rope_theta: 160_000.,
+            local_attention: 8,
+            local_rope_theta: 10_000.,
+            classifier_config: None,
+        }
+    }
+
+    /// A converted-weights file in the checkpoint's naming, with layer 0 lacking
+    /// its attention norm as ModernBERT checkpoints do.
+    fn write_weights(path: &std::path::Path, config: &Config, dtype: DType) {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+        };
+        let (h, i) = (config.hidden_size, config.intermediate_size);
+        let mut shapes = vec![
+            (
+                "embeddings.tok_embeddings.weight".to_string(),
+                vec![config.vocab_size, h],
+            ),
+            ("embeddings.norm.weight".into(), vec![h]),
+            ("final_norm.weight".into(), vec![h]),
+        ];
+        for layer in 0..config.num_hidden_layers {
+            for (name, shape) in [
+                ("attn.Wqkv", vec![3 * h, h]),
+                ("attn.Wo", vec![h, h]),
+                ("mlp.Wi", vec![2 * i, h]),
+                ("mlp.Wo", vec![h, i]),
+                ("mlp_norm", vec![h]),
+            ] {
+                shapes.push((format!("layers.{layer}.{name}.weight"), shape));
+            }
+            if layer > 0 {
+                shapes.push((format!("layers.{layer}.attn_norm.weight"), vec![h]));
+            }
+        }
+        let tensors: HashMap<String, Tensor> = shapes
+            .into_iter()
+            .map(|(name, shape)| {
+                let values: Vec<f32> = (0..shape.iter().product::<usize>())
+                    .map(|_| {
+                        if name.contains("norm") {
+                            1. + next() * 0.1
+                        } else {
+                            next() * 0.2
+                        }
+                    })
+                    .collect();
+                let tensor = Tensor::from_vec(values, shape, &Device::Cpu)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap();
+                (name, tensor)
+            })
+            .collect();
+        candle_core::safetensors::save(&tensors, path).unwrap();
+    }
+
+    #[test]
+    fn mapped_query_weights_embed_bit_for_bit_like_copied_weights() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("weights-f32.safetensors");
+        let config = fixture_config();
+        write_weights(&path, &config, DType::F32);
+        let vb = || {
+            unsafe { VarBuilder::from_mmaped_safetensors(&[&path], DType::F32, &Device::Cpu) }
+                .unwrap()
+                .rename_f(|name| checkpoint_name(name).to_owned())
+        };
+        let copied = ModernBert::load(vb(), &config, None).unwrap();
+        let weights = MappedWeights::open(&path).unwrap();
+        let mapped = ModernBert::load(vb(), &config, Some(&weights)).unwrap();
+        drop(weights);
+        // One short query, one long enough for the split parallel projection,
+        // and a padded batch.
+        for lengths in [vec![1], vec![7], vec![300], vec![9, 4]] {
+            let width = *lengths.iter().max().unwrap();
+            let mut ids = vec![0u32; lengths.len() * width];
+            let mut mask = vec![0u32; ids.len()];
+            for (row, &length) in lengths.iter().enumerate() {
+                for token in 0..length {
+                    ids[row * width + token] = ((row * 7 + token * 5 + 1) % 11) as u32;
+                    mask[row * width + token] = 1;
+                }
+            }
+            let ids = Tensor::from_vec(ids, (lengths.len(), width), &Device::Cpu).unwrap();
+            let mask = Tensor::from_vec(mask, (lengths.len(), width), &Device::Cpu).unwrap();
+            let run = |model: &ModernBert| {
+                model
+                    .forward(&ids, &mask, &lengths)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            };
+            let (expected, actual) = (run(&copied), run(&mapped));
+            assert!(expected.iter().all(|x| x.is_finite()));
+            assert!(expected.iter().any(|x| x.abs() > 0.01));
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&actual), bits(&expected), "lengths {lengths:?}");
+        }
+    }
+
+    #[test]
+    fn mapped_weights_accept_only_aligned_f32_tensors() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = fixture_config();
+        let f16 = dir.path().join("weights-f16.safetensors");
+        write_weights(&f16, &config, DType::F16);
+        assert!(MappedWeights::open(&f16).is_err());
+        let f32 = dir.path().join("weights-f32.safetensors");
+        write_weights(&f32, &config, DType::F32);
+        let bytes = std::fs::read(&f32).unwrap();
+        let truncated = dir.path().join("truncated.safetensors");
+        std::fs::write(&truncated, &bytes[..bytes.len() - 4]).unwrap();
+        assert!(MappedWeights::open(&truncated).is_err());
+        let weights = MappedWeights::open(&f32).unwrap();
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&f32], DType::F32, &Device::Cpu) }
+            .unwrap()
+            .rename_f(|name| checkpoint_name(name).to_owned());
+        // A checkpoint whose shapes disagree with the configuration is refused.
+        let wider = Config {
+            intermediate_size: 64,
+            ..config
+        };
+        assert!(ModernBert::load(vb, &wider, Some(&weights)).is_err());
     }
 }

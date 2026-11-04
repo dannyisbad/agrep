@@ -1,5 +1,44 @@
 # 0.5.0 keyword engine
 
+## Windowed ranking at the previous head's speed
+
+A measured checkpoint, **not SPEC §9 acceptance**. Scoring keyword hits inside 0.4.9's snippet window (b23d2727) lowered page scores, so more blocks cleared their ceilings and more tool lanes ran; against the previous head (084e77af) it was 0.43–0.88× on release, regex, json, natural, compact_release, tool_error and recall ([before and after](measurements/window-speed-eng.json)). Profiles: `tool_error` decoded 42,012 tool rows to find 3,847 holding the term (57% of samples in decompression); release spent 62% of its samples in per-block FTS queries, each seeking every word in each of the 13 tool segments; regex read 200 prose and 95 tool blocks. Windowed gram counts would not help: replayed on the owner's newest tool blocks, they would drop 4 of 104 blocks for `error` and 1 of 177 for `release workflow`.
+
+### What changed
+
+- **Run admission.** A bounded scan no longer queries the text index once per block. When it reaches a block, one rowid-range query admits the rows of up to 64 blocks the page still admits, using the words those blocks hold; visited, excluded and ceiling-less blocks between them (up to 8 in a row) are stepped over. Each word's postings are opened once per run instead of once per block. Tool blocks of a common single term are admitted the same way instead of decoding every row.
+- **Regular expressions** require their suffix literal as well as their prefix literal. A pattern `A.*B` with `A` never empty and `.*` greedy and unbounded matches a snippet at most once (its first match's `.*` runs to the last place `B` matches, and snippets hold no line break), so its blocks are bounded with one match.
+- **Smaller costs.** Candidate ids bind as one JSON list, so one statement stays prepared. Tool candidates read their text by blob id instead of through the `tools` view. Each thread keeps one inflate state and decodes into uninitialized capacity. Session ids are sorted in Rust instead of by `SELECT DISTINCT`, and a command loads them once for all its hit handles.
+
+Results are unchanged except one disclosed number: with one interposed wall-clock instant, stdout, stderr and exit codes match the merged previous commit byte for byte on **1,105 of 1,116** real-history cases (18 queries, 14 scopes, text, JSON, `-l`, `-c`, `-n 0`, `--sort time`, `-n 5`, compact). The 11 others are `-E release.*workflow`, whose floor count (`N+ matches (floor)`, JSON `completeness.total` with basis `floor`) is smaller because its scan stops earlier; rows, order, scores, snippets, handles and exit codes are identical. The 0.4.9 ranking fixture, the exhaustive and randomized bounded-page tests and the rest of the suite pass; unit tests cover literal extraction and the single-match analysis.
+
+Eight ABBA-interleaved fresh-process pairs per case on one isolated index of the owner's history, normal census and detached refresh; every sample and load is in the [report](measurements/window-speed-eng.json).
+
+| Case | Previous head p50 / p95 ms | This change p50 / p95 ms | Head ÷ new | Load 1 / 5 / 15 |
+|---|---:|---:|---:|---|
+| release | 91.1 / 118.7 | 76.9 / 92.3 | 1.18× | 21 / 12 / 11 |
+| error | 41.9 / 45.9 | 42.9 / 46.2 | 0.98× | 21 / 12 / 11 |
+| natural | 102.3 / 110.2 | 71.5 / 73.5 | 1.43× | 21 / 12 / 11 |
+| flaky | 44.7 / 47.1 | 42.2 / 45.8 | 1.06× | 21 / 12 / 11 |
+| short | 173.4 / 200.5 | 74.4 / 79.5 | 2.33× | 19 / 12 / 11 |
+| regex | 48.8 / 225.2 | 42.1 / 84.4 | 1.16× | 19 / 12 / 11 |
+| list | 240.2 / 256.3 | 149.4 / 184.2 | 1.61× | 19 / 12 / 11 |
+| json | 118.6 / 137.0 | 103.5 / 112.5 | 1.15× | 18 / 12 / 11 |
+| rare_hit | 44.4 / 131.2 | 44.7 / 48.1 | 0.99× | 18 / 12 / 11 |
+| compact_release | 98.7 / 145.1 | 83.9 / 97.2 | 1.18× | 18 / 12 / 11 |
+| compact_natural | 131.3 / 143.2 | 95.1 / 102.0 | 1.38× | 17 / 11 / 11 |
+| tool_error | 144.9 / 159.3 | 127.4 / 141.8 | 1.14× | 17 / 11 / 11 |
+| recall | 292.7 / 327.2 | 253.4 / 298.5 | 1.16× | 16 / 11 / 11 |
+| pack | 195.7 / 224.5 | 169.7 / 206.7 | 1.15× | 15 / 11 / 11 |
+
+`error` and `rare_hit` run the plans they ran before (a common prose term with no tool lane, a selective term); their medians differ by 1 ms, within the spread of their samples.
+
+### Where the remaining time goes
+
+- **Run admission** is the largest remaining query cost (a third of tool_error's samples): FTS5 seeks each word in each of the 13–15 segments that incremental refreshes leave behind.
+- **tool_error** still decodes about 3,800 rows; **recall** spends a quarter of its samples loading tool events for windows.
+- `--chat` filters and the caller-exclusion probes still match sessions with `LIKE`, which cannot use the session indexes.
+
 ## Dense first build: parallel family statistics
 
 A measured checkpoint, **not SPEC §9 acceptance**. The dense 2M first index was the matched run's only dense loss (0.4.9 114.8 s, 0.5 187.9 s, at loads 34–105). Its profile spent about 37 s in family statistics, 11 s in FTS segments forced by 64-row statements, and 7 s each in secondary indexes and parser graph pages. Derived data is unchanged.

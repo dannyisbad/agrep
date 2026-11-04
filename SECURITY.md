@@ -19,9 +19,11 @@ tightens an existing owned root when it validates FORMAT. `agrep doctor` reports
 remaining group/world permission exposure. Filesystem ACLs and account security
 remain the operating system's responsibility.
 
-Transcript text is untrusted. One shared human-output sanitizer neutralizes control
-characters and bidirectional/format characters, including in evidence headers.
-JSON output escapes these characters while preserving their decoded values.
+Transcript text is untrusted. One shared human-output sanitizer quotes C0 and C1 control
+characters, DEL, and bidirectional, format and line/paragraph separator characters as
+`\uXXXX` escapes (`\UXXXXXXXX` beyond the Basic Multilingual Plane), including in evidence
+headers; it keeps only the zero-width joiner and non-joiner that ordinary text needs. JSON
+output escapes these characters while preserving their decoded values.
 
 Model downloads use pinned revisions, lengths and SHA-256 digests. Status and doctor
 verify model integrity using the same verified-file stamps as model loading.

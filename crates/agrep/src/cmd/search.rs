@@ -145,7 +145,7 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
     } else {
         keyword_start.elapsed().as_secs_f64() * 1000.
     };
-    let (mut result, semantic_coverage) = if let Some(lane) = lane {
+    let (mut result, semantic_coverage, keyword_only) = if let Some(lane) = lane {
         match lane.and_then(|work| semantic::finish(&c, work)) {
             Ok(mut found) => {
                 caller::decorate_semantic(&c, &mut found.result, &caller)?;
@@ -160,7 +160,7 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
                         hybrid::Lane::Compact,
                     )
                 };
-                (result, Some(found.coverage))
+                (result, Some(found.coverage), false)
             }
             Err(error) => {
                 agrep_core::logging::semantic_failure(&root, &error);
@@ -174,7 +174,7 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
                 } else {
                     keyword
                 };
-                (fallback, None)
+                (fallback, None, true)
             }
         }
     } else {
@@ -185,6 +185,7 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
             } else {
                 None
             },
+            true,
         )
     };
     if timing {
@@ -253,6 +254,20 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
     } else {
         None
     };
+    let request = caller::Request {
+        include_self: s.scope.include_self,
+        no_self: s.scope.no_self,
+        waived: f.chat.is_some().then_some("chat-filter"),
+    };
+    let policy = caller.policy(request);
+    // As in 0.4.9, only a result drawn from the keyword lane alone has an exact count of
+    // the rows the policy withheld; a second ranked lane has no exact union with it.
+    let excluded = match &policy {
+        Some(policy) if keyword_only && !s.coverage => policy
+            .withheld(&c, &options, f.chat.as_deref())?
+            .map(caller::Withheld::total),
+        _ => None,
+    };
     let pending_sources = {
         let _span = agrep_core::semantic_profile::span("freshness_join");
         finish_census(&root, census)?
@@ -275,11 +290,7 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
         requested: s.max,
         diversify: !s.scope.all_side_chats,
         caller_unknown: caller.identity.agent_context && !caller.resolved,
-        self_exclusion: if f.chat.is_some() && !s.scope.no_self {
-            serde_json::json!({"active":false,"reason":"chat-filter"})
-        } else {
-            caller.metadata(s.scope.include_self, s.scope.no_self)
-        },
+        self_exclusion: caller.metadata(request, excluded),
         filter_coverage: coverage.clone(),
         pending_sources,
     };
@@ -326,6 +337,9 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
     }
     if !s.json {
         agrep_core::coverage::disclose(&coverage);
+        if let Some(line) = policy.zip(excluded).and_then(|(p, n)| p.notice(n, "hit")) {
+            eprintln!("{line}");
+        }
     }
     Ok(if result.total != 0 {
         0

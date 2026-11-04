@@ -302,3 +302,50 @@ The base already won first_hybrid in both of today's real-history runs. The
 committed loss (`matched-real-history.json`, 1785 / 2050 against 1364 / 10001)
 came from two slow candidate samples out of three. The real first_hybrid p95 is
 a single cold sample per run: 818 before, 976 after, at different loads.
+
+## Fixed cost of a fresh query process (CPU-only)
+
+**macos-14 "regression".** The fb697b4c macos-14 job ran its whole performance step at
+one-minute load 9-21 on 3 vCPUs (five-minute 15.5-21.4), including `--version` cases of
+6 ms processes; a2aebecb's job ran at 1.5-2.5. The next run, 5b1ec127, with the same
+semantic code as fb697b4c (only zlib reuse and a CI component line changed), ran at load
+~2 and won all three semantic cases on macos-14: semantic_only 70 / 79 against 0.4.9's
+79 / 81, warm_hybrid 79 / 126 against 125 / 155, first_hybrid 138 / 497 against
+2168 / 2168 (median / p95 ms). Locally, alternating fresh processes (20 each,
+`RAYON_NUM_THREADS=3`, CPU query path, warm cache, load 5.8) gave a2aebecb 61.0 / 66.0 ms
+and 5b1ec127 57.5 / 58.9 ms for `-s`, 61.7 / 64.9 and 57.8 / 59.4 for warm hybrid, with
+88.3 and 89.0 ms of CPU per `-s` process. No code change between them costs 280 ms; the
+loss came from a process that needs about 90 ms of CPU on a VM whose CPUs were busy.
+
+**Stages.** Medians of 20 `AGREP_QUERY_TIMING` runs of `-s` on the matched semantic
+workload (301 embedded rows). Thread CPU is the stage's own thread; several stages run
+in parallel, so the columns do not add up to the process total.
+
+| Stage (ms) | macOS before wall / CPU | macOS after wall / CPU | Linux before wall | Linux after wall / CPU |
+|---|---:|---:|---:|---:|
+| whole process, spawn to exit (CPU = all threads) | 57.9 / 90.5 | 42.5 / 48.8 | 77.6 / 141.4 | 48.2 / 68.7 |
+| model read-ahead (own thread) | 4.1 / 4.0 | 0.4 / 0.4 | 1.4 | 0.3 / 0.3 |
+| weight load and model construction | 28.9 / 28.2 | 0.4 / 0.4 | 43.6 | 0.6 / 0.6 |
+| weight prefault (during tokenizer load) | - | 4.3 / 4.3 | - | 2.1 / 2.0 |
+| tokenizer load (own thread) | 32.5 / 32.5 | 18.1 / 18.1 | 47.7 | 24.4 / 22.5 |
+| tokenize | 1.0 / 1.0 | 0.9 / 0.9 | 1.0 | 1.0 / 1.0 |
+| query inference | 7.9 / 7.6 | 7.7 / 7.5 | 12.7 | 11.0 / 2.4 (gemm on Rayon workers) |
+| vector scan and sort | 0.2 / 0.1 | 0.2 / 0.1 | 0.2 | 0.2 / 0.1 |
+| refine and resolve | 0.1 / 0.1 | 0.1 / 0.1 | 0.2 | 0.1 / 0.1 |
+| render | 0.03 | 0.03 | 0.03 | 0.03 |
+
+macOS: Apple M2 Max, `RAYON_NUM_THREADS=3`, load 6-13. Linux: aarch64 VM with 4 vCPUs,
+the container pinned to 3 CPUs, load 0.8. Before is 5b1ec127; the Linux before binary
+predates per-thread CPU spans. Alternating Linux runs (20 each, load 0.9): `-s`
+81.4 / 86.4 to 51.1 / 55.5 ms and 146.6 to 72.7 ms CPU; warm hybrid 82.5 / 87.4 to
+50.5 / 53.4 ms and 157.5 to 83.2 ms CPU.
+
+Weight loading copied 190 MB of F32 tensors into each process. The query path now uses
+the mapped converted file in place (bit-identical, see SEMANTIC.md). The tokenizer's
+`from_file` buffered the whole model through serde's untagged enum, then a
+`serde_json::Value`, before building the BPE; going straight to the BPE deserializer
+removes that pass. The tokenizer is now the longest stage: about 13.5 ms of it is
+parsing and allocating 50,280 vocabulary strings and 50,009 merge pairs and the library
+builder's merge map, which any use of the library BPE model pays. A compact BPE table
+written at provisioning, read by a `tokenizers::Model` implementation without per-entry
+allocation, would remove it; that is not done here.

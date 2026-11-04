@@ -2332,7 +2332,14 @@ fn coverage_bounds_use_terms_in_the_same_row_and_preserve_unicode() {
         options.limit = 40;
         let fast = agrep_core::query::search(&c, &options).unwrap();
         assert_eq!(fast.hits.len(), 40);
-        assert!(fast.examined <= 1024, "{pattern}: {}", fast.examined);
+        // The first stage reads the rarest term's rows in the four blocks before coverage
+        // bounds apply. Rows of the other term differ only past the fourth place, so they
+        // tie and those earlier in the chat join the page; the second stage reads only them.
+        assert!(
+            fast.examined <= 1024 + options.limit,
+            "{pattern}: {}",
+            fast.examined
+        );
         options.exact = true;
         let full = agrep_core::query::search(&c, &options).unwrap();
         assert_eq!(
@@ -2604,4 +2611,239 @@ fn recall_fits_budgets_like_0_4_9() {
     assert!(String::from_utf8_lossy(&out.stderr).contains(
         "--budget 64 is too small for this page: its first hit block and the over-budget line need at least 113 bytes"
     ));
+}
+/// A ranking as `--json` prints it: each row's turn, speaker, score, snippet and lane.
+fn ranked_rows(out: Output) -> Vec<Value> {
+    String::from_utf8(ok(out).stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|row| row.get("handle").is_some())
+        .map(|row| {
+            serde_json::json!({
+                "turn": row["turn"],
+                "who": row["who"],
+                "score": row["score"],
+                "snippet": row["snippet"],
+                "matched": row.get("matched").cloned().unwrap_or_else(|| "phrase".into()),
+            })
+        })
+        .collect()
+}
+/// `ranking_0_4_9/expected.json` holds agrep 0.4.9's `--json` rankings of this fixture.
+/// Scores count the query only inside each hit's snippet window: long repetitive replies,
+/// tighter matches outside the window, whitespace runs that collapse, de-cut boundary
+/// grading, all-terms windows stitched across cuts, -w and -E, an exact four-place tie
+/// rounded half to even, session heads folding lanes, time order and bounded pages.
+#[test]
+fn keyword_rankings_match_0_4_9() {
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let d = t.path().join("d");
+    fixture("ranking_0_4_9", &h);
+    ok(cli(&h, &d, &["index"]));
+    let golden =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ranking_0_4_9/expected.json");
+    let cases: Vec<Value> = serde_json::from_str(&fs::read_to_string(golden).unwrap()).unwrap();
+    assert_eq!(cases.len(), 13);
+    for case in cases {
+        let mut args: Vec<&str> = case["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap())
+            .collect();
+        args.extend(["--json", "--no-auto"]);
+        assert_eq!(
+            ranked_rows(cli(&h, &d, &args)),
+            case["rows"].as_array().unwrap().clone(),
+            "{args:?}"
+        );
+    }
+}
+/// Rows rank by their four-place score, then time. The newest row of a tie may sit in a
+/// block whose ceiling the first block's row outranks before rounding; agrep 0.4.9
+/// returned it first, at 0.0133 each (raw 0.0133038 for the user row, 0.0132964 for the
+/// agent row).
+#[test]
+fn a_four_place_tie_in_a_later_block_wins_on_time_as_in_0_4_9() {
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let d = t.path().join("d");
+    let mut messages = vec![
+        ("user", format!("flaky{}windows", "-".repeat(439))),
+        ("assistant", "noted.".to_owned()),
+    ];
+    for i in 0..300 {
+        messages.push(("user", "next?".to_owned()));
+        messages.push(("assistant", format!("flaky x windows {i}")));
+    }
+    messages.push(("user", "next?".to_owned()));
+    messages.push(("assistant", format!("flaky{}windows", "-".repeat(349))));
+    let mut lines = vec![serde_json::json!({"type":"session","id":"tie-session","version":3,"cwd":"/work/project","timestamp":"2099-01-01T00:00:00Z"}).to_string()];
+    for (i, (role, text)) in messages.iter().enumerate() {
+        let content = if *role == "user" {
+            serde_json::json!(text)
+        } else {
+            serde_json::json!([{"type": "text", "text": text}])
+        };
+        let parent = if i == 0 {
+            Value::Null
+        } else {
+            format!("m{}", i - 1).into()
+        };
+        let stamp = format!(
+            "2099-01-01T{:02}:{:02}:{:02}Z",
+            i / 3600,
+            i / 60 % 60,
+            i % 60
+        );
+        lines.push(serde_json::json!({"type":"message","id":format!("m{i}"),"parentId":parent,"timestamp":stamp,"message":{"role":role,"content":content}}).to_string());
+    }
+    let base = h.join(".pi/agent/sessions/project");
+    fs::create_dir_all(&base).unwrap();
+    fs::write(base.join("tie.jsonl"), lines.join("\n") + "\n").unwrap();
+    ok(cli(&h, &d, &["index"]));
+    let db =
+        Connection::open_with_flags(d.join("index.db"), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let block = |turn: i64, who: &str| {
+        db.query_row(
+            "SELECT id FROM prose WHERE position=?1 AND who=?2",
+            rusqlite::params![turn, who],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            / 512
+    };
+    assert!(block(0, "user") < block(301, "agent"));
+    for (limit, expected) in [
+        ("1", vec![(301, "agent")]),
+        ("2", vec![(301, "agent"), (0, "user")]),
+    ] {
+        let rows = ranked_rows(cli(
+            &h,
+            &d,
+            &["flaky windows", "--json", "--no-auto", "-n", limit],
+        ));
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row["turn"].as_i64().unwrap(), row["who"].as_str().unwrap()))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(rows.iter().all(|row| row["score"] == 0.0133));
+    }
+}
+/// Bounded pages equal the exhaustive ranking's head under snippet-window scores: rows
+/// repeat terms far beyond their window, spread phrases over whitespace runs, mix Unicode
+/// separators and round to equal scores across several blocks and chats. Timestamps lie
+/// in the future (recency one) or far in the past for prompts (their floor), so the
+/// clock cannot move a score across a rounding step between the two searches.
+#[test]
+fn bounded_pages_equal_exhaustive_rankings_with_snippet_windows() {
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let d = t.path().join("d");
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move |n: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % n as u64) as usize
+    };
+    let words = [
+        "flaky",
+        "windows",
+        "cache",
+        "flakywindows",
+        "Flaky",
+        "WINDOWS",
+        "café",
+        "the",
+        "a",
+        "runner",
+        "xflaky",
+        "windowsx",
+        "build",
+        "naïve",
+        "release",
+        "workflow",
+    ];
+    let gaps = [
+        " ", " ", " ", "  ", "\n\n", "-", "_", " — ", "… ", ", ", "/", "\t\t\t ",
+    ];
+    let base = h.join(".pi/agent/sessions/project");
+    for session in 0..6 {
+        let mut lines = vec![serde_json::json!({"type":"session","id":format!("s{session}"),"version":3,"cwd":"/work/project","timestamp":"2099-01-01T00:00:00Z"}).to_string()];
+        for i in 0..520 {
+            let long = next(4) == 0;
+            let length = 3 + next(if long { 400 } else { 40 });
+            let mut text = String::new();
+            for _ in 0..length {
+                text += words[next(words.len())];
+                text += gaps[next(gaps.len())];
+            }
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            let content = if role == "user" {
+                serde_json::json!(text)
+            } else {
+                serde_json::json!([{"type": "text", "text": text}])
+            };
+            let stamp = if role == "user" && next(3) == 0 {
+                format!("2020-01-{:02}T00:00:00Z", 1 + next(28))
+            } else {
+                format!("2099-01-{:02}T{:02}:00:00Z", 1 + next(28), next(24))
+            };
+            let parent = if i == 0 {
+                Value::Null
+            } else {
+                format!("m{}", i - 1).into()
+            };
+            lines.push(serde_json::json!({"type":"message","id":format!("m{i}"),"parentId":parent,"timestamp":stamp,"message":{"role":role,"content":content}}).to_string());
+        }
+        fs::create_dir_all(&base).unwrap();
+        fs::write(
+            base.join(format!("s{session}.jsonl")),
+            lines.join("\n") + "\n",
+        )
+        .unwrap();
+    }
+    ok(cli(&h, &d, &["index"]));
+    let c = store::reader(&DataRoot::open(&d, false).unwrap()).unwrap();
+    let search = |o: &agrep_core::query::Options| {
+        let result = agrep_core::query::search(&c, o).unwrap();
+        let hits = result
+            .hits
+            .into_iter()
+            .map(|h| (h.session, h.turn, h.who, h.score, h.snippet))
+            .collect::<Vec<_>>();
+        (hits, result.examined)
+    };
+    let (mut bounded, mut exhaustive) = (0, 0);
+    for (pattern, regex, word, chats) in [
+        ("flaky windows", false, false, false),
+        ("flaky windows", false, false, true),
+        ("windows flaky", false, false, false),
+        ("cache", false, false, false),
+        ("café naïve", false, false, false),
+        ("release workflow cache", false, false, false),
+        ("flak[ey]", true, false, false),
+        ("windows", false, true, false),
+    ] {
+        for limit in [1, 7, 25] {
+            let mut o = retrieval_options(pattern);
+            (o.regex, o.word, o.chats, o.limit) = (regex, word, chats, limit);
+            let (fast, read) = search(&o);
+            o.limit = 0;
+            let (mut all, every) = search(&o);
+            all.truncate(limit);
+            assert_eq!(
+                fast, all,
+                "{pattern} regex={regex} word={word} chats={chats} -n {limit}"
+            );
+            (bounded, exhaustive) = (bounded + read, exhaustive + every);
+        }
+    }
+    // Nearly every row holds the terms here, yet bounded pages still read fewer rows.
+    assert!(bounded < exhaustive, "{bounded} of {exhaustive}");
 }

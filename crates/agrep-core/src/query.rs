@@ -2,6 +2,7 @@
 use crate::{
     boundary_rank::{self, PreparedQuery, Stats},
     store::{self, BLOCK},
+    window::{self, insensitive_span, Folded, Snip, View},
 };
 use anyhow::{bail, Result};
 use rusqlite::{params_from_iter, types::Value, Connection, OptionalExtension};
@@ -79,6 +80,9 @@ pub struct Hit {
     pub rowid: i64,
     #[serde(skip)]
     pub tier: u8,
+    /// The characters of `text` 0.4.9 placed the hit's match at (`_match_span`).
+    #[serde(skip)]
+    pub span: Option<(usize, usize)>,
 }
 #[derive(Default, Serialize, Deserialize, Debug)]
 pub struct Results {
@@ -114,6 +118,7 @@ impl Timings {
         self.score_ms += other.score_ms;
     }
 }
+/// The speaker/source prior: 0.4.9's speaker weight times its source scale.
 pub fn weight(who: &str) -> f64 {
     match who {
         "user" => 1.,
@@ -126,8 +131,96 @@ pub fn weight(who: &str) -> f64 {
         _ => 0.5,
     }
 }
+/// 0.4.9's speaker weight and source scale, which its score multiplies separately.
+fn speaker(who: &str) -> (f64, f64) {
+    match who {
+        "user" => (1., 1.),
+        "agent" => (0.8, 1.),
+        "subagent" => (0.85, 0.85),
+        "tool" => (0.4, 0.55),
+        "recap" | "control" => (0.5, 0.65),
+        "synthetic" | "harness" => (0.5, 0.6),
+        _ => (0.5, 1.),
+    }
+}
+/// A row's score from its match strength, recency and boundary factor, multiplied and
+/// rounded to four places in 0.4.9's order.
+fn score(strength: f64, rec: f64, who: &str, factor: f64) -> f64 {
+    let (w, s) = speaker(who);
+    crate::window::round4(strength * rec * w * factor * s)
+}
 pub fn recency(ts: i64, now: i64) -> f64 {
-    2f64.powf(-((now - ts).max(0) as f64) / (14. * 86400000.))
+    let days = (now - ts).max(0) as f64 / 86_400_000.;
+    0.5f64.powf(days / 14.)
+}
+/// The ranked (rounded) score a row can reach when its raw score is at most `ceiling`.
+/// The margin covers products formed in another order than the score's.
+fn ranked(ceiling: f64) -> f64 {
+    window::round4(ceiling * (1. + 1e-12))
+}
+/// Session-head views fold lane confidence into the score.
+fn lane(tier: u8) -> f64 {
+    match tier {
+        1 => 0.7,
+        2 => 0.5,
+        _ => 1.,
+    }
+}
+/// A row as `Matcher::evaluate` found it.
+struct Scored {
+    tier: u8,
+    score: f64,
+    /// The boundary class; `explicit`, `counted`, or `unscored` when the row cannot
+    /// enter the page.
+    class: &'static str,
+    snippet: String,
+    /// 0.4.9's match span (`_match_span`), in bytes of the row.
+    span: Option<std::ops::Range<usize>>,
+}
+impl Scored {
+    fn bare(tier: u8, class: &'static str) -> Self {
+        Self {
+            tier,
+            score: 0.,
+            class,
+            snippet: String::new(),
+            span: None,
+        }
+    }
+}
+/// The page's last row, which another row must outrank to enter a full page.
+struct Cutoff {
+    chats: bool,
+    tier: u8,
+    /// Its score, lane-folded for session heads.
+    score: f64,
+    /// Whether the candidate loses equal scores on time, session and turn.
+    later: bool,
+}
+impl Cutoff {
+    /// `last` as the cutoff for a candidate (or a block's best tie key) at `ts`,
+    /// `session` and `turn`.
+    fn of(last: &Hit, chats: bool, ts: i64, session: &str, turn: i64) -> Self {
+        Self {
+            chats,
+            tier: last.tier,
+            score: last.score * if chats { lane(last.tier) } else { 1. },
+            later: ts < last.ts
+                || (ts == last.ts
+                    && (session > last.session.as_str()
+                        || (session == last.session && turn > last.turn))),
+        }
+    }
+    /// Whether a row of `tier` whose raw score is at most `ceiling` cannot enter. Rows
+    /// rank by rounded score, then (session heads) lane, then time and position.
+    fn excludes(&self, tier: u8, ceiling: f64) -> bool {
+        if !self.chats && tier != self.tier {
+            return tier > self.tier;
+        }
+        let best = ranked(ceiling) * if self.chats { lane(tier) } else { 1. };
+        best < self.score
+            || (best == self.score && (tier > self.tier || (tier == self.tier && self.later)))
+    }
 }
 type CandidateGroups = std::sync::Arc<HashMap<i64, Vec<i64>>>;
 /// A selective scope's blocks with their row counts, in block order.
@@ -374,7 +467,13 @@ struct Matcher {
     ordered_terms: Vec<Vec<String>>,
     estimated: usize,
     phrase: Option<regex::Regex>,
+    /// The phrase with one group per query token, for boundary spans.
+    capture: Option<regex::Regex>,
     explicit: Option<fancy_regex::Regex>,
+    /// 0.4.9's query length for explicit scores: zero for a regular expression.
+    explicit_chars: usize,
+    /// Whether the regular expression matches at most once in any snippet (`matches_once`).
+    explicit_once: bool,
     boundary: PreparedQuery,
     query_chars: usize,
     required: Vec<String>,
@@ -388,23 +487,63 @@ struct Matcher {
     coverage_excluded: HashSet<usize>,
     minimum_coverage: f64,
 }
+/// Literals every match of a regular expression begins or ends with, normalized: the
+/// single prefix literal and the single suffix literal, when the expression has them.
 fn literal_terms(s: &str) -> Vec<String> {
+    use regex_syntax::hir::literal::{ExtractKind, Extractor};
     let Ok(hir) = regex_syntax::ParserBuilder::new().build().parse(s) else {
         return vec![];
     };
-    let seq = regex_syntax::hir::literal::Extractor::new().extract(&hir);
-    let Some(lits) = seq.literals() else {
-        return vec![];
+    let mut out = Vec::new();
+    for kind in [ExtractKind::Prefix, ExtractKind::Suffix] {
+        let seq = Extractor::new().kind(kind).extract(&hir);
+        let Some([literal]) = seq.literals() else {
+            continue;
+        };
+        let literal = String::from_utf8_lossy(literal.as_bytes());
+        if !literal.is_empty() {
+            let literal = store::normalize(&literal);
+            if !out.contains(&literal) {
+                out.push(literal);
+            }
+        }
+    }
+    out
+}
+/// Whether a regular expression matches at most once in a snippet, whose collapsed
+/// whitespace leaves no line break: it is `A.*B` with `A` never empty and `.*` greedy and
+/// unbounded. The first match's `.*` runs to the last place `B` matches after `A`, and any
+/// later match would offer a later one.
+fn matches_once(pattern: &str) -> bool {
+    use regex_syntax::hir::{Class, HirKind};
+    let Ok(mut hir) = regex_syntax::ParserBuilder::new().build().parse(pattern) else {
+        return false;
     };
-    if lits.len() != 1 {
-        return vec![];
+    while let HirKind::Capture(capture) = hir.kind() {
+        hir = (*capture.sub).clone();
     }
-    let s = String::from_utf8_lossy(lits[0].as_bytes()).into_owned();
-    if s.is_empty() {
-        vec![]
-    } else {
-        vec![store::normalize(&s)]
-    }
+    let HirKind::Concat(parts) = hir.kind() else {
+        return false;
+    };
+    // Any character but a line break, which the snippet's whitespace runs replace.
+    let dot = |class: &Class| match class {
+        Class::Unicode(class) => {
+            let mut missing = class.clone();
+            missing.negate();
+            missing
+                .ranges()
+                .iter()
+                .all(|range| (range.start()..=range.end()).all(|c| c == '\n' || c == '\r'))
+        }
+        Class::Bytes(_) => false,
+    };
+    parts.iter().enumerate().any(|(at, part)| {
+        matches!(part.kind(), HirKind::Repetition(r)
+            if r.greedy && r.max.is_none() && matches!(r.sub.kind(), HirKind::Class(c) if dot(c)))
+            && parts[..at]
+                .iter()
+                .any(|before| before.properties().minimum_len().is_some_and(|n| n > 0))
+    })
 }
 impl Matcher {
     fn new(o: &Options, c: &Connection) -> Result<Self> {
@@ -415,7 +554,7 @@ impl Matcher {
         if o.pattern.is_empty() || (terms.is_empty() && !o.regex && !o.word) {
             bail!("a nonempty search pattern is required")
         }
-        let (explicit, required, phrase) = if o.regex || o.word {
+        let (explicit, required, phrase, capture) = if o.regex || o.word {
             let pattern = if o.word {
                 format!(r"(?<!\w)(?:{})(?!\w)", regex::escape(&o.pattern))
             } else {
@@ -431,15 +570,25 @@ impl Matcher {
                     literal_terms(&o.pattern)
                 },
                 None,
+                None,
             )
         } else {
-            let pattern = boundary_rank::query_tokens(&o.pattern)
+            let tokens: Vec<String> = boundary_rank::query_tokens(&o.pattern)
                 .iter()
                 .map(|t| regex::escape(&store::normalize(t)))
-                .collect::<Vec<_>>()
-                .join(r"[\W_]*");
-            (None, vec![], Some(regex::Regex::new(&pattern)?))
+                .collect();
+            let groups: Vec<String> = tokens.iter().map(|t| format!("({t})")).collect();
+            (
+                None,
+                vec![],
+                Some(regex::Regex::new(&tokens.join(r"[\W_]*"))?),
+                Some(regex::Regex::new(&groups.join(r"[\W_]*"))?),
+            )
         };
+        let query_chars = boundary_rank::query_tokens(&o.pattern)
+            .iter()
+            .map(|t| t.chars().count())
+            .sum();
         let mut stats = Stats::new();
         for token in boundary_rank::query_tokens(&o.pattern) {
             let normalized = store::normalize(token);
@@ -460,12 +609,12 @@ impl Matcher {
             estimated: usize::MAX,
             terms,
             phrase,
+            capture,
             explicit,
+            explicit_chars: if o.word { query_chars } else { 0 },
+            explicit_once: o.regex && matches_once(&o.pattern),
             boundary: boundary_rank::prepare_query(&o.pattern, &stats),
-            query_chars: boundary_rank::query_tokens(&o.pattern)
-                .iter()
-                .map(|t| t.chars().count())
-                .sum(),
+            query_chars,
             required,
             idf: vec![],
             tool_terms: HashMap::new(),
@@ -614,16 +763,37 @@ impl Matcher {
         who: &str,
         ts: i64,
         now: i64,
-        cutoff: Option<(u8, f64, bool)>,
-    ) -> Result<Option<(u8, f64, String)>> {
+        cutoff: Option<&Cutoff>,
+    ) -> Result<Option<Scored>> {
         let rec = recency(ts, now).max(if who == "user" { 0.35 } else { 0. });
         if let Some(re) = &self.explicit {
-            return match re.find(text)? {
-                Some(_) => Ok(Some((0, weight(who) * rec.max(0.5), "explicit".into()))),
-                None => Ok(None),
+            let Some(found) = re.find(text)? else {
+                return Ok(None);
             };
+            let span = found.start()..found.end();
+            let snip = Snip::new(text, std::slice::from_ref(&span));
+            let (mut n, mut best) = (0, 0);
+            if snip.chars >= self.explicit_chars {
+                for m in re.find_iter(&snip.text) {
+                    let m = m?;
+                    n += 1;
+                    let length = snip.text[m.start()..m.end()].chars().count();
+                    if best == 0 || length < best {
+                        best = length;
+                    }
+                }
+            }
+            let strength = window::strength(n, best, self.explicit_chars);
+            return Ok(Some(Scored {
+                tier: 0,
+                score: score(strength, rec.max(0.5), who, 1.),
+                class: "explicit",
+                snippet: snip.text,
+                span: Some(span),
+            }));
         }
-        let low = store::normalize(text);
+        let row = Folded::new(text);
+        let low = &row.low;
         if self.quick_count {
             let mut matches = self
                 .terms
@@ -634,12 +804,11 @@ impl Matcher {
             } else {
                 matches.all(|v| v)
             };
-            return Ok(found.then(|| (0, 0., "counted".into())));
+            return Ok(found.then(|| Scored::bare(0, "counted")));
         }
         let mut found = Vec::new();
         let mut found_weight = 0.;
         for (i, variants) in self.terms.iter().enumerate() {
-            // Only presence matters here; the phrase tier counts its own matches.
             let present = variants.iter().any(|v| low.contains(v.as_str()));
             if (present && self.coverage_excluded.contains(&i))
                 || (!present && self.coverage_term == Some(i))
@@ -654,148 +823,245 @@ impl Matcher {
                 }
             }
             found_weight += self.idf.get(i).copied().unwrap_or(1.);
-            found.push(variants[0].clone());
+            found.push(i);
         }
         if found.is_empty()
             || (self.partial && found_weight < self.minimum_coverage * self.idf.iter().sum::<f64>())
         {
             return Ok(None);
         }
-        let phrase = self.phrase.as_ref().unwrap();
-        let matches: Vec<_> = phrase.find_iter(&low).collect();
-        let is_phrase = !self.partial && !matches.is_empty();
-        if (self.phase == 1 && !is_phrase) || (self.phase == 2 && is_phrase) {
+        let first = if self.partial {
+            None
+        } else {
+            self.phrase.as_ref().unwrap().find(low)
+        };
+        if (self.phase == 1 && first.is_none()) || (self.phase == 2 && first.is_some()) {
             return Ok(None);
         }
-        let occurrences = matches.len();
-        let tier = if self.partial {
-            2
-        } else {
-            u8::from(!is_phrase)
-        };
-        let upper = if is_phrase {
-            (1. - 2f64.powi(-(occurrences.min(60) as i32)))
-                * if low.is_ascii() {
-                    (self.query_chars as f64
-                        / matches
-                            .iter()
-                            .map(|m| m.end() - m.start())
-                            .min()
-                            .unwrap_or(1) as f64)
-                        .min(1.)
-                } else {
-                    1.
-                }
-        } else if self.partial {
-            0.5 * found_weight / self.idf.iter().sum::<f64>().max(1.)
-        } else if text.is_ascii() {
-            proximity_upper(&low, &self.terms, self.query_chars)
-        } else {
-            // Compatibility characters can expand under normalization. Their
-            // original spans may be tighter than the normalized ASCII span.
-            1.
-        } * rec
-            * weight(who);
-        if cutoff.is_some_and(|(t, score, tied)| {
-            let ceiling = upper
-                * if t == 255 {
-                    match tier {
-                        1 => 0.7,
-                        2 => 0.5,
-                        _ => 1.,
-                    }
-                } else {
-                    1.
-                };
-            (t != 255 && tier > t)
-                || ((t == 255 || tier == t) && (ceiling < score || (tied && ceiling == score)))
-        }) {
-            return Ok(Some((tier, 0., "unscored".into())));
-        }
-        if is_phrase {
-            let boundary = self.boundary.evaluate_compact(text, None, true)?;
-            let span = matches
-                .iter()
-                .map(|m| low[m.start()..m.end()].chars().count())
-                .min()
-                .unwrap_or(1);
-            let tight = (self.query_chars as f64 / span as f64).min(1.);
-            let repetition = 1. - 2f64.powi(-(occurrences.min(60) as i32));
-            return Ok(Some((
-                0,
-                tight * repetition * rec * weight(who) * boundary.factor,
-                boundary.match_class.into(),
-            )));
-        }
-        let b = if self.partial {
-            boundary_rank::prepare_query(&found.join(" "), &Stats::new())
-                .evaluate(text, None, true)?
-        } else {
-            self.boundary.evaluate(text, None, true)?
-        };
-        let span = if is_phrase {
-            matches
-                .iter()
-                .map(|m| low[m.start()..m.end()].chars().count())
-                .min()
-                .unwrap_or(1)
-        } else {
-            let spans: Vec<_> = b.spans.iter().flatten().collect();
-            let lo = spans.iter().map(|s| s[0]).min().unwrap_or(0);
-            let hi = spans.iter().map(|s| s[1]).max().unwrap_or(1);
-            (hi - lo).max(1) as usize
-        };
-        let mut tight = (self.query_chars as f64 / span as f64).min(1.);
-        if !is_phrase {
-            let quality_scale = b
-                .qualities
-                .iter()
-                .copied()
-                .map(|q| (2. * q - 1.).max(0.))
-                .fold(1., f64::min);
-            tight = 0.5 + 0.5 * tight * quality_scale;
-        }
-        let repetition = if is_phrase {
-            1. - 2f64.powi(-(occurrences.min(60) as i32))
-        } else {
-            1.
-        };
-        let score = tight
-            * repetition
-            * rec
-            * weight(who)
-            * b.factor
-            * if self.partial {
-                0.5 * found_weight / self.idf.iter().sum::<f64>().max(1.)
+        if let Some(first) = first {
+            // 0.4.9 anchors a lone word at its first aligned occurrence and a phrase at
+            // its first match.
+            let anchor = if self.terms.len() == 1 {
+                insensitive_span(&row, &self.terms[0][..1])
             } else {
-                1.
-            };
-        Ok(Some((tier, score, b.match_class.into())))
-    }
-    // On ASCII rows, fully aligned distinct terms occupy disjoint spans with at
-    // least one separator. Any partial boundary has quality <= 0.5, making the
-    // all-terms tightness 0.5. This bounds both cases without scanning text.
-    fn all_terms_tightness(&self) -> f64 {
-        if self.terms.len() < 2
-            || self
+                None
+            }
+            .unwrap_or_else(|| row.start(first.start())..row.end(first.end()));
+            let snip = Snip::new(text, std::slice::from_ref(&anchor));
+            let view = View::new(&row, &snip);
+            let strength = self.phrase_strength(&row, &snip, &view);
+            let (w, s) = speaker(who);
+            // Boundary factors never exceed one, so this is the row's best score.
+            if cutoff.is_some_and(|c| c.excludes(0, strength * rec * w * s)) {
+                return Ok(Some(Scored::bare(0, "unscored")));
+            }
+            let (factor, class) = self.phrase_boundary(&row, &snip, &view)?;
+            return Ok(Some(Scored {
+                tier: 0,
+                score: score(strength, rec, who, factor),
+                class,
+                snippet: snip.text,
+                span: Some(anchor),
+            }));
+        }
+        if !self.partial {
+            let Some(spans) = self
                 .terms
                 .iter()
-                .flatten()
-                .any(|s| s.is_empty() || !s.bytes().all(|b| b.is_ascii_alphanumeric()))
-            || self.terms.iter().enumerate().any(|(i, variants)| {
-                self.terms[..i]
+                .map(|variants| insensitive_span(&row, variants))
+                .collect::<Option<Vec<_>>>()
+            else {
+                return Ok(None);
+            };
+            let snip = Snip::new(text, &spans);
+            let view = View::new(&row, &snip);
+            let phrase = self.phrase_strength(&row, &snip, &view);
+            let graded = boundary_rank::decut_text(&snip.text, true);
+            let b = self.boundary.evaluate(&graded, None, true)?;
+            let shift = i64::from(snip.text.starts_with(window::CUT));
+            let selected: Vec<_> = b
+                .spans
+                .iter()
+                .map(|span| span.map(|[start, end]| [start - shift, end - shift]))
+                .collect();
+            let near = window::proximity(&snip.text, &selected, &b.qualities, self.query_chars);
+            return Ok(Some(Scored {
+                tier: 1,
+                score: score(phrase.max(near), rec, who, b.factor),
+                class: b.match_class,
+                span: spans
                     .iter()
-                    .any(|prior| variants.iter().any(|v| prior.contains(v)))
+                    .min_by_key(|span| (span.start, span.end))
+                    .cloned(),
+                snippet: snip.text,
+            }));
+        }
+        let coverage = 0.5 * found_weight / self.idf.iter().sum::<f64>().max(1.);
+        if cutoff.is_some_and(|c| c.excludes(2, coverage * rec * weight(who))) {
+            return Ok(Some(Scored::bare(2, "unscored")));
+        }
+        let terms: Vec<&str> = found.iter().map(|&i| self.terms[i][0].as_str()).collect();
+        let b = boundary_rank::prepare_query(&terms.join(" "), &Stats::new())
+            .evaluate(text, None, true)?;
+        let spans: Vec<_> = b.spans.iter().flatten().collect();
+        let lo = spans.iter().map(|s| s[0]).min().unwrap_or(0);
+        let hi = spans.iter().map(|s| s[1]).max().unwrap_or(1);
+        let quality_scale = b
+            .qualities
+            .iter()
+            .copied()
+            .map(|q| (2. * q - 1.).max(0.))
+            .fold(1., f64::min);
+        let tight =
+            0.5 + 0.5 * (self.query_chars as f64 / (hi - lo).max(1) as f64).min(1.) * quality_scale;
+        // The earliest occurrence of a found term anchors the snippet, as 0.4.9's content
+        // lanes place theirs; they find the literal term, so a spelling variant counts
+        // only for a term found through it alone.
+        let anchor = found
+            .iter()
+            .filter_map(|&i| {
+                let spellings = &self.terms[i];
+                let at = |v: &String| low.find(v.as_str()).map(|at| (at, at + v.len()));
+                at(&spellings[0]).or_else(|| spellings[1..].iter().filter_map(at).min())
+            })
+            .min_by_key(|&(at, _)| at)
+            .map(|(at, end)| row.start(at)..row.end(end));
+        let snip = Snip::new(text, anchor.as_slice());
+        Ok(Some(Scored {
+            tier: 2,
+            score: window::round4(tight * rec * weight(who) * b.factor * coverage),
+            class: b.match_class,
+            snippet: snip.text,
+            span: anchor,
+        }))
+    }
+    /// 0.4.9's phrase strength in a snippet: its matches counted, the tightest measured in
+    /// snippet characters.
+    fn phrase_strength(&self, row: &Folded, snip: &Snip, view: &View) -> f64 {
+        let (mut n, mut best) = (0, 0);
+        if snip.chars >= self.query_chars {
+            let tokens = self.capture.as_ref().map_or(1, |c| c.captures_len() - 1);
+            for m in self.phrase.as_ref().unwrap().find_iter(&view.text) {
+                n += 1;
+                let mut length = view.span(row, snip, m.range()).len();
+                if tokens > 1 && length < self.query_chars + tokens - 1 {
+                    // Folding can make a match span fewer original characters than its
+                    // folded tokens and separators. Block ceilings count each separator
+                    // the folded text holds, so a match is never measured shorter.
+                    if let Some(groups) = self
+                        .capture
+                        .as_ref()
+                        .and_then(|c| c.captures_at(&view.text, m.start()))
+                    {
+                        let gaps = (2..groups.len())
+                            .filter(|&i| {
+                                groups
+                                    .get(i)
+                                    .zip(groups.get(i - 1))
+                                    .is_some_and(|(next, prior)| next.start() > prior.end())
+                            })
+                            .count();
+                        length = length.max(self.query_chars + gaps);
+                    }
+                }
+                if best == 0 || length < best {
+                    best = length;
+                }
+            }
+        }
+        window::strength(n, best, self.query_chars)
+    }
+    /// 0.4.9's phrase boundary factor: graded on the de-cut snippet at each match's token
+    /// spans, the best factor, then the shorter match.
+    fn phrase_boundary(
+        &self,
+        row: &Folded,
+        snip: &Snip,
+        view: &View,
+    ) -> Result<(f64, &'static str)> {
+        let Some(capture) = self
+            .capture
+            .as_ref()
+            .filter(|c| c.captures_len() - 1 == self.boundary.len())
+        else {
+            return Ok((1., "aligned"));
+        };
+        let graded = boundary_rank::decut_text(&snip.text, false);
+        let mut best: Option<(f64, usize, &'static str)> = None;
+        for groups in capture.captures_iter(&view.text) {
+            let spans: Vec<_> = (1..groups.len())
+                .map(|i| {
+                    groups.get(i).map(|g| {
+                        let span = view.span(row, snip, g.range());
+                        [span.start as i64, span.end as i64]
+                    })
+                })
+                .collect();
+            let length = groups
+                .get(0)
+                .map_or(0, |m| view.span(row, snip, m.range()).len());
+            let value = self
+                .boundary
+                .evaluate_compact(&graded, Some(&spans), false)?;
+            if best.is_none_or(|(factor, shortest, _)| {
+                value.factor > factor || (value.factor == factor && length < shortest)
+            }) {
+                best = Some((value.factor, length, value.match_class));
+            }
+        }
+        Ok(best.map_or((1., "aligned"), |(factor, _, class)| (factor, class)))
+    }
+    /// On ASCII rows, the all-terms strength ceiling, with the bridges whose adjacency
+    /// would break it: each pair of spellings of two terms, one after the other.
+    ///
+    /// A phrase match in an all-terms snippet crosses a window joint (three separator
+    /// characters). The proximity spread covers one selected occurrence of each term;
+    /// below one quality, its adjacency bonus is zero. Aligned occurrences of distinct
+    /// terms that neither contain nor overlap each other and are not written adjacently
+    /// sit at least one character apart. Only a cut marker in the spread, which adds 80,
+    /// can bring a de-cut copy of a neighbour into an occurrence; the start pad, which
+    /// Python's negative slice does not count, would put the same character twice at a
+    /// spelling's start.
+    fn all_terms_ceiling(&self) -> Option<(f64, Vec<Vec<String>>)> {
+        let count = self.terms.len();
+        let spellings = || self.terms.iter().flatten();
+        if count < 2
+            || spellings().any(|s| {
+                s.len() < 3
+                    || !s.bytes().all(|b| b.is_ascii_alphanumeric())
+                    || s.as_bytes()[0] == s.as_bytes()[1]
             })
         {
-            return 1.;
+            return None;
         }
         let width: usize = self
             .terms
             .iter()
             .map(|v| v.iter().map(String::len).min().unwrap_or(0))
             .sum();
-        0.5 + 0.5 * (self.query_chars as f64 / (width + self.terms.len() - 1) as f64).min(1.)
+        if width + count - 1 > window::PAD {
+            return None;
+        }
+        let mut bridges = Vec::new();
+        for (i, left) in self.terms.iter().enumerate() {
+            for (j, right) in self.terms.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                for (a, b) in left.iter().flat_map(|a| right.iter().map(move |b| (a, b))) {
+                    let overlaps = (1..a.len().min(b.len()))
+                        .any(|k| a.as_bytes()[a.len() - k..] == b.as_bytes()[..k]);
+                    if a.contains(b.as_str()) || overlaps {
+                        return None;
+                    }
+                    let joined = format!("{}{}", &a[a.len() - 2..], &b[..2]);
+                    bridges.push(vec![joined[..3].to_owned(), joined[1..].to_owned()]);
+                }
+            }
+        }
+        let qlen = self.query_chars as f64;
+        let near = 0.5 + 0.5 * (qlen / (width + count - 1) as f64).min(1.);
+        Some((near.max(qlen / (qlen + 3.)), bridges))
     }
     // Each alternative keeps its own upper count. Min across terms is a sound occurrence bound.
     fn phrase_bridges(&self) -> Vec<Vec<String>> {
@@ -1037,6 +1303,20 @@ fn escape_like(value: &str) -> String {
         .replace('%', "\\%")
         .replace('_', "\\_")
 }
+/// Row ids as a JSON array for `json_each`.
+fn id_list(ids: &[i64]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(ids.len() * 8 + 2);
+    out.push('[');
+    for (index, id) in ids.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        let _ = write!(out, "{id}");
+    }
+    out.push(']');
+    out
+}
 fn sql_filters(f: &Filters, alias: &str, c: &Connection) -> Result<(String, Vec<Value>)> {
     let mut clauses = vec![];
     let mut values = vec![];
@@ -1169,14 +1449,16 @@ pub(crate) fn project_ok(value: &str, pattern: &str) -> bool {
         v == p || v.rsplit(['/', '\\']).next() == Some(p.as_str())
     }
 }
+/// 0.4.9's `_rank_key` (rows) and `_session_view_key` (session heads) over rounded
+/// scores, then the row id.
 fn compare(a: &Hit, b: &Hit, sort: &str, chats: bool) -> std::cmp::Ordering {
-    let score = |h: &Hit| h.score * if chats && h.tier == 1 { 0.7 } else { 1. };
+    let score = |h: &Hit| h.score * lane(h.tier);
     let order = match sort {
         "time" => b.ts.cmp(&a.ts),
         "position" => a.session.cmp(&b.session).then(a.turn.cmp(&b.turn)),
         _ => {
             if chats {
-                score(b).total_cmp(&score(a))
+                score(b).total_cmp(&score(a)).then(a.tier.cmp(&b.tier))
             } else {
                 a.tier.cmp(&b.tier).then(b.score.total_cmp(&a.score))
             }
@@ -1190,11 +1472,22 @@ fn compare(a: &Hit, b: &Hit, sort: &str, chats: bool) -> std::cmp::Ordering {
         .then(a.rowid.cmp(&b.rowid))
 }
 type BlockBound = (i64, f64, i64, String, i64, i64);
+/// Each block's ceiling on the raw scores of this pass's rows; their rounding and lane
+/// folding are applied where pages compare them.
+///
+/// A phrase row scores `tight * (1 - 0.5^n) * R * W * B` over its snippet. Every phrase
+/// match counted there is a match of the row's folded text, so it holds a distinct
+/// occurrence of each token's grams: `n` is at most the least gram maximum. A match
+/// spans at least the query's characters plus one per adjacent token pair whose
+/// bridging gram the block lacks (`Matcher::phrase_strength` never measures it
+/// shorter), which bounds `tight`. `R * W` is at most each gram's newest weighted
+/// recency, and `B <= 1`. An explicit pattern's snippet matches each begin or end with
+/// its required literals, so they too hold distinct occurrences of its grams; a pattern
+/// that matches a snippet at most once (`matches_once`) has `n <= 1`.
 fn block_bounds(
     c: &Connection,
     m: &Matcher,
     now: i64,
-    folded: bool,
     table: &str,
     cache: &mut PlanCache,
     coverage: Option<&CoverageBounds>,
@@ -1206,13 +1499,22 @@ fn block_bounds(
     };
     let grams = m.bound_grams();
     let bridges = m.phrase_bridges();
-    let all_terms_tightness = m.all_terms_tightness();
+    let all_terms = if m.phase == 2 && !m.partial && m.explicit.is_none() {
+        m.all_terms_ceiling()
+    } else {
+        None
+    };
     let mut map: HashMap<String, HashMap<i64, store::Posting>> = HashMap::new();
     for g in grams
         .iter()
         .flatten()
         .flatten()
         .chain(bridges.iter().flatten())
+        .chain(
+            all_terms
+                .iter()
+                .flat_map(|(_, joined)| joined.iter().flatten()),
+        )
     {
         if !store::indexed_gram(g) || map.contains_key(g) {
             continue;
@@ -1333,35 +1635,34 @@ fn block_bounds(
         }
         // All-terms scores have no repetition penalty. Their finite ceiling
         // must therefore use one, independently of the phrase occurrence cap.
-        let repetition = if m.explicit.is_some() || m.phase == 2 {
+        let repetition = if m.phase == 2 {
             1.
         } else {
-            1. - 2f64.powi(-(n.min(60) as i32))
+            1. - 2f64.powi(-(n.min(if m.explicit_once { 1 } else { 60 }) as i32))
+        };
+        let absent = |g: &String| {
+            !map.get(g)
+                .is_some_and(|postings| postings.contains_key(&id))
         };
         // If a cross-token gram is absent, this block cannot contain that
-        // pair with zero separator characters. Account for the mandatory gap
-        // in the same normalized-character span used by phrase scoring.
+        // pair with zero separator characters.
         let gaps = bridges
             .iter()
-            .filter(|bridge| {
-                !bridge.is_empty()
-                    && bridge.iter().any(|g| {
-                        !map.get(g)
-                            .is_some_and(|postings| postings.contains_key(&id))
-                    })
-            })
+            .filter(|bridge| !bridge.is_empty() && bridge.iter().any(absent))
             .count();
-        let phrase_tightness = if m.phase == 2 && all_ascii {
-            all_terms_tightness
+        let phrase_tightness = if m.phase == 2 {
+            match &all_terms {
+                Some((ceiling, joined))
+                    if all_ascii && joined.iter().all(|bridge| bridge.iter().any(absent)) =>
+                {
+                    *ceiling
+                }
+                _ => 1.,
+            }
         } else if bridges.is_empty() {
             1.
         } else {
-            let width: usize = m
-                .terms
-                .iter()
-                .map(|variants| variants[0].chars().count())
-                .sum();
-            (m.query_chars as f64 / (width + gaps).max(1) as f64).min(1.)
+            (m.query_chars as f64 / (m.query_chars + gaps).max(1) as f64).min(1.)
         };
         let rw = if m.partial {
             global_clock
@@ -1373,10 +1674,6 @@ fn block_bounds(
             id,
             if m.partial {
                 rw * (0.5 * possible_weight / m.idf.iter().sum::<f64>().max(1.))
-            } else if folded && m.phase == 2 {
-                0.7 * phrase_tightness * rw
-            } else if folded {
-                (phrase_tightness * repetition * rw).max(0.7 * rw)
             } else {
                 phrase_tightness * repetition * rw
             },
@@ -1558,6 +1855,13 @@ pub fn coverage(c: &Connection, o: &Options) -> Result<Results> {
 /// Below this many scope rows, decoding a run's rows costs less than reading
 /// its postings.
 const SCOPE_INDEX_ROWS: usize = 32;
+/// The most blocks a bounded scan reads its admitted rows for at once. One rowid-range
+/// query opens each word's postings once for the run instead of once per block, and
+/// larger runs widen the word union faster than they save.
+const RUN_BLOCKS: usize = 64;
+/// Consecutive blocks a run may step over: ones without a ceiling, already read, or
+/// below the page's cutoff.
+const RUN_GAP: usize = 8;
 /// The rows of a selective scope that its lane's text index admits, using the
 /// expressions unselective plans rely on as necessary conditions. Each run of
 /// consecutive scope blocks is one rowid-range query, so a word's postings are
@@ -1571,12 +1875,6 @@ fn scope_candidates(
     span: Option<&[u8]>,
     scope: &[(i64, usize)],
 ) -> Result<HashMap<i64, Vec<i64>>> {
-    let sql = match (table, span) {
-        ("tools", Some(_)) => "SELECT f.rowid FROM tools_fts f LEFT JOIN event_rows e INDEXED BY event_tool_id ON e.tool_id=f.rowid AND e.active=1 LEFT JOIN tool_blobs t ON t.id=e.blob WHERE tools_fts MATCH ?1 AND f.rowid>=?2 AND f.rowid<?3 AND agrep_word_span(tools_fts,?4,CASE WHEN t.ascii THEN 0 ELSE ?5 END)".to_owned(),
-        (_, Some(_)) => format!("SELECT rowid FROM {table}_fts WHERE {table}_fts MATCH ?1 AND rowid>=?2 AND rowid<?3 AND agrep_word_span({table}_fts,?4,?5)"),
-        (_, None) => format!("SELECT rowid FROM {table}_fts WHERE {table}_fts MATCH ?1 AND rowid>=?2 AND rowid<?3"),
-    };
-    let mut query = c.prepare_cached(&sql)?;
     let mut admitted = HashMap::new();
     let mut rest = scope;
     while let Some(&(first, _)) = rest.first() {
@@ -1591,62 +1889,85 @@ fn scope_candidates(
             continue;
         }
         let blocks: Vec<i64> = run.iter().map(|&(block, _)| block).collect();
-        let last = blocks[blocks.len() - 1];
-        // Tool blocks hold their own words; a required group without any word
-        // in the run admits no row of it.
-        let own = if table != "tools" {
-            None
-        } else {
-            let plan = if span.is_some() {
-                m.word_positions(Some(&blocks))
-            } else {
-                m.fts(Some(&blocks))
-                    .map(|expression| (expression, Vec::new()))
-            };
-            let Some(plan) = plan else {
-                admitted.extend(blocks.iter().map(|&block| (block, Vec::new())));
-                continue;
-            };
-            Some(plan)
-        };
-        let (expression, ordinals) = own.as_ref().map_or((expression, span), |(e, o)| {
-            (e.as_str(), Some(o.as_slice()))
-        });
-        let mut bind = vec![
-            Value::Text(expression.to_owned()),
-            Value::Integer(first * BLOCK),
-            Value::Integer((last + 1) * BLOCK),
-        ];
-        if let Some(ordinals) = ordinals.filter(|_| span.is_some()) {
-            // The widest gap of the run's blocks bounds every row in it.
-            let max_gap = if table == "tools" {
-                c.query_row(
-                    "SELECT CASE WHEN count(*)=?3 THEN max(max_gap) ELSE 2147483647 END FROM tool_blocks WHERE id BETWEEN ?1 AND ?2",
-                    rusqlite::params![first, last, blocks.len() as i64],
-                    |r| r.get(0),
-                )?
-            } else {
-                i64::from(i32::MAX)
-            };
-            bind.push(Value::Blob(ordinals.to_vec()));
-            bind.push(Value::Integer(max_gap));
-        }
-        for &block in &blocks {
-            admitted.insert(block, Vec::new());
-        }
-        for id in query.query_map(params_from_iter(bind), |r| r.get::<_, i64>(0))? {
-            let id = id?;
-            if let Some(ids) = admitted.get_mut(&(id / BLOCK)) {
-                ids.push(id);
-            }
-        }
-        for block in &blocks {
-            if let Some(ids) = admitted.get_mut(block) {
-                ids.sort_unstable();
-            }
-        }
+        admit_run(c, m, table, expression, span, &blocks, None, &mut admitted)?;
     }
     Ok(admitted)
+}
+/// Adds to `admitted` the rows of `blocks` (sorted) that the text index admits, read with
+/// one rowid-range query over their span; other blocks inside it are left out. Tool rows
+/// are bounded by `max_gap`, which a consecutive run may leave to its blocks' metadata.
+#[allow(clippy::too_many_arguments)]
+fn admit_run(
+    c: &Connection,
+    m: &Matcher,
+    table: &str,
+    expression: &str,
+    span: Option<&[u8]>,
+    blocks: &[i64],
+    max_gap: Option<i64>,
+    admitted: &mut HashMap<i64, Vec<i64>>,
+) -> Result<()> {
+    let (first, last) = (blocks[0], blocks[blocks.len() - 1]);
+    // Tool blocks hold their own words; a required group without any word
+    // in the run admits no row of it.
+    let own = if table != "tools" {
+        None
+    } else {
+        let plan = if span.is_some() {
+            m.word_positions(Some(blocks))
+        } else {
+            m.fts(Some(blocks))
+                .map(|expression| (expression, Vec::new()))
+        };
+        let Some(plan) = plan else {
+            admitted.extend(blocks.iter().map(|&block| (block, Vec::new())));
+            return Ok(());
+        };
+        Some(plan)
+    };
+    let (expression, ordinals) = own.as_ref().map_or((expression, span), |(e, o)| {
+        (e.as_str(), Some(o.as_slice()))
+    });
+    let sql = match (table, span) {
+        ("tools", Some(_)) => "SELECT f.rowid FROM tools_fts f LEFT JOIN event_rows e INDEXED BY event_tool_id ON e.tool_id=f.rowid AND e.active=1 LEFT JOIN tool_blobs t ON t.id=e.blob WHERE tools_fts MATCH ?1 AND f.rowid>=?2 AND f.rowid<?3 AND agrep_word_span(tools_fts,?4,CASE WHEN t.ascii THEN 0 ELSE ?5 END)".to_owned(),
+        (_, Some(_)) => format!("SELECT rowid FROM {table}_fts WHERE {table}_fts MATCH ?1 AND rowid>=?2 AND rowid<?3 AND agrep_word_span({table}_fts,?4,?5)"),
+        (_, None) => format!("SELECT rowid FROM {table}_fts WHERE {table}_fts MATCH ?1 AND rowid>=?2 AND rowid<?3"),
+    };
+    let mut bind = vec![
+        Value::Text(expression.to_owned()),
+        Value::Integer(first * BLOCK),
+        Value::Integer((last + 1) * BLOCK),
+    ];
+    if let Some(ordinals) = ordinals.filter(|_| span.is_some()) {
+        // The widest gap of the run's blocks bounds every row in it.
+        let max_gap = if table != "tools" {
+            i64::from(i32::MAX)
+        } else if let Some(max_gap) = max_gap {
+            max_gap
+        } else {
+            c.query_row(
+                "SELECT CASE WHEN count(*)=?3 THEN max(max_gap) ELSE 2147483647 END FROM tool_blocks WHERE id BETWEEN ?1 AND ?2",
+                rusqlite::params![first, last, blocks.len() as i64],
+                |r| r.get(0),
+            )?
+        };
+        bind.push(Value::Blob(ordinals.to_vec()));
+        bind.push(Value::Integer(max_gap));
+    }
+    let mut rows: HashMap<i64, Vec<i64>> =
+        blocks.iter().map(|&block| (block, Vec::new())).collect();
+    let mut query = c.prepare_cached(&sql)?;
+    for id in query.query_map(params_from_iter(bind), |r| r.get::<_, i64>(0))? {
+        let id = id?;
+        if let Some(ids) = rows.get_mut(&(id / BLOCK)) {
+            ids.push(id);
+        }
+    }
+    for ids in rows.values_mut() {
+        ids.sort_unstable();
+    }
+    admitted.extend(rows);
+    Ok(())
 }
 fn count_tool_terms(
     c: &Connection,
@@ -1705,6 +2026,8 @@ fn search_pass(
     let mut m = Matcher::new(o, c)?;
     m.partial = partial;
     m.phase = phase;
+    // The tier this pass's rows take; a pass over both tiers is bounded as phrase rows.
+    let pass_tier = if partial { 2 } else { u8::from(phase == 2) };
     if partial {
         m.terms = if cache.coverage_all {
             coverage_terms(&o.pattern)
@@ -1884,7 +2207,10 @@ fn search_pass(
             )
             .optional()?
             .unwrap_or(0);
-        let common_scan = !partial
+        // A prose term in most rows is cheaper to verify than to admit through the index.
+        // Tool rows decode far more slowly, so tool blocks always read admitted rows.
+        let common_scan = table == "prose"
+            && !partial
             && !o.regex
             && !o.word
             && !o.exact
@@ -1892,15 +2218,11 @@ fn search_pass(
             && o.sort == "score"
             && m.terms.len() == 1
             && m.estimated != usize::MAX
-            && m.estimated
-                .saturating_mul(if table == "tools" { 8 } else { 4 })
-                >= lane_total;
-        let span_plan = if table == "tools" && !common_scan {
+            && m.estimated.saturating_mul(4) >= lane_total;
+        let span_plan = if table == "tools" {
             m.word_positions(None)
-        } else if table == "prose" {
-            m.prose_positions()
         } else {
-            None
+            m.prose_positions()
         };
         let fts = if common_scan {
             None
@@ -1950,7 +2272,7 @@ fn search_pass(
             && matches!(o.sort.as_str(), "score" | "time");
         let mut coverage = None;
         let mut blocks = if bounded {
-            block_bounds(c, &m, now, o.chats, table, cache, coverage.as_ref())?
+            block_bounds(c, &m, now, table, cache, coverage.as_ref())?
         } else {
             vec![(
                 -1,
@@ -1982,7 +2304,7 @@ fn search_pass(
             && result.hits[o.limit - 1].tier == 0
             && blocks
                 .first()
-                .is_some_and(|b| b.1 < result.hits[o.limit - 1].score)
+                .is_some_and(|b| ranked(b.1) < result.hits[o.limit - 1].score)
         {
             result.total_basis = "floor".into();
             result.timings.plan_ms += plan_started.elapsed().as_secs_f64() * 1000.;
@@ -2035,20 +2357,36 @@ fn search_pass(
             }
             _ => None,
         };
-        let mut remaining = blocks.into_iter();
+        let mut order = blocks;
+        let mut position: HashMap<i64, usize> = order
+            .iter()
+            .enumerate()
+            .map(|(at, entry)| (entry.0, at))
+            .collect();
+        let mut next = 0;
+        // Rows the text index admits in blocks still to visit, read for whole runs of
+        // consecutive blocks at once.
+        let mut runs: HashMap<i64, Vec<i64>> = HashMap::new();
         let mut visited = HashSet::new();
         let mut coverage_tried = false;
-        while let Some((block, bound, max_ts, min_session, min_turn, max_gap)) = remaining.next() {
+        while let Some((block, bound, max_ts, min_session, min_turn, max_gap)) =
+            order.get(next).cloned()
+        {
+            next += 1;
             let block_index = visited.len();
             if bounded && partial && table == "prose" && !coverage_tried && block_index >= 4 {
                 coverage_tried = true;
                 let tick = Instant::now();
                 coverage = cache.coverage_bounds(c, &m, lane_total)?;
                 if let Some(coverage) = &coverage {
-                    let mut replacement =
-                        block_bounds(c, &m, now, o.chats, table, cache, Some(coverage))?;
+                    let mut replacement = block_bounds(c, &m, now, table, cache, Some(coverage))?;
                     replacement.retain(|entry| !visited.contains(&entry.0));
-                    remaining = replacement.into_iter();
+                    position = replacement
+                        .iter()
+                        .enumerate()
+                        .map(|(at, entry)| (entry.0, at))
+                        .collect();
+                    (order, next) = (replacement, 0);
                     ids = Some(coverage.candidates.clone());
                     result.timings.plan_ms += tick.elapsed().as_secs_f64() * 1000.;
                     continue;
@@ -2056,26 +2394,6 @@ fn search_pass(
                 result.timings.plan_ms += tick.elapsed().as_secs_f64() * 1000.;
             }
             visited.insert(block);
-            let (fts, block_span) = if table == "tools"
-                && bounded
-                && block >= 0
-                && !selective
-                && ids.is_none()
-                && fts.is_some()
-            {
-                let found = if span_plan.is_some() {
-                    m.word_positions(Some(&[block]))
-                        .map(|(expression, ordinals)| (Some(expression), Some(ordinals)))
-                } else {
-                    m.fts(Some(&[block]))
-                        .map(|expression| (Some(expression), None))
-                };
-                // A required group without any word in this block cannot match here.
-                let Some(found) = found else { continue };
-                found
-            } else {
-                (fts.clone(), span_plan.as_ref().map(|(_, v)| v.clone()))
-            };
             if bounded && result.hits.len() >= o.limit {
                 let last = &result.hits[o.limit - 1];
                 if o.sort == "time" {
@@ -2083,32 +2401,11 @@ fn search_pass(
                         result.total_basis = "floor".into();
                         break;
                     }
-                } else {
-                    let ceiling = if m.partial || m.phase == 2 || o.chats || last.tier == 0 {
-                        bound
-                    } else {
-                        f64::INFINITY
-                    };
-                    let threshold = last.score
-                        * if o.chats {
-                            match last.tier {
-                                1 => 0.7,
-                                2 => 0.5,
-                                _ => 1.,
-                            }
-                        } else {
-                            1.
-                        };
-                    if ceiling < threshold
-                        || (ceiling == threshold
-                            && (max_ts < last.ts
-                                || (max_ts == last.ts
-                                    && (min_session > last.session
-                                        || (min_session == last.session && min_turn > last.turn)))))
-                    {
-                        result.total_basis = "floor".into();
-                        break;
-                    }
+                } else if Cutoff::of(last, o.chats, max_ts, &min_session, min_turn)
+                    .excludes(pass_tier, bound)
+                {
+                    result.total_basis = "floor".into();
+                    break;
                 }
             }
             if adaptive_prose && block_index > 0 {
@@ -2124,13 +2421,68 @@ fn search_pass(
                     result.timings.sqlite_ms += tick.elapsed().as_secs_f64() * 1000.;
                 }
             }
-            let block_ids = ids.as_ref().and_then(|map| map.get(&block));
-            if ids.is_some() && block_ids.is_none() {
+            let spanned = bounded && block >= 0 && !selective && ids.is_none() && fts.is_some();
+            if spanned && !runs.contains_key(&block) {
+                let page = (o.limit > 0 && result.hits.len() >= o.limit)
+                    .then(|| &result.hits[o.limit - 1]);
+                // Blocks the page still admits will be visited unless its cutoff rises.
+                let admits = |entry: &BlockBound| {
+                    page.is_none_or(|last| {
+                        if o.sort == "time" {
+                            entry.2 >= last.ts
+                        } else {
+                            !Cutoff::of(last, o.chats, entry.2, &entry.3, entry.4)
+                                .excludes(pass_tier, entry.1)
+                        }
+                    })
+                };
+                // The adaptive prose plan reads one candidate stream after this block.
+                let limit = if adaptive_prose { 1 } else { RUN_BLOCKS };
+                let mut run = vec![block];
+                for step in [1, -1] {
+                    let (mut id, mut skipped) = (block + step, 0);
+                    while id >= 0 && run.len() < limit && skipped <= RUN_GAP {
+                        let member = position.get(&id).is_some_and(|&at| {
+                            !visited.contains(&id) && !runs.contains_key(&id) && admits(&order[at])
+                        });
+                        if member {
+                            run.push(id);
+                            skipped = 0;
+                        } else {
+                            skipped += 1;
+                        }
+                        id += step;
+                    }
+                }
+                run.sort_unstable();
+                let max_gap = run
+                    .iter()
+                    .map(|id| order[position[id]].5)
+                    .max()
+                    .unwrap_or(max_gap);
+                let tick = Instant::now();
+                admit_run(
+                    c,
+                    &m,
+                    table,
+                    fts.as_deref().unwrap_or_default(),
+                    span_plan.as_ref().map(|(_, v)| v.as_slice()),
+                    &run,
+                    Some(max_gap),
+                    &mut runs,
+                )?;
+                result.timings.sqlite_ms += tick.elapsed().as_secs_f64() * 1000.;
+            }
+            let block_ids = match &ids {
+                Some(map) => map.get(&block),
+                None => runs.get(&block),
+            };
+            if (ids.is_some() || spanned) && block_ids.is_none_or(Vec::is_empty) {
                 continue;
             }
             result.blocks += 1;
             let mut bind = vec![];
-            let uses_fts = !selective && fts.is_some() && ids.is_none();
+            let uses_fts = !selective && fts.is_some() && ids.is_none() && !spanned;
             let candidate_table = if table == "tools" && (uses_fts || ids.is_some() || bounded) {
                 crate::tool_store::CANDIDATES_BY_ID
             } else {
@@ -2148,10 +2500,16 @@ fn search_pass(
             } else {
                 format!("{candidate_table} p WHERE 1")
             };
-            let mut sql=format!("SELECT p.id,p.session,p.agent,NULL,p.position,p.who,NULL,NULL,p.ts,NULL,NULL,NULL FROM {from}{scope}");
+            // A tool candidate row names its stored text, read without the view's joins.
+            let blob = if candidate_table == crate::tool_store::CANDIDATES_BY_ID {
+                "p.blob"
+            } else {
+                "NULL"
+            };
+            let mut sql=format!("SELECT p.id,p.session,p.agent,{blob},p.position,p.who,NULL,NULL,p.ts,NULL,NULL,NULL FROM {from}{scope}");
             bind.extend(values.clone());
             if uses_fts {
-                if let Some(ordinals) = &block_span {
+                if let Some((_, ordinals)) = &span_plan {
                     sql.push_str(&if table == "tools" {
                         " AND agrep_word_span(tools_fts,?,CASE WHEN (SELECT ascii FROM tool_blobs WHERE id=p.blob) THEN 0 ELSE ? END)".into()
                     } else {
@@ -2166,11 +2524,9 @@ fn search_pass(
                 }
             }
             if let Some(ids) = block_ids {
-                sql.push_str(&format!(
-                    " AND p.id IN ({})",
-                    vec!["?"; ids.len()].join(",")
-                ));
-                bind.extend(ids.iter().copied().map(Value::Integer));
+                // One statement text for every list keeps the statement prepared.
+                sql.push_str(" AND p.id IN (SELECT value FROM json_each(?))");
+                bind.push(Value::Text(id_list(ids)));
             } else if block >= 0 {
                 sql.push_str(if uses_fts {
                     " AND f.rowid>=? AND f.rowid<?"
@@ -2184,7 +2540,7 @@ fn search_pass(
             }
             if bounded && !o.chats && o.sort == "score" && result.hits.len() >= o.limit {
                 let last = &result.hits[o.limit - 1];
-                if bound <= last.score {
+                if last.tier == pass_tier && ranked(bound) <= last.score {
                     // At the block's best possible score, an older row cannot
                     // win the deterministic tie. Keep equal timestamps for
                     // the session/position tie breakers below.
@@ -2192,6 +2548,9 @@ fn search_pass(
                     bind.push(Value::Integer(last.ts));
                     result.total_basis = "floor".into();
                 }
+            }
+            if block_ids.is_some() {
+                sql.push_str(" ORDER BY p.id");
             }
             let sql_started = Instant::now();
             let mut stmt = c.prepare_cached(&sql)?;
@@ -2205,14 +2564,6 @@ fn search_pass(
                 let who: String = r.get(5)?;
                 let ts: i64 = r.get(8)?;
                 if !o.exact && o.limit > 0 && result.hits.len() >= o.limit && o.sort == "score" {
-                    let last = &result.hits[o.limit - 1];
-                    let tier = if partial {
-                        2
-                    } else if phase == 2 {
-                        1
-                    } else {
-                        0
-                    };
                     let mut ceiling = weight(&who)
                         * if m.explicit.is_some() {
                             recency(ts, now).max(0.5)
@@ -2232,22 +2583,12 @@ fn search_pass(
                             ceiling *= 0.5;
                         }
                     }
-                    if bounded && !o.chats {
+                    if bounded {
                         ceiling = ceiling.min(bound);
                     }
-                    if o.chats && tier == 1 {
-                        ceiling *= 0.7;
-                    }
-                    let threshold = last.score * if o.chats && last.tier == 1 { 0.7 } else { 1. };
                     let session: String = r.get(1)?;
-                    let turn: i64 = r.get(4)?;
-                    let later = ts < last.ts
-                        || (ts == last.ts
-                            && (session > last.session
-                                || (session == last.session && turn > last.turn)));
-                    if (!o.chats && tier > last.tier)
-                        || ((o.chats || tier == last.tier)
-                            && (ceiling < threshold || (ceiling == threshold && later)))
+                    if Cutoff::of(&result.hits[o.limit - 1], o.chats, ts, &session, r.get(4)?)
+                        .excludes(pass_tier, ceiling)
                     {
                         result.total_basis = "floor".into();
                         continue;
@@ -2263,46 +2604,36 @@ fn search_pass(
                     }
                 }
                 let hydrate_started = Instant::now();
-                let bytes: Vec<u8> = c
-                    .prepare_cached(&format!("SELECT text FROM {table} WHERE id=?"))?
-                    .query_row([r.get::<_, i64>(0)?], |r| r.get(0))?;
+                let bytes: Vec<u8> = match r.get::<_, Option<i64>>(3)? {
+                    Some(blob) => c
+                        .prepare_cached("SELECT body FROM tool_blobs WHERE id=?")?
+                        .query_row([blob], |r| r.get(0))?,
+                    None => c
+                        .prepare_cached(&format!("SELECT text FROM {table} WHERE id=?"))?
+                        .query_row([r.get::<_, i64>(0)?], |r| r.get(0))?,
+                };
                 let text = store::decode(table, bytes)?;
                 result.timings.hydrate_ms += hydrate_started.elapsed().as_secs_f64() * 1000.;
                 result.examined += 1;
                 let score_started = Instant::now();
-                let evaluated = m.evaluate(
-                    &text,
-                    &who,
-                    ts,
-                    now,
-                    if o.sort == "score" && o.limit > 0 && result.hits.len() >= o.limit {
-                        let h = &result.hits[o.limit - 1];
-                        let session: String = r.get(1)?;
-                        Some((
-                            if o.chats { 255 } else { h.tier },
-                            h.score
-                                * if o.chats {
-                                    match h.tier {
-                                        1 => 0.7,
-                                        2 => 0.5,
-                                        _ => 1.,
-                                    }
-                                } else {
-                                    1.
-                                },
-                            ts < h.ts
-                                || (ts == h.ts
-                                    && (session > h.session
-                                        || (session == h.session && r.get::<_, i64>(4)? > h.turn))),
-                        ))
-                    } else {
-                        None
-                    },
-                )?;
+                let cutoff = if o.sort == "score" && o.limit > 0 && result.hits.len() >= o.limit {
+                    let session: String = r.get(1)?;
+                    Some(Cutoff::of(
+                        &result.hits[o.limit - 1],
+                        o.chats,
+                        ts,
+                        &session,
+                        r.get(4)?,
+                    ))
+                } else {
+                    None
+                };
+                let evaluated = m.evaluate(&text, &who, ts, now, cutoff.as_ref())?;
                 result.timings.score_ms += score_started.elapsed().as_secs_f64() * 1000.;
-                let Some((tier, score, boundary)) = evaluated else {
+                let Some(scored) = evaluated else {
                     continue;
                 };
+                let (tier, score) = (scored.tier, scored.score);
                 let meta_marker = o.filters.no_meta
                     && crate::history_meta::is_meta(
                         c,
@@ -2323,7 +2654,7 @@ fn search_pass(
                         result.tool_rows += 1;
                     }
                 }
-                if boundary == "unscored" {
+                if scored.class == "unscored" {
                     continue;
                 }
                 let class = if tier == 2 {
@@ -2331,7 +2662,7 @@ fn search_pass(
                 } else if tier == 1 {
                     "all_terms"
                 } else {
-                    match boundary.as_str() {
+                    match scored.class {
                         "aligned" => "phrase_aligned",
                         "partial" => "phrase_partial",
                         _ => "phrase_interior",
@@ -2374,16 +2705,23 @@ fn search_pass(
                         Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
                     })?;
                 let target = session_target(&session)?;
+                let span = scored.span.map(|span| {
+                    (
+                        text[..span.start].chars().count(),
+                        text[..span.end].chars().count(),
+                    )
+                });
                 let handle = if extra.is_empty() {
                     format!("{target}:{turn}.{digest}")
                 } else {
+                    let (start, end) = span
+                        .filter(|(start, end)| end > start)
+                        .unwrap_or((0, text.chars().count()));
                     format!(
-                        "{target}:{turn}.{digest}~{}:0-{}",
+                        "{target}:{turn}.{digest}~{}:{start}-{end}",
                         event_id(&session, ts, &text),
-                        text.chars().count()
                     )
                 };
-                let snippet = snippet(&text, &o.pattern, 280);
                 let self_marker = o.filters.caller.as_ref().is_some_and(|caller| {
                     caller.agent == r.get::<_, String>(2).unwrap_or_default()
                         && caller.session == session
@@ -2400,7 +2738,7 @@ fn search_pass(
                     model_source,
                     ts,
                     text,
-                    snippet,
+                    snippet: scored.snippet,
                     score,
                     matched: match tier {
                         0 => "phrase",
@@ -2408,12 +2746,13 @@ fn search_pass(
                         _ => "content-terms",
                     }
                     .into(),
-                    boundary_class: boundary,
+                    boundary_class: scored.class.into(),
                     handle,
                     self_marker,
                     meta_marker,
                     rowid: r.get(0)?,
                     tier,
+                    span,
                 };
                 if meta_marker {
                     save_meta(&mut result, h, o);
@@ -2539,47 +2878,6 @@ pub fn snippet(text: &str, query: &str, max: usize) -> String {
     )
 }
 
-/// Minimal covering span ignores boundary penalties, so it is an admissible score ceiling.
-fn proximity_upper(text: &str, terms: &[Vec<String>], query_chars: usize) -> f64 {
-    if !text.is_ascii() || terms.len() < 2 {
-        return 1.;
-    }
-    let mut events = Vec::new();
-    for (i, variants) in terms.iter().enumerate() {
-        for v in variants {
-            for (start, _) in text.match_indices(v) {
-                events.push((start, start + v.len(), i));
-            }
-        }
-    }
-    events.sort_unstable();
-    let mut counts = vec![0; terms.len()];
-    let mut present = 0;
-    let mut left = 0;
-    let mut width = usize::MAX;
-    for right in 0..events.len() {
-        let (_, end, term) = events[right];
-        if counts[term] == 0 {
-            present += 1;
-        }
-        counts[term] += 1;
-        while present == terms.len() {
-            width = width.min(end.saturating_sub(events[left].0).max(1));
-            let t = events[left].2;
-            counts[t] -= 1;
-            if counts[t] == 0 {
-                present -= 1;
-            }
-            left += 1;
-        }
-    }
-    if width == usize::MAX {
-        1.
-    } else {
-        0.5 + 0.5 * (query_chars as f64 / width as f64).min(1.)
-    }
-}
-
 #[cfg(test)]
 mod handle_tests {
     #[test]
@@ -2591,5 +2889,80 @@ mod handle_tests {
         assert_eq!(super::session_target("a:b/é").unwrap(), "@~YTpiL8Op");
         assert!(super::session_target("").is_err());
         assert!(super::session_target(&"x".repeat(800)).is_err());
+    }
+}
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    fn evaluate(pattern: &str, text: &str, phase: u8, partial: bool) -> Scored {
+        let options = Options {
+            pattern: pattern.into(),
+            regex: false,
+            word: false,
+            sort: "score".into(),
+            limit: 10,
+            exact: false,
+            count_only: false,
+            count_by_tier: false,
+            content: false,
+            chats: false,
+            tools: false,
+            filters: Filters::default(),
+        };
+        let mut m = Matcher::new(&options, &Connection::open_in_memory().unwrap()).unwrap();
+        (m.phase, m.partial) = (phase, partial);
+        if partial {
+            m.terms = content_terms(pattern);
+        }
+        m.evaluate(text, "tool", 0, 0, None).unwrap().unwrap()
+    }
+    // Expected spans were produced by agrep 0.4.9's own matchers: the `[\W_]*` phrase
+    // search, `console.insensitive_span` with and without `_keyword_term_specs` variants,
+    // and `corpusdb.content`'s earliest lowered occurrence.
+    #[test]
+    fn hit_spans_follow_0_4_9_match_spans() {
+        let text = "bash [failed]: ./run-migration --step 3\nERROR copper falcon migration timeout; copper-falcon_migration";
+        let span = |pattern: &str, phase: u8, partial: bool| {
+            let span = evaluate(pattern, text, phase, partial).span.unwrap();
+            (
+                text[..span.start].chars().count(),
+                text[..span.end].chars().count(),
+            )
+        };
+        assert_eq!(span("copper falcon migration", 1, false), (46, 69));
+        assert_eq!(span("falcon migrations copper", 2, false), (21, 30));
+        assert_eq!(span("migration", 1, false), (21, 30));
+        assert_eq!(span("timeout copper", 0, true), (46, 52));
+    }
+}
+#[cfg(test)]
+mod regex_bound_tests {
+    use super::*;
+    #[test]
+    fn required_literals_come_from_both_ends() {
+        assert_eq!(literal_terms("Release.*workflow"), ["release", "workflow"]);
+        assert_eq!(literal_terms("release"), ["release"]);
+        assert!(literal_terms("release|workflow").is_empty());
+        assert!(literal_terms("(?<=a)b").is_empty());
+    }
+    #[test]
+    fn only_a_greedy_dot_run_after_a_nonempty_part_matches_once() {
+        for (pattern, once) in [
+            ("release.*workflow", true),
+            ("(release.*workflow)", true),
+            ("release.+", true),
+            ("release.*?workflow", false),
+            (".*workflow", false),
+            ("release.{0,9}workflow", false),
+            ("release[^x]*workflow", false),
+            ("release.*workflow|cache", false),
+            ("(?s)release.*workflow", true),
+        ] {
+            assert_eq!(matches_once(pattern), once, "{pattern}");
+        }
+        // Any later match would have offered the first match's `.*` a later end.
+        let re = fancy_regex::Regex::new("(?i:release.*workflow)").unwrap();
+        let snippet = "release a workflow … release b workflow release c";
+        assert_eq!(re.find_iter(snippet).count(), 1);
     }
 }

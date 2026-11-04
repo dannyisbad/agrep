@@ -16,6 +16,7 @@ pub mod safe_fs;
 pub mod semantic_q8;
 pub mod store;
 mod unicode_v16;
+pub mod window;
 pub use model::Message;
 
 pub mod row_class;

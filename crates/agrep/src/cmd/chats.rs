@@ -37,43 +37,72 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
         .as_ref()
         .is_some_and(|id| all.iter().any(|s| s.id.starts_with(id)));
     filters.no_side = !args.side && !direct;
+    let caller = agrep_core::caller::Caller::resolve(&c, agrep_core::caller::Identity::detect())?;
+    // A bare listing is identity, not an echo: only --no-self narrows it.
+    let request = agrep_core::caller::Request {
+        include_self: args.scope.include_self,
+        no_self: args.scope.no_self,
+        waived: if direct {
+            Some("chat-filter")
+        } else if pattern.is_empty() {
+            Some("not-applicable")
+        } else {
+            None
+        },
+    };
+    let policy = caller.policy(request);
+    let apply_self =
+        !args.scope.include_self && (args.scope.no_self || (!pattern.is_empty() && !direct));
     let mut hits = HashMap::new();
     let mut exact = true;
     if !pattern.is_empty() && !direct {
+        let options = Options {
+            pattern: pattern.clone(),
+            regex: false,
+            word: false,
+            sort: "score".into(),
+            limit: if args.max == 0 {
+                0
+            } else {
+                20.max(args.max.saturating_mul(2))
+            },
+            exact: args.max == 0,
+            count_only: false,
+            count_by_tier: false,
+            content: false,
+            chats: true,
+            tools: root.config()?.tools,
+            filters: filters.clone(),
+        };
+        // Content heads come from outside the withheld rows, so a chat's head can sit
+        // before the caller's window.
         let result = query::search(
             &c,
-            &Options {
-                pattern: pattern.clone(),
-                regex: false,
-                word: false,
-                sort: "score".into(),
-                limit: if args.max == 0 {
-                    0
-                } else {
-                    20.max(args.max.saturating_mul(2))
-                },
-                exact: args.max == 0,
-                count_only: false,
-                count_by_tier: false,
-                content: false,
-                chats: true,
-                tools: root.config()?.tools,
-                filters: filters.clone(),
-            },
+            &agrep_core::caller::options(&options, &caller, !apply_self, args.scope.no_self),
         )?;
         exact = result.total_basis == "exact" && result.total <= result.hits.len();
         for (rank, hit) in result.hits.into_iter().enumerate() {
             hits.insert((hit.agent.clone(), hit.session.clone()), (rank, hit));
         }
     }
-    let caller = agrep_core::caller::Caller::resolve(&c, agrep_core::caller::Identity::detect())?;
-    let apply_self =
-        !args.scope.include_self && (args.scope.no_self || (!pattern.is_empty() && !direct));
     let mut excluded = 0;
     let mut selected: Vec<_> = all
         .iter()
         .filter(|s| {
             if !h::in_scope(s, &filters) {
+                return false;
+            }
+            let hit = hits.get(&(s.agent.clone(), s.id.clone()));
+            let matched = if direct {
+                identity.as_ref().is_some_and(|id| s.id.starts_with(id))
+            } else {
+                let identity = format!("{} {} {}", s.id, s.project, s.title).to_lowercase();
+                args.pattern
+                    .iter()
+                    .all(|p| identity.contains(&p.to_lowercase()))
+                    || hit.is_some()
+            };
+            if !matched {
                 return false;
             }
             if apply_self
@@ -82,8 +111,7 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
                     &caller,
                     &s.agent,
                     &s.id,
-                    hits.get(&(s.agent.clone(), s.id.clone()))
-                        .map_or(0, |(_, hit)| hit.turn),
+                    hit.map_or(0, |(_, hit)| hit.turn),
                     false,
                     args.scope.no_self,
                 )
@@ -91,14 +119,7 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
                 excluded += 1;
                 return false;
             }
-            if direct {
-                return identity.as_ref().is_some_and(|id| s.id.starts_with(id));
-            }
-            let identity = format!("{} {} {}", s.id, s.project, s.title).to_lowercase();
-            args.pattern
-                .iter()
-                .all(|p| identity.contains(&p.to_lowercase()))
-                || hits.contains_key(&(s.agent.clone(), s.id.clone()))
+            true
         })
         .collect();
     selected.sort_by_key(|s| {
@@ -118,7 +139,7 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
     let pending_sources = crate::finish_census(&root, census)?;
     let checked = agrep_core::render::checked(no_auto);
     if args.json {
-        let mut meta = json!({"kind":"agrep-meta","engine":"keyword","filters":filters,"freshness":render::freshness(checked,pending_sources),"self_exclusion":caller.metadata(!apply_self,args.scope.no_self),"self_excluded":excluded,"completeness":{"shown":selected.len(),"total":total,"total_basis":if exact{"exact"}else{"floor"},"truncated":selected.len()<total||!exact}});
+        let mut meta = json!({"kind":"agrep-meta","engine":"keyword","filters":filters,"freshness":render::freshness(checked,pending_sources),"self_exclusion":caller.metadata(request,None),"self_excluded":excluded,"completeness":{"shown":selected.len(),"total":total,"total_basis":if exact{"exact"}else{"floor"},"truncated":selected.len()<total||!exact}});
         if selected.is_empty() {
             meta["hits"] = json!([]);
         }
@@ -179,6 +200,9 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
                 ""
             }
         );
+        if let Some(notice) = policy.and_then(|p| p.notice(excluded, "chat")) {
+            eprintln!("{notice}");
+        }
     }
     Ok(if !selected.is_empty() {
         0

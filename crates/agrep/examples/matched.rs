@@ -90,6 +90,14 @@ struct Args {
     /// Comma-separated case names, for diagnosis.
     #[arg(long, conflicts_with = "check")]
     only: Option<String>,
+    /// KEY=VALUE set for every command of both lanes, e.g. to measure CPU-only runs.
+    #[arg(long = "env", value_parser = parse_env)]
+    env: Vec<(String, String)>,
+}
+
+fn parse_env(text: &str) -> Result<(String, String)> {
+    let (key, value) = text.split_once('=').context("expected KEY=VALUE")?;
+    Ok((key.into(), value.into()))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -212,6 +220,8 @@ struct Bench {
     /// Real history: diagnostics never print command output.
     private: bool,
     trace: Option<PathBuf>,
+    /// Extra environment of every command.
+    env: Vec<(String, String)>,
 }
 
 fn load_average() -> Option<[f64; 3]> {
@@ -297,6 +307,7 @@ impl Bench {
         if let Some(model) = &lane.model {
             command.env("AGREP_MODEL_DIR", model);
         }
+        command.envs(self.env.iter().map(|(k, v)| (k, v)));
         command.args(args).stdin(Stdio::null());
         let load = load_average();
         let start = Instant::now();
@@ -1002,6 +1013,7 @@ fn measure(
         tmp: tmp.clone(),
         private: a.workload == Workload::Real,
         trace: trace.clone(),
+        env: a.env.clone(),
     };
     let versions = json!({
         "reference": version(&bench, bench.reference())?,
@@ -1100,6 +1112,7 @@ fn measure(
                     tmp: tmp.clone(),
                     private: true,
                     trace: trace.clone(),
+                    env: a.env.clone(),
                 };
                 preparation = hybrid.embed(a.model_dir.as_deref())?;
                 for case in hybrid_cases(NATURAL) {
@@ -1136,6 +1149,7 @@ fn measure(
                 tmp: tmp.clone(),
                 private: true,
                 trace: trace.clone(),
+                env: a.env.clone(),
             };
             active_bench.build()?;
             let refresh = Case::new("one_session_refresh", &["index"], "classic", Kind::Refresh);
@@ -1167,6 +1181,7 @@ fn measure(
         "source_bytes": source_bytes,
         "runs": a.runs,
         "build_runs": a.build_runs,
+        "child_env": a.env.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>(),
         "versions": versions,
         "host": {"os": std::env::consts::OS, "arch": std::env::consts::ARCH,
                  "cpus": std::thread::available_parallelism().map_or(0, |n| n.get())},

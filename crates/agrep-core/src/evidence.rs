@@ -755,6 +755,13 @@ pub fn anchored_cap(
     }
     cap(text, limit, command)
 }
+impl Row {
+    /// Ingest keeps at most `REPLY_CAP` characters of a reply; 0.4.9 flagged a reply
+    /// truncated exactly when its source count passed it.
+    pub fn reply_truncated(&self) -> bool {
+        self.who == "agent" && self.source_chars > crate::ingest::REPLY_CAP
+    }
+}
 impl Event {
     /// Ingest keeps at most `EVENT_CAP` characters of a tool input or output; 0.4.9
     /// flagged an event truncated exactly when a source count passed it.
@@ -1275,9 +1282,14 @@ pub fn render(w: &Window, d: &Display) -> Result<String> {
             v
         };
         let all: Vec<_> = w.rows.iter().collect();
-        let mut meta = json!({"kind":"agrep-meta","scope":{"policy":if d.full{"forensic"}else if w.claim.is_some(){"bounded_inclusive"}else{"root_prose"},"session":w.session,"selected_session_role":if w.side{"delegated"}else{"root_main"},"selected_record_role":if w.claim.is_none(){"none"}else if w.claim.as_ref().is_some_and(|c|c.event.is_some()){"tool"}else{"prose_turn_inclusive"},"center_turn":w.center,"radius":w.radius.unwrap_or((w.center-w.first).max(w.last-w.center)),"bounds":{"first_indexed_turn":w.first,"last_indexed_turn":w.last},"selection_order":if w.radius.is_none(){"whole_chat"}else if w.latest{"newest_tail"}else{"requested_center"},"render_order":"chronological","family_widened":false,"project_or_folder_ranked":false,"counts_state":"exact","tools":{"mode":tool_mode,"available":w.events.len(),"shown":events.len(),"hidden":w.events.len()-events.len()},"prose":{"available_by_role":counts(&all),"shown_by_role":counts(&rows),"hidden":w.rows.len()-rows.len()},"adoption":if w.side{"unresolved"}else{"root_main"},"truncation":{"message_cap_chars":if row_cap==0{None}else{Some(row_cap)},"message_cap_state":if d.full{"forensic_uncapped"}else if row_cap==0{"explicit_uncapped"}else{"bounded"},"render_truncated_rows":truncated,"source_truncated_agent_rows":rows.iter().filter(|r|r.source_chars>r.text.chars().count()).count(),"source_truncated_events":events.iter().filter(|e|e.input_chars>e.input.chars().count()||e.output_chars>e.output.chars().count()).count()},"expansion_argv":expansion}});
-        meta["self_exclusion"] = d.caller.metadata(true, false);
-        meta["self_exclusion"]["reason"] = json!("chat-filter");
+        let mut meta = json!({"kind":"agrep-meta","scope":{"policy":if d.full{"forensic"}else if w.claim.is_some(){"bounded_inclusive"}else{"root_prose"},"session":w.session,"selected_session_role":if w.side{"delegated"}else{"root_main"},"selected_record_role":if w.claim.is_none(){"none"}else if w.claim.as_ref().is_some_and(|c|c.event.is_some()){"tool"}else{"prose_turn_inclusive"},"center_turn":w.center,"radius":w.radius.unwrap_or((w.center-w.first).max(w.last-w.center)),"bounds":{"first_indexed_turn":w.first,"last_indexed_turn":w.last},"selection_order":if w.radius.is_none(){"whole_chat"}else if w.latest{"newest_tail"}else{"requested_center"},"render_order":"chronological","family_widened":false,"project_or_folder_ranked":false,"counts_state":"exact","tools":{"mode":tool_mode,"available":w.events.len(),"shown":events.len(),"hidden":w.events.len()-events.len()},"prose":{"available_by_role":counts(&all),"shown_by_role":counts(&rows),"hidden":w.rows.len()-rows.len()},"adoption":if w.side{"unresolved"}else{"root_main"},"truncation":{"message_cap_chars":if row_cap==0{None}else{Some(row_cap)},"message_cap_state":if d.full{"forensic_uncapped"}else if row_cap==0{"explicit_uncapped"}else{"bounded"},"render_truncated_rows":truncated,"source_truncated_agent_rows":w.rows.iter().filter(|r|r.reply_truncated()).count(),"source_truncated_events":w.events.iter().filter(|e|e.input_truncated()||e.output_truncated()).count()},"expansion_argv":expansion}});
+        meta["self_exclusion"] = d.caller.metadata(
+            crate::caller::Request {
+                waived: Some("chat-filter"),
+                ..Default::default()
+            },
+            None,
+        );
         meta["freshness"] = crate::render::freshness(d.checked, d.pending_sources);
         if !w.notes.is_empty() {
             meta["served"] = json!({"served_as_requested":false,"divergences":w.notes});
@@ -1356,7 +1368,7 @@ pub fn render(w: &Window, d: &Display) -> Result<String> {
                 None
             };
             if d.json {
-                let mut v = json!({"kind":e.kind,"session":w.session,"project":w.project,"turn":e.turn,"ts":e.ts,"name":e.name,"input":e.input,"ok":e.ok,"input_chars":e.input_chars,"output_chars":e.output_chars,"output_bytes":e.output_bytes,"input_truncated":e.input_chars>e.input.chars().count(),"output_truncated":e.output_chars>e.output.chars().count()});
+                let mut v = json!({"kind":e.kind,"session":w.session,"project":w.project,"turn":e.turn,"ts":e.ts,"name":e.name,"input":e.input,"ok":e.ok,"input_chars":e.input_chars,"output_chars":e.output_chars,"output_bytes":e.output_bytes,"input_truncated":e.input_truncated(),"output_truncated":e.output_truncated()});
                 if let Some(p) = preview {
                     v["match_preview"] = json!(p);
                 }
@@ -1395,7 +1407,7 @@ pub fn render(w: &Window, d: &Display) -> Result<String> {
                             true
                         )
                         .replace('\n', "\n    "),
-                        if e.output_chars > e.output.chars().count() {
+                        if e.output_truncated() {
                             " [source truncated at ingest]"
                         } else {
                             ""
@@ -1419,14 +1431,14 @@ fn prose_output(w: &Window, d: &Display, r: &Row, text: &str, omitted: usize) ->
         let mut v = json!({"kind":"msg","self":d.caller.resolved && d.caller.agent == w.agent && d.caller.session == w.session,"session":w.session,"project":w.project,"turn":r.turn,"who":r.who,"ts":r.ts,"text":text,"omitted_chars":omitted});
         if r.who == "agent" {
             v["reply_chars"] = json!(r.source_chars);
-            v["reply_truncated"] = json!(r.source_chars > r.text.chars().count())
+            v["reply_truncated"] = json!(r.reply_truncated())
         }
         return format!(
             "{}\n",
             crate::json_output::to_string(&v).expect("serializing JSON value")
         );
     }
-    let loss = if r.source_chars > r.text.chars().count() {
+    let loss = if r.reply_truncated() {
         format!(
             " [source truncated at ingest; original reply {} chars]",
             surface::number(r.source_chars)

@@ -33,29 +33,46 @@ pub(crate) fn deflate(prefix: &[u8], input: &[u8]) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn inflate(bytes: &[u8]) -> Result<Vec<u8>> {
-    let mut decoder = zlib_rs::Inflate::new(true, 15);
-    let mut output = Vec::new();
-    let step = bytes.len().saturating_mul(4).clamp(256, 16 * 1024);
-    loop {
-        let before_in = decoder.total_in();
-        let before_out = output.len();
-        output.resize(before_out + step, 0);
-        let status = decoder
-            .decompress(
-                &bytes[before_in as usize..],
-                &mut output[before_out..],
-                zlib_rs::InflateFlush::NoFlush,
-            )
-            .map_err(|e| anyhow::anyhow!("invalid compressed data: {}", e.as_str()))?;
-        output.truncate(decoder.total_out() as usize);
-        if status == zlib_rs::Status::StreamEnd {
-            return Ok(output);
-        }
-        ensure!(
-            decoder.total_in() != before_in || output.len() != before_out,
-            "truncated compressed data"
-        );
+    // Queries inflate thousands of short tool texts; one state per thread spares
+    // allocating and initializing a decoder for each.
+    thread_local! {
+        static DECODER: RefCell<Option<zlib_rs::Inflate>> = const { RefCell::new(None) };
     }
+    DECODER.with(|decoder| {
+        let mut decoder = decoder.borrow_mut();
+        let decoder = match decoder.as_mut() {
+            Some(decoder) => {
+                decoder.reset(true);
+                decoder
+            }
+            None => decoder.insert(zlib_rs::Inflate::new(true, 15)),
+        };
+        let mut output: Vec<u8> = Vec::with_capacity(bytes.len().saturating_mul(4).max(256));
+        loop {
+            let before_in = decoder.total_in() as usize;
+            let before_out = output.len();
+            if output.len() == output.capacity() {
+                output.reserve(output.len());
+            }
+            let status = decoder
+                .decompress_uninit(
+                    &bytes[before_in..],
+                    output.spare_capacity_mut(),
+                    zlib_rs::InflateFlush::NoFlush,
+                )
+                .map_err(|e| anyhow::anyhow!("invalid compressed data: {}", e.as_str()))?;
+            // SAFETY: the decoder initialized every byte it reports as output, all of them
+            // in the spare capacity it was given.
+            unsafe { output.set_len(decoder.total_out() as usize) };
+            if status == zlib_rs::Status::StreamEnd {
+                return Ok(output);
+            }
+            ensure!(
+                decoder.total_in() as usize != before_in || output.len() != before_out,
+                "truncated compressed data"
+            );
+        }
+    })
 }
 
 #[cfg(test)]
