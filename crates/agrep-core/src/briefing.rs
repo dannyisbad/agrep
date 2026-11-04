@@ -4,24 +4,119 @@ use crate::{
     model::ReplyShape,
 };
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::{
+    cell::OnceCell,
+    collections::{BTreeMap, HashSet},
+};
 
-pub fn events(c: &Connection, s: &Session) -> Result<Vec<Value>> {
-    let events = crate::evidence::load_events(c, &s.id, i64::MIN, i64::MAX)?;
-    Ok(events
+/// An indexed event as briefings read it. Classification reads the columns of every event of
+/// a chat but the text of only a few, so the stored text is decoded on first use.
+pub struct Event<'a> {
+    pub ts: i64,
+    pub kind: &'a str,
+    pub name: &'a str,
+    pub ok: Option<bool>,
+    pub child_session: String,
+    pub meta: String,
+    pub state: String,
+    input_chars: i64,
+    input_end: Option<usize>,
+    output_start: Option<usize>,
+    blob: Option<i64>,
+    text: OnceCell<(String, String)>,
+}
+impl Event<'_> {
+    /// The input and output `evidence::load_events` gives the event.
+    fn text(&self, c: &Connection) -> Result<&(String, String)> {
+        if let Some(text) = self.text.get() {
+            return Ok(text);
+        }
+        let text = if self.kind == "control" {
+            (self.meta.clone(), String::new())
+        } else {
+            let stored = match self.blob {
+                Some(blob) => c
+                    .prepare_cached("SELECT body FROM tool_blobs WHERE id=?1")?
+                    .query_row([blob], |r| r.get::<_, Vec<u8>>(0))
+                    .optional()?,
+                None => None,
+            };
+            let text = stored
+                .map(|bytes| crate::store::decode("tools", bytes))
+                .transpose()?
+                .unwrap_or_default();
+            crate::tool_text::split(
+                &text,
+                self.kind,
+                self.name,
+                self.ok,
+                self.input_end,
+                self.output_start,
+            )
+        };
+        Ok(self.text.get_or_init(|| text))
+    }
+    pub fn input(&self, c: &Connection) -> Result<&str> {
+        Ok(&self.text(c)?.0)
+    }
+    pub fn output(&self, c: &Connection) -> Result<&str> {
+        Ok(&self.text(c)?.1)
+    }
+}
+/// The kind and tool names `event_rows` refers to by id.
+pub struct Symbols(Vec<(i64, String)>);
+impl Symbols {
+    pub fn load(c: &Connection) -> Result<Self> {
+        let mut q = c.prepare("SELECT id,value FROM symbols ORDER BY id")?;
+        let names = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(Self(names.collect::<rusqlite::Result<_>>()?))
+    }
+    fn get(&self, id: i64) -> Option<&str> {
+        let at = self.0.binary_search_by_key(&id, |(key, _)| *key).ok()?;
+        Some(&self.0[at].1)
+    }
+}
+/// The events `evidence::load_events` loads for the chat, in its order and with its replay
+/// de-duplication, their text left stored.
+pub fn events<'a>(c: &Connection, symbols: &'a Symbols, s: &Session) -> Result<Vec<Event<'a>>> {
+    // That query's plan feeds SQLite's sorter the rows in this index order to sort by
+    // (position, ts, call_id). The sorter is stable, so a stable sort of the same rows here
+    // gives its order without copying every row through the sorter.
+    let mut q = c.prepare_cached("SELECT e.position,e.call_id,e.ts,e.kind_key,e.name_key,CASE WHEN e.ok IS NULL THEN NULL WHEN e.ok THEN 1 ELSE 0 END,e.child_session,e.meta,e.state,e.input_chars,e.input_end,e.output_start,e.blob FROM event_rows e JOIN event_sessions s ON s.id=e.session_key WHERE e.active=1 AND e.visible=1 AND s.session=?1 AND e.position BETWEEN ?2 AND ?3 ORDER BY s.id,e.position,e.ts,e.id")?;
+    let mut rows = q.query(params![s.id, i64::MIN, i64::MAX])?;
+    let offset = |v: Option<i64>| v.and_then(|v| usize::try_from(v).ok());
+    let mut found: Vec<(i64, String, Event<'a>)> = vec![];
+    while let Some(r) = rows.next()? {
+        let (Some(kind), Some(name)) = (symbols.get(r.get(3)?), symbols.get(r.get(4)?)) else {
+            continue;
+        };
+        found.push((
+            r.get(0)?,
+            r.get(1)?,
+            Event {
+                ts: r.get(2)?,
+                kind,
+                name,
+                ok: r.get::<_, Option<i64>>(5)?.map(|ok| ok != 0),
+                child_session: r.get(6)?,
+                meta: r.get(7)?,
+                state: r.get(8)?,
+                input_chars: r.get(9)?,
+                input_end: offset(r.get(10)?),
+                output_start: offset(r.get(11)?),
+                blob: r.get(12)?,
+                text: OnceCell::new(),
+            },
+        ));
+    }
+    found.sort_by(|(p1, call1, e1), (p2, call2, e2)| (p1, e1.ts, call1).cmp(&(p2, e2.ts, call2)));
+    // Replay copies of one call share its id; separate identical calls stay separate.
+    let mut seen = HashSet::new();
+    Ok(found
         .into_iter()
-        .map(|e| {
-            let mut raw = e.raw;
-            raw["ts"] = json!(e.ts);
-            raw["turn"] = json!(e.turn);
-            raw["input"] = json!(e.input);
-            raw["output"] = json!(e.output);
-            raw["kind"] = json!(e.kind);
-            raw["name"] = json!(e.name);
-            raw
-        })
+        .filter_map(|(_, call, event)| seen.insert(call).then_some(event))
         .collect())
 }
 
@@ -47,7 +142,7 @@ pub fn span(intervals: &[(i64, i64)]) -> i64 {
 }
 pub fn intervals(
     rows: &[Row],
-    events: &[Value],
+    events: &[Event],
     cap: i64,
     since: i64,
     until: i64,
@@ -59,8 +154,8 @@ pub fn intervals(
         .chain(
             events
                 .iter()
-                .filter(|e| e["name"] == "compacted")
-                .filter_map(|e| e["ts"].as_i64()),
+                .filter(|e| e.name == "compacted")
+                .map(|e| e.ts),
         )
         .collect();
     points.sort_unstable();
@@ -72,8 +167,8 @@ pub fn intervals(
     if let Some(&last) = points.last() {
         if let Some(end) = events
             .iter()
-            .filter(|e| e["kind"] == "tool" || e["kind"] == "subagent_result")
-            .filter_map(|e| e["ts"].as_i64())
+            .filter(|e| e.kind == "tool" || e.kind == "subagent_result")
+            .map(|e| e.ts)
             .max()
         {
             raw.push((last, end.min(last.saturating_add(cap))));
@@ -554,14 +649,14 @@ fn todo_op(tasks: &mut Vec<Task>, payload: &Value) -> bool {
         _ => false,
     }
 }
-fn todos(events: &[Value]) -> (Vec<String>, Option<String>) {
+fn todos(c: &Connection, events: &[Event]) -> Result<(Vec<String>, Option<String>)> {
     let mut tasks: Vec<Task> = vec![];
     let mut claude = BTreeMap::<String, Task>::new();
     let mut claude_last = false;
     let mut unknown = None;
     let mut claude_unknown = None;
     for event in events {
-        let name = event["name"].as_str().unwrap_or("");
+        let name = event.name;
         if !name.to_lowercase().contains("todo")
             && !matches!(
                 name,
@@ -570,18 +665,18 @@ fn todos(events: &[Value]) -> (Vec<String>, Option<String>) {
         {
             continue;
         }
-        if event["ok"] == false {
+        if event.ok == Some(false) {
             continue;
         }
-        let raw = event["state"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .or_else(|| event["input"].as_str())
-            .unwrap_or("");
+        let raw = if event.state.is_empty() {
+            event.input(c)?
+        } else {
+            event.state.as_str()
+        };
         let state = serde_json::from_str::<Value>(raw).ok();
         if name.starts_with("Task") {
             claude_last = true;
-            let output = event["output"].as_str().unwrap_or("");
+            let output = event.output(c)?;
             match name {
                 "TaskCreate" => {
                     if let Some(m) =
@@ -745,11 +840,11 @@ fn todos(events: &[Value]) -> (Vec<String>, Option<String>) {
         })
         .map(|t| t.text)
         .collect();
-    if unknown.is_some() {
+    Ok(if unknown.is_some() {
         (vec![], unknown)
     } else {
         (open, unknown)
-    }
+    })
 }
 pub fn is_turn(rows: &[Row], row: &Row) -> bool {
     row.who != "agent"
@@ -767,8 +862,9 @@ fn terminal_reply(
 ) -> Result<(String, ReplyShape)> {
     let mut text = String::new();
     let mut combined = ReplyShape::default();
-    let mut q =
-        c.prepare("SELECT body FROM reply_shapes WHERE source=?1 AND session=?2 AND turn=?3")?;
+    let mut q = c.prepare_cached(
+        "SELECT body FROM reply_shapes WHERE source=?1 AND session=?2 AND turn=?3",
+    )?;
     for reply in rows.iter().filter(|r| {
         r.who == "agent"
             && (r.turn == last.turn
@@ -829,19 +925,19 @@ fn terminal(c: &Connection, s: &Session, rows: &[Row], last: &Row) -> Result<Ter
         missing,
     })
 }
-fn name(e: &Value) -> &str {
-    e["name"].as_str().unwrap_or_default()
-}
-fn named<'a>(e: &'a Value, fallback: &'a str) -> &'a str {
-    Some(name(e)).filter(|n| !n.is_empty()).unwrap_or(fallback)
+fn named<'a>(e: &Event<'a>, fallback: &'a str) -> &'a str {
+    if e.name.is_empty() {
+        fallback
+    } else {
+        e.name
+    }
 }
 /// Python's `max(events, key=(ts, i))`: the latest, the last recorded on a tie.
-fn newest<'a>(events: impl Iterator<Item = &'a Value>) -> Option<&'a Value> {
-    events.max_by_key(|e| e["ts"].as_i64().unwrap_or(0))
+fn newest<'a, 'b>(events: impl Iterator<Item = &'a Event<'b>>) -> Option<&'a Event<'b>> {
+    events.max_by_key(|e| e.ts)
 }
 /// 0.4.9's `_question_head` (py/summary.py:1215-1239): what a parked question tool asked.
-fn question_head(event: &Value) -> String {
-    let raw = event["input"].as_str().unwrap_or_default();
+fn question_head(raw: &str, name: &str) -> String {
     let payload = serde_json::from_str::<Value>(raw).ok();
     if let Some(payload) = payload.as_ref().filter(|p| p.is_object()) {
         if let Some(questions) = payload["questions"].as_array() {
@@ -877,7 +973,7 @@ fn question_head(event: &Value) -> String {
         }
     }
     if payload.is_none() && raw.trim_start().starts_with(['{', '[']) {
-        return if name(event) == "ExitPlanMode" {
+        return if name == "ExitPlanMode" {
             "presented a plan"
         } else {
             "asked a question"
@@ -887,17 +983,19 @@ fn question_head(event: &Value) -> String {
     one_line(raw)
 }
 /// 0.4.9's `_api_error` (py/summary.py:1265-1288): the error a Claude turn stopped on.
-fn api_error(s: &Session, later: &[&Value], reply: &str) -> Option<String> {
+fn api_error(c: &Connection, s: &Session, later: &[&Event], reply: &str) -> Result<Option<String>> {
     if s.agent != "claude" || reply.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let event = newest(later.iter().copied())?;
-    if event["kind"] != "control" || name(event) != "api_error" {
-        return None;
+    let Some(event) = newest(later.iter().copied()) else {
+        return Ok(None);
+    };
+    if event.kind != "control" || event.name != "api_error" {
+        return Ok(None);
     }
-    let text = event["input"].as_str().unwrap_or_default();
+    let text = event.input(c)?;
     let length = text.chars().count();
-    let chars = event["input_chars"].as_u64().unwrap_or(0) as usize;
+    let chars = u64::try_from(event.input_chars).unwrap_or(0) as usize;
     let (head, ends) = if text.ends_with('…') && chars >= length {
         let head = one_line(&text.chars().take(length - 1).collect::<String>());
         let reply_chars: Vec<char> = reply.chars().collect();
@@ -913,22 +1011,21 @@ fn api_error(s: &Session, later: &[&Value], reply: &str) -> Option<String> {
         let ends = flat == head || flat.ends_with(&format!(" {head}"));
         (head, ends)
     };
-    (!head.is_empty() && ends).then(|| one_line(text))
+    Ok((!head.is_empty() && ends).then(|| one_line(text)))
 }
 /// 0.4.9's `_trailing_call` (py/summary.py:1378-1387): the turn's latest work call when no
 /// reply followed it.
-fn trailing_call<'a>(later: &[&'a Value]) -> Option<&'a Value> {
+fn trailing_call<'a, 'b>(later: &[&'a Event<'b>]) -> Option<&'a Event<'b>> {
     let latest = newest(later.iter().copied().filter(|e| {
-        let name = name(e);
-        e["kind"] == "tool"
+        let name = e.name;
+        e.kind == "tool"
             && !(name.to_lowercase().contains("todo")
                 || name.to_lowercase().contains("update_plan")
                 || matches!(name, "TaskCreate" | "TaskUpdate" | "TaskList")
                 || name.eq_ignore_ascii_case("yield"))
     }))?;
-    let after_reply = latest["meta"]
-        .as_str()
-        .unwrap_or_default()
+    let after_reply = latest
+        .meta
         .split_whitespace()
         .find_map(|part| {
             part.split_once('=')
@@ -961,30 +1058,30 @@ fn classify_root(
     c: &Connection,
     s: &Session,
     rows: &[Row],
-    events: &[Value],
+    events: &[Event],
     last: &Row,
 ) -> Result<Option<Record>> {
     let t = terminal(c, s, rows, last)?;
     let reply = t.text.as_str();
-    let later: Vec<&Value> = events
+    let later: Vec<&Event> = events
         .iter()
-        .filter(|e| last.ts <= 0 || e["ts"].as_i64().unwrap_or(0) >= last.ts)
+        .filter(|e| last.ts <= 0 || e.ts >= last.ts)
         .collect();
     let mut r = Record::default();
-    if let Some(question) =
-        newest(later.iter().copied().filter(|e| e["kind"] == "tool")).filter(|e| {
-            re(r"(?i)^(?:AskUserQuestion|ExitPlanMode|ask|request_user_input|question)$")
-                .is_match(name(e))
-                && e["ok"].is_null()
-                && e["output"].as_str().unwrap_or_default().trim().is_empty()
-        })
-    {
-        r.status = "waiting_on_user";
-        r.signals = vec![format!("{} awaits your answer", name(question))];
-        r.evidence = question_head(question);
-        return Ok(Some(r));
+    let question = newest(later.iter().copied().filter(|e| e.kind == "tool")).filter(|e| {
+        re(r"(?i)^(?:AskUserQuestion|ExitPlanMode|ask|request_user_input|question)$")
+            .is_match(e.name)
+            && e.ok.is_none()
+    });
+    if let Some(question) = question {
+        if question.output(c)?.trim().is_empty() {
+            r.status = "waiting_on_user";
+            r.signals = vec![format!("{} awaits your answer", question.name)];
+            r.evidence = question_head(question.input(c)?, question.name);
+            return Ok(Some(r));
+        }
     }
-    if let Some(error) = api_error(s, &later, reply) {
+    if let Some(error) = api_error(c, s, &later, reply)? {
         r.status = "agent_work_incomplete";
         r.signals = vec!["final reply is an API error".into()];
         r.evidence = error;
@@ -1026,10 +1123,11 @@ fn classify_root(
     let failed = later
         .iter()
         .rev()
-        .find(|e| e["kind"] == "tool" && e["ok"] == false);
-    let stopped = later.iter().rev().find(|e| {
-        e["kind"] == "control" && re(r"(?i)interrupt|abort|cancel|stop").is_match(name(e))
-    });
+        .find(|e| e.kind == "tool" && e.ok == Some(false));
+    let stopped = later
+        .iter()
+        .rev()
+        .find(|e| e.kind == "control" && re(r"(?i)interrupt|abort|cancel|stop").is_match(e.name));
     let failed_signal = failed.map(|e| format!("latest tool failed ({})", named(e, "tool")));
     let stopped_signal = stopped.map(|e| format!("turn {}", named(e, "stopped")));
     if reply.is_empty() {
@@ -1042,15 +1140,14 @@ fn classify_root(
             r.evidence = one_line(&last.text);
         } else {
             r.status = "agent_work_incomplete";
-            r.evidence = one_line(
-                failed
-                    .map(|e| e["output"].as_str().unwrap_or_default())
-                    .unwrap_or(&last.text),
-            );
+            r.evidence = one_line(match failed {
+                Some(e) => e.output(c)?,
+                None => &last.text,
+            });
         }
         return Ok(Some(r));
     }
-    let (open, unknown) = todos(events);
+    let (open, unknown) = todos(c, events)?;
     r.caveats = unknown.into_iter().collect();
     if !open.is_empty() {
         r.status = "todo_open";
@@ -1094,17 +1191,14 @@ fn classify_side(
     c: &Connection,
     s: &Session,
     rows: &[Row],
-    events: &[Value],
+    events: &[Event],
     last: &Row,
 ) -> Result<Option<Record>> {
     if last.ts <= 0 {
         return Ok(None);
     }
     let t = terminal(c, s, rows, last)?;
-    let later: Vec<&Value> = events
-        .iter()
-        .filter(|e| e["ts"].as_i64().unwrap_or(0) >= last.ts)
-        .collect();
+    let later: Vec<&Event> = events.iter().filter(|e| e.ts >= last.ts).collect();
     let mut r = Record {
         status: "agent_work_incomplete",
         ..Default::default()
@@ -1114,7 +1208,7 @@ fn classify_side(
         if let Some(failed) = later
             .iter()
             .rev()
-            .find(|e| e["kind"] == "tool" && e["ok"] == false)
+            .find(|e| e.kind == "tool" && e.ok == Some(false))
         {
             r.signals
                 .push(format!("latest tool failed ({})", named(failed, "tool")));
@@ -1122,12 +1216,12 @@ fn classify_side(
         r.evidence = one_line(&last.text);
         return Ok(Some(r));
     }
-    if let Some(error) = api_error(s, &later, &t.text) {
+    if let Some(error) = api_error(c, s, &later, &t.text)? {
         r.signals = vec!["side chat's final reply is an API error".into()];
         r.evidence = error;
         return Ok(Some(r));
     }
-    let (open, unknown) = todos(events);
+    let (open, unknown) = todos(c, events)?;
     r.caveats = unknown.into_iter().collect();
     if !open.is_empty() {
         r.status = "todo_open";
@@ -1178,7 +1272,7 @@ pub fn pending(
     c: &Connection,
     s: &Session,
     rows: &[Row],
-    events: &[Value],
+    events: &[Event],
 ) -> Result<Option<Value>> {
     let Some(last) = last_turn(rows) else {
         return Ok(None);
@@ -1190,65 +1284,132 @@ pub fn side_pending(
     c: &Connection,
     s: &Session,
     rows: &[Row],
-    events: &[Value],
+    events: &[Event],
 ) -> Result<Option<Value>> {
     let Some(last) = last_turn(rows) else {
         return Ok(None);
     };
     Ok(classify_side(c, s, rows, events, last)?.map(|r| item(s, last, r, "side-chat")))
 }
-
-pub fn returned(rows: &[Row], events: &[Value]) -> bool {
+/// A chat of a family: its session, rows and events.
+pub type Member<'a> = (&'a Session, Vec<Row>, Vec<Event<'a>>);
+/// Which members of a family (`members[0]` its root) handed their result back to the root:
+/// a side chat that yielded it, or whose final reply a reached member's delegation returned.
+pub fn handed_back(c: &Connection, members: &[Member<'_>]) -> Result<Vec<bool>> {
+    let mut reached = vec![false; members.len()];
+    let mut holders = vec![0];
+    reached[0] = true;
+    for (at, (_, rows, events)) in members.iter().enumerate().skip(1) {
+        if yielded(c, rows, events)? {
+            reached[at] = true;
+            holders.push(at);
+        }
+    }
+    let finals: Vec<String> = members
+        .iter()
+        .map(|(_, rows, _)| {
+            rows.iter()
+                .rev()
+                .find(|r| r.who == "agent")
+                .map(|r| history::one_line(&r.text, usize::MAX))
+                .unwrap_or_default()
+        })
+        .collect();
+    while let Some(holder) = holders.pop() {
+        let events = &members[holder].2;
+        let results: HashSet<&str> = events
+            .iter()
+            .filter(|e| e.kind == "subagent_result" && e.ok != Some(false))
+            .map(|e| e.child_session.as_str())
+            .collect();
+        // Each delegation call's linked child and flattened output, decoded once a side chat
+        // has a final reply long enough to match.
+        let mut delegations: Option<Vec<(&str, String)>> = None;
+        for side in 1..members.len() {
+            if reached[side] {
+                continue;
+            }
+            let id = members[side].0.id.as_str();
+            let mut received = results.contains(id);
+            if !received && finals[side].len() >= 20 {
+                if delegations.is_none() {
+                    let mut calls = vec![];
+                    for e in events.iter().filter(|e| {
+                        matches!(
+                            e.name,
+                            "task" | "agent" | "subagent" | "wait_agent" | "Task"
+                        )
+                    }) {
+                        calls.push((
+                            e.child_session.as_str(),
+                            history::one_line(e.output(c)?, usize::MAX),
+                        ));
+                    }
+                    delegations = Some(calls);
+                }
+                received = delegations.iter().flatten().any(|(child, output)| {
+                    (child.is_empty() || *child == id) && output.contains(&finals[side])
+                });
+            }
+            if received {
+                reached[side] = true;
+                holders.push(side);
+            }
+        }
+    }
+    Ok(reached)
+}
+/// Whether the side chat's last work call is a `yield` that handed its result back.
+fn yielded(c: &Connection, rows: &[Row], events: &[Event]) -> Result<bool> {
     let Some(last) = events
         .iter()
-        .filter(|e| matches!(e["kind"].as_str(), Some("tool" | "subagent_result")))
-        .max_by_key(|e| e["ts"].as_i64().unwrap_or(0))
+        .filter(|e| matches!(e.kind, "tool" | "subagent_result"))
+        .max_by_key(|e| e.ts)
     else {
-        return false;
+        return Ok(false);
     };
-    if !last["name"]
-        .as_str()
-        .is_some_and(|s| s.eq_ignore_ascii_case("yield"))
-        || last["ok"] == false
-    {
-        return false;
+    if !last.name.eq_ignore_ascii_case("yield") || last.ok == Some(false) {
+        return Ok(false);
     }
-    if rows
-        .iter()
-        .any(|r| r.who != "agent" && r.ts > last["ts"].as_i64().unwrap_or(0))
-    {
-        return false;
+    if rows.iter().any(|r| r.who != "agent" && r.ts > last.ts) {
+        return Ok(false);
     }
-    let input = last["input"].as_str().unwrap_or("");
-    !serde_json::from_str::<Value>(input)
+    Ok(!serde_json::from_str::<Value>(last.input(c)?)
         .ok()
-        .is_some_and(|v| v["type"].is_array())
+        .is_some_and(|v| v["type"].is_array()))
 }
-pub fn received(events: &[Value], side: &Session, rows: &[Row]) -> bool {
-    let final_text = rows
-        .iter()
-        .rev()
-        .find(|r| r.who == "agent")
-        .map(|r| history::one_line(&r.text, usize::MAX))
-        .unwrap_or_default();
-    events.iter().any(|e| {
-        let child = e["child_session"].as_str().unwrap_or("");
-        let output = e["output"].as_str().unwrap_or("");
-        (child == side.id && e["kind"] == "subagent_result" && e["ok"] != false)
-            || ((child.is_empty() || child == side.id)
-                && matches!(
-                    e["name"].as_str(),
-                    Some("task" | "agent" | "subagent" | "wait_agent" | "Task")
-                )
-                && final_text.len() >= 20
-                && history::one_line(output, usize::MAX).contains(&final_text))
-    })
+/// Whether a root event linked to the side chat is its result or returned output.
+pub fn delivered(c: &Connection, root: &[Event], side: &Session) -> Result<bool> {
+    for e in root.iter().filter(|e| e.child_session == side.id) {
+        if e.kind == "subagent_result" || !e.output(c)?.is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn event(name: &str, state: Value) -> Value {
-        json!({"name":name,"kind":"tool","ok":true,"state":state.to_string()})
+    fn event(name: &'static str, state: Value) -> Event<'static> {
+        Event {
+            ts: 0,
+            kind: "tool",
+            name,
+            ok: Some(true),
+            child_session: String::new(),
+            meta: String::new(),
+            state: state.to_string(),
+            input_chars: 0,
+            input_end: None,
+            output_start: None,
+            blob: None,
+            text: OnceCell::new(),
+        }
+    }
+    fn open(events: &[Event]) -> Vec<String> {
+        todos(&Connection::open_in_memory().unwrap(), events)
+            .unwrap()
+            .0
     }
     #[test]
     fn whole_lists_and_partial_merges_preserve_fields() {
@@ -1260,27 +1421,28 @@ mod tests {
             "todo_write",
             json!({"merge":true,"todos":[{"id":"a","status":"completed"}]}),
         );
-        assert_eq!(todos(&[initial, merge]).0, vec!["second"]);
+        assert_eq!(open(&[initial, merge]), vec!["second"]);
         assert_eq!(
-            todos(&[event(
+            open(&[event(
                 "write_todos",
                 json!({"todos":[{"description":"Gemini task","status":"In Progress"}]})
-            )])
-            .0,
+            )]),
             vec!["Gemini task"]
         );
     }
     #[test]
     fn phase_operations_and_failed_updates_are_evidence() {
-        let init = event(
-            "todo",
-            json!({"list":[{"phase":"build","items":["compile","test"]}]}),
-        );
+        let init = || {
+            event(
+                "todo",
+                json!({"list":[{"phase":"build","items":["compile","test"]}]}),
+            )
+        };
         let done = event("todo", json!({"op":"done","phase":"build"}));
-        assert!(todos(&[init.clone(), done]).0.is_empty());
+        assert!(open(&[init(), done]).is_empty());
         let mut failed = event("todo", json!({"op":"done","phase":"build"}));
-        failed["ok"] = json!(false);
-        assert_eq!(todos(&[init, failed]).0, vec!["compile", "test"]);
+        failed.ok = Some(false);
+        assert_eq!(open(&[init(), failed]), vec!["compile", "test"]);
     }
     // Expected values are 0.4.9's own helpers in py/summary.py.
     #[test]
@@ -1303,7 +1465,7 @@ mod tests {
             )),
             "Shall we ship it?"
         );
-        let asked = |input: &str, name: &str| question_head(&json!({"input":input,"name":name}));
+        let asked = question_head;
         assert_eq!(
             asked(
                 r#"{"questions":[{"question":"Pick one?"}]}"#,

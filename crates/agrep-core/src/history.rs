@@ -80,7 +80,7 @@ pub fn sessions(c: &Connection) -> Result<Vec<Session>> {
     Ok(result)
 }
 pub fn rows(c: &Connection, s: &Session) -> Result<Vec<Row>> {
-    let mut q=c.prepare("SELECT position,who,ts,text,source,turn FROM prose WHERE session=?1 AND agent=?2 AND visible=1 ORDER BY position,id")?;
+    let mut q=c.prepare_cached("SELECT position,who,ts,text,source,turn FROM prose WHERE session=?1 AND agent=?2 AND visible=1 ORDER BY position,id")?;
     let raw = q
         .query_map(params![s.id, s.agent], |r| {
             Ok((

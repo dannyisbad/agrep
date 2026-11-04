@@ -246,8 +246,13 @@ or punctuation: one pass per remaining term, highest IDF first, each over the ro
 lacking the earlier terms. `--coverage` is a separate bm25 lane; see
 [SEARCH_RANKING.md](SEARCH_RANKING.md).
 
-`-w` and `-E` compile a case-insensitive fancy-regex with a backtrack limit of 100,000.
-The literal every match begins or ends with, if there is one, drives the index.
+`-E` compiles a case-insensitive fancy-regex. It hands an expression that needs none of
+its own features (look-around, backreferences and the like) to the linear-time regex
+crate, and backtracks at most 100,000 times per search on the others. `-w` matches as
+0.4.9's `(?<!\w)` + term + `(?!\w)` under Python's `re.I`, without backtracking: the
+regex crate finds the term with each character spelled as `re`'s case-insensitive
+matching allows, and a match stands where neither neighbor is `\w` (`str.isalnum()` or
+`_`). The literal every match begins or ends with, if there is one, drives the index.
 
 - Terms are ordered by estimated document frequency: in prose, the least frequent of the
   term's trigrams in `prose_terms`; in tools, the summed frequency of its words. Prose
@@ -258,7 +263,9 @@ The literal every match begins or ends with, if there is one, drives the index.
 - Outside a selective scope, with more than 128 estimated matches, a page limit and
   score or time order, a pass visits blocks in descending ceiling order (newest first
   for time order) and stops once the page is full and the next block cannot beat the
-  page's last row.
+  page's last row. A block whose rounded ceiling only equals that row's score and loses
+  the tie on time and position is skipped, not the end: a lower ceiling can round to the
+  same score, and a newer row behind it wins the tie.
 - When metadata filters (agent, `--chat`, project, model, `--since`, `--until` or a
   session scope) select at most max(4,096, min(lane rows / 16, 65,536)) rows, the scope
   is selective: its own blocks are scanned and the FTS index only admits rows, one
@@ -369,7 +376,8 @@ only while the lock is free, and leaves the queue to a background worker.
   digits, are verified on row text instead of read through an index, so an exact count
   of such a query reads every row in scope. Non-ASCII text gets the universal block
   ceiling, so early termination helps it less.
-- A regular expression that exceeds the backtrack limit fails the command (exit 2).
+- An `-E` expression that needs fancy-regex's own features and exceeds the backtrack limit
+  fails the command (exit 2).
 - Until a merger runs, each refresh leaves one more segment per FTS table for lookups to
   seek. A carry that reaches the first build's segment rewrites it in the background,
   which can take seconds.

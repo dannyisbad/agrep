@@ -14,17 +14,20 @@ use std::{
     process::{Command, Output},
 };
 use tempfile::TempDir;
-fn run(t: &TempDir, args: &[&str]) -> Output {
-    Command::new(support::binary())
+fn command(t: &TempDir, args: &[&str]) -> Command {
+    let mut command = Command::new(support::binary());
+    command
         .env_clear()
         .env("HOME", t.path().join("home"))
         .env("AGREP_HOME", t.path().join("home"))
         .env("AGREP_DATA_DIR", t.path().join("data"))
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("TZ", "UTC")
-        .args(args)
-        .output()
-        .unwrap()
+        .args(args);
+    command
+}
+fn run(t: &TempDir, args: &[&str]) -> Output {
+    command(t, args).output().unwrap()
 }
 fn ok(out: Output) -> Output {
     assert!(
@@ -202,6 +205,71 @@ fn summary_validates_windows_and_idle_caps() {
     ] {
         assert_eq!(run(&t, &args).status.code(), Some(2));
     }
+}
+/// A pi chat on `day` of `turns` turns, each a prompt, a shell call, its output and a reply
+/// asking to go on.
+fn shell_chat(home: &Path, id: &str, day: &str, turns: usize) {
+    let path = home.join(format!(".pi/agent/sessions/work/{day}_{id}.jsonl"));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let at =
+        |turn: usize, step: usize| format!("{day}T{:02}:{:02}:{step:02}Z", turn / 60, turn % 60);
+    let mut lines =
+        vec![json!({"type":"session","id":id,"version":3,"cwd":"/work","timestamp":at(0, 0)})];
+    let mut parent = Value::Null;
+    for turn in 0..turns {
+        let call = format!("call-{turn}");
+        for (step, message) in [
+            json!({"role":"user","content":[{"type":"text","text":format!("check part {turn}")}]}),
+            json!({"role":"assistant","model":"test","content":[{"type":"toolCall","id":call,"name":"bash","arguments":{"command":format!("make check-{turn}")}}]}),
+            json!({"role":"toolResult","toolCallId":call,"toolName":"bash","content":[{"type":"text","text":format!("part {turn} passed")}]}),
+            json!({"role":"assistant","model":"test","content":[{"type":"text","text":format!("Part {turn} passed. Shall I continue?")}]}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("m{turn}-{step}");
+            lines.push(json!({"type":"message","id":id,"parentId":parent,"timestamp":at(turn, step),"message":message}));
+            parent = json!(id);
+        }
+    }
+    let body: Vec<String> = lines.iter().map(Value::to_string).collect();
+    fs::write(path, body.join("\n") + "\n").unwrap();
+}
+// 0.4.9 read only the chats a summary window admits (py/summary.py:2116-2130): history
+// outside the window, however long, adds no work.
+#[test]
+fn summary_work_is_bounded_by_its_window() {
+    let mut work = vec![];
+    for before in [2, 200] {
+        let t = TempDir::new().unwrap();
+        let home = t.path().join("home");
+        shell_chat(&home, "inside-0001", "2099-01-10", 3);
+        shell_chat(&home, "before-0001", "2098-06-01", before);
+        ok(run(&t, &["index"]));
+        let mut ops = vec![];
+        for mode in [None, Some("pending"), Some("time")] {
+            let mut args = vec!["summary"];
+            args.extend(mode);
+            args.extend(["--since", "2099-01-01", "--until", "2099-02-01"]);
+            args.extend(["--json", "--no-auto"]);
+            let out = ok(command(&t, &args)
+                .env("AGREP_QUERY_TIMING", "1")
+                .output()
+                .unwrap());
+            assert_eq!(records(&out)[0]["chats"], 1);
+            let stats = String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find_map(|event| event.get("summary").cloned())
+                .expect("summary work event");
+            ops.push(stats["sqlite_ops"].as_u64().unwrap());
+        }
+        work.push(ops);
+    }
+    assert_eq!(
+        work[0], work[1],
+        "summary work grew with history outside its window"
+    );
 }
 #[test]
 fn diagnostics_are_read_only_and_prove_index_and_absence() {

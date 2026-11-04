@@ -1,0 +1,248 @@
+[
+ {
+  "args": [
+   "test",
+   "-w",
+   "-n",
+   "0"
+  ],
+  "rows": [
+   {
+    "turn": 3,
+    "who": "user",
+    "score": 0.5,
+    "snippet": "test\u200dzwj joined",
+    "matched": "phrase"
+   },
+   {
+    "turn": 0,
+    "who": "user",
+    "score": 0.5,
+    "snippet": "the test suite passed",
+    "matched": "phrase"
+   },
+   {
+    "turn": 4,
+    "who": "agent",
+    "score": 0.4,
+    "snippet": "TEST in capitals",
+    "matched": "phrase"
+   },
+   {
+    "turn": 2,
+    "who": "agent",
+    "score": 0.4,
+    "snippet": "test\u203fjoined by an undertie",
+    "matched": "phrase"
+   },
+   {
+    "turn": 1,
+    "who": "agent",
+    "score": 0.4,
+    "snippet": "\u24b6test circled letter",
+    "matched": "phrase"
+   },
+   {
+    "turn": 0,
+    "who": "agent",
+    "score": 0.4,
+    "snippet": "a\u0301test of combining marks",
+    "matched": "phrase"
+   }
+  ]
+ },
+ {
+  "args": [
+   "c++",
+   "-w",
+   "-n",
+   "0"
+  ],
+  "rows": [
+   {
+    "turn": 5,
+    "who": "user",
+    "score": 0.5,
+    "snippet": "we use c++ daily",
+    "matched": "phrase"
+   }
+  ]
+ },
+ {
+  "args": [
+   ".env",
+   "-w",
+   "-n",
+   "0"
+  ],
+  "rows": [
+   {
+    "turn": 6,
+    "who": "user",
+    "score": 0.5,
+    "snippet": "copy .env first",
+    "matched": "phrase"
+   }
+  ]
+ },
+ {
+  "args": [
+   "flaky windows",
+   "-w",
+   "-n",
+   "0"
+  ],
+  "rows": [
+   {
+    "turn": 7,
+    "who": "user",
+    "score": 0.4615,
+    "snippet": "the flaky windows build",
+    "matched": "phrase"
+   }
+  ]
+ },
+ {
+  "args": [
+   "foo.",
+   "-w",
+   "-n",
+   "0"
+  ],
+  "rows": [
+   {
+    "turn": 8,
+    "who": "user",
+    "score": 0.5,
+    "snippet": "foo.bar first, then foo. at the end",
+    "matched": "phrase"
+   }
+  ]
+ },
+ {
+  "args": [
+   "kit",
+   "-w",
+   "-n",
+   "0"
+  ],
+  "rows": [
+   {
+    "turn": 8,
+    "who": "agent",
+    "score": 0.4,
+    "snippet": "the \u212aIT arrived",
+    "matched": "phrase"
+   }
+  ]
+ },
+ {
+  "args": [
+   "base",
+   "-w",
+   "-n",
+   "0"
+  ],
+  "rows": [
+   {
+    "turn": 9,
+    "who": "user",
+    "score": 0.5,
+    "snippet": "a ba\u017fe camp",
+    "matched": "phrase"
+   }
+  ]
+ },
+ {
+  "args": [
+   "\u03c3\u03bf\u03c6\u03bf\u03c2",
+   "-w",
+   "-n",
+   "0"
+  ],
+  "rows": [
+   {
+    "turn": 9,
+    "who": "agent",
+    "score": 0.4,
+    "snippet": "\u03a3\u039f\u03a6\u039f\u03a3 in capitals",
+    "matched": "phrase"
+   }
+  ]
+ },
+ {
+  "args": [
+   "is",
+   "-w",
+   "-n",
+   "0"
+  ],
+  "rows": [
+   {
+    "turn": 10,
+    "who": "user",
+    "score": 0.75,
+    "snippet": "\u0130S it, \u0131s too",
+    "matched": "phrase"
+   },
+   {
+    "turn": 6,
+    "who": "agent",
+    "score": 0.4,
+    "snippet": "x.env is no match",
+    "matched": "phrase"
+   }
+  ]
+ },
+ {
+  "args": [
+   "aa",
+   "-w",
+   "-n",
+   "0"
+  ],
+  "rows": [
+   {
+    "turn": 10,
+    "who": "agent",
+    "score": 0.4,
+    "snippet": "aaa aa",
+    "matched": "phrase"
+   }
+  ]
+ },
+ {
+  "args": [
+   "ab ab",
+   "-w",
+   "-n",
+   "0"
+  ],
+  "rows": [
+   {
+    "turn": 11,
+    "who": "user",
+    "score": 0.4,
+    "snippet": "xab ab ab",
+    "matched": "phrase"
+   }
+  ]
+ },
+ {
+  "args": [
+   ".a.",
+   "-w",
+   "-n",
+   "0"
+  ],
+  "rows": [
+   {
+    "turn": 11,
+    "who": "agent",
+    "score": 0.6,
+    "snippet": ".a..a.",
+    "matched": "phrase"
+   }
+  ]
+ }
+]

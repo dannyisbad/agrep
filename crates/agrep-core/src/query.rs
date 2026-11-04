@@ -1,6 +1,7 @@
 //! Substring retrieval with admissible, query-specific block bounds.
 use crate::{
     boundary_rank::{self, PreparedQuery, Stats},
+    pattern::Pattern,
     store::{self, BLOCK},
     window::{self, insensitive_span, Folded, Snip, View},
 };
@@ -264,12 +265,20 @@ impl Cutoff {
     /// Whether a row of `tier` whose raw score is at most `ceiling` cannot enter. Rows
     /// rank by rounded score, then (session heads) lane, then time and position.
     fn excludes(&self, tier: u8, ceiling: f64) -> bool {
+        self.below(tier, ceiling)
+            || (self.later && tier == self.tier && self.best(tier, ceiling) == self.score)
+    }
+    /// Whether such a row ranks below the cutoff whatever its time and position, as does
+    /// every row of a lower ceiling.
+    fn below(&self, tier: u8, ceiling: f64) -> bool {
         if !self.chats && tier != self.tier {
             return tier > self.tier;
         }
-        let best = ranked(ceiling) * if self.chats { lane(tier) } else { 1. };
-        best < self.score
-            || (best == self.score && (tier > self.tier || (tier == self.tier && self.later)))
+        let best = self.best(tier, ceiling);
+        best < self.score || (best == self.score && tier > self.tier)
+    }
+    fn best(&self, tier: u8, ceiling: f64) -> f64 {
+        ranked(ceiling) * if self.chats { lane(tier) } else { 1. }
     }
 }
 type CandidateGroups = std::sync::Arc<HashMap<i64, Vec<i64>>>;
@@ -531,7 +540,7 @@ struct Matcher {
     phrase: Option<regex::Regex>,
     /// The phrase with one group per query token, for boundary spans.
     capture: Option<regex::Regex>,
-    explicit: Option<fancy_regex::Regex>,
+    explicit: Option<Pattern>,
     /// 0.4.9's query length for explicit scores: zero for a regular expression.
     explicit_chars: usize,
     /// Whether the regular expression matches at most once in any snippet (`matches_once`).
@@ -623,21 +632,17 @@ impl Matcher {
         if o.pattern.is_empty() || (terms.is_empty() && !o.regex && !o.word) {
             bail!("a nonempty search pattern is required")
         }
-        let (explicit, required, phrase, capture) = if o.regex || o.word {
-            let pattern = if o.word {
-                format!(r"(?<!\w)(?:{})(?!\w)", regex::escape(&o.pattern))
-            } else {
-                o.pattern.clone()
-            };
-            let mut b = fancy_regex::RegexBuilder::new(&format!("(?i:{pattern})"));
-            b.backtrack_limit(100_000);
+        let (explicit, required, phrase, capture) = if o.word {
             (
-                Some(b.build()?),
-                if o.word {
-                    vec![store::normalize(&o.pattern)]
-                } else {
-                    literal_terms(&o.pattern)
-                },
+                Some(Pattern::word(&o.pattern)?),
+                vec![store::normalize(&o.pattern)],
+                None,
+                None,
+            )
+        } else if o.regex {
+            (
+                Some(Pattern::regex(&o.pattern)?),
+                literal_terms(&o.pattern),
                 None,
                 None,
             )
@@ -838,22 +843,23 @@ impl Matcher {
     ) -> Result<Option<Scored>> {
         let rec = recency(ts, now).max(if who == "user" { 0.35 } else { 0. });
         let meta = meta_role(who, turn);
-        if let Some(re) = &self.explicit {
-            let Some(found) = re.find(text)? else {
+        if let Some(pattern) = &self.explicit {
+            let Some(span) = pattern.find(text)? else {
                 return Ok(None);
             };
-            let span = found.start()..found.end();
+            if self.quick_count {
+                return Ok(Some(Scored::bare(0, "counted")));
+            }
             let snip = Snip::new(text, std::slice::from_ref(&span));
             let (mut n, mut best) = (0, 0);
             if snip.chars >= self.explicit_chars {
-                for m in re.find_iter(&snip.text) {
-                    let m = m?;
+                pattern.each(&snip.text, |m| {
                     n += 1;
-                    let length = snip.text[m.start()..m.end()].chars().count();
+                    let length = snip.text[m].chars().count();
                     if best == 0 || length < best {
                         best = length;
                     }
-                }
+                })?;
             }
             let strength = window::strength(n, best, self.explicit_chars);
             return Ok(Some(Scored {
@@ -2853,11 +2859,18 @@ fn search_pass(
                         result.total_basis = "floor".into();
                         break;
                     }
-                } else if Cutoff::of(last, o.chats, max_ts, &min_session, min_turn)
-                    .excludes(pass_tier, bound)
-                {
-                    result.total_basis = "floor".into();
-                    break;
+                } else {
+                    let cutoff = Cutoff::of(last, o.chats, max_ts, &min_session, min_turn);
+                    if cutoff.excludes(pass_tier, bound) {
+                        result.total_basis = "floor".into();
+                        // Blocks come in descending raw ceiling order, and a lower raw
+                        // ceiling can round to the same score: a block that only loses
+                        // that tie on time ends nothing, as a newer row after it may win.
+                        if cutoff.below(pass_tier, bound) {
+                            break;
+                        }
+                        continue;
+                    }
                 }
             }
             if adaptive_prose && block_index > 0 {

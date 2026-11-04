@@ -89,7 +89,9 @@ visible prose, visible tool and source-error counts.
 
 `AGREP_QUERY_TIMING` prints phase timings as JSON lines on stderr. `index` and `reindex`
 add `{"index": …}`: the `Refresh` without `skipped_lock`, plus `after_refresh_ms`, the
-time from the refresh's end to the line. A blocking lock acquisition prints
+time from the refresh's end to the line. `summary` adds `{"summary": {"chats": …,
+"sqlite_ops": …}}`: the families its window admitted and the SQLite VM instructions its
+reads ran, counted in hundreds. A blocking lock acquisition prints
 `{"lock_wait": {"lock": …, "ms": …}}` (`writer_queue`, `writer_lock`, `work_lock`), and
 an archive command that starts waiting for a capture or a SQLite writer in another
 process prints `{"wait": "archive.lock"}` or `{"wait": "sqlite"}`. `AGREP_SEM_PROFILE`

@@ -9,6 +9,7 @@ pub mod intake;
 pub mod intake_batch;
 pub mod integrations;
 pub mod model;
+mod pattern;
 mod prose_index;
 pub mod query;
 pub mod render;

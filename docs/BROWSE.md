@@ -8,7 +8,9 @@ JSON is one `agrep-meta` envelope and then row-only objects, including on pipes;
 empty output is a single envelope with `hits: []`.
 
 `summary`, `summary pending`, and `summary time` read the canonical `visible=1`
-prose, retained reply shapes, and event facts. Active time is explicitly an
+prose, retained reply shapes, and event facts of the families their window admits,
+as 0.4.9 did, and no other history; a stored event text is decoded only when
+classification reads it. Active time is explicitly an
 estimate: adjacent prompt/compaction timestamps are capped, tool activity can
 close the last interval, and all intervals are unioned within each root family.
 Local midnight boundaries split intervals before day/week/month grouping. A

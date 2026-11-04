@@ -456,6 +456,7 @@ fn resolve_scan(
             .then(a.session.cmp(&b.session))
             .then(a.turn.cmp(&b.turn))
             .then(a.who.cmp(&b.who))
+            .then(a.rowid.cmp(&b.rowid))
     };
     let mut exhausted = true;
     for &(block, slot, upper, score) in candidates {
@@ -1000,5 +1001,91 @@ mod tests {
             .map(|p| p.id)
             .collect();
         assert_eq!(left, [1]);
+    }
+    /// Equal cosines spread through the blocks of a parallel scan resolve to one order on
+    /// every search: by cosine, then newest, then session and turn, one row a session.
+    #[test]
+    fn equal_cosines_across_parallel_blocks_keep_one_order() {
+        const SESSIONS: usize = 64;
+        const ROWS: usize = PARALLEL_SCAN_ROWS / SESSIONS + 8;
+        let (_t, r, mut o) = setup();
+        {
+            let mut c = store::writer(&r).unwrap();
+            let tx = c.transaction().unwrap();
+            for s in 0..SESSIONS {
+                let session = format!("session-{s:02}");
+                tx.execute("INSERT INTO sessions(agent,id,project,parent,family,side,title,first_ts,last_ts) VALUES('codex',?1,'alpha','',?1,0,'',0,0)", [&session]).unwrap();
+                for turn in 0..ROWS {
+                    let id = (s * ROWS + turn + 1) as i64;
+                    let text = format!("connection timeout row {id}");
+                    // Turns share three times a session; sessions differ by tens.
+                    let ts = 1000 + (s % 4 * 10 + turn % 3) as i64;
+                    tx.execute("INSERT INTO prose(id,source,agent,session,project,turn,who,model,model_source,ts,text,digest,extra,position) VALUES(?1,1,'codex',?2,'alpha',?3,'user','model','observed',?4,?5,?6,'',?3)", params![id, session, turn as i64, ts, text.as_bytes(), store::digest(&text)]).unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+        // Each session's first 32 turns share one cosine above the floor; the newest-first
+        // embedding order spreads them through the blocks.
+        loop {
+            let pending = semantic_store::batch(&store::reader(&r).unwrap(), 4096).unwrap();
+            if pending.is_empty() {
+                break;
+            }
+            let refs: Vec<_> = pending.iter().map(|p| (p.key.clone(), 0)).collect();
+            let vectors: Vec<_> = pending
+                .iter()
+                .map(|p| {
+                    let cosine = if (p.id as usize - 1) % ROWS < 32 {
+                        0.9f32
+                    } else {
+                        0.5
+                    };
+                    let mut v = vec![0f32; semantic_model::DIM];
+                    v[0] = cosine;
+                    v[1 + p.id as usize % (semantic_model::DIM - 1)] =
+                        (1. - cosine * cosine).sqrt();
+                    v
+                })
+                .collect();
+            semantic_store::publish(&r, &pending, &refs, &vectors).unwrap();
+        }
+        let c = store::reader(&r).unwrap();
+        let blocks = semantic_store::blocks(&r, &c).unwrap();
+        assert!(blocks.len() > 4);
+        assert!(blocks.iter().map(|b| b.rows).sum::<usize>() >= PARALLEL_SCAN_ROWS);
+        let mut q = vec![0f32; semantic_model::DIM];
+        q[0] = 1.;
+        o.chats = false;
+        let mut ranked = |limit: usize| {
+            o.limit = limit;
+            search_vector(&r, &c, &o, false, &q)
+                .unwrap()
+                .hits
+                .into_iter()
+                .map(|h| (h.session, h.turn, h.score))
+                .collect::<Vec<_>>()
+        };
+        let first = ranked(SESSIONS);
+        let mut expected: Vec<_> = (0..SESSIONS)
+            .map(|s| (3 - s % 4, format!("session-{s:02}")))
+            .collect();
+        expected.sort();
+        // A session's head is its first turn at its newest time.
+        assert_eq!(
+            first
+                .iter()
+                .map(|(session, turn, _)| (session.as_str(), *turn))
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|(_, session)| (session.as_str(), 2))
+                .collect::<Vec<_>>()
+        );
+        assert!(first.iter().all(|(_, _, score)| *score == first[0].2));
+        for _ in 0..3 {
+            assert_eq!(ranked(SESSIONS), first);
+        }
+        assert_eq!(ranked(10), first[..10]);
     }
 }

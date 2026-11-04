@@ -3793,22 +3793,21 @@ fn ranked_rows(out: Output) -> Vec<Value> {
         })
         .collect()
 }
-/// `ranking_0_4_9/expected.json` holds agrep 0.4.9's `--json` rankings of this fixture.
-/// Scores count the query only inside each hit's snippet window: long repetitive replies,
-/// tighter matches outside the window, whitespace runs that collapse, de-cut boundary
-/// grading, all-terms windows stitched across cuts, -w and -E, an exact four-place tie
-/// rounded half to even, session heads folding lanes, time order and bounded pages.
-#[test]
-fn keyword_rankings_match_0_4_9() {
+/// Indexes `fixtures/<name>/home` and compares each case of `<name>/expected.json`, agrep
+/// 0.4.9's `--json` rankings of that fixture.
+#[track_caller]
+fn rankings_match_0_4_9(name: &str, count: usize) {
     let t = TempDir::new().unwrap();
     let h = t.path().join("h");
     let d = t.path().join("d");
-    fixture("ranking_0_4_9", &h);
+    fixture(name, &h);
     ok(cli(&h, &d, &["index"]));
-    let golden =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ranking_0_4_9/expected.json");
+    let golden = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+        .join("expected.json");
     let cases: Vec<Value> = serde_json::from_str(&fs::read_to_string(golden).unwrap()).unwrap();
-    assert_eq!(cases.len(), 13);
+    assert_eq!(cases.len(), count);
     for case in cases {
         let mut args: Vec<&str> = case["args"]
             .as_array()
@@ -3823,6 +3822,46 @@ fn keyword_rankings_match_0_4_9() {
             "{args:?}"
         );
     }
+}
+/// Scores count the query only inside each hit's snippet window: long repetitive replies,
+/// tighter matches outside the window, whitespace runs that collapse, de-cut boundary
+/// grading, all-terms windows stitched across cuts, -w and -E, an exact four-place tie
+/// rounded half to even, session heads folding lanes, time order and bounded pages.
+#[test]
+fn keyword_rankings_match_0_4_9() {
+    rankings_match_0_4_9("ranking_0_4_9", 13);
+}
+/// `-w` as Python's `re` matched it: `\w` is an alphanumeric character or `_`, so combining
+/// marks, connector punctuation, joiners and circled letters bound a word while
+/// superscript and circled digits extend one; IGNORECASE equates i, İ and ı, s and ſ, k and
+/// the Kelvin sign, σ and ς. The term is literal: its spaces, and its punctuation edges,
+/// whose outer neighbors are checked; an occurrence rejected at its edges does not hide one
+/// overlapping it, and two matches in a snippet score higher than one.
+#[test]
+fn whole_words_match_0_4_9() {
+    rankings_match_0_4_9("word_0_4_9", 12);
+}
+/// `-w` used to compile `(?<!\w)(?:test)(?!\w)` for fancy-regex, which charges a backtrack
+/// for each start position it rejects: a row holding "test" only inside longer words
+/// exceeded its limit of 100,000 and failed the search (exit 2).
+#[test]
+fn a_whole_word_search_reads_rows_past_the_old_backtrack_limit() {
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let d = t.path().join("d");
+    let long = "testing the latest tests ".repeat(10_000);
+    let ending = format!("{long}test");
+    transcript(&h, &[&long, &ending]);
+    ok(cli(&h, &d, &["index"]));
+    let count = ok(cli(&h, &d, &["test", "-w", "-c"])).stdout;
+    assert_eq!(String::from_utf8(count).unwrap().trim(), "1");
+    let rows = ranked_rows(cli(
+        &h,
+        &d,
+        &["test", "-w", "-n", "0", "--json", "--no-auto"],
+    ));
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["turn"], 1);
 }
 /// Rows rank by their four-place score, then time. The newest row of a tie may sit in a
 /// block whose ceiling the first block's row outranks before rounding; agrep 0.4.9
@@ -3895,6 +3934,120 @@ fn a_four_place_tie_in_a_later_block_wins_on_time_as_in_0_4_9() {
             expected
         );
         assert!(rows.iter().all(|row| row["score"] == 0.0133));
+    }
+}
+/// A block that only loses a score tie on time does not end the walk: blocks come in raw
+/// ceiling order, and a later block's lower ceiling can round to the same score. Old
+/// prompts keep the 0.35 recency floor, so eleven separated pairs give the middle block a
+/// ceiling of 0.9 * (1 - 2^-11) * 0.35 = 0.314846, above the 0.96875 * 0.325 = 0.314844 of
+/// the last block's recap. Both round to 0.3148, where that newer recap beats the first
+/// block's older twin.
+#[test]
+fn a_tie_won_on_time_lies_past_a_block_that_loses_it() {
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let d = t.path().join("d");
+    let base = h.join(".pi/agent/sessions/project");
+    fs::create_dir_all(&base).unwrap();
+    let session = |id: &str, entries: Vec<(&str, &str, &str)>| {
+        let mut lines = vec![serde_json::json!({"type":"session","id":id,"version":3,"cwd":"/work/project","timestamp":"2099-01-01T00:00:00Z"}).to_string()];
+        // More rows than a block holds, so the next session's rows start a later block.
+        let filler = (0..600).map(|i| {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            (role, "2099-01-01T00:00:05Z", "ill")
+        });
+        let mut parent = Value::Null;
+        for (i, (kind, stamp, text)) in entries.into_iter().chain(filler).enumerate() {
+            let entry = format!("{id}-{i}");
+            let line = if kind == "compaction" {
+                serde_json::json!({"type":"compaction","id":entry,"parentId":parent,"timestamp":stamp,"summary":text,"tokensBefore":1000,"firstKeptEntryId":parent})
+            } else {
+                let content = if kind == "user" {
+                    serde_json::json!(text)
+                } else {
+                    serde_json::json!([{"type": "text", "text": text}])
+                };
+                serde_json::json!({"type":"message","id":entry,"parentId":parent,"timestamp":stamp,"message":{"role":kind,"content":content}})
+            };
+            lines.push(line.to_string());
+            parent = entry.into();
+        }
+        fs::write(base.join(format!("{id}.jsonl")), lines.join("\n") + "\n").unwrap();
+    };
+    let recap = ["quokZebra"; 5].join(" ");
+    let pairs = ["quok zebra"; 11].join(" ");
+    // A fresh prompt holding both words gives the first block the highest ceiling.
+    session(
+        "tie-a",
+        vec![
+            ("user", "2099-01-01T00:00:00Z", "zebra then quok"),
+            ("compaction", "2099-01-01T00:00:01Z", &recap),
+        ],
+    );
+    session(
+        "tie-b",
+        (0..300)
+            .map(|i| {
+                if i % 2 == 0 {
+                    ("user", "2020-01-01T00:00:00Z", pairs.as_str())
+                } else {
+                    ("assistant", "2020-01-01T00:00:00Z", "ill")
+                }
+            })
+            .collect(),
+    );
+    session(
+        "tie-c",
+        vec![
+            ("user", "2099-06-01T00:00:00Z", "ill"),
+            ("compaction", "2099-06-01T00:00:01Z", &recap),
+        ],
+    );
+    ok(cli(&h, &d, &["index"]));
+    let db =
+        Connection::open_with_flags(d.join("index.db"), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    // The recaps of the first and last sessions, and the middle session's old prompts.
+    let blocks = |session: &str, rows: &str| {
+        db.query_row(
+            &format!("SELECT min(id)/512,max(id)/512 FROM prose WHERE session=?1 AND {rows}"),
+            [session],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .unwrap()
+    };
+    let (a, b, c) = (
+        blocks("tie-a", "who='recap'"),
+        blocks("tie-b", "who='user' AND ts<1600000000000"),
+        blocks("tie-c", "who='recap'"),
+    );
+    assert!(a.1 < b.0 && b.1 < c.0, "{a:?} {b:?} {c:?}");
+    let page = |n: &str| -> Vec<(String, i64, String, f64)> {
+        let out = ok(cli(&h, &d, &["quok zebra", "--json", "--no-auto", "-n", n]));
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|row| row.get("handle").is_some())
+            .map(|row| {
+                (
+                    row["session"].as_str().unwrap().to_owned(),
+                    row["turn"].as_i64().unwrap(),
+                    row["who"].as_str().unwrap().to_owned(),
+                    row["score"].as_f64().unwrap(),
+                )
+            })
+            .collect()
+    };
+    let all = page("0");
+    assert_eq!(
+        all[..2],
+        [
+            ("tie-c".to_owned(), 1, "recap".to_owned(), 0.3148),
+            ("tie-a".to_owned(), 1, "recap".to_owned(), 0.3148)
+        ]
+    );
+    for n in [1, 2] {
+        assert_eq!(page(&n.to_string()), all[..n], "-n {n}");
     }
 }
 /// Bounded pages equal the exhaustive ranking's head under snippet-window scores: rows

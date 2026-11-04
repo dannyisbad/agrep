@@ -50,6 +50,23 @@ discover agent histories. Source conversations stay in their native stores.
 Search reads the committed index and checks for changed sources. Updates are processed
 automatically; `--no-auto` reads without checking. The first index is built inline.
 
+Compared with 0.4.9, median wall time for a complete command on a hosted
+Ubuntu x64 runner, 100,000-row history:
+
+| Command | 0.4.9 | 0.5 |
+|---|---:|---:|
+| first `agrep index` | 19.9 s | 7.7 s |
+| check with nothing changed | 383 ms | 12 ms |
+| refresh after one new turn | 3.0 s | 28 ms |
+| keyword search | 927 ms | 33 ms |
+| `recall` | 569 ms | 49 ms |
+| first meaning query after setup | 1.07 s | 62 ms |
+| meaning-only search (CPU) | 135 ms | 46 ms |
+
+On a 1.2-million-row personal history (Apple M2 Max) the first index takes
+84 s against 0.4.9's 319 s. CI repeats the comparison on Linux, macOS and
+Windows, x64 and arm64, and every case must beat 0.4.9 at median and p95.
+
 **Before upgrading from 0.4, run `agrep remove` with 0.4** to remove its
 instruction blocks, hooks and uninstall sentinel. Then install 0.5, build a
 fresh index and run `agrep setup`. 0.5 does not read or migrate old data.

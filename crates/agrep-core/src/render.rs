@@ -4,6 +4,7 @@ use crate::{
     data::DataRoot,
     evidence::{content_terms, py_space},
     pages,
+    pattern::Pattern,
     query::{Filters, Hit, Results},
     surface,
     window::Snip,
@@ -199,26 +200,21 @@ pub fn hit_value(h: &Hit, now: i64) -> Value {
 pub struct Marks {
     /// `_match_pat`: the phrase with `[\W_]*` between its tokens, a whole word, or the
     /// user's regex; none for a meaning-only result.
-    pattern: Option<fancy_regex::Regex>,
+    pattern: Option<Pattern>,
     /// `_terms_hl_pat`: each content term, for keyword rows matched in any order.
-    terms: Option<fancy_regex::Regex>,
+    terms: Option<Pattern>,
     /// The query's boundary terms, which place an any-order row's matches.
     prepared: boundary_rank::PreparedQuery,
 }
 impl Marks {
     pub fn new(q: &str, s: &Style) -> Self {
-        let build = |pattern: String| {
-            let mut b = fancy_regex::RegexBuilder::new(&format!("(?i:{pattern})"));
-            b.backtrack_limit(100_000);
-            b.build().ok()
-        };
         let keyword = !s.semantic && !s.regex && !s.word;
         let pattern = if s.semantic {
             None
         } else if s.regex {
-            build(q.to_owned())
+            Pattern::regex(q).ok()
         } else if s.word {
-            build(format!(r"(?<!\w)(?:{})(?!\w)", regex::escape(q)))
+            (!q.is_empty()).then(|| Pattern::word(q).ok()).flatten()
         } else {
             let tokens: Vec<String> = q
                 .split(|c: char| py_space(c) || c == '-' || c == '_')
@@ -226,7 +222,7 @@ impl Marks {
                 .map(regex::escape)
                 .collect();
             (!tokens.is_empty())
-                .then(|| build(tokens.join(r"[\W_]*")))
+                .then(|| Pattern::linear(&tokens.join(r"[\W_]*")).ok())
                 .flatten()
         };
         let mut variants: Vec<String> = content_terms(q)
@@ -243,13 +239,14 @@ impl Marks {
         variants.dedup();
         let terms = (keyword && !variants.is_empty())
             .then(|| {
-                build(
-                    variants
+                Pattern::linear(
+                    &variants
                         .iter()
                         .map(|v| regex::escape(v))
                         .collect::<Vec<_>>()
                         .join("|"),
                 )
+                .ok()
             })
             .flatten();
         Self {
@@ -267,14 +264,22 @@ impl Marks {
             }
             _ => self.pattern.as_ref(),
         };
-        match pattern.filter(|_| color) {
-            Some(p) => p
-                .try_replacen(&snippet, 0, |m: &fancy_regex::Captures| {
-                    format!("\x1b[1;31m{}\x1b[0m", &m[0])
-                })
-                .map_or_else(|_| snippet.clone(), |s| s.into_owned()),
-            None => snippet,
+        let Some(p) = pattern.filter(|_| color) else {
+            return snippet;
+        };
+        let (mut painted, mut last) = (String::with_capacity(snippet.len()), 0);
+        let done = p.each(&snippet, |m| {
+            painted.push_str(&snippet[last..m.start]);
+            painted.push_str("\x1b[1;31m");
+            painted.push_str(&snippet[m.start..m.end]);
+            painted.push_str("\x1b[0m");
+            last = m.end;
+        });
+        if done.is_err() {
+            return snippet;
         }
+        painted.push_str(&snippet[last..]);
+        painted
     }
     /// `_compact_snippet`: the snippet narrowed to 32 characters around its matches.
     fn compact(&self, h: &Hit) -> String {
@@ -300,7 +305,6 @@ impl Marks {
             self.pattern
                 .as_ref()
                 .and_then(|p| p.find(text).ok().flatten())
-                .map(|m| m.start()..m.end())
                 .into_iter()
                 .collect()
         };

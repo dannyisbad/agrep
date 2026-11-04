@@ -1,0 +1,25 @@
+{"type": "session", "id": "word-session", "version": 3, "cwd": "/work/project", "timestamp": "2099-01-01T01:00:00Z"}
+{"type": "message", "id": "m0", "parentId": null, "timestamp": "2099-01-01T01:00:00Z", "message": {"role": "user", "content": "the test suite passed"}}
+{"type": "message", "id": "m1", "parentId": "m0", "timestamp": "2099-01-01T01:01:00Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "a\u0301test of combining marks"}]}}
+{"type": "message", "id": "m2", "parentId": "m1", "timestamp": "2099-01-01T01:02:00Z", "message": {"role": "user", "content": "x\u00b2test squared"}}
+{"type": "message", "id": "m3", "parentId": "m2", "timestamp": "2099-01-01T01:03:00Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "\u24b6test circled letter"}]}}
+{"type": "message", "id": "m4", "parentId": "m3", "timestamp": "2099-01-01T01:04:00Z", "message": {"role": "user", "content": "\u2460test circled digit"}}
+{"type": "message", "id": "m5", "parentId": "m4", "timestamp": "2099-01-01T01:05:00Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "test\u203fjoined by an undertie"}]}}
+{"type": "message", "id": "m6", "parentId": "m5", "timestamp": "2099-01-01T01:06:00Z", "message": {"role": "user", "content": "test\u200dzwj joined"}}
+{"type": "message", "id": "m7", "parentId": "m6", "timestamp": "2099-01-01T01:07:00Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "testing the latest tests"}]}}
+{"type": "message", "id": "m8", "parentId": "m7", "timestamp": "2099-01-01T01:08:00Z", "message": {"role": "user", "content": "_test and test_ underscores"}}
+{"type": "message", "id": "m9", "parentId": "m8", "timestamp": "2099-01-01T01:09:00Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "TEST in capitals"}]}}
+{"type": "message", "id": "m10", "parentId": "m9", "timestamp": "2099-01-01T01:10:00Z", "message": {"role": "user", "content": "we use c++ daily"}}
+{"type": "message", "id": "m11", "parentId": "m10", "timestamp": "2099-01-01T01:11:00Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "c++x and xc++ are not words"}]}}
+{"type": "message", "id": "m12", "parentId": "m11", "timestamp": "2099-01-01T01:12:00Z", "message": {"role": "user", "content": "copy .env first"}}
+{"type": "message", "id": "m13", "parentId": "m12", "timestamp": "2099-01-01T01:13:00Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "x.env is no match"}]}}
+{"type": "message", "id": "m14", "parentId": "m13", "timestamp": "2099-01-01T01:14:00Z", "message": {"role": "user", "content": "the flaky windows build"}}
+{"type": "message", "id": "m15", "parentId": "m14", "timestamp": "2099-01-01T01:15:00Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "flaky  windows and flaky-windows"}]}}
+{"type": "message", "id": "m16", "parentId": "m15", "timestamp": "2099-01-01T01:16:00Z", "message": {"role": "user", "content": "foo.bar first, then foo. at the end"}}
+{"type": "message", "id": "m17", "parentId": "m16", "timestamp": "2099-01-01T01:17:00Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "the \u212aIT arrived"}]}}
+{"type": "message", "id": "m18", "parentId": "m17", "timestamp": "2099-01-01T01:18:00Z", "message": {"role": "user", "content": "a ba\u017fe camp"}}
+{"type": "message", "id": "m19", "parentId": "m18", "timestamp": "2099-01-01T01:19:00Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "\u03a3\u039f\u03a6\u039f\u03a3 in capitals"}]}}
+{"type": "message", "id": "m20", "parentId": "m19", "timestamp": "2099-01-01T01:20:00Z", "message": {"role": "user", "content": "\u0130S it, \u0131s too"}}
+{"type": "message", "id": "m21", "parentId": "m20", "timestamp": "2099-01-01T01:21:00Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "aaa aa"}]}}
+{"type": "message", "id": "m22", "parentId": "m21", "timestamp": "2099-01-01T01:22:00Z", "message": {"role": "user", "content": "xab ab ab"}}
+{"type": "message", "id": "m23", "parentId": "m22", "timestamp": "2099-01-01T01:23:00Z", "message": {"role": "assistant", "content": [{"type": "text", "text": ".a..a."}]}}

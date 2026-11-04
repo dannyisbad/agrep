@@ -2870,3 +2870,145 @@ fn usage_errors_write_0_4_9_json_records() {
     assert_eq!(o.status.code(), Some(2));
     assert!(!unbuilt.join("index.db").exists());
 }
+/// Repeated runs print the same bytes on every result surface, and rows that tie on score
+/// keep the documented order across blocks: newer first, then session, turn and speaker,
+/// then row order. Timestamps in the future hold recency at one, so the clock cannot move a
+/// score. Every eight messages share a time across three sessions whose ids sort against
+/// their files, and the two tool calls of one reply tie on everything but their order.
+#[test]
+fn repeated_runs_print_the_same_bytes_on_every_surface() {
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let d = t.path().join("d");
+    let dir = h.join(".pi/agent/sessions/-work-ties");
+    fs::create_dir_all(&dir).unwrap();
+    for (file, id) in [("1", "tie-c"), ("2", "tie-a"), ("3", "tie-b")] {
+        let mut lines = vec![
+            serde_json::json!({"type":"session","id":id,"version":3,"cwd":"/work/ties","timestamp":"2099-01-01T00:00:00Z"}),
+        ];
+        let mut parent = Value::Null;
+        let mut add = |n: usize, message: Value| {
+            let entry = format!("m{}", lines.len());
+            let at = format!("2099-01-01T00:{:02}:{:02}Z", n / 8 / 60, n / 8 % 60);
+            lines.push(serde_json::json!({"type":"message","id":entry,"parentId":parent,"timestamp":at,"message":message}));
+            parent = entry.into();
+        };
+        for n in (0..600).step_by(2) {
+            add(
+                n,
+                serde_json::json!({"role":"user","content":format!("zebra crossing check {n}")}),
+            );
+            if n % 50 != 0 {
+                add(
+                    n + 1,
+                    serde_json::json!({"role":"assistant","content":[{"type":"text","text":format!("zebra noted {n}")}]}),
+                );
+                continue;
+            }
+            let call = |file: &str| serde_json::json!({"type":"toolCall","id":format!("{id}-{n}-{file}"),"name":"bash","arguments":{"command":format!("grep zebra src/{file}.rs")}});
+            add(
+                n + 1,
+                serde_json::json!({"role":"assistant","content":[{"type":"text","text":format!("crossing then zebra {n}")},call("a"),call("b")]}),
+            );
+            for file in ["a", "b"] {
+                add(
+                    n + 1,
+                    serde_json::json!({"role":"toolResult","toolCallId":format!("{id}-{n}-{file}"),"toolName":"bash","isError":false,"content":[{"type":"text","text":format!("src/{file}.rs:1: zebra")}]}),
+                );
+            }
+        }
+        let body: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        fs::write(dir.join(format!("{file}.jsonl")), body).unwrap();
+    }
+    ok(cli(&h, &d, &["index"], &[]));
+    // A compact page's continuation handle names a new frozen page on each run.
+    let masked = |bytes: &[u8]| {
+        let text = String::from_utf8_lossy(bytes).into_owned();
+        match text.find("--more m.") {
+            Some(at) => format!("{}{}", &text[..at], &text[at + 17..]),
+            None => text,
+        }
+    };
+    // Each surface's arguments, and whether it runs under the compact profile.
+    let surfaces: [(&[&str], bool); 17] = [
+        (&["zebra", "--json", "-n", "0", "--no-auto"], false),
+        (&["zebra", "--json", "-n", "40", "--no-auto"], false),
+        (&["zebra", "--flat", "-n", "0", "--no-auto"], false),
+        (
+            &["zebra", "--sort", "time", "--json", "-n", "40", "--no-auto"],
+            false,
+        ),
+        (&["zebra", "-l", "--json", "-n", "0", "--no-auto"], false),
+        (&["zebra", "-l", "--no-auto"], false),
+        (&["zebra", "--count-by-tier", "--no-auto"], false),
+        (&["zebra", "-n", "60", "--no-auto", "--color=always"], false),
+        (&["zebra", "--no-auto"], true),
+        (&["zebra crossing", "--no-auto"], true),
+        (&["zebra crossing", "--coverage", "--no-auto"], false),
+        (&["recall", "zebra", "--no-auto"], false),
+        (&["recall", "zebra crossing", "--json", "--no-auto"], false),
+        (&["pack", "zebra", "crossing", "--no-auto"], false),
+        (&["chats", "zebra", "--no-auto"], false),
+        (&["chats", "--json", "-n", "0", "--no-auto"], false),
+        (
+            &["summary", "--json", "--since", "2026-01-01", "--no-auto"],
+            false,
+        ),
+    ];
+    for (args, compact) in surfaces {
+        let env: &[(&str, &str)] = if compact {
+            &[("AGREP_PROFILE", "compact")]
+        } else {
+            &[]
+        };
+        let runs: Vec<_> = (0..3)
+            .map(|_| {
+                let o = cli(&h, &d, args, env);
+                (o.status.code(), o.stdout, masked(&o.stderr))
+            })
+            .collect();
+        assert_eq!(runs[0].0, Some(0), "{args:?}: {}", runs[0].2);
+        assert!(runs.iter().all(|run| *run == runs[0]), "{args:?}");
+    }
+    let rows = |n: &str| {
+        values(&ok(cli(
+            &h,
+            &d,
+            &["zebra", "--json", "-n", n, "--no-auto"],
+            &[],
+        )))[1..]
+            .to_vec()
+    };
+    let all = rows("0");
+    let order = |row: &Value| {
+        (
+            std::cmp::Reverse((row["score"].as_f64().unwrap() * 1e4).round() as i64),
+            std::cmp::Reverse(row["ts"].as_i64().unwrap()),
+            row["session"].as_str().unwrap().to_owned(),
+            row["turn"].as_i64().unwrap(),
+            row["who"].as_str().unwrap().to_owned(),
+        )
+    };
+    assert!(all.windows(2).all(|w| order(&w[0]) <= order(&w[1])));
+    // The newest time's prompts lead, three sessions of them tied in session order.
+    let lead: Vec<_> = all[..12]
+        .iter()
+        .map(|row| row["session"].as_str().unwrap())
+        .collect();
+    assert_eq!(lead, [["tie-a"; 4], ["tie-b"; 4], ["tie-c"; 4]].concat());
+    // Calls of one reply tie on everything else and keep the order they were made in.
+    let tools: Vec<_> = all.iter().filter(|row| row["who"] == "tool").collect();
+    assert_eq!(tools.len(), 72);
+    for pair in tools.chunks(2) {
+        assert_eq!(order(pair[0]), order(pair[1]));
+        assert!(
+            pair[0]["snippet"].as_str().unwrap().contains("src/a.rs"),
+            "{pair:?}"
+        );
+        assert!(
+            pair[1]["snippet"].as_str().unwrap().contains("src/b.rs"),
+            "{pair:?}"
+        );
+    }
+    assert_eq!(rows("40"), all[..40]);
+}

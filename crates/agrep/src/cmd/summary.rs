@@ -8,9 +8,11 @@ use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     io::IsTerminal,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
-/// A family member: its session, its rows after self-exclusion, and its events.
-type FamilyMember<'a> = (&'a h::Session, Vec<h::Row>, Vec<Value>);
 const METRIC: &str = "estimated active time";
 fn duration(s: &str) -> Option<i64> {
     for (unit, mul) in [
@@ -168,7 +170,22 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
     }
     let (root, census) = ready(no_auto)?;
     let c = store::reader(&root)?;
+    // Under AGREP_QUERY_TIMING the briefing reports the SQLite work it did, which its window
+    // must bound however much history lies outside it.
+    let ops = agrep_core::semantic_profile::timing_enabled().then(|| {
+        let ops = Arc::new(AtomicU64::new(0));
+        let tally = ops.clone();
+        c.progress_handler(
+            100,
+            Some(move || {
+                tally.fetch_add(100, Ordering::Relaxed);
+                false
+            }),
+        );
+        ops
+    });
     let all = h::sessions(&c)?;
+    let symbols = b::Symbols::load(&c)?;
     let filters = Filters {
         project: args.project.clone(),
         agent: args.agent.clone(),
@@ -209,7 +226,7 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
     let overlaps =
         |s: &h::Session| s.last_ts >= since && (until_arg.is_none() || s.first_ts < until);
     let (mut excluded, mut unknown, mut side_count) = (0, 0, 0);
-    let mut families: Vec<(Vec<FamilyMember<'_>>, bool)> = Vec::new();
+    let mut families: Vec<(Vec<b::Member<'_>>, bool)> = Vec::new();
     'families: for ((head, _), sessions) in grouped {
         let Some(&first) = sessions.iter().find(|s| s.id == head) else {
             continue;
@@ -252,7 +269,7 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
                 .iter()
                 .filter(|r| b::is_turn(&rows, r) && r.ts <= 0)
                 .count();
-            let events = b::events(&c, s)?;
+            let events = b::events(&c, &symbols, s)?;
             members.push((s, rows, events));
         }
         side_count += members.len() - 1;
@@ -304,37 +321,21 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
             }
         });
         if mode != "time" {
-            let mut returned = HashSet::new();
-            returned.insert(s.id.clone());
-            loop {
-                let prior = returned.len();
-                for (side, rows, events) in members.iter().skip(1) {
-                    if b::returned(rows, events)
-                        || members.iter().any(|(holder, _, events)| {
-                            returned.contains(&holder.id) && b::received(events, side, rows)
-                        })
-                    {
-                        returned.insert(side.id.clone());
-                    }
-                }
-                if returned.len() == prior {
-                    break;
-                }
-            }
             let mut item = b::pending(&c, s, &root.1, &root.2)?;
             if item.is_none() {
-                for (side, rows, events) in members
+                let later: Vec<_> = members
                     .iter()
+                    .enumerate()
                     .skip(1)
-                    .filter(|(side, _, _)| side.last_ts > s.last_ts)
-                {
-                    let delivered = returned.contains(&side.id)
-                        || root.2.iter().any(|e| {
-                            e["child_session"] == side.id
-                                && (e["kind"] == "subagent_result"
-                                    || !e["output"].as_str().unwrap_or("").is_empty())
-                        });
-                    if delivered {
+                    .filter(|(_, (side, _, _))| side.last_ts > s.last_ts)
+                    .collect();
+                let reached = if later.is_empty() {
+                    vec![]
+                } else {
+                    b::handed_back(&c, members)?
+                };
+                for (at, (side, rows, events)) in later {
+                    if reached[at] || b::delivered(&c, &root.2, side)? {
                         continue;
                     }
                     if let Some(mut i) = b::side_pending(&c, side, rows, events)? {
@@ -461,6 +462,12 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
     );
     if unknown > 0 {
         caveats.push(unknown_line.clone());
+    }
+    if let Some(ops) = ops {
+        agrep_core::semantic_profile::event(json!({"summary": {
+            "chats": families.len(),
+            "sqlite_ops": ops.load(Ordering::Relaxed),
+        }}));
     }
     let timezone = render::timezone_label();
     let pending_sources = crate::finish_census(&root, census)?;
