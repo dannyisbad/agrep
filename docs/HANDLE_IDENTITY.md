@@ -4,6 +4,13 @@ A current result handle is `@session:turn.digest`; a tool pointer may add an
 event selector and a bounded span. Session prefixes widen to disambiguate, and
 identifiers that need encoding use the public opaque-session form.
 
+A tool pointer's span counts characters of the event's indexed text and marks where
+the query matched, as 0.4.9 placed it: the first separator-flexible phrase match
+(query words joined by any run of non-alphanumeric characters); for a one-word query,
+its best-aligned occurrence; for all-terms hits, the earliest of each term's
+best-aligned occurrence; for content-terms hits, the earliest occurrence of any
+content term. Regex and whole-word searches use their first match.
+
 The four-hex digest checks accidental content drift. It is not cryptographic
 integrity. It binds the reference to indexed text so turn renumbering or a
 prefix collision cannot silently serve a different message.

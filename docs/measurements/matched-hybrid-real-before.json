@@ -1,0 +1,577 @@
+{
+  "workload": "real",
+  "requested_rows": 0,
+  "text_bytes": 0,
+  "source_bytes": 0,
+  "runs": 20,
+  "build_runs": 3,
+  "versions": {
+    "reference": "agrep 0.4.9 distribution 3b9a9a5a46932c7dd733 runtime b4fad94fcff89a13600f native b6c37eecd7f9d76c43bb writer 335673c58e49894778d6",
+    "candidate": "agrep 0.5.0"
+  },
+  "host": {
+    "os": "macos",
+    "arch": "aarch64",
+    "cpus": 12
+  },
+  "scope": "fresh processes through full exit, reference then candidate per sample, every sample kept; index samples of the reference end when its queued search-database build is served; one recorded warm-up per lane before warm cases; background processes of both lanes ended between cases",
+  "gate": "every case: candidate median < reference median and candidate p95 < reference p95, with every sample of both lanes verified",
+  "preparation": {
+    "candidate_embed_ms": 365607.717584,
+    "reference_reindex_ms": 332391.7065,
+    "candidate_semantic_rows": 132900,
+    "candidate_semantic_total": 132900,
+    "candidate_semantic_backlog": 0
+  },
+  "summary": {
+    "cases": 2,
+    "wins": 2,
+    "losses": 0,
+    "reference_failures": 0,
+    "candidate_failures": 0,
+    "both_failed": 0
+  },
+  "gate_failures": [
+    "first_index: missing case",
+    "no_change_index: missing case",
+    "release: missing case",
+    "error: missing case",
+    "natural: missing case",
+    "flaky: missing case",
+    "rare: missing case",
+    "short: missing case",
+    "regex: missing case",
+    "list: missing case",
+    "json: missing case",
+    "count: missing case",
+    "rare_hit: missing case",
+    "compact_release: missing case",
+    "compact_error: missing case",
+    "compact_natural: missing case",
+    "compact_flaky: missing case",
+    "compact_rare: missing case",
+    "rare_hit_pi_filtered: missing case",
+    "release_filtered: missing case",
+    "error_filtered: missing case",
+    "natural_filtered: missing case",
+    "flaky_filtered: missing case",
+    "rare_filtered: missing case",
+    "short_filtered: missing case",
+    "regex_filtered: missing case",
+    "list_filtered: missing case",
+    "json_filtered: missing case",
+    "count_filtered: missing case",
+    "rare_hit_filtered: missing case",
+    "tool_error: missing case",
+    "all_error: missing case",
+    "recall: missing case",
+    "pack: missing case",
+    "chats: missing case",
+    "status: missing case",
+    "around: missing case",
+    "semantic_only: missing case",
+    "version_control: missing case"
+  ],
+  "cases": [
+    {
+      "verdict": "win",
+      "reference_failure": null,
+      "candidate_failure": null,
+      "reference": {
+        "median_ms": 1552.5966250000001,
+        "p95_ms": 8762.119875,
+        "samples_ms": [
+          8762.119875,
+          1421.2334170000001,
+          1552.5966250000001
+        ],
+        "exit_codes": [
+          0,
+          0,
+          0
+        ],
+        "verified": [
+          true,
+          true,
+          true
+        ],
+        "load_averages": [
+          [
+            35.3681640625,
+            30.654296875,
+            37.6015625
+          ],
+          [
+            36.31689453125,
+            31.0244140625,
+            37.65185546875
+          ],
+          [
+            36.31689453125,
+            31.0244140625,
+            37.65185546875
+          ]
+        ],
+        "warmup": null,
+        "last_result": {
+          "result_rows": 0,
+          "text_hits": 4,
+          "count": null,
+          "semantic_rows": 0,
+          "meaning_lines": 1,
+          "stdout_bytes": 543
+        },
+        "background_processes_ended": 18
+      },
+      "candidate": {
+        "median_ms": 414.768042,
+        "p95_ms": 817.867416,
+        "samples_ms": [
+          817.867416,
+          191.78841599999998,
+          414.768042
+        ],
+        "exit_codes": [
+          0,
+          0,
+          0
+        ],
+        "verified": [
+          true,
+          true,
+          true
+        ],
+        "load_averages": [
+          [
+            36.31689453125,
+            31.0244140625,
+            37.65185546875
+          ],
+          [
+            36.31689453125,
+            31.0244140625,
+            37.65185546875
+          ],
+          [
+            36.31689453125,
+            31.0244140625,
+            37.65185546875
+          ]
+        ],
+        "warmup": null,
+        "last_result": {
+          "result_rows": 0,
+          "text_hits": 6,
+          "count": null,
+          "semantic_rows": 0,
+          "meaning_lines": 1,
+          "stdout_bytes": 1793
+        },
+        "background_processes_ended": 3
+      },
+      "median_ratio": 0.2671447530681061,
+      "p95_ratio": 0.09334127216560137,
+      "name": "first_hybrid",
+      "args": [
+        "how did the drafting go last run"
+      ],
+      "profile": "compact",
+      "expected_exit": 0,
+      "samples_per_lane": 3
+    },
+    {
+      "verdict": "win",
+      "reference_failure": null,
+      "candidate_failure": null,
+      "reference": {
+        "median_ms": 451.494,
+        "p95_ms": 630.9497080000001,
+        "samples_ms": [
+          615.878375,
+          394.250625,
+          635.296208,
+          369.48825,
+          381.763125,
+          451.168791,
+          630.9497080000001,
+          478.666083,
+          485.031833,
+          571.458875,
+          501.803584,
+          453.154292,
+          527.941958,
+          451.494,
+          337.836,
+          386.21879199999995,
+          342.769459,
+          396.582625,
+          317.303875,
+          387.737292
+        ],
+        "exit_codes": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "verified": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "load_averages": [
+          [
+            34.36962890625,
+            30.70849609375,
+            37.50146484375
+          ],
+          [
+            34.36962890625,
+            30.70849609375,
+            37.50146484375
+          ],
+          [
+            34.36962890625,
+            30.70849609375,
+            37.50146484375
+          ],
+          [
+            34.36962890625,
+            30.70849609375,
+            37.50146484375
+          ],
+          [
+            35.701171875,
+            31.044921875,
+            37.580078125
+          ],
+          [
+            35.701171875,
+            31.044921875,
+            37.580078125
+          ],
+          [
+            35.701171875,
+            31.044921875,
+            37.580078125
+          ],
+          [
+            35.701171875,
+            31.044921875,
+            37.580078125
+          ],
+          [
+            35.701171875,
+            31.044921875,
+            37.580078125
+          ],
+          [
+            35.701171875,
+            31.044921875,
+            37.580078125
+          ],
+          [
+            35.701171875,
+            31.044921875,
+            37.580078125
+          ],
+          [
+            35.48486328125,
+            31.0771484375,
+            37.55322265625
+          ],
+          [
+            35.48486328125,
+            31.0771484375,
+            37.55322265625
+          ],
+          [
+            35.48486328125,
+            31.0771484375,
+            37.55322265625
+          ],
+          [
+            35.48486328125,
+            31.0771484375,
+            37.55322265625
+          ],
+          [
+            35.48486328125,
+            31.0771484375,
+            37.55322265625
+          ],
+          [
+            35.48486328125,
+            31.0771484375,
+            37.55322265625
+          ],
+          [
+            35.48486328125,
+            31.0771484375,
+            37.55322265625
+          ],
+          [
+            34.16455078125,
+            30.87646484375,
+            37.4443359375
+          ],
+          [
+            34.16455078125,
+            30.87646484375,
+            37.4443359375
+          ]
+        ],
+        "warmup": {
+          "ms": 1216.302083,
+          "exit": 0,
+          "load": [
+            34.36962890625,
+            30.70849609375,
+            37.50146484375
+          ]
+        },
+        "last_result": {
+          "result_rows": 0,
+          "text_hits": 4,
+          "count": null,
+          "semantic_rows": 0,
+          "meaning_lines": 1,
+          "stdout_bytes": 543
+        },
+        "background_processes_ended": 4
+      },
+      "candidate": {
+        "median_ms": 226.346125,
+        "p95_ms": 363.388209,
+        "samples_ms": [
+          238.726292,
+          204.871375,
+          212.954,
+          206.083875,
+          244.42666699999998,
+          382.83887500000003,
+          363.388209,
+          220.308666,
+          264.71020899999996,
+          228.12975,
+          224.41916700000002,
+          232.863875,
+          226.346125,
+          215.40579100000002,
+          235.178584,
+          232.339667,
+          200.745958,
+          200.41916600000002,
+          190.985125,
+          194.670208
+        ],
+        "exit_codes": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "verified": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "load_averages": [
+          [
+            34.36962890625,
+            30.70849609375,
+            37.50146484375
+          ],
+          [
+            34.36962890625,
+            30.70849609375,
+            37.50146484375
+          ],
+          [
+            34.36962890625,
+            30.70849609375,
+            37.50146484375
+          ],
+          [
+            34.36962890625,
+            30.70849609375,
+            37.50146484375
+          ],
+          [
+            35.701171875,
+            31.044921875,
+            37.580078125
+          ],
+          [
+            35.701171875,
+            31.044921875,
+            37.580078125
+          ],
+          [
+            35.701171875,
+            31.044921875,
+            37.580078125
+          ],
+          [
+            35.701171875,
+            31.044921875,
+            37.580078125
+          ],
+          [
+            35.701171875,
+            31.044921875,
+            37.580078125
+          ],
+          [
+            35.701171875,
+            31.044921875,
+            37.580078125
+          ],
+          [
+            35.48486328125,
+            31.0771484375,
+            37.55322265625
+          ],
+          [
+            35.48486328125,
+            31.0771484375,
+            37.55322265625
+          ],
+          [
+            35.48486328125,
+            31.0771484375,
+            37.55322265625
+          ],
+          [
+            35.48486328125,
+            31.0771484375,
+            37.55322265625
+          ],
+          [
+            35.48486328125,
+            31.0771484375,
+            37.55322265625
+          ],
+          [
+            35.48486328125,
+            31.0771484375,
+            37.55322265625
+          ],
+          [
+            35.48486328125,
+            31.0771484375,
+            37.55322265625
+          ],
+          [
+            35.48486328125,
+            31.0771484375,
+            37.55322265625
+          ],
+          [
+            34.16455078125,
+            30.87646484375,
+            37.4443359375
+          ],
+          [
+            34.16455078125,
+            30.87646484375,
+            37.4443359375
+          ]
+        ],
+        "warmup": {
+          "ms": 266.839875,
+          "exit": 0,
+          "load": [
+            34.36962890625,
+            30.70849609375,
+            37.50146484375
+          ]
+        },
+        "last_result": {
+          "result_rows": 0,
+          "text_hits": 6,
+          "count": null,
+          "semantic_rows": 0,
+          "meaning_lines": 1,
+          "stdout_bytes": 1793
+        },
+        "background_processes_ended": 0
+      },
+      "median_ratio": 0.5013269833043186,
+      "p95_ratio": 0.5759384692511815,
+      "name": "warm_hybrid",
+      "args": [
+        "how did the drafting go last run"
+      ],
+      "profile": "compact",
+      "expected_exit": 0,
+      "samples_per_lane": 20
+    }
+  ]
+}

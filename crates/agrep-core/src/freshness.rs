@@ -326,22 +326,13 @@ pub fn spawn(root: &DataRoot, binary: &Path) -> Result<bool> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(crate::logging::open(root)?);
+    // Its own process group keeps terminal signals from the worker. A pre_exec hook
+    // would force fork+exec and make the command wait until the child is scheduled
+    // and execs; without one std uses posix_spawn. __work lowers its own priority.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::setsid() < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::getpriority(libc::PRIO_PROCESS, 0) < 10
-                    && libc::setpriority(libc::PRIO_PROCESS, 0, 10) < 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        cmd.process_group(0);
     }
     #[cfg(windows)]
     {

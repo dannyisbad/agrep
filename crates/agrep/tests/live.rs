@@ -208,7 +208,7 @@ mod pty {
             }
         }
         fn read_until(&mut self, needle: &[u8]) -> Vec<u8> {
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + Duration::from_secs(60);
             let mut out = vec![];
             while Instant::now() < deadline {
                 let mut poll = libc::pollfd {

@@ -10,7 +10,13 @@ use rusqlite::{params, Connection};
 pub use semantic_model::{installed, provision};
 pub use semantic_policy::eligible;
 pub use semantic_store::{coverage, initialize, reclaim, reset, Coverage};
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 pub struct SearchResults {
     pub result: Results,
@@ -133,17 +139,17 @@ pub fn drain(root: &DataRoot, explicit: bool) -> Result<usize> {
     Ok(total)
 }
 struct VectorScan {
-    blocks: Vec<semantic_store::Block>,
-    vector: Vec<f32>,
-    candidates: Vec<(usize, usize, f32)>,
+    names: Vec<String>,
+    /// (block, slot, upper bound, exact cosine) in descending bound order.
+    candidates: Vec<(usize, usize, f32, f32)>,
     total_rows: usize,
 }
 impl VectorScan {
-    fn new(blocks: Vec<semantic_store::Block>, vector: Vec<f32>) -> Result<Self> {
+    fn new(blocks: Vec<semantic_store::Block>, vector: &[f32]) -> Result<Self> {
         let _span = crate::semantic_profile::span("vector_scan_and_sort");
         use rayon::prelude::*;
         let started = std::time::Instant::now();
-        let (q, scale) = semantic_store::quantize(&vector)?;
+        let (q, scale) = semantic_store::quantize(vector)?;
         let total_rows = blocks.iter().map(|b| b.rows).sum();
         let mut candidates: Vec<_> = {
             let _span = crate::semantic_profile::span("vector_scan");
@@ -152,9 +158,9 @@ impl VectorScan {
                 .enumerate()
                 .flat_map_iter(|(b, block)| {
                     block
-                        .candidates(&q, scale, semantic_policy::FLOOR as f32)
+                        .candidates(&q, scale, vector, semantic_policy::FLOOR as f32)
                         .into_iter()
-                        .map(move |(slot, upper)| (b, slot, upper))
+                        .map(move |(slot, upper, exact)| (b, slot, upper, exact))
                 })
                 .collect()
         };
@@ -172,8 +178,7 @@ impl VectorScan {
             );
         }
         Ok(Self {
-            blocks,
-            vector,
+            names: blocks.into_iter().map(|b| b.name).collect(),
             candidates,
             total_rows,
         })
@@ -186,6 +191,8 @@ pub struct QueryWork {
     options: Options,
     family_diverse: bool,
     lane: Option<std::thread::JoinHandle<Result<VectorScan>>>,
+    /// Set when the caller starts waiting for the lane.
+    joined: Arc<AtomicBool>,
 }
 pub fn begin(
     root: &DataRoot,
@@ -193,7 +200,6 @@ pub fn begin(
     o: &Options,
     family_diverse: bool,
 ) -> Result<QueryWork> {
-    let started = std::time::Instant::now();
     if !installed(root) {
         bail!("semantic model not installed: run agrep setup");
     }
@@ -205,25 +211,45 @@ pub fn begin(
         let _span = crate::semantic_profile::span("semantic_coverage");
         coverage(c)?
     };
+    let joined = Arc::new(AtomicBool::new(false));
     let lane = if coverage.embedded == 0 {
         None
     } else {
-        let blocks = {
-            let _span = crate::semantic_profile::span("vector_block_open");
-            semantic_store::blocks(root, c)?
+        let listed = {
+            let _span = crate::semantic_profile::span("vector_block_list");
+            semantic_store::block_list(c)?
         };
-        if crate::semantic_profile::timing_enabled() {
-            eprintln!(
-                "{}",
-                serde_json::json!({"coverage_and_blocks_ms":started.elapsed().as_secs_f64()*1000.})
-            );
-        }
         let root = root.clone();
         let pattern = o.pattern.clone();
+        let options = o.clone();
+        let waiting = joined.clone();
         Some(crate::logging::spawn_semantic(move || {
-            let model = Embedder::query(&root)?;
-            let vector = model.embed(&[pattern])?.remove(0);
-            VectorScan::new(blocks, vector)
+            // Mapping and reading the blocks overlaps model loading and inference.
+            let (blocks, vector) = std::thread::scope(|scope| -> Result<_> {
+                let opened = {
+                    let root = &root;
+                    std::thread::Builder::new()
+                        .name("agrep-semantic-query".into())
+                        .spawn_scoped(scope, move || {
+                            let _span = crate::semantic_profile::span("vector_block_open");
+                            semantic_store::open_blocks(root, listed)
+                        })?
+                };
+                let vector =
+                    Embedder::query(&root).and_then(|model| Ok(model.embed(&[pattern])?.remove(0)));
+                let blocks = opened.join().map_err(crate::logging::panic_error)?;
+                Ok((blocks, vector))
+            })?;
+            let scan = VectorScan::new(blocks?, &vector?)?;
+            // While the keyword lane still runs, the same resolution on this thread's
+            // own snapshot pages in the rows `finish` reads; its result is discarded.
+            if !waiting.load(Ordering::Relaxed) {
+                if let Ok(reader) = store::reader(&root) {
+                    let _span = crate::semantic_profile::span("vector_prefetch");
+                    let _ = resolve_scan(&reader, &options, family_diverse, &scan, Some(&waiting));
+                }
+            }
+            Ok(scan)
         })?)
     };
     Ok(QueryWork {
@@ -231,12 +257,15 @@ pub fn begin(
         options: o.clone(),
         family_diverse,
         lane,
+        joined,
     })
 }
 pub fn finish(c: &Connection, work: QueryWork) -> Result<SearchResults> {
     let mut result = if let Some(lane) = work.lane {
+        work.joined.store(true, Ordering::Relaxed);
         let scan = lane.join().map_err(crate::logging::panic_error)??;
-        resolve_scan(c, &work.options, work.family_diverse, scan)?
+        let _span = crate::semantic_profile::span("vector_refine");
+        resolve_scan(c, &work.options, work.family_diverse, &scan, None)?
     } else {
         let mut r = Results::default();
         r.total_basis = "exact".into();
@@ -266,21 +295,22 @@ pub fn search_vector(
         c,
         o,
         family_diverse,
-        VectorScan::new(semantic_store::blocks(root, c)?, vector.to_vec())?,
+        &VectorScan::new(semantic_store::blocks(root, c)?, vector)?,
+        None,
     )
 }
+/// `stop` ends a speculative resolution before its next row lookup.
 fn resolve_scan(
     c: &Connection,
     o: &Options,
     family_diverse: bool,
-    scan: VectorScan,
+    scan: &VectorScan,
+    stop: Option<&AtomicBool>,
 ) -> Result<Results> {
-    let _span = crate::semantic_profile::span("vector_refine");
     let started = std::time::Instant::now();
-    let mut refined = 0usize;
+    let (mut refined, mut resolved) = (0usize, 0usize);
     let VectorScan {
-        blocks,
-        vector,
+        names,
         candidates,
         total_rows,
     } = scan;
@@ -311,12 +341,11 @@ fn resolve_scan(
             .then(a.who.cmp(&b.who))
     };
     let mut exhausted = true;
-    for (block, slot, upper) in candidates {
+    for &(block, slot, upper, score) in candidates {
         if o.sort == "score" && hits.len() > want && upper < hits[want].score as f32 {
             exhausted = false;
             break;
         }
-        let score = blocks[block].exact_score(slot, &vector);
         refined += 1;
         if (score as f64) < semantic_policy::FLOOR {
             continue;
@@ -327,7 +356,11 @@ fn resolve_scan(
             exhausted = false;
             continue;
         }
-        let rows = resolve.query_map(params![blocks[block].name, slot], |r| {
+        if stop.is_some_and(|s| s.load(Ordering::Relaxed)) {
+            break;
+        }
+        resolved += 1;
+        let rows = resolve.query_map(params![names[block], slot], |r| {
             Ok((
                 Hit {
                     rowid: r.get(0)?,
@@ -404,15 +437,15 @@ fn resolve_scan(
     if crate::semantic_profile::timing_enabled() {
         eprintln!(
             "{}",
-            serde_json::json!({"refine_resolve_ms":started.elapsed().as_secs_f64()*1000.,"refined":refined})
+            serde_json::json!({"refine_resolve_ms":started.elapsed().as_secs_f64()*1000.,"refined":refined,"resolved":resolved,"prefetch":stop.is_some()})
         );
     }
     result.total = matched_groups.len();
     hits.truncate(want);
     result.hits = hits;
     result.total_basis = if exhausted { "exact" } else { "floor" }.into();
-    result.examined = total_rows;
-    result.blocks = blocks.len();
+    result.examined = *total_rows;
+    result.blocks = names.len();
     Ok(result)
 }
 
@@ -610,6 +643,7 @@ mod tests {
             options,
             family_diverse: false,
             lane: Some(crate::logging::spawn_semantic(|| panic!("test inference panic")).unwrap()),
+            joined: Default::default(),
         };
         let error = finish(&store::reader(&root).unwrap(), work).err().unwrap();
         assert!(format!("{error:#}").contains("test inference panic"));
@@ -692,7 +726,7 @@ mod tests {
         let c = store::reader(&r).unwrap();
         let mut q = vec![0f32; semantic_model::DIM];
         q[0] = 1.;
-        let scan = VectorScan::new(semantic_store::blocks(&r, &c).unwrap(), q.clone()).unwrap();
+        let scan = VectorScan::new(semantic_store::blocks(&r, &c).unwrap(), &q).unwrap();
         store::writer(&r)
             .unwrap()
             .execute(
@@ -700,7 +734,7 @@ mod tests {
                 [store::digest("new body")],
             )
             .unwrap();
-        let old = resolve_scan(&c, &o, true, scan).unwrap();
+        let old = resolve_scan(&c, &o, true, &scan, None).unwrap();
         assert_eq!(old.hits[0].text, "connection timeout row 1");
         assert!(search_vector(&r, &store::reader(&r).unwrap(), &o, true, &q)
             .unwrap()

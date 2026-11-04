@@ -1,0 +1,771 @@
+{
+  "workload": "dense",
+  "requested_rows": 2000000,
+  "text_bytes": 150888896,
+  "source_bytes": 413557858,
+  "runs": 20,
+  "build_runs": 3,
+  "versions": {
+    "reference": "agrep 0.4.9 distribution 3b9a9a5a46932c7dd733 runtime b4fad94fcff89a13600f native b6c37eecd7f9d76c43bb writer 335673c58e49894778d6",
+    "candidate": "agrep 0.5.0"
+  },
+  "host": {
+    "os": "macos",
+    "arch": "aarch64",
+    "cpus": 12
+  },
+  "scope": "fresh processes through full exit, samples alternating reference and candidate, every sample kept; index samples of the reference end when its queued search-database build is served; one recorded warm-up per lane before warm cases; background processes of both lanes ended between cases",
+  "schedule": "runs (build_runs for first builds and first hybrid queries) samples per lane, unless the first min(5, ceil(runs/2)) pairs are completely separated: every candidate sample slower than every reference sample ends the case; every candidate sample faster stops the reference while the candidate completes its samples alone, and the case ends when all of them stay faster than every reference sample, else the reference resumes to its full count",
+  "gate": "every case: candidate median < reference median and candidate p95 < reference p95 over the samples taken, with every sample of both lanes verified and each lane holding exactly the samples its schedule asked for",
+  "preparation": {},
+  "summary": {
+    "cases": 3,
+    "wins": 2,
+    "losses": 1,
+    "reference_failures": 0,
+    "candidate_failures": 0,
+    "both_failed": 0
+  },
+  "gate_failures": [
+    "no_change_index: missing case",
+    "one_session_refresh: missing case",
+    "search_changed_source: missing case",
+    "old_dense_no_auto: missing case",
+    "old_dense_word: missing case",
+    "old_dense_regex: missing case",
+    "old_dense_time: missing case",
+    "old_dense_agent: missing case",
+    "old_dense_project: missing case",
+    "old_dense_since: missing case",
+    "old_dense_count: missing case",
+    "version_control: missing case",
+    "first_index: loss (median ratio 1.558, p95 ratio 1.175)"
+  ],
+  "cases": [
+    {
+      "verdict": "loss",
+      "reference_failure": null,
+      "candidate_failure": null,
+      "reference": {
+        "median_ms": 92723.920125,
+        "p95_ms": 130019.41970900001,
+        "samples_ms": [
+          130019.41970900001,
+          92723.920125,
+          85872.524334
+        ],
+        "exit_codes": [
+          0,
+          0,
+          0
+        ],
+        "verified": [
+          true,
+          true,
+          true
+        ],
+        "load_averages": [
+          [
+            35.3486328125,
+            30.0947265625,
+            29.85302734375
+          ],
+          [
+            38.88916015625,
+            44.61083984375,
+            37.650390625
+          ],
+          [
+            28.88427734375,
+            39.00732421875,
+            37.11669921875
+          ]
+        ],
+        "process_exit_ms": [
+          8223.793875,
+          18656.903334,
+          9692.828292
+        ],
+        "warmup": null,
+        "last_result": {
+          "result_rows": 0,
+          "text_hits": 0,
+          "count": null,
+          "semantic_rows": 0,
+          "meaning_lines": 0,
+          "stdout_bytes": 1113
+        },
+        "background_processes_ended": 3
+      },
+      "candidate": {
+        "median_ms": 144434.64375,
+        "p95_ms": 152796.83937499998,
+        "samples_ms": [
+          144434.64375,
+          121537.419458,
+          152796.83937499998
+        ],
+        "exit_codes": [
+          0,
+          0,
+          0
+        ],
+        "verified": [
+          true,
+          true,
+          true
+        ],
+        "load_averages": [
+          [
+            52.6796875,
+            44.91015625,
+            36.20751953125
+          ],
+          [
+            38.5888671875,
+            45.16943359375,
+            38.71044921875
+          ],
+          [
+            25.51220703125,
+            35.7451171875,
+            36.0615234375
+          ]
+        ],
+        "process_exit_ms": [
+          144434.64299999998,
+          121537.418833,
+          152796.836209
+        ],
+        "warmup": null,
+        "last_result": {
+          "result_rows": 0,
+          "text_hits": 0,
+          "count": null,
+          "semantic_rows": 0,
+          "meaning_lines": 0,
+          "stdout_bytes": 657
+        },
+        "background_processes_ended": 0,
+        "unpaired_samples": []
+      },
+      "median_ratio": 1.5576848299261872,
+      "p95_ratio": 1.175184750993188,
+      "schedule": {
+        "planned_samples": 3,
+        "early_pairs": 2,
+        "stop": "full",
+        "reference_samples": 3,
+        "candidate_samples": 3
+      },
+      "name": "first_index",
+      "args": [
+        "index"
+      ],
+      "profile": "classic",
+      "expected_exit": 0
+    },
+    {
+      "verdict": "win",
+      "reference_failure": null,
+      "candidate_failure": null,
+      "reference": {
+        "median_ms": 20291.164625,
+        "p95_ms": 21528.144708,
+        "samples_ms": [
+          21528.144708,
+          16235.290834000001,
+          21050.397375,
+          20291.164625,
+          15751.741458999999
+        ],
+        "exit_codes": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "verified": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "load_averages": [
+          [
+            44.4130859375,
+            38.42724609375,
+            36.9775390625
+          ],
+          [
+            43.212890625,
+            38.62060546875,
+            37.0849609375
+          ],
+          [
+            40.3623046875,
+            38.20068359375,
+            36.96044921875
+          ],
+          [
+            36.5830078125,
+            37.427734375,
+            36.712890625
+          ],
+          [
+            33.603515625,
+            36.6875,
+            36.46337890625
+          ]
+        ],
+        "warmup": {
+          "ms": 10359.5355,
+          "exit": 0,
+          "load": [
+            43.23974609375,
+            38.02734375,
+            36.8232421875
+          ]
+        },
+        "last_result": {
+          "result_rows": 40,
+          "text_hits": 40,
+          "count": null,
+          "semantic_rows": 0,
+          "meaning_lines": 0,
+          "stdout_bytes": 13259,
+          "oracle_match": true
+        },
+        "background_processes_ended": 2
+      },
+      "candidate": {
+        "median_ms": 92.806416,
+        "p95_ms": 409.514208,
+        "samples_ms": [
+          92.806416,
+          104.841375,
+          549.1844580000001,
+          409.514208,
+          358.607834,
+          102.43279199999999,
+          83.624625,
+          85.674,
+          97.789166,
+          92.666416,
+          89.301459,
+          90.166,
+          88.146875,
+          90.26308399999999,
+          80.20037500000001,
+          82.626209,
+          79.272541,
+          96.66404200000001,
+          96.688833,
+          98.373666
+        ],
+        "exit_codes": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "verified": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "load_averages": [
+          [
+            43.212890625,
+            38.62060546875,
+            37.0849609375
+          ],
+          [
+            40.3623046875,
+            38.20068359375,
+            36.96044921875
+          ],
+          [
+            36.5830078125,
+            37.427734375,
+            36.712890625
+          ],
+          [
+            33.603515625,
+            36.6875,
+            36.46337890625
+          ],
+          [
+            32.1669921875,
+            36.2265625,
+            36.302734375
+          ],
+          [
+            32.1669921875,
+            36.2265625,
+            36.302734375
+          ],
+          [
+            32.1669921875,
+            36.2265625,
+            36.302734375
+          ],
+          [
+            32.1669921875,
+            36.2265625,
+            36.302734375
+          ],
+          [
+            32.1669921875,
+            36.2265625,
+            36.302734375
+          ],
+          [
+            32.1669921875,
+            36.2265625,
+            36.302734375
+          ],
+          [
+            32.1669921875,
+            36.2265625,
+            36.302734375
+          ],
+          [
+            32.1669921875,
+            36.2265625,
+            36.302734375
+          ],
+          [
+            32.1669921875,
+            36.2265625,
+            36.302734375
+          ],
+          [
+            32.1669921875,
+            36.2265625,
+            36.302734375
+          ],
+          [
+            32.1669921875,
+            36.2265625,
+            36.302734375
+          ],
+          [
+            32.1669921875,
+            36.2265625,
+            36.302734375
+          ],
+          [
+            32.1669921875,
+            36.2265625,
+            36.302734375
+          ],
+          [
+            32.1669921875,
+            36.2265625,
+            36.302734375
+          ],
+          [
+            32.1669921875,
+            36.2265625,
+            36.302734375
+          ],
+          [
+            32.1669921875,
+            36.2265625,
+            36.302734375
+          ]
+        ],
+        "warmup": {
+          "ms": 140.414875,
+          "exit": 0,
+          "load": [
+            44.4130859375,
+            38.42724609375,
+            36.9775390625
+          ]
+        },
+        "last_result": {
+          "result_rows": 40,
+          "text_hits": 40,
+          "count": null,
+          "semantic_rows": 0,
+          "meaning_lines": 0,
+          "stdout_bytes": 13121
+        },
+        "background_processes_ended": 0,
+        "unpaired_samples": [
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19
+        ]
+      },
+      "median_ratio": 0.004573735303771406,
+      "p95_ratio": 0.019022271243272618,
+      "schedule": {
+        "planned_samples": 20,
+        "early_pairs": 5,
+        "stop": "early_win",
+        "reference_samples": 5,
+        "candidate_samples": 20
+      },
+      "name": "old_dense",
+      "args": [
+        "deepold",
+        "--json",
+        "-n",
+        "40"
+      ],
+      "profile": "classic",
+      "expected_exit": 0
+    },
+    {
+      "verdict": "win",
+      "reference_failure": null,
+      "candidate_failure": null,
+      "reference": {
+        "median_ms": 128537.70125,
+        "p95_ms": 192910.95075000002,
+        "samples_ms": [
+          192910.95075000002,
+          145206.838292,
+          128537.70125,
+          76194.761375,
+          50827.365708000005
+        ],
+        "exit_codes": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "verified": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "load_averages": [
+          [
+            28.2314453125,
+            34.5810546875,
+            35.6875
+          ],
+          [
+            130.60595703125,
+            66.30517578125,
+            47.625
+          ],
+          [
+            98.50537109375,
+            86.0615234375,
+            59.1767578125
+          ],
+          [
+            104.8125,
+            90.25390625,
+            64.4384765625
+          ],
+          [
+            99.451171875,
+            92.7666015625,
+            67.6318359375
+          ]
+        ],
+        "warmup": {
+          "ms": 38551.626542,
+          "exit": 0,
+          "load": [
+            32.1669921875,
+            36.2265625,
+            36.302734375
+          ]
+        },
+        "last_result": {
+          "result_rows": 40,
+          "text_hits": 40,
+          "count": null,
+          "semantic_rows": 0,
+          "meaning_lines": 0,
+          "stdout_bytes": 13330,
+          "oracle_match": true
+        },
+        "background_processes_ended": 2
+      },
+      "candidate": {
+        "median_ms": 163.602458,
+        "p95_ms": 666.9185,
+        "samples_ms": [
+          666.9185,
+          855.6495,
+          560.838375,
+          115.282167,
+          169.70433300000002,
+          166.34325,
+          162.508042,
+          200.16270799999998,
+          163.602458,
+          148.0915,
+          161.97304100000002,
+          177.206042,
+          165.31520799999998,
+          147.842708,
+          150.18362499999998,
+          154.564958,
+          188.20291699999999,
+          156.36191599999998,
+          116.808666,
+          142.31574999999998
+        ],
+        "exit_codes": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "verified": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "load_averages": [
+          [
+            130.60595703125,
+            66.30517578125,
+            47.625
+          ],
+          [
+            98.50537109375,
+            86.0615234375,
+            59.1767578125
+          ],
+          [
+            104.8125,
+            90.25390625,
+            64.4384765625
+          ],
+          [
+            99.451171875,
+            92.7666015625,
+            67.6318359375
+          ],
+          [
+            73.193359375,
+            86.33447265625,
+            66.66259765625
+          ],
+          [
+            73.193359375,
+            86.33447265625,
+            66.66259765625
+          ],
+          [
+            71.416015625,
+            85.74755859375,
+            66.57080078125
+          ],
+          [
+            71.416015625,
+            85.74755859375,
+            66.57080078125
+          ],
+          [
+            71.416015625,
+            85.74755859375,
+            66.57080078125
+          ],
+          [
+            71.416015625,
+            85.74755859375,
+            66.57080078125
+          ],
+          [
+            71.416015625,
+            85.74755859375,
+            66.57080078125
+          ],
+          [
+            71.416015625,
+            85.74755859375,
+            66.57080078125
+          ],
+          [
+            71.416015625,
+            85.74755859375,
+            66.57080078125
+          ],
+          [
+            71.416015625,
+            85.74755859375,
+            66.57080078125
+          ],
+          [
+            71.416015625,
+            85.74755859375,
+            66.57080078125
+          ],
+          [
+            71.416015625,
+            85.74755859375,
+            66.57080078125
+          ],
+          [
+            71.416015625,
+            85.74755859375,
+            66.57080078125
+          ],
+          [
+            71.416015625,
+            85.74755859375,
+            66.57080078125
+          ],
+          [
+            71.416015625,
+            85.74755859375,
+            66.57080078125
+          ],
+          [
+            71.416015625,
+            85.74755859375,
+            66.57080078125
+          ]
+        ],
+        "warmup": {
+          "ms": 697.097666,
+          "exit": 0,
+          "load": [
+            28.2314453125,
+            34.5810546875,
+            35.6875
+          ]
+        },
+        "last_result": {
+          "result_rows": 40,
+          "text_hits": 40,
+          "count": null,
+          "semantic_rows": 0,
+          "meaning_lines": 0,
+          "stdout_bytes": 13330
+        },
+        "background_processes_ended": 0,
+        "unpaired_samples": [
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19
+        ]
+      },
+      "median_ratio": 0.001272797447044744,
+      "p95_ratio": 0.003457131372828507,
+      "schedule": {
+        "planned_samples": 20,
+        "early_pairs": 5,
+        "stop": "early_win",
+        "reference_samples": 5,
+        "candidate_samples": 20
+      },
+      "name": "old_dense_phrase",
+      "args": [
+        "deepold ordinary",
+        "--json",
+        "-n",
+        "40"
+      ],
+      "profile": "classic",
+      "expected_exit": 0
+    }
+  ]
+}

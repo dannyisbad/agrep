@@ -1,5 +1,73 @@
 # 0.5.0 keyword engine
 
+## Dense first build: parallel family statistics
+
+A measured checkpoint, **not SPEC §9 acceptance**. The dense 2M first index was the matched run's only dense loss (0.4.9 114.8 s, 0.5 187.9 s, at loads 34–105). Its profile spent about 37 s in family statistics, 11 s in FTS segments forced by 64-row statements, and 7 s each in secondary indexes and parser graph pages. Derived data is unchanged.
+
+### What changed
+
+- **Family statistics in parallel.** The first build tallied per-family token counts on one thread, fed by a query that read every row through the time index and sorted the result by family, and each row built two sets of owned strings. One id-order pass now assigns visible rows to families; each family's rows are read in runs of consecutive ids and tallied on the pool, every token going straight into its family's count, once per row and column. Tokens of up to four bytes, nearly all of them, are packed into integer keys. `family_stats`, written on every build and read by nothing, is removed.
+- **One row per FTS statement.** A multi-row INSERT opens a statement savepoint, and FTS5 flushes its pending terms into a new segment at every savepoint, so each 64-row statement wrote a segment for the merges to rewrite. Single-row statements leave flushing to the 16 MiB pending-term limit.
+- **Parser graph pages.** A replaced source no longer reads back the graph pages it has just deleted, and pages are packed in parallel batches of about 8,192 nodes instead of one pool round trip per source. Packing on the pool while the writer went on was measured and dropped: on the live history it competed with the writer, and graph time rose from 18–26 s to 31–36 s (`rejected_variant` in the [report](measurements/first-build-eng.json)).
+
+Every derived table is identical between the previous head (951fc4cd) and this binary on the dense corpus and on a frozen clone of the owner's history: prose rows, sessions, row and term statistics, family token counts (decoded), `prose_terms`, both FTS vocabularies, parser graph pages byte for byte, block bounds and tool words. A unit test compares the new tally with the original per-row token sets across chunk boundaries, interleaved and contiguous families, orphan and invisible rows and Unicode text, then refreshes incrementally from the new bodies.
+
+### First builds, paired
+
+ABBA pairs of fresh processes into empty data directories; every sample and load is in the [report](measurements/first-build-eng.json). The real-history pairs indexed one APFS clone of the owner's Claude, Codex and OMP stores, so both binaries read identical inputs.
+
+| Corpus | Previous head s | This binary s | Load 1 min |
+|---|---:|---:|---|
+| dense 2M | 83.5, 79.9 | 43.2, 45.3 | 12–16 |
+| real history (frozen clone) | 179.4, 174.4 | 154.7, 169.8 | 12–20 |
+
+| Phase s, previous head → this binary | Dense 2M | Real history |
+|---|---|---|
+| statistics | 34.0, 32.1 → 5.7, 6.2 | 6.7, 6.5 → 3.3, 3.5 |
+| FTS | 18.2, 18.5 → 10.4, 11.7 | 38.3, 36.3 → 28.9, 29.9 |
+| parser graph pages | 6.2, 5.6 → 3.5, 4.9 | 27.5, 27.1 → 15.9, 26.2 |
+| secondary indexes | 5.7, 6.0 → 5.6, 5.4 | 3.6, 3.2 → 3.4, 3.6 |
+
+### Matched against 0.4.9
+
+`matched --workload dense --only first_index,old_dense,old_dense_project,old_dense_count,version_control`, a diagnostic subset, so its gate lists the other cases as missing. 0.4.9 and this binary alternated on one generated 2M corpus with temporary data directories ([report](measurements/matched-dense-2000000-eng.json)):
+
+| Case | 0.4.9 p50 / p95 ms | This binary p50 / p95 ms | Load 1 min |
+|---|---:|---:|---|
+| first_index | 62,874 / 72,491 | 42,718 / 45,923 | 9–16 |
+| old_dense | 6,462 / 6,945 | 63.0 / 75.6 | 11–13 |
+| old_dense_project | 1,297 / 1,992 | 103.4 / 119.1 | 11 |
+| old_dense_count | 631 / 1,523 | 142.8 / 258.7 | 21–32 |
+| version_control | 44.0 / 72.9 | 10.0 / 13.8 | 31 |
+
+0.4.9's first index took 62.9 s at load 11–16 here, against 114.8 s at loads 34–105 in the earlier matched run.
+
+### Where the remaining time goes
+
+- **Dense**, profiled at load about 100 (durations inflated): FTS 10 s (trigram tokenizing about 3 s, docsize rows 1.7 s, segment flushes 1.4 s, the final merge 3.3 s); row writes 8 s, about 3 s of it reply shapes and 2.3 s prose inserts; five secondary indexes 5 s; the semantic queue filled after the build 2.7 s; `prose_terms` read from the FTS vocabulary 2.3 s; family statistics 2.2 s, half of it the `row_stats` join. SQLite's sorter worker threads (`PRAGMA threads=4`, with the build's or a smaller cache) built the five indexes in 6.0–7.0 s against 6.1 s without, so they stay off.
+- **Real history**: parsing 26–30 s, row writes 31–35 s, FTS 29–30 s, graph pages 16–26 s, the tool dictionary 14 s.
+
+## Selective metadata scopes read their text index
+
+A measured checkpoint, **not SPEC §9 acceptance**. A scope at most the selectivity limit (`--agent codex --since 14d`: 581 prose and 9,736 tool rows) was scanned by decoding and scoring every row, once per tier: 20,634 decoded rows and 130–280 ms of hydration per query, the cause of the four filtered real-history losses. The scan now keeps its order, ceilings and floor marking, so the same rows fill the page and the same totals and bases result, but a row is decoded only if the lane's text index admits it. The admission sets use the expressions unselective plans already rely on as necessary conditions (positional word plans for phrases, the two rarest groups otherwise), with one rowid-range query per run of consecutive scope blocks; a run under 32 scope rows is decoded directly. The scope probe now returns its per-block row counts from SQL. On that scope, flaky decodes 26 rows instead of 20,634 and its retrieval fell from 170 to 24 ms.
+
+Results are unchanged: stdout, stderr and exit codes of the previous head (a2aebecb) and this binary are byte-identical on **682 of 682** real-history cases with one interposed wall-clock instant, except the random saved-page handle in compact stderr (11 queries across 14 scopes, in text, JSON, `-l`, `-c`, `-n 0`, `--sort time`, `-n 5` and compact). A new integration test fails before the change: on a 3,136-row scope it requires pages identical to the unscoped and exhaustive rankings, exact totals when the page is not full, and fewer than 512 decoded rows.
+
+Twenty ABBA-interleaved fresh-process pairs per case on one isolated index of the owner's history, normal census and detached refresh. 0.4.9 numbers are from the matched run, at different loads; a matched rerun against 0.4.9 under the same load is still needed. [Every sample and load](measurements/selective-scope-eng.json), including a first campaign at load 13–18 (flaky 233.3 → 63.6 ms, natural 415.1 → 132.4, list 226.3 → 84.9, rare_hit 226.9 → 73.5) with a per-block variant of the same change.
+
+| Case | 0.4.9 matched p50 / p95 ms | Previous head p50 / p95 ms | This binary p50 / p95 ms | Head ÷ new | Load 1 / 5 / 15 |
+|---|---:|---:|---:|---:|---|
+| natural_filtered | 174 / 267 | 269 / 324 | 100 / 188 | 2.69× | 50 / 86 / 78 |
+| flaky_filtered | 122 / 170 | 300 / 361 | 166 / 241 | 1.81× | 47 / 84 / 77 |
+| list_filtered | 268 / 424 | 314 / 372 | 133 / 180 | 2.35× | 45 / 83 / 77 |
+| rare_hit_filtered | 246 / 2116 | 285 / 326 | 118 / 162 | 2.41× | 44 / 81 / 76 |
+| release_filtered | 213 / 318 | 198 / 244 | 131 / 187 | 1.52× | 42 / 80 / 76 |
+| rare_filtered | 288 / 379 | 289 / 386 | 118 / 163 | 2.45× | 38 / 77 / 75 |
+| regex_filtered | 273 / 1116 | 190 / 224 | 148 / 173 | 1.28× | 36 / 75 / 74 |
+| json_filtered | 442 / 825 | 195 / 220 | 96 / 138 | 2.02× | 35 / 74 / 74 |
+
+error, short, count and rare_hit_pi filtered run unchanged plans (a common term, a two-character term, counts, an unselective scope) and stayed within noise. After this change the census (40–90 ms under load, concurrent) is the critical path of these commands; in-process, the natural query still spends about 10 ms planning (tool expansions, the phrase regex) and 13 ms in SQLite.
+
 ## V9: recall and pack windows and depth
 
 A measured checkpoint, **not SPEC §9 acceptance**. The previous head (ffc57df4) and this binary ran on one isolated index of the owner's history, built read-only by the previous head, in ABBA-interleaved pairs of fresh processes with normal census and detached refresh, so both saw the same load. The machine was far busier than for V8 (median loads 60–113). Every sample and load is kept: [report](measurements/recall-pack-w3.json).

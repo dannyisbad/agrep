@@ -2005,6 +2005,76 @@ fn selective_tool_stream_keeps_exact_winners_across_tiers_and_folded_filters() {
 }
 
 #[test]
+fn selective_scope_decodes_only_rows_the_text_index_admits() {
+    use serde_json::json;
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let data = temp.path().join("data");
+    let path = home.join(".pi/agent/sessions/test/scope.jsonl");
+    let mut rows =
+        vec![json!({"type":"session","id":"selective-scope","version":3,"cwd":"/work/test"})];
+    let mut parent = Value::Null;
+    for i in 0..3072 {
+        if i % 48 == 0 {
+            let prompt = format!("prompt-{i}");
+            let text = if i % 96 == 0 {
+                format!("needle uncommon prompt {i}")
+            } else {
+                format!("plain prompt {i}")
+            };
+            rows.push(json!({"type":"message","id":prompt,"parentId":parent,"message":{"role":"user","content":text}}));
+            parent = json!(prompt);
+        }
+        let call = format!("call-{i}");
+        let result = format!("result-{i}");
+        let output = match i % 101 {
+            0 => format!("needle uncommon result {i}"),
+            50 => format!("uncommon then needle {i}"),
+            _ => format!("ordinary result {i}"),
+        };
+        rows.push(json!({"type":"message","id":call,"parentId":parent,"message":{"role":"assistant","content":[{"type":"toolCall","id":call,"name":"shell","arguments":{"command":"inspect"}}]}}));
+        rows.push(json!({"type":"message","id":result,"parentId":call,"message":{"role":"toolResult","toolCallId":call,"content":output}}));
+        parent = json!(result);
+    }
+    write_records(&path, &rows, false);
+    ok(cli(&home, &data, &["index"]));
+    let c = store::reader(&DataRoot::open(&data, false).unwrap()).unwrap();
+    let handles = |r: &agrep_core::query::Results| {
+        r.hits.iter().map(|h| h.handle.clone()).collect::<Vec<_>>()
+    };
+    for (pattern, chats) in [
+        ("needle uncommon", false),
+        ("uncommon needle", false),
+        ("needle", false),
+        ("needle uncommon", true),
+    ] {
+        for limit in [20, 400] {
+            let mut options = retrieval_options(pattern);
+            options.limit = limit;
+            options.tools = true;
+            options.chats = chats;
+            let everywhere = agrep_core::query::search(&c, &options).unwrap();
+            options.filters.agent = Some("pi".into());
+            let scoped = agrep_core::query::search(&c, &options).unwrap();
+            options.exact = true;
+            let exact = agrep_core::query::search(&c, &options).unwrap();
+            assert!(!scoped.hits.is_empty(), "{pattern}");
+            assert_eq!(handles(&scoped), handles(&everywhere), "{pattern}");
+            assert_eq!(handles(&scoped), handles(&exact), "{pattern}");
+            if scoped.hits.len() < limit {
+                assert_eq!(
+                    (scoped.total, scoped.total_basis.as_str()),
+                    (exact.total, "exact"),
+                    "{pattern}"
+                );
+            }
+            // The scope holds 3,136 rows; only rows holding the terms are decoded.
+            assert!(scoped.examined < 512, "{pattern}: {}", scoped.examined);
+        }
+    }
+}
+
+#[test]
 fn initial_single_source_metadata_uses_visible_rows_and_first_prompt() {
     use serde_json::json;
     let t = TempDir::new().unwrap();
@@ -2374,4 +2444,164 @@ fn measured_query(
         },
     )
     .unwrap()
+}
+/// Two pi chats for recall coverage expansion: a small one the budget can show whole,
+/// and a long one whose other turns name single query terms.
+fn expansion_fixture(home: &Path) {
+    let base = home.join(".pi/agent/sessions/project");
+    fs::create_dir_all(&base).unwrap();
+    let notes = |turn: usize, n: usize| {
+        (0..n)
+            .map(|j| format!("note{turn}-{j}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let write = |name: &str, id: &str, day: usize, texts: Vec<String>| {
+        let mut lines = vec![serde_json::json!({"type":"session","id":id,"version":3,"cwd":"/work/project","timestamp":format!("2026-10-{day:02}T12:00:00Z")}).to_string()];
+        for (i, text) in texts.iter().enumerate() {
+            lines.push(serde_json::json!({"type":"message","id":format!("m{i}"),"parentId":if i == 0 {Value::Null} else {Value::String(format!("m{}", i - 1))},"timestamp":format!("2026-10-{day:02}T12:{i:02}:00Z"),"message":{"role":"user","content":text}}).to_string());
+        }
+        fs::write(base.join(name), lines.join("\n") + "\n").unwrap();
+    };
+    let mut small: Vec<String> = (0..6)
+        .map(|i| format!("small turn {i} {}", notes(i, 5)))
+        .collect();
+    small[0] = format!("where is the cobalt lantern checklist {}", notes(0, 5));
+    write("small.jsonl", "small-session", 1, small);
+    let mut large: Vec<String> = (0..40)
+        .map(|i| format!("large turn {i} {}", notes(i, 400)))
+        .collect();
+    large[20] = format!("the cobalt lantern checklist moved {}", notes(20, 400));
+    large[5] = format!("a cobalt note {}", notes(5, 400));
+    large[35] = format!("a lantern note {}", notes(35, 400));
+    write("large.jsonl", "large-session", 2, large);
+}
+/// The block of `text` whose head names `handle_prefix`, as turn numbers and gap lines.
+fn block_turns(text: &str, handle_prefix: &str) -> Vec<String> {
+    text.split("\n\n")
+        .find(|block| block.starts_with(&format!("── {handle_prefix}")))
+        .unwrap_or_else(|| panic!("no block for {handle_prefix}: {text}"))
+        .lines()
+        .skip(1)
+        .map(|line| {
+            let line = line.trim_start();
+            if line.starts_with('[') {
+                line.to_owned()
+            } else {
+                line.split_whitespace().next().unwrap().to_owned()
+            }
+        })
+        .collect()
+}
+#[test]
+fn recall_shows_fitting_chats_whole_and_covers_other_query_turns() {
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let d = t.path().join("d");
+    expansion_fixture(&h);
+    ok(cli(&h, &d, &["index"]));
+    let out = ok(cli(&h, &d, &["recall", "cobalt lantern"]));
+    let text = String::from_utf8(out.stdout).unwrap();
+    let turns = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    // agrep 0.4.9 renders this page byte for byte: the small chat fits its share and is
+    // shown whole; the long chat adds one-turn windows around the turns holding a query
+    // term, merged into its block with the turns between them named.
+    assert_eq!(
+        block_turns(&text, "@small-se:0."),
+        turns(&["0", "1", "2", "3", "4", "5"])
+    );
+    assert_eq!(
+        block_turns(&text, "@large-se:20."),
+        turns(&[
+            "4",
+            "5",
+            "6",
+            "[turns 7-17 not shown]",
+            "18",
+            "19",
+            "20",
+            "21",
+            "22",
+            "[turns 23-33 not shown]",
+            "34",
+            "35",
+            "36"
+        ])
+    );
+    // An uncapped page has no share to fill: each hit keeps its own window.
+    let out = ok(cli(&h, &d, &["recall", "cobalt lantern", "--budget", "0"]));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(block_turns(&text, "@small-se:0."), turns(&["0", "1", "2"]));
+    assert_eq!(
+        block_turns(&text, "@large-se:20."),
+        turns(&["18", "19", "20", "21", "22"])
+    );
+    // The JSON page carries the same merged windows.
+    let out = ok(cli(&h, &d, &["recall", "cobalt lantern", "--json"]));
+    let page: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rows = |hit: &Value| {
+        hit["window"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["turn"].as_i64().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        rows(&page["hits"][0]),
+        [4, 5, 6, 18, 19, 20, 21, 22, 34, 35, 36]
+    );
+    assert_eq!(rows(&page["hits"][1]), [0, 1, 2, 3, 4, 5]);
+}
+/// `golden` with its UTC head times rendered in this machine's zone, as the CLI renders them.
+fn localized(golden: &str, utc: &[&str]) -> String {
+    let mut out = golden.to_owned();
+    for stamp in utc {
+        let local = chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d %H:%M")
+            .unwrap()
+            .and_utc()
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
+        out = out.replace(stamp, &local);
+    }
+    out
+}
+#[test]
+fn recall_fits_budgets_like_0_4_9() {
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let d = t.path().join("d");
+    expansion_fixture(&h);
+    ok(cli(&h, &d, &["index"]));
+    // The goldens are agrep 0.4.9's pages for this fixture: blocks share the budget with a
+    // double share for the first, messages are capped to their block's share, and the
+    // farthest context turns give way first.
+    for budget in ["8000", "4000"] {
+        let out = ok(cli(
+            &h,
+            &d,
+            &["recall", "cobalt lantern", "--lexical", "--budget", budget],
+        ));
+        let golden = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("tests/golden/recall-expansion-{budget}.txt")),
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            localized(&golden, &["2026-10-02 12:20", "2026-10-01 12:00"]),
+            "--budget {budget}"
+        );
+    }
+    let out = cli(
+        &h,
+        &d,
+        &["recall", "cobalt lantern", "--lexical", "--budget", "64"],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains(
+        "--budget 64 is too small for this page: its first hit block and the over-budget line need at least 113 bytes"
+    ));
 }

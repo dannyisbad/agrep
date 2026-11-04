@@ -48,33 +48,60 @@ fn normalize(graphemes: &[&str]) -> String {
     out
 }
 
-fn insert_ngrams(run: &[&str], out: &mut HashSet<String>) {
-    let normalized = normalize(run);
-    let graphemes: Vec<&str> = UnicodeSegmentation::graphemes(normalized.as_str(), true).collect();
-    for start in 0..graphemes.len() {
-        for width in 1..=4.min(graphemes.len() - start) {
-            out.insert(graphemes[start..start + width].concat());
+/// Receives every token `collect_text` finds; a token may arrive more than once.
+pub(crate) trait TokenSink {
+    fn token(&mut self, aligned: bool, token: &str);
+}
+
+struct TokenSets<'a> {
+    anywhere: &'a mut HashSet<String>,
+    aligned: &'a mut HashSet<String>,
+}
+
+impl TokenSink for TokenSets<'_> {
+    fn token(&mut self, aligned: bool, token: &str) {
+        let set = if aligned {
+            &mut *self.aligned
+        } else {
+            &mut *self.anywhere
+        };
+        if !set.contains(token) {
+            set.insert(token.to_owned());
         }
     }
 }
 
-fn insert_ascii(bytes: &[u8], out: &mut HashSet<String>) {
+fn insert_ngrams(run: &[&str], sink: &mut impl TokenSink) {
+    let normalized = normalize(run);
+    let bounds: Vec<usize> = UnicodeSegmentation::grapheme_indices(normalized.as_str(), true)
+        .map(|(at, _)| at)
+        .chain(std::iter::once(normalized.len()))
+        .collect();
+    let graphemes = bounds.len() - 1;
+    for start in 0..graphemes {
+        for width in 1..=4.min(graphemes - start) {
+            sink.token(false, &normalized[bounds[start]..bounds[start + width]]);
+        }
+    }
+}
+
+fn insert_ascii(bytes: &[u8], aligned: bool, sink: &mut impl TokenSink) {
     let mut folded = [0u8; 4];
     for (index, byte) in bytes.iter().enumerate() {
         folded[index] = byte.to_ascii_lowercase();
     }
-    let token = std::str::from_utf8(&folded[..bytes.len()]).unwrap();
-    if !out.contains(token) {
-        out.insert(token.to_string());
-    }
+    sink.token(
+        aligned,
+        std::str::from_utf8(&folded[..bytes.len()]).unwrap(),
+    );
 }
 
-fn insert_ascii_ngrams(run: &[u8], out: &mut HashSet<String>) {
+fn insert_ascii_ngrams(run: &[u8], sink: &mut impl TokenSink) {
     for start in 0..run.len() {
         for width in 1..=4.min(run.len() - start) {
             let piece = &run[start..start + width];
             if piece.iter().all(u8::is_ascii_alphanumeric) {
-                insert_ascii(piece, out);
+                insert_ascii(piece, false, sink);
             }
         }
     }
@@ -94,27 +121,27 @@ fn ascii_boundary(run: &[u8], index: usize) -> bool {
         || acronym_word
 }
 
-fn collect_ascii_run(run: &[u8], anywhere: &mut HashSet<String>, aligned: &mut HashSet<String>) {
+fn collect_ascii_run(run: &[u8], sink: &mut impl TokenSink) {
     for chunk in run.split(|byte| *byte == b'\'') {
         if !chunk.is_empty() {
-            insert_ascii_ngrams(chunk, anywhere);
+            insert_ascii_ngrams(chunk, sink);
         }
     }
     let mut start = 0;
     for index in 1..run.len() {
         if ascii_boundary(run, index) {
             if index - start <= 4 && run[start..index].iter().all(u8::is_ascii_alphanumeric) {
-                insert_ascii(&run[start..index], aligned);
+                insert_ascii(&run[start..index], true, sink);
             }
             start = index;
         }
     }
     if run.len() - start <= 4 && run[start..].iter().all(u8::is_ascii_alphanumeric) {
-        insert_ascii(&run[start..], aligned);
+        insert_ascii(&run[start..], true, sink);
     }
 }
 
-fn insert_subtokens(run: &[&str], out: &mut HashSet<String>) {
+fn insert_subtokens(run: &[&str], sink: &mut impl TokenSink) {
     let kinds: Vec<Option<GraphemeKind>> = run.iter().map(|g| grapheme_kind(g)).collect();
     let mut start = 0;
     for index in 1..run.len() {
@@ -136,37 +163,37 @@ fn insert_subtokens(run: &[&str], out: &mut HashSet<String>) {
             || acronym_word
             || script_boundary(left, right);
         if boundary {
-            insert_subtoken(&run[start..index], out);
+            insert_subtoken(&run[start..index], sink);
             start = index;
         }
     }
-    insert_subtoken(&run[start..], out);
+    insert_subtoken(&run[start..], sink);
 }
 
-fn insert_subtoken(piece: &[&str], out: &mut HashSet<String>) {
+fn insert_subtoken(piece: &[&str], sink: &mut impl TokenSink) {
     if piece.is_empty() || piece.iter().any(|g| grapheme_kind(g).is_none()) {
         return;
     }
     let normalized = normalize(piece);
     let width = UnicodeSegmentation::graphemes(normalized.as_str(), true).count();
     if (1..=4).contains(&width) {
-        out.insert(normalized);
+        sink.token(true, &normalized);
     }
 }
 
-fn collect_unicode_run(text: &str, anywhere: &mut HashSet<String>, aligned: &mut HashSet<String>) {
+fn collect_unicode_run(text: &str, sink: &mut impl TokenSink) {
     let run: Vec<&str> = UnicodeSegmentation::graphemes(text, true).collect();
     if !run.is_empty() {
         let mut chunk_start = 0;
         for cursor in 0..=run.len() {
             if cursor == run.len() || grapheme_kind(run[cursor]).is_none() {
                 if chunk_start < cursor {
-                    insert_ngrams(&run[chunk_start..cursor], anywhere);
+                    insert_ngrams(&run[chunk_start..cursor], sink);
                 }
                 chunk_start = cursor + 1;
             }
         }
-        insert_subtokens(&run, aligned);
+        insert_subtokens(&run, sink);
     }
 }
 
@@ -174,7 +201,7 @@ fn attachment(ch: char) -> bool {
     crate::unicode_v16::is_attachment(ch) || ch == '\u{200d}'
 }
 
-fn collect_text(text: &str, anywhere: &mut HashSet<String>, aligned: &mut HashSet<String>) {
+fn collect_text(text: &str, sink: &mut impl TokenSink) {
     let mut start = None;
     let mut last_alpha = false;
     for (index, ch) in text.char_indices() {
@@ -187,7 +214,7 @@ fn collect_text(text: &str, anywhere: &mut HashSet<String>, aligned: &mut HashSe
         if in_run {
             start.get_or_insert(index);
         } else if let Some(run_start) = start.take() {
-            collect_run(&text[run_start..index], anywhere, aligned);
+            collect_run(&text[run_start..index], sink);
         }
         // Attachments stay in-run, so they must not hide the base letter from the
         // apostrophe joiner: NFD cafe\u{301}'s has to join exactly like NFC café's.
@@ -196,15 +223,15 @@ fn collect_text(text: &str, anywhere: &mut HashSet<String>, aligned: &mut HashSe
         }
     }
     if let Some(run_start) = start {
-        collect_run(&text[run_start..], anywhere, aligned);
+        collect_run(&text[run_start..], sink);
     }
 }
 
-fn collect_run(text: &str, anywhere: &mut HashSet<String>, aligned: &mut HashSet<String>) {
+fn collect_run(text: &str, sink: &mut impl TokenSink) {
     if text.is_ascii() {
-        collect_ascii_run(text.as_bytes(), anywhere, aligned);
+        collect_ascii_run(text.as_bytes(), sink);
     } else {
-        collect_unicode_run(text, anywhere, aligned);
+        collect_unicode_run(text, sink);
     }
 }
 
@@ -440,11 +467,15 @@ pub fn family_tokens(
     let mut anywhere = HashSet::new();
     let mut aligned = HashSet::new();
     let mut qualities = [NO_QUALITY; SHORT_TOKEN_COUNT];
+    let mut sets = TokenSets {
+        anywhere: &mut anywhere,
+        aligned: &mut aligned,
+    };
     for message in messages {
         let text = ngram_source(&message.text);
         let reply = ngram_source(&message.reply);
-        collect_text(text, &mut anywhere, &mut aligned);
-        collect_text(reply, &mut anywhere, &mut aligned);
+        collect_text(text, &mut sets);
+        collect_text(reply, &mut sets);
         collect_short_quality(text, &mut qualities);
         collect_short_quality(reply, &mut qualities);
     }
@@ -456,8 +487,17 @@ pub fn family_tokens(
 pub fn text_tokens<'a>(texts: impl Iterator<Item = &'a str>) -> (HashSet<String>, HashSet<String>) {
     let mut any = HashSet::new();
     let mut aligned = HashSet::new();
+    let mut sets = TokenSets {
+        anywhere: &mut any,
+        aligned: &mut aligned,
+    };
     for text in texts {
-        collect_text(ngram_source(text), &mut any, &mut aligned);
+        collect_text(ngram_source(text), &mut sets);
     }
     (any, aligned)
+}
+
+/// Feeds one row's n/s tokens to `sink`, exactly those `text_tokens` collects.
+pub(crate) fn row_tokens(text: &str, sink: &mut impl TokenSink) {
+    collect_text(ngram_source(text), sink);
 }

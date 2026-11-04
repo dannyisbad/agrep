@@ -53,11 +53,11 @@ pub fn installed_at(path: &Path) -> bool {
 
 /// Start read-ahead before freshness and metadata work. The mapping owns no
 /// mutable data and is only a performance hint; normal load verification still
-/// decides which bytes may be used by inference.
-pub fn prefetch_query(root: &DataRoot) -> Option<memmap2::Mmap> {
+/// decides which bytes may be used by inference. Darwin pages a WillNeed range
+/// in before returning, so the hint runs on its own thread.
+pub fn prefetch_query(root: &DataRoot) -> Option<std::thread::JoinHandle<()>> {
     #[cfg(unix)]
     {
-        let _span = crate::semantic_profile::span("model_read_ahead");
         let path = directory(root);
         let source = stamps(&path, &FILES).ok()?;
         let name = if conversion_matches(&path, &source) {
@@ -66,26 +66,33 @@ pub fn prefetch_query(root: &DataRoot) -> Option<memmap2::Mmap> {
             "model.safetensors"
         };
         let file = File::open(path.join(name)).ok()?;
-        let map = unsafe { memmap2::MmapOptions::new().map(&file).ok()? };
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as usize;
-        let mut residency = vec![0u8; map.len().div_ceil(page_size)];
-        // mincore only observes our mapping and writes one residency byte per
-        // page. Avoid the kernel's full read-ahead walk when pages are hot.
-        let known = unsafe {
-            libc::mincore(
-                map.as_ptr().cast_mut().cast(),
-                map.len(),
-                residency.as_mut_ptr().cast(),
-            ) == 0
-        };
-        let needed = !known || residency.iter().any(|r| r & 1 == 0);
-        if needed {
-            map.advise(memmap2::Advice::WillNeed).ok()?;
-        }
-        crate::semantic_profile::event(serde_json::json!({"model_read_ahead":{
-            "bytes":map.len(),"requested":needed,"resident_pages":residency.iter().filter(|r|**r&1!=0).count(),"pages":residency.len()
-        }}));
-        Some(map)
+        std::thread::Builder::new()
+            .name("agrep-model-read-ahead".into())
+            .spawn(move || {
+                let _span = crate::semantic_profile::span("model_read_ahead");
+                let Ok(map) = (unsafe { memmap2::MmapOptions::new().map(&file) }) else {
+                    return;
+                };
+                let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as usize;
+                let mut residency = vec![0u8; map.len().div_ceil(page_size)];
+                // mincore only observes our mapping and writes one residency byte per
+                // page. Avoid the kernel's full read-ahead walk when pages are hot.
+                let known = unsafe {
+                    libc::mincore(
+                        map.as_ptr().cast_mut().cast(),
+                        map.len(),
+                        residency.as_mut_ptr().cast(),
+                    ) == 0
+                };
+                let needed = !known || residency.iter().any(|r| r & 1 == 0);
+                if needed {
+                    let _ = map.advise(memmap2::Advice::WillNeed);
+                }
+                crate::semantic_profile::event(serde_json::json!({"model_read_ahead":{
+                    "bytes":map.len(),"requested":needed,"resident_pages":residency.iter().filter(|r|**r&1!=0).count(),"pages":residency.len()
+                }}));
+            })
+            .ok()
     }
     #[cfg(not(unix))]
     {
@@ -183,7 +190,7 @@ fn convert_weights(path: &Path) -> Result<()> {
             .collect::<candle_core::Result<std::collections::HashMap<_, _>>>()?;
         let temp = path.join(format!("{name}.partial"));
         candle_core::safetensors::save(&tensors, &temp)?;
-        File::open(&temp)?.sync_all()?;
+        OpenOptions::new().write(true).open(&temp)?.sync_all()?;
         fs::rename(temp, path.join(name))?;
         files.push((
             name,

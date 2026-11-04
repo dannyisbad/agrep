@@ -130,6 +130,8 @@ pub fn recency(ts: i64, now: i64) -> f64 {
     2f64.powf(-((now - ts).max(0) as f64) / (14. * 86400000.))
 }
 type CandidateGroups = std::sync::Arc<HashMap<i64, Vec<i64>>>;
+/// A selective scope's blocks with their row counts, in block order.
+type ScopeBlocks = std::sync::Arc<Vec<(i64, usize)>>;
 struct CoverageBounds {
     candidates: CandidateGroups,
     rows: HashMap<i64, f64>,
@@ -196,7 +198,9 @@ struct PlanCache {
     rejected_candidates: HashSet<String>,
     coverage_idf: Option<Vec<f64>>,
     coverage_all: bool,
-    selective_scopes: HashMap<String, bool>,
+    /// Per lane, a selective metadata scope's blocks; None when the scope is
+    /// too broad to scan.
+    scopes: HashMap<String, Option<ScopeBlocks>>,
 }
 impl PlanCache {
     fn coverage_bounds(
@@ -898,20 +902,22 @@ impl Matcher {
         })
     }
     /// Indexed words for one query group. A block keeps only the words its rows contain.
-    fn group_words(&self, group: &[String], block: Option<i64>) -> Vec<&str> {
+    fn group_words(&self, group: &[String], blocks: Option<&[i64]>) -> Vec<&str> {
         let mut words: Vec<&str> = Vec::new();
         for v in group {
             let expansion = &self.tool_terms[v];
-            match block {
+            match blocks {
                 None => words.extend(expansion.words.iter().map(|w| w.term.as_str())),
-                Some(block) => {
-                    if let Ok(block) = u32::try_from(block) {
-                        words.extend(
-                            expansion
-                                .in_block(block)
-                                .iter()
-                                .map(|&i| expansion.words[i as usize].term.as_str()),
-                        );
+                Some(blocks) => {
+                    for &block in blocks {
+                        if let Ok(block) = u32::try_from(block) {
+                            words.extend(
+                                expansion
+                                    .in_block(block)
+                                    .iter()
+                                    .map(|&i| expansion.words[i as usize].term.as_str()),
+                            );
+                        }
                     }
                 }
             }
@@ -920,7 +926,7 @@ impl Matcher {
         words.dedup();
         words
     }
-    fn fts(&self, block: Option<i64>) -> Option<String> {
+    fn fts(&self, blocks: Option<&[i64]>) -> Option<String> {
         let mut clauses = vec![];
         for group in &self.ordered_terms {
             if group.iter().any(|v| !self.tool_supported.contains(v)) {
@@ -929,7 +935,7 @@ impl Matcher {
                 }
                 continue;
             }
-            let words = self.group_words(group, block);
+            let words = self.group_words(group, blocks);
             if words.is_empty() {
                 if self.partial {
                     continue;
@@ -953,7 +959,7 @@ impl Matcher {
         // for each block in a long all-terms query.
         (!clauses.is_empty()).then(|| clauses.join(if self.partial { " OR " } else { " AND " }))
     }
-    fn word_positions(&self, block: Option<i64>) -> Option<(String, Vec<u8>)> {
+    fn word_positions(&self, blocks: Option<&[i64]>) -> Option<(String, Vec<u8>)> {
         if self.phase != 1
             || self.partial
             // A selective term in a longer sentence is cheaper to drive once
@@ -991,7 +997,7 @@ impl Matcher {
             groups.sort_by_key(|(i, _)| *i);
         }
         for (i, group) in groups {
-            let words = self.group_words(group, block);
+            let words = self.group_words(group, blocks);
             if words.is_empty() {
                 return None;
             }
@@ -1549,6 +1555,99 @@ pub fn coverage(c: &Connection, o: &Options) -> Result<Results> {
     result.timings.total_ms = started.elapsed().as_secs_f64() * 1000.;
     Ok(result)
 }
+/// Below this many scope rows, decoding a run's rows costs less than reading
+/// its postings.
+const SCOPE_INDEX_ROWS: usize = 32;
+/// The rows of a selective scope that its lane's text index admits, using the
+/// expressions unselective plans rely on as necessary conditions. Each run of
+/// consecutive scope blocks is one rowid-range query, so a word's postings are
+/// opened once per run rather than once per block. Blocks absent from the map
+/// are not filtered.
+fn scope_candidates(
+    c: &Connection,
+    m: &Matcher,
+    table: &str,
+    expression: &str,
+    span: Option<&[u8]>,
+    scope: &[(i64, usize)],
+) -> Result<HashMap<i64, Vec<i64>>> {
+    let sql = match (table, span) {
+        ("tools", Some(_)) => "SELECT f.rowid FROM tools_fts f LEFT JOIN event_rows e INDEXED BY event_tool_id ON e.tool_id=f.rowid AND e.active=1 LEFT JOIN tool_blobs t ON t.id=e.blob WHERE tools_fts MATCH ?1 AND f.rowid>=?2 AND f.rowid<?3 AND agrep_word_span(tools_fts,?4,CASE WHEN t.ascii THEN 0 ELSE ?5 END)".to_owned(),
+        (_, Some(_)) => format!("SELECT rowid FROM {table}_fts WHERE {table}_fts MATCH ?1 AND rowid>=?2 AND rowid<?3 AND agrep_word_span({table}_fts,?4,?5)"),
+        (_, None) => format!("SELECT rowid FROM {table}_fts WHERE {table}_fts MATCH ?1 AND rowid>=?2 AND rowid<?3"),
+    };
+    let mut query = c.prepare_cached(&sql)?;
+    let mut admitted = HashMap::new();
+    let mut rest = scope;
+    while let Some(&(first, _)) = rest.first() {
+        let length = rest
+            .iter()
+            .enumerate()
+            .take_while(|&(i, &(block, _))| block == first + i as i64)
+            .count();
+        let (run, tail) = rest.split_at(length);
+        rest = tail;
+        if run.iter().map(|&(_, rows)| rows).sum::<usize>() < SCOPE_INDEX_ROWS {
+            continue;
+        }
+        let blocks: Vec<i64> = run.iter().map(|&(block, _)| block).collect();
+        let last = blocks[blocks.len() - 1];
+        // Tool blocks hold their own words; a required group without any word
+        // in the run admits no row of it.
+        let own = if table != "tools" {
+            None
+        } else {
+            let plan = if span.is_some() {
+                m.word_positions(Some(&blocks))
+            } else {
+                m.fts(Some(&blocks))
+                    .map(|expression| (expression, Vec::new()))
+            };
+            let Some(plan) = plan else {
+                admitted.extend(blocks.iter().map(|&block| (block, Vec::new())));
+                continue;
+            };
+            Some(plan)
+        };
+        let (expression, ordinals) = own.as_ref().map_or((expression, span), |(e, o)| {
+            (e.as_str(), Some(o.as_slice()))
+        });
+        let mut bind = vec![
+            Value::Text(expression.to_owned()),
+            Value::Integer(first * BLOCK),
+            Value::Integer((last + 1) * BLOCK),
+        ];
+        if let Some(ordinals) = ordinals.filter(|_| span.is_some()) {
+            // The widest gap of the run's blocks bounds every row in it.
+            let max_gap = if table == "tools" {
+                c.query_row(
+                    "SELECT CASE WHEN count(*)=?3 THEN max(max_gap) ELSE 2147483647 END FROM tool_blocks WHERE id BETWEEN ?1 AND ?2",
+                    rusqlite::params![first, last, blocks.len() as i64],
+                    |r| r.get(0),
+                )?
+            } else {
+                i64::from(i32::MAX)
+            };
+            bind.push(Value::Blob(ordinals.to_vec()));
+            bind.push(Value::Integer(max_gap));
+        }
+        for &block in &blocks {
+            admitted.insert(block, Vec::new());
+        }
+        for id in query.query_map(params_from_iter(bind), |r| r.get::<_, i64>(0))? {
+            let id = id?;
+            if let Some(ids) = admitted.get_mut(&(id / BLOCK)) {
+                ids.push(id);
+            }
+        }
+        for block in &blocks {
+            if let Some(ids) = admitted.get_mut(block) {
+                ids.sort_unstable();
+            }
+        }
+    }
+    Ok(admitted)
+}
 fn count_tool_terms(
     c: &Connection,
     m: &Matcher,
@@ -1818,8 +1917,8 @@ fn search_pass(
             || o.filters.model.is_some()
             || o.filters.project.is_some()
             || o.filters.until.is_some();
-        let selective = if let Some(&selective) = cache.selective_scopes.get(table) {
-            selective
+        let scope_blocks = if let Some(blocks) = cache.scopes.get(table) {
+            blocks.clone()
         } else if has_scope {
             let limit = 4096usize.max((lane_total / 16).min(65_536));
             // Invisible rows may conservatively make a scope look larger, but
@@ -1827,16 +1926,23 @@ fn search_pass(
             // agent/time probes use their covering indexes instead of fetching
             // thousands of prose records past their text payload.
             let sql = format!(
-                "SELECT count(*) FROM (SELECT 1 FROM {table} p WHERE 1{filter_scope} LIMIT {})",
+                "SELECT id/{BLOCK},count(*) FROM (SELECT p.id FROM {table} p WHERE 1{filter_scope} LIMIT {}) GROUP BY 1 ORDER BY 1",
                 limit + 1
             );
-            let count: usize = c.query_row(&sql, params_from_iter(values.clone()), |r| r.get(0))?;
-            let selective = count <= limit;
-            cache.selective_scopes.insert(table.into(), selective);
-            selective
+            let blocks = c
+                .prepare(&sql)?
+                .query_map(params_from_iter(values.clone()), |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, usize>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let blocks = (blocks.iter().map(|(_, rows)| rows).sum::<usize>() <= limit)
+                .then(|| std::sync::Arc::new(blocks));
+            cache.scopes.insert(table.into(), blocks.clone());
+            blocks
         } else {
-            false
+            None
         };
+        let selective = scope_blocks.is_some();
         let bounded = !selective
             && m.estimated > 128
             && !o.exact
@@ -1910,6 +2016,25 @@ fn search_pass(
                 result.timings.sqlite_ms += tick.elapsed().as_secs_f64() * 1000.;
             }
         }
+        // A selective scope is still scanned in its own order, so the same rows
+        // fill the page and meet the same ceilings; the text index only spares
+        // decoding rows it proves cannot match.
+        let admitted = match (&scope_blocks, &fts) {
+            (Some(scope_blocks), Some(expression)) => {
+                let tick = Instant::now();
+                let admitted = scope_candidates(
+                    c,
+                    &m,
+                    table,
+                    expression,
+                    span_plan.as_ref().map(|(_, v)| v.as_slice()),
+                    scope_blocks,
+                )?;
+                result.timings.sqlite_ms += tick.elapsed().as_secs_f64() * 1000.;
+                Some(admitted)
+            }
+            _ => None,
+        };
         let mut remaining = blocks.into_iter();
         let mut visited = HashSet::new();
         let mut coverage_tried = false;
@@ -1939,10 +2064,10 @@ fn search_pass(
                 && fts.is_some()
             {
                 let found = if span_plan.is_some() {
-                    m.word_positions(Some(block))
+                    m.word_positions(Some(&[block]))
                         .map(|(expression, ordinals)| (Some(expression), Some(ordinals)))
                 } else {
-                    m.fts(Some(block))
+                    m.fts(Some(&[block]))
                         .map(|expression| (Some(expression), None))
                 };
                 // A required group without any word in this block cannot match here.
@@ -2125,6 +2250,15 @@ fn search_pass(
                             && (ceiling < threshold || (ceiling == threshold && later)))
                     {
                         result.total_basis = "floor".into();
+                        continue;
+                    }
+                }
+                if let Some(admitted) = &admitted {
+                    let id: i64 = r.get(0)?;
+                    if admitted
+                        .get(&(id / BLOCK))
+                        .is_some_and(|ids| ids.binary_search(&id).is_err())
+                    {
                         continue;
                     }
                 }

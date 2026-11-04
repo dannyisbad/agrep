@@ -297,7 +297,7 @@ fn decorate(c: &Connection, result: &mut Results, caller: &Caller, o: &Options) 
     } else {
         None
     };
-    let boundary = crate::boundary_rank::prepare_query(&o.pattern, &Default::default());
+    let spans = MatchSpans::new(&o.pattern);
     let index = handles::SessionIndex::load(c)?;
     for h in &mut result.hits {
         h.self_marker = caller.resolved && h.agent == caller.agent && h.session == caller.session;
@@ -311,14 +311,7 @@ fn decorate(c: &Connection, result: &mut Results, caller: &Caller, o: &Options) 
                     )
                 })
             } else {
-                let score = boundary.evaluate(&h.text, None, true)?;
-                let spans: Vec<_> = score.spans.iter().flatten().collect();
-                spans
-                    .iter()
-                    .map(|v| v[0])
-                    .min()
-                    .zip(spans.iter().map(|v| v[1]).max())
-                    .map(|(a, b)| (a as usize, b as usize))
+                spans.find(&h.text, &h.matched)
             };
             if let Some((start, end)) = matched.filter(|(a, b)| b > a) {
                 h.handle += &format!(
@@ -329,6 +322,183 @@ fn decorate(c: &Connection, result: &mut Results, caller: &Caller, o: &Options) 
         }
     }
     Ok(())
+}
+/// Where 0.4.9 placed a keyword hit's match (`_match_span`), in characters: the first
+/// separator-flexible phrase match; a lone word's best-aligned occurrence; for all
+/// terms, the earliest of each term's best-aligned occurrence; for content terms, the
+/// earliest occurrence of any.
+struct MatchSpans {
+    words: Vec<String>,
+    phrase: Option<regex::Regex>,
+    terms: Vec<(String, Vec<String>)>,
+    content: Vec<String>,
+}
+impl MatchSpans {
+    fn new(pattern: &str) -> Self {
+        let words: Vec<String> = pattern
+            .split(|c: char| crate::evidence::py_space(c) || c == '-' || c == '_')
+            .filter(|word| !word.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let phrase = (words.len() > 1)
+            .then(|| {
+                let joined: Vec<String> = words.iter().map(|w| regex::escape(w)).collect();
+                regex::Regex::new(&format!("(?i){}", joined.join(r"[\W_]*"))).ok()
+            })
+            .flatten();
+        let mut terms: Vec<(String, Vec<String>)> = Vec::new();
+        for word in &words {
+            let variants = crate::boundary_rank::term_variants(word);
+            if !variants.is_empty() && !terms.iter().any(|(_, seen)| *seen == variants) {
+                terms.push((word.clone(), variants));
+            }
+        }
+        let mut content: Vec<String> = Vec::new();
+        for term in crate::evidence::content_terms(pattern) {
+            let term = term.to_lowercase();
+            if !content.contains(&term) {
+                content.push(term);
+            }
+        }
+        Self {
+            words,
+            phrase,
+            terms,
+            content,
+        }
+    }
+    fn find(&self, text: &str, matched: &str) -> Option<(usize, usize)> {
+        let low = text.to_lowercase();
+        let terms = || {
+            self.terms
+                .iter()
+                .filter_map(|(word, variants)| insensitive_span(text, &low, word, variants))
+                .min()
+        };
+        match matched {
+            "phrase" if self.words.len() == 1 => {
+                insensitive_span(text, &low, &self.words[0], &self.words)
+            }
+            // The engine's phrase tier and this pattern agree; terms cover any drift.
+            "phrase" => self
+                .phrase
+                .as_ref()
+                .and_then(|phrase| phrase.find(text))
+                .map(|m| {
+                    (
+                        text[..m.start()].chars().count(),
+                        text[..m.end()].chars().count(),
+                    )
+                })
+                .or_else(terms),
+            "content-terms" => {
+                let found = self
+                    .content
+                    .iter()
+                    .filter_map(|term| low.find(term.as_str()).map(|at| (at, term)))
+                    .min_by_key(|(at, _)| *at)?;
+                let start = low[..found.0].chars().count();
+                Some(original_span(text, start, start + found.1.chars().count()))
+            }
+            _ => terms(),
+        }
+    }
+}
+/// 0.4.9's `insensitive_span`: of the occurrences of any spelling in the lowercased text,
+/// the first with the best boundary quality, as original characters.
+fn insensitive_span(
+    text: &str,
+    low: &str,
+    word: &str,
+    spellings: &[String],
+) -> Option<(usize, usize)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut first = None;
+    let mut best = None;
+    let mut best_quality = -1.0;
+    for spelling in spellings {
+        let needle = spelling.to_lowercase();
+        let Some(width) = needle.chars().next().map(char::len_utf8) else {
+            continue;
+        };
+        let mut from = 0;
+        while let Some(at) = low[from..].find(&needle).map(|at| from + at) {
+            let start = low[..at].chars().count();
+            let span = original_span(text, start, start + needle.chars().count());
+            first.get_or_insert(span);
+            let quality = (f64::from(u8::from(boundary(&chars, span.0)))
+                + f64::from(u8::from(boundary(&chars, span.1))))
+                / 2.0;
+            if quality > best_quality {
+                (best, best_quality) = (Some(span), quality);
+                if quality == 1.0 {
+                    return best;
+                }
+            }
+            from = at + low[at..].chars().next().map_or(width, char::len_utf8);
+        }
+    }
+    if first.is_none() {
+        let m = regex::Regex::new(&format!("(?i){}", regex::escape(word)))
+            .ok()?
+            .find(text)?;
+        return Some((
+            text[..m.start()].chars().count(),
+            text[..m.end()].chars().count(),
+        ));
+    }
+    best.or(first)
+}
+/// 0.4.9's `_ascii_boundary`: whether a word boundary falls before character `at`.
+fn boundary(chars: &[char], at: usize) -> bool {
+    if at == 0 || at == chars.len() {
+        return true;
+    }
+    let (left, right) = (chars[at - 1], chars[at]);
+    if right == '\''
+        && at + 1 < chars.len()
+        && left.is_alphabetic()
+        && chars[at + 1].is_alphabetic()
+    {
+        return false;
+    }
+    if left == '\'' && at >= 2 && chars[at - 2].is_alphabetic() && right.is_alphabetic() {
+        return false;
+    }
+    if !left.is_alphanumeric() || !right.is_alphanumeric() {
+        return true;
+    }
+    if left.is_lowercase() && right.is_uppercase() {
+        return true;
+    }
+    if left.is_uppercase()
+        && right.is_uppercase()
+        && at + 1 < chars.len()
+        && chars[at + 1].is_lowercase()
+    {
+        return true;
+    }
+    (left.is_alphabetic() && right.is_numeric()) || (left.is_numeric() && right.is_alphabetic())
+}
+/// The original characters covering characters `start..end` of `text.to_lowercase()`,
+/// which can be longer than `text` (0.4.9's `original_span_for_lowered`).
+fn original_span(text: &str, start: usize, end: usize) -> (usize, usize) {
+    let mut lowered = 0;
+    let mut from = None;
+    for (index, c) in text.chars().enumerate() {
+        let next = lowered + c.to_lowercase().count();
+        if from.is_none() && start < next {
+            from = Some(index);
+        }
+        if let Some(from) = from {
+            if end <= next {
+                return (from, index + 1);
+            }
+        }
+        lowered = next;
+    }
+    let n = text.chars().count();
+    (from.unwrap_or(n), n)
 }
 fn publication_root() -> PathBuf {
     if let Some(p) = std::env::var_os("AGREP_CALLER_PUBLICATION_DIR") {
@@ -483,5 +653,20 @@ mod tests {
         let id = Identity::from_env(&env);
         assert!(id.session.is_none());
         assert_eq!(id.reason, "identity-conflict");
+    }
+    // Expected spans were produced by agrep 0.4.9's own matchers: the `[\W_]*` phrase
+    // search, `console.insensitive_span` with and without `_keyword_term_specs` variants,
+    // and `corpusdb.content`'s earliest lowered occurrence.
+    #[test]
+    fn tool_hit_spans_follow_0_4_9_match_spans() {
+        let text = "bash [failed]: ./run-migration --step 3\nERROR copper falcon migration timeout; copper-falcon_migration";
+        let span = |query: &str, tier: &str| MatchSpans::new(query).find(text, tier);
+        assert_eq!(span("copper falcon migration", "phrase"), Some((46, 69)));
+        assert_eq!(
+            span("falcon migrations copper", "all-terms"),
+            Some((21, 30))
+        );
+        assert_eq!(span("migration", "phrase"), Some((21, 30)));
+        assert_eq!(span("timeout copper", "content-terms"), Some((46, 52)));
     }
 }

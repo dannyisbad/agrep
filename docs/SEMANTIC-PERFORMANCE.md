@@ -251,3 +251,54 @@ read-only reference checkout with explicit temporary roots and model paths.
 
 The accompanying evidence commit contains the fixtures, runners, every retained
 measurement, and this report. No branch was pushed, merged or rebased.
+
+## First hybrid query on the owner's history
+
+Profiled with `AGREP_QUERY_TIMING` on a temporary index of the owner's history
+(156k vectors in 1,038 blocks), base `a2aebecb`. The cold measurements had every
+agrep file evicted from the page cache; the matched harness's own first sample
+showed the same shape. The query embeds on CPU (F32), so Metal device and
+pipeline creation is not on its path. Cold base stages, ms:
+
+| Stage | Cold base | Where |
+|---|---:|---|
+| Model read-ahead (190 MB, Darwin pages WillNeed in before returning) | 77-101 | main thread, blocking |
+| Vector block open with WillNeed (175 MB) | 51-65 | main thread, blocking |
+| Model and tokenizer load (overlapped) | 39-54 | semantic lane |
+| Query inference | 17-27 (124 at load 100) | semantic lane |
+| q8 scan and sort | 5-11 | semantic lane |
+| Keyword lane | 503-595 | main thread |
+| Refinement: 118.6k exact cosines row by row, 162 cold row lookups | 157-188 | main thread, after keyword |
+| Worker spawn (`pre_exec` forces fork+exec, waits for the child to exec) | 6-126 | main thread, before render |
+
+After the change, the main thread only lists blocks and then runs the keyword
+lane. The semantic lane maps blocks while the model loads, scores exact cosines
+eight rows per call (bit-identical), and pre-reads refinement rows on its own
+snapshot while the keyword lane runs. Refinement then takes 5-10 ms warm or cold,
+and spawning `__work` takes 0.4-3.7 ms. Alternating fresh processes on the same
+index, medians: warm 248 to 174 ms (load 33-38) and cold 1,037-1,169 to 794-873 ms
+(two campaigns, load 61-90). All 60 compared real-history query variants produced byte-identical
+stdout. The cold keyword lane (530-780 ms) now dominates. It is outside the
+semantic lane.
+
+Matched harness, 0.4.9 alternating with 0.5, every sample kept. Before and after
+are separate runs at different loads ([real before](measurements/matched-hybrid-real-before.json),
+[real after](measurements/matched-hybrid-real-after.json),
+[synthetic before](measurements/matched-hybrid-semantic-1000-before.json),
+[synthetic after](measurements/matched-hybrid-semantic-1000-after.json)):
+
+| Workload | Case | Binary | 0.4.9 median / p95 | 0.5 median / p95 | 1-min load |
+|---|---|---|---:|---:|---|
+| real | first_hybrid | before | 1553 / 8762 | 415 / 818 | 35-36 |
+| real | first_hybrid | after | 2194 / 11514 | 323 / 976 | 28-31 |
+| real | warm_hybrid | before | 451 / 631 | 226 / 363 | 34-36 |
+| real | warm_hybrid | after | 386 / 1044 | 161 / 264 | 28-29 |
+| semantic 1000 | first_hybrid | before | 1879 / 2198 | 162 / 212 | 77-84 |
+| semantic 1000 | first_hybrid | after | 1196 / 2788 | 104 / 129 | 108-112 |
+| semantic 1000 | warm_hybrid | before | 448 / 1453 | 129 / 272 | 84-105 |
+| semantic 1000 | warm_hybrid | after | 178 / 349 | 91 / 167 | 116-118 |
+
+The base already won first_hybrid in both of today's real-history runs. The
+committed loss (`matched-real-history.json`, 1785 / 2050 against 1364 / 10001)
+came from two slow candidate samples out of three. The real first_hybrid p95 is
+a single cold sample per run: 818 before, 976 after, at different loads.

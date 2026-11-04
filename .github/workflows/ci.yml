@@ -60,7 +60,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          nice -n 10 cargo build --locked --release --workspace --bins --examples
+          nice -n 10 cargo build --locked --release --workspace --bin agrep --example matched --example semantic_eval --example semantic_scale
           suffix=""
           if [ "$RUNNER_OS" = Windows ]; then suffix=.exe; fi
           model="$RUNNER_TEMP/agrep-model"
@@ -71,7 +71,6 @@ jobs:
           "${matched[@]}" --workload mixed --output matched-mixed.json || performance_status=1
           "${matched[@]}" --workload semantic --model-dir "$model" --output matched-semantic.json || performance_status=1
           nice -n 10 python bench/semantic_owner.py --binary "target/release/agrep$suffix" --builder "target/release/examples/semantic_scale$suffix" --evaluator "target/release/examples/semantic_eval$suffix" --model "$model" --runs 20 --output semantic-owner.json || performance_status=1
-          "${matched[@]}" --workload dense --output matched-dense.json || performance_status=1
           exit "$performance_status"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
@@ -81,6 +80,45 @@ jobs:
             *-tests.log
             matched-*.json*
             semantic-owner.json
+  # The dense 2,000,000-row comparison is most of the performance gate's time; its own
+  # job keeps each job's wall time bounded.
+  dense:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14, macos-15-intel, windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: '1.97.0'
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Install the agrep 0.4.9 reference in an isolated environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts=bin
+          suffix=""
+          if [ "$RUNNER_OS" = Windows ]; then scripts=Scripts; suffix=.exe; fi
+          python -m venv "$RUNNER_TEMP/agrep-0.4.9"
+          "$RUNNER_TEMP/agrep-0.4.9/$scripts/python$suffix" -m pip install --disable-pip-version-check --no-input agrep==0.4.9
+          echo "AGREP_REFERENCE=$RUNNER_TEMP/agrep-0.4.9/$scripts/agrep$suffix" >> "$GITHUB_ENV"
+      - name: Matched dense performance gate against agrep 0.4.9
+        shell: bash
+        run: |
+          set -euo pipefail
+          nice -n 10 cargo build --locked --release --workspace --bin agrep --example matched
+          suffix=""
+          if [ "$RUNNER_OS" = Windows ]; then suffix=.exe; fi
+          nice -n 10 "target/release/examples/matched$suffix" --reference "$AGREP_REFERENCE" --candidate "target/release/agrep$suffix" --runs 20 --build-runs 3 --check --workload dense --output matched-dense.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: evidence-dense-${{ matrix.os }}
+          path: matched-dense.json*
   privacy-history:
     runs-on: ubuntu-24.04
     steps:

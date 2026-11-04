@@ -1,158 +1,62 @@
+mod page;
 use crate::{ready, Recall};
 use agrep_core::{
     caller::{self, Caller, Identity},
-    evidence::{self, Request, Row, Window},
+    evidence::{self, Request, Window},
     handles, hybrid,
     query::{Hit, Options},
     render, semantic, store, surface,
 };
 use anyhow::{bail, Result};
-use serde_json::{json, Value};
+use serde_json::json;
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     io::IsTerminal,
 };
-/// Removes the context row farthest from its hit in the last block that has
-/// one, returning that block's index and the row's former index.
-fn drop_context(blocks: &mut [Block]) -> Option<(usize, usize)> {
-    for (at, block) in blocks.iter_mut().enumerate().rev() {
-        if let Some((index, _)) = block
-            .window
-            .rows
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| !block.hit_turns.contains(&row.turn))
-            .max_by_key(|(_, row)| (row.turn - block.hit.turn).abs())
-        {
-            block.window.rows.remove(index);
-            return Some((at, index));
-        }
-        // JSON renders events only at retained prose turns; human output renders
-        // their availability count. Deleting the other events one at a time
-        // cannot trim that text and used to rebuild large windows thousands of
-        // times before the message cap was applied.
-    }
-    None
-}
+/// One chat's evidence: the first hit's head over every window of the chat.
 struct Block {
-    hit_turns: BTreeSet<i64>,
     hit: Hit,
     window: Window,
+    /// The turns the chat's windows centered on.
+    hit_turns: BTreeSet<i64>,
+    /// The query each merged window came from, in merge order.
+    queries: Vec<usize>,
 }
-fn head(block: &Block) -> String {
-    let h = &block.hit;
-    format!(
-        "{} · {} · {} · {}{}{}",
-        h.handle,
+/// Bag-of-words scatter and sub-strong meaning matches: evidence that earns one line
+/// rather than a transcript.
+fn weak(h: &Hit) -> bool {
+    matches!(h.matched.as_str(), "all-terms" | "content-terms")
+        || (h.matched == "semantic" && h.score < 0.84)
+}
+/// A block's head: handle · agent · project · when · meaning label · provenance marks.
+fn head(h: &Hit) -> String {
+    let meaning = if h.matched == "semantic" && h.score < 0.84 {
+        "weak meaning match"
+    } else if h.matched == "semantic" {
+        "meaning match"
+    } else {
+        ""
+    };
+    let marks = [
+        h.self_marker.then_some("~self"),
+        h.meta_marker.then_some("~meta"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ");
+    [
+        surface::safe(&h.handle, false),
         surface::safe(&h.agent, false),
         surface::safe(&render::project(&h.project), false),
         surface::timestamp(h.ts),
-        if h.self_marker { " · ~self" } else { "" },
-        if h.matched == "semantic" {
-            " · meaning match"
-        } else if h.matched != "phrase" {
-            " · all terms"
-        } else {
-            ""
-        }
-    )
-}
-fn row_value(r: &Row, w: &Window, text: &str, omitted: usize) -> Value {
-    let mut value = json!({"kind":"msg","session":w.session,"project":w.project,"turn":r.turn,"who":r.who,"ts":r.ts,"text":text,"omitted_chars":omitted});
-    if r.who == "agent" {
-        value["reply_chars"] = json!(r.source_chars);
-        value["reply_truncated"] = json!(r.source_chars > r.text.chars().count());
-    }
-    value
-}
-fn row_line(b: &Block, r: &Row, cap: usize) -> String {
-    let source = r.text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let cmd = format!(
-        "agrep around {} {} -C 0 --max-chars 0",
-        b.window.target, r.turn
-    );
-    let (body, _) = evidence::cap(&source, cap, &cmd);
-    format!(
-        "  {:>4} {}: {}\n",
-        r.turn,
-        r.who,
-        surface::safe(&body, false)
-    )
-}
-fn row_lines(b: &Block, cap: usize) -> Vec<String> {
-    b.window.rows.iter().map(|r| row_line(b, r, cap)).collect()
-}
-/// A block's text from its rows' lines, which must be `row_lines` at one cap.
-fn block_text(b: &Block, lines: &[String], color: bool) -> String {
-    let mut text = if color {
-        format!("\x1b[1m── {}\x1b[0m\n", head(b))
-    } else {
-        format!("── {}\n", head(b))
-    };
-    let target = &b.window.target;
-    for line in lines {
-        text += line;
-    }
-    if b.hit.who == "tool" {
-        text += &format!("       {}\n", surface::safe(&b.hit.snippet, false));
-    }
-    let visible_events = b
-        .window
-        .events
-        .iter()
-        .filter(|event| b.window.rows.iter().any(|row| row.turn == event.turn))
-        .count();
-    if visible_events > 0 {
-        text += &format!(
-            "       [+{} tool calls - agrep around {target} {} -C {} --tool-output 200]\n",
-            visible_events,
-            b.window.center,
-            b.window
-                .rows
-                .iter()
-                .map(|r| (r.turn - b.window.center).abs())
-                .max()
-                .unwrap_or(0)
-        );
-    }
-    text
-}
-fn json_len(value: &Value) -> Result<usize> {
-    struct Count(usize);
-    impl std::io::Write for Count {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 += bytes.len();
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut count = Count(0);
-    agrep_core::json_output::to_writer(&mut count, value)?;
-    Ok(count.0)
-}
-fn block_value(b: &Block, cap: usize) -> Value {
-    let mut rows = Vec::new();
-    let turns: BTreeSet<_> = b.window.rows.iter().map(|r| r.turn).collect();
-    for turn in turns {
-        for r in b.window.rows.iter().filter(|r| r.turn == turn) {
-            let (text, omitted) = evidence::cap(
-                &r.text,
-                cap,
-                &format!(
-                    "agrep around {} {} -C 0 --max-chars 0",
-                    b.window.target.clone(),
-                    r.turn
-                ),
-            );
-            rows.push(row_value(r, &b.window, &text, omitted));
-        }
-        for e in b.window.events.iter().filter(|e| e.turn == turn) {
-            rows.push(json!({"kind":e.kind,"session":b.window.session,"project":b.window.project,"turn":e.turn,"ts":e.ts,"name":e.name,"input":surface::clip(&e.input,if cap==0{4000}else{cap}),"ok":e.ok,"input_chars":e.input_chars,"output_chars":e.output_chars,"output_bytes":e.output_bytes,"input_truncated":e.input_chars>e.input.chars().count(),"output_truncated":e.output_chars>e.output.chars().count()}));
-        }
-    }
-    json!({"session":b.window.session,"turn":b.window.center,"ts":b.hit.ts,"agent":b.window.agent,"project":b.window.project,"score":b.hit.score,"sem_score":if b.hit.matched=="semantic"{Some(b.hit.score)}else{None},"score_kind":null,"matched":b.hit.matched,"handle":b.hit.handle,"self":b.hit.self_marker,"window":rows})
+        meaning.into(),
+        marks,
+    ]
+    .into_iter()
+    .filter(|field| !field.is_empty())
+    .collect::<Vec<_>>()
+    .join(" · ")
 }
 /// Takes each query's next hit in turn, skipping turns already taken and
 /// families that query already supplied, until `target` hits. Also reports,
@@ -226,118 +130,240 @@ fn select_deepening<T>(
         }
     }
 }
-/// Within `budget` bytes (0 is unbounded), drops the farthest context rows,
-/// then caps every message at 1000 and halving characters down to 64, then
-/// omits the last hits, until the page fits.
-fn text_page(blocks: &mut Vec<Block>, budget: usize, color: bool) -> Result<String> {
-    let mut cap = 0;
-    let mut omitted = Vec::new();
-    // Each row's line depends only on the cap, so a dropped row re-renders
-    // nothing and a smaller cap renders each remaining row once.
-    let mut lines: Vec<_> = blocks.iter().map(|b| row_lines(b, cap)).collect();
-    let mut texts: Vec<_> = blocks
-        .iter()
-        .zip(&lines)
-        .map(|(b, l)| block_text(b, l, color))
-        .collect();
-    loop {
-        let over = if omitted.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "[+{} hit(s) over budget - {}]\n",
-                omitted.len(),
-                omitted.join(" ")
-            )
-        };
-        let len = texts.iter().map(String::len).sum::<usize>() + texts.len() - 1 + over.len();
-        if budget == 0 || len <= budget {
-            return Ok(texts.join("\n") + &over);
+/// The head line cost 0.4.9's recall reserves per block.
+const HEAD_COST: usize = 120;
+/// Hit-turn bytes beyond which a block needs no more to be judged.
+const JUDGEABLE_BLOCK: usize = 900;
+/// Visible hit-turn bytes below which a block is a stub rather than evidence.
+const JUDGEABLE_HIT: usize = 200;
+/// What one `[+N chars - agrep around …]` marker costs.
+const CAP_MARKER_RESERVE: usize = 120;
+/// The largest level with the sum of `min(extra, level)` within `budget`.
+fn water_level(extras: &[i64], budget: i64) -> i64 {
+    let mut ordered = extras.to_vec();
+    ordered.sort_unstable();
+    let mut used = 0;
+    for (index, extra) in ordered.iter().enumerate() {
+        let share = (budget - used).div_euclid((ordered.len() - index) as i64);
+        if *extra > share {
+            return share.max(0);
         }
-        if let Some((block, row)) = drop_context(blocks) {
-            lines[block].remove(row);
-            texts[block] = block_text(&blocks[block], &lines[block], color);
-            continue;
-        }
-        if cap == 0 {
-            cap = 1000;
-        } else if cap > 64 {
-            cap = (cap / 2).max(64);
-        } else if blocks.len() > 1 {
-            omitted.push(blocks.pop().unwrap().hit.handle);
-            lines.pop();
-            texts.pop();
-            continue;
-        } else {
-            let b = &blocks[0];
-            let minimum = format!(
-                "── {}\n  {}\n",
-                b.hit.handle,
-                surface::clip(
-                    &surface::safe(&b.hit.snippet, false),
-                    budget.saturating_sub(b.hit.handle.len() + 12)
-                )
-            );
-            if minimum.len() > budget || minimum.trim_end().ends_with(&b.hit.handle) {
-                bail!(
-                    "--budget needs at least {} bytes for the first reference",
-                    b.hit.handle.len() + 16
-                )
-            }
-            return Ok(minimum);
-        }
-        lines = blocks.iter().map(|b| row_lines(b, cap)).collect();
-        texts = blocks
-            .iter()
-            .zip(&lines)
-            .map(|(b, l)| block_text(b, l, color))
-            .collect();
+        used += extra;
     }
+    budget
 }
-/// `value` with its hits within `budget` bytes, trimmed as `text_page` trims.
-fn json_page(value: &mut Value, blocks: &mut Vec<Block>, budget: usize) -> Result<String> {
-    let mut cap = 0;
-    let mut omitted = Vec::new();
-    // Compact JSON is compositional: the page is the envelope with its hits
-    // array filled in. Only the block a drop changed is serialized again.
-    let mut hits: Vec<_> = blocks.iter().map(|b| block_value(b, cap)).collect();
-    let mut sizes = hits.iter().map(json_len).collect::<Result<Vec<_>>>()?;
-    loop {
-        value["hits"] = json!([]);
-        if !omitted.is_empty() {
-            value["omitted_hits"] = json!(omitted)
-        }
-        let len =
-            json_len(value)? + sizes.iter().sum::<usize>() + sizes.len().saturating_sub(1) + 1;
-        if budget == 0 || len <= budget {
-            value["hits"] = Value::Array(hits);
-            let text = agrep_core::json_output::to_string(value)? + "\n";
-            debug_assert_eq!(text.len(), len);
-            return Ok(text);
-        }
-        if let Some((block, _)) = drop_context(blocks) {
-            hits[block] = block_value(&blocks[block], cap);
-            sizes[block] = json_len(&hits[block])?;
-            continue;
-        }
-        if cap == 0 {
-            cap = 1000;
-        } else if cap > 64 {
-            cap = (cap / 2).max(64);
-        } else if blocks.len() > 1 {
-            omitted.push(blocks.pop().unwrap().hit.handle);
-            hits.pop();
-            sizes.pop();
-            continue;
-        } else {
-            bail!(
-                "--budget needs at least {} bytes for the first reference and JSON envelope",
-                len
-            )
-        }
-        hits = blocks.iter().map(|b| block_value(b, cap)).collect();
-        sizes = hits.iter().map(json_len).collect::<Result<_>>()?;
+/// Bytes reserved for each hit's own turn before anything widens: every hit gets its
+/// `needs` when the budget holds them all; otherwise the budget is water-filled above
+/// each block's indivisible minimum (`heads` plus `lows`), and the lowest-ranked hits get
+/// nothing until the kept ones are judgeable.
+fn hit_floors(needs: &[usize], heads: &[usize], lows: &[usize], budget: usize) -> Vec<usize> {
+    let mins: Vec<usize> = needs
+        .iter()
+        .zip(heads.iter().zip(lows))
+        .map(|(need, (head, low))| (*need).min(head + low))
+        .collect();
+    if budget == 0 || needs.iter().sum::<usize>() <= budget {
+        return needs.to_vec();
     }
+    for keep in (1..=needs.len()).rev() {
+        let base: usize = mins[..keep].iter().sum();
+        if base > budget && keep > 1 {
+            continue;
+        }
+        let extras: Vec<i64> = needs[..keep]
+            .iter()
+            .zip(&mins)
+            .map(|(need, low)| (need - low) as i64)
+            .collect();
+        let level = water_level(&extras, budget.saturating_sub(base) as i64);
+        let floors: Vec<usize> = needs[..keep]
+            .iter()
+            .zip(&mins)
+            .map(|(need, low)| low + ((need - low) as i64).min(level) as usize)
+            .collect();
+        let judgeable = floors
+            .iter()
+            .zip(heads.iter().zip(needs))
+            .all(|(floor, (head, need))| {
+                *floor as i64 - *head as i64 - CAP_MARKER_RESERVE as i64
+                    >= (JUDGEABLE_HIT as i64)
+                        .min(*need as i64 - *head as i64 - CAP_MARKER_RESERVE as i64)
+            });
+        if judgeable || keep == 1 {
+            let mut floors = floors;
+            floors.resize(needs.len(), 0);
+            return floors;
+        }
+    }
+    vec![0; needs.len()]
+}
+/// Bytes the hit's own turn takes as rendered rows, at most one judgeable block.
+fn hit_need(w: &Window) -> usize {
+    page::hit_need(&page::turns(&w.rows), &BTreeSet::from([w.center]))
+}
+/// Coverage expansion: a hit session whose prose fits its share of the budget left after
+/// every hit's own turn is shown whole; then turns elsewhere in the hit sessions holding
+/// the most distinct query terms, newest first, get windows of one turn around them until
+/// the page holds as many windows as the budget feeds (one per 2,500 bytes, at most 12).
+fn expand(
+    c: &rusqlite::Connection,
+    mut pairs: Vec<(Hit, Window)>,
+    queries: &[String],
+    budget: usize,
+    context: i64,
+    before: Option<&(String, i64)>,
+) -> Result<Vec<(Hit, Window)>> {
+    let mut sessions: Vec<String> = Vec::new();
+    for (_, w) in &pairs {
+        if !sessions.contains(&w.session) {
+            sessions.push(w.session.clone());
+        }
+    }
+    let mut terms: Vec<String> = Vec::new();
+    for term in evidence::content_terms(&queries.join(" ")) {
+        let term = term.to_lowercase();
+        if !terms.contains(&term) {
+            terms.push(term);
+        }
+    }
+    terms.truncate(32);
+    let room = (budget / 2500).min(12);
+    let scanned: &[String] = if room > pairs.len() { &terms } else { &[] };
+    let mut stats = std::collections::HashMap::new();
+    for session in &sessions {
+        let boundary = before
+            .filter(|(caller, _)| caller == session)
+            .map(|(_, turn)| *turn);
+        stats.insert(
+            session.clone(),
+            evidence::coverage(c, session, boundary, scanned)?,
+        );
+    }
+    let needs: Vec<usize> = pairs.iter().map(|(_, w)| hit_need(w) + HEAD_COST).collect();
+    let heads = vec![HEAD_COST; pairs.len()];
+    let floors = hit_floors(&needs, &heads, &vec![0; pairs.len()], budget);
+    let spare = budget.saturating_sub(floors.iter().sum()) / pairs.len();
+    let mut widened = HashSet::new();
+    let mut widen = Vec::new();
+    for (i, (h, w)) in pairs.iter().enumerate() {
+        let chars = stats[&w.session].chars as f64;
+        if chars - floors[i] as f64 <= spare as f64 * 1.2 && widened.insert(w.session.clone()) {
+            let radius = (w.center - w.first).max(w.last - w.center);
+            widen.push((i, Request::new(&h.handle, None, Some(radius))));
+        }
+    }
+    let requests: Vec<_> = widen.iter().map(|(_, r)| r.clone()).collect();
+    for ((i, _), window) in widen.into_iter().zip(evidence::windows(c, &requests)?) {
+        pairs[i].1 = window;
+    }
+    if pairs.len() >= room || terms.is_empty() {
+        return Ok(pairs);
+    }
+    let mut covered: HashSet<(String, i64)> = pairs
+        .iter()
+        .flat_map(|(_, w)| w.rows.iter().map(|r| (r.session.clone(), r.turn)))
+        .collect();
+    let mut candidates: Vec<(u32, i64, &String, i64)> = sessions
+        .iter()
+        .flat_map(|s| {
+            stats[s]
+                .turns
+                .iter()
+                .map(move |(turn, ts, n)| (*n, *ts, s, *turn))
+        })
+        .collect();
+    candidates.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then(b.1.cmp(&a.1))
+            .then(a.2.cmp(b.2))
+            .then(a.3.cmp(&b.3))
+    });
+    candidates.truncate((room * 32).max(256));
+    let radius = context.min(1);
+    let mut extra = Vec::new();
+    for (n, ts, session, turn) in candidates {
+        if pairs.len() + extra.len() >= room {
+            break;
+        }
+        if covered.contains(&(session.clone(), turn)) {
+            continue;
+        }
+        for nearby in turn - radius..=turn + radius {
+            covered.insert((session.clone(), nearby));
+        }
+        extra.push((n, ts, session.clone(), turn));
+    }
+    let requests: Vec<_> = extra
+        .iter()
+        .map(|(_, _, session, turn)| Request::new(session, Some(*turn), Some(radius)))
+        .collect();
+    for ((n, ts, session, turn), w) in extra.into_iter().zip(evidence::windows(c, &requests)?) {
+        let text = w
+            .rows
+            .iter()
+            .find(|r| r.turn == w.center)
+            .map_or("", |r| r.text.as_str());
+        let hit = Hit {
+            handle: handles::mint_full(&session, w.center, text),
+            session,
+            agent: w.agent.clone(),
+            project: w.project.clone(),
+            family: w.family.clone(),
+            side: w.side,
+            turn,
+            ts,
+            score: f64::from(n) / terms.len() as f64,
+            matched: "expanded".into(),
+            ..Hit::default()
+        };
+        pairs.push((hit, w));
+    }
+    Ok(pairs)
+}
+/// One chronological block per chat: every window of a session merges into the session's
+/// first block, each row and event once, and each window's center becomes a hit turn.
+/// `query_of` names the query each hit came from; expansion windows count as the first.
+fn merge_chats(pairs: Vec<(Hit, Window)>, query_of: &HashMap<String, usize>) -> Vec<Block> {
+    let mut blocks: Vec<Block> = Vec::new();
+    for (hit, window) in pairs {
+        let query = query_of.get(&hit.handle).copied().unwrap_or(0);
+        let Some(b) = blocks
+            .iter_mut()
+            .find(|b| b.window.session == window.session)
+        else {
+            blocks.push(Block {
+                hit_turns: BTreeSet::from([window.center]),
+                hit,
+                window,
+                queries: vec![query],
+            });
+            continue;
+        };
+        b.hit_turns.insert(window.center);
+        b.queries.push(query);
+        for row in window.rows {
+            if !b
+                .window
+                .rows
+                .iter()
+                .any(|r| r.turn == row.turn && r.who == row.who && r.text == row.text)
+            {
+                b.window.rows.push(row);
+            }
+        }
+        b.window
+            .rows
+            .sort_by_key(|r| (r.turn, r.who == "agent", r.ts));
+        let known: HashSet<String> = b.window.events.iter().map(|e| e.identity.clone()).collect();
+        b.window.events.extend(
+            window
+                .events
+                .into_iter()
+                .filter(|e| !known.contains(&e.identity)),
+        );
+        b.window.events.sort_by_key(|e| (e.turn, e.ts));
+    }
+    blocks
 }
 pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i32> {
     if a.query
@@ -602,74 +628,38 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
         .collect();
     let windows_span = agrep_core::semantic_profile::span("windows");
     let windows = evidence::windows(&c, &requests)?;
-    drop(windows_span);
-    let blocks: Vec<_> = selected
-        .into_iter()
-        .zip(windows)
-        .map(|((_query, hit), window)| Block {
-            hit_turns: BTreeSet::from([hit.turn]),
-            hit,
-            window,
-        })
+    // The caller's current window stays excluded after expansion reads neighboring turns.
+    let before = (caller.resolved && !include_self && !handles::is_handle(&queries[0]))
+        .then(|| (caller.session.clone(), caller.boundary.unwrap_or(0)));
+    let query_of: HashMap<String, usize> = selected
+        .iter()
+        .map(|(query, h)| (h.handle.clone(), *query))
         .collect();
-    let mut merged: Vec<Block> = Vec::new();
-    for b in blocks {
-        let lo = b
-            .window
-            .rows
-            .first()
-            .map(|r| r.turn)
-            .unwrap_or(b.window.center);
-        let hi = b
-            .window
-            .rows
-            .last()
-            .map(|r| r.turn)
-            .unwrap_or(b.window.center);
-        if let Some(existing) = merged.iter_mut().find(|m| {
-            m.window.session == b.window.session
-                && m.window.rows.first().is_some_and(|r| r.turn <= hi + 1)
-                && m.window.rows.last().is_some_and(|r| r.turn + 1 >= lo)
-        }) {
-            existing.hit_turns.extend(&b.hit_turns);
-            for row in b.window.rows {
-                if !existing
-                    .window
-                    .rows
-                    .iter()
-                    .any(|r| r.turn == row.turn && r.who == row.who && r.text == row.text)
-                {
-                    existing.window.rows.push(row);
-                }
-            }
-            existing
-                .window
-                .rows
-                .sort_by_key(|r| (r.turn, r.who == "agent", r.ts));
-            for event in b.window.events {
-                if !existing
-                    .window
-                    .events
-                    .iter()
-                    .any(|e| e.identity == event.identity)
-                {
-                    existing.window.events.push(event);
-                }
-            }
-        } else {
-            merged.push(b)
-        }
+    let mut pairs: Vec<(Hit, Window)> = selected
+        .into_iter()
+        .map(|(_, hit)| hit)
+        .zip(windows)
+        .collect();
+    if a.budget > 0 && !pairs.is_empty() {
+        pairs = expand(
+            &c,
+            pairs,
+            &queries,
+            a.budget,
+            a.context as i64,
+            before.as_ref(),
+        )?;
     }
-    let mut blocks = merged;
-    // Keep current-window exclusions true after expanding neighboring context.
-    if caller.resolved && !include_self && !handles::is_handle(&queries[0]) {
+    drop(windows_span);
+    let mut blocks = merge_chats(pairs, &query_of);
+    if let Some((session, boundary)) = &before {
         for b in &mut blocks {
-            if b.window.session == caller.session {
-                b.window
-                    .rows
-                    .retain(|r| r.turn < caller.boundary.unwrap_or(0));
+            if &b.window.session == session {
+                b.window.rows.retain(|r| r.turn < *boundary);
+                b.window.events.retain(|e| e.turn < *boundary);
             }
         }
+        blocks.retain(|b| !b.window.rows.is_empty());
     }
     if !a.json {
         agrep_core::coverage::disclose(&coverage);
@@ -709,7 +699,7 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
             };
             format!(
                 "recall: {lead} · {} · pull: {}",
-                head(b),
+                head(&b.hit),
                 surface::shell(
                     &std::iter::once("agrep".to_owned())
                         .chain(std::iter::once(if pack { "pack" } else { "recall" }.into()))
@@ -753,17 +743,18 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
         });
     }
     let color = color == "always" || (color == "auto" && std::io::stdout().is_terminal());
+    let page = page::Page::new(&blocks, &queries, a.budget);
     if a.json {
         let mut value = json!({"query":if pack{json!(queries)}else{json!(queries[0])},"engine":"sqlite","hits":[],"semantic_status":{"state":if semantic_failed{"failed"}else if semantic_ran{"complete"}else{"not-run"},"reason":if semantic_failed{Some("retrieval-failed")}else if semantic_ran{None}else{Some(if a.lexical{"--lexical"}else if !semantic::installed(&root){"model-not-installed"}else{"query-ineligible"})}},"self_exclusion":caller.metadata(include_self,a.scope.no_self),"filter_coverage":coverage,"freshness":render::freshness(checked,pending_sources),"semantic_coverage":semantic_coverage});
         if override_filters {
             value["filter_override"] = json!({"supplied":direct_filters,"reason":"direct-handle"});
         }
-        surface::write(&json_page(&mut value, &mut blocks, a.budget)?)?;
+        surface::write(&page::json(&page, &mut value)?)?;
     } else if blocks.is_empty() {
         let n: i64 = c.query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))?;
         eprintln!("no hits across {n} indexed sessions.");
     } else {
-        surface::write(&text_page(&mut blocks, a.budget, color)?)?;
+        surface::write(&page::text(&page, color)?)?;
     }
     Ok(exit)
 }
@@ -771,262 +762,134 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agrep_core::evidence::Row;
+
+    fn row(session: &str, turn: i64, who: &str, text: &str) -> Row {
+        Row {
+            session: session.into(),
+            turn,
+            who: who.into(),
+            ts: 1_700_000_000_000 + turn,
+            text: text.into(),
+            model: String::new(),
+            model_source: String::new(),
+            source: 1,
+            source_chars: text.chars().count(),
+        }
+    }
+    fn window(session: &str, center: i64, turns: std::ops::RangeInclusive<i64>) -> Window {
+        Window {
+            target: session.into(),
+            session: session.into(),
+            agent: "pi".into(),
+            project: "/work/agrep".into(),
+            title: String::new(),
+            family: session.into(),
+            side: false,
+            center,
+            radius: Some(1),
+            latest: false,
+            first: 0,
+            last: 20,
+            rows: turns
+                .map(|turn| row(session, turn, "user", &format!("turn {turn}")))
+                .collect(),
+            events: vec![],
+            notes: vec![],
+            claim: None,
+        }
+    }
+
+    // Expected values below were computed by agrep 0.4.9's own `_content_terms`,
+    // `_water_level` and `_hit_floors` (py/search.py, py/recall.py).
+    #[test]
+    fn content_terms_water_levels_and_floors_match_0_4_9() {
+        for (query, terms) in [
+            (
+                "how did the drafting go last run?",
+                vec!["drafting", "go", "last", "run"],
+            ),
+            (
+                "release-workflow_cache",
+                vec!["release", "workflow", "cache"],
+            ),
+            ("a I it's", vec!["it's"]),
+            ("Flaky (windows) cache!", vec!["Flaky", "windows", "cache"]),
+            ("x ab", vec!["ab"]),
+        ] {
+            assert_eq!(evidence::content_terms(query), terms, "{query}");
+        }
+        for (extras, budget, level) in [
+            (vec![5, 1, 9], 12, 6),
+            (vec![100, 200, 300], 1000, 1000),
+            (vec![50, 50], 30, 15),
+            (vec![7], 3, 3),
+            (vec![], 5, 5),
+        ] {
+            assert_eq!(water_level(&extras, budget), level, "{extras:?} {budget}");
+        }
+        for (texts, budget, floors) in [
+            (vec![100, 200], 5000, vec![234, 334]),
+            (vec![1500, 1500, 1500], 1000, vec![500, 500, 0]),
+            (vec![800, 50, 3000], 900, vec![716, 184, 0]),
+            (vec![300, 300, 300, 300], 600, vec![434, 0, 0, 0]),
+            (vec![2000], 150, vec![150]),
+        ] {
+            let needs: Vec<usize> = texts
+                .iter()
+                .map(|n| (n + 10 + "user".len()).min(JUDGEABLE_BLOCK) + HEAD_COST)
+                .collect();
+            let heads = vec![HEAD_COST; needs.len()];
+            let lows = vec![0; needs.len()];
+            assert_eq!(
+                hit_floors(&needs, &heads, &lows, budget),
+                floors,
+                "{texts:?} {budget}"
+            );
+        }
+    }
 
     #[test]
-    fn invisible_tool_context_does_not_delay_the_message_cap() {
-        let event = evidence::Event {
-            turn: 1,
-            ts: 1,
-            name: "shell".into(),
-            kind: "tool".into(),
-            input: "unused context".into(),
-            output: String::new(),
-            input_chars: 14,
-            output_chars: 0,
-            output_bytes: Some(0),
-            ok: Some(true),
-            identity: "event".into(),
-            text: String::new(),
-            raw: json!({}),
+    fn windows_of_one_chat_merge_into_one_block_with_gap_lines() {
+        let hit = |session: &str, turn: i64| Hit {
+            session: session.into(),
+            turn,
+            handle: format!("@{session}:{turn}.abcd"),
+            agent: "pi".into(),
+            project: "/work/agrep".into(),
+            matched: "phrase".into(),
+            ..Default::default()
         };
-        let mut block = Block {
-            hit_turns: BTreeSet::from([0]),
-            hit: Hit {
-                session: "fixture".into(),
-                ..Default::default()
-            },
-            window: Window {
-                target: "fixture".into(),
-                session: "fixture".into(),
-                agent: "pi".into(),
-                project: String::new(),
-                title: String::new(),
-                family: "fixture".into(),
-                side: false,
-                center: 0,
-                radius: Some(2),
-                latest: false,
-                first: 0,
-                last: 2,
-                rows: vec![Row {
-                    session: "fixture".into(),
-                    turn: 0,
-                    who: "user".into(),
-                    ts: 0,
-                    text: "retained evidence".into(),
-                    model: String::new(),
-                    model_source: String::new(),
-                    source: 1,
-                    source_chars: 17,
-                }],
-                events: vec![event; 4096],
-                notes: vec![],
-                claim: None,
-            },
-        };
-        let before = block_value(&block, 64);
-        assert!(drop_context(std::slice::from_mut(&mut block)).is_none());
-        assert_eq!(block.window.events.len(), 4096);
-        assert_eq!(block_value(&block, 64), before);
-        assert!(!block_text(&block, &row_lines(&block, 64), false).contains("4096 tool calls"));
-    }
-
-    /// The page builders before incremental rendering: every iteration
-    /// rendered and serialized every block again.
-    fn rerendered_text(blocks: &mut Vec<Block>, budget: usize, color: bool) -> Result<String> {
-        let mut cap = 0;
-        let mut omitted: Vec<String> = Vec::new();
-        loop {
-            let mut text = blocks
-                .iter()
-                .map(|b| block_text(b, &row_lines(b, cap), color))
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !omitted.is_empty() {
-                text += &format!(
-                    "[+{} hit(s) over budget - {}]\n",
-                    omitted.len(),
-                    omitted.join(" ")
-                );
-            }
-            if budget == 0 || text.len() <= budget {
-                return Ok(text);
-            }
-            if drop_context(blocks).is_some() {
-                continue;
-            }
-            if cap == 0 {
-                cap = 1000;
-                continue;
-            }
-            if cap > 64 {
-                cap = (cap / 2).max(64);
-                continue;
-            }
-            if blocks.len() > 1 {
-                omitted.push(blocks.pop().unwrap().hit.handle);
-                continue;
-            }
-            let b = &blocks[0];
-            let minimum = format!(
-                "── {}\n  {}\n",
-                b.hit.handle,
-                surface::clip(
-                    &surface::safe(&b.hit.snippet, false),
-                    budget.saturating_sub(b.hit.handle.len() + 12)
-                )
-            );
-            if minimum.len() > budget || minimum.trim_end().ends_with(&b.hit.handle) {
-                bail!(
-                    "--budget needs at least {} bytes for the first reference",
-                    b.hit.handle.len() + 16
-                )
-            }
-            return Ok(minimum);
-        }
-    }
-    fn reserialized_json(
-        value: &mut Value,
-        blocks: &mut Vec<Block>,
-        budget: usize,
-    ) -> Result<String> {
-        let mut cap = 0;
-        let mut omitted: Vec<String> = Vec::new();
-        loop {
-            value["hits"] = json!(blocks
-                .iter()
-                .map(|b| block_value(b, cap))
-                .collect::<Vec<_>>());
-            if !omitted.is_empty() {
-                value["omitted_hits"] = json!(omitted)
-            }
-            let text = agrep_core::json_output::to_string(&value)? + "\n";
-            if budget == 0 || text.len() <= budget {
-                return Ok(text);
-            }
-            if drop_context(blocks).is_some() {
-                continue;
-            }
-            if cap == 0 {
-                cap = 1000;
-                continue;
-            }
-            if cap > 64 {
-                cap = (cap / 2).max(64);
-                continue;
-            }
-            if blocks.len() > 1 {
-                omitted.push(blocks.pop().unwrap().hit.handle);
-                continue;
-            }
-            bail!(
-                "--budget needs at least {} bytes for the first reference and JSON envelope",
-                text.len()
-            )
-        }
-    }
-    /// Blocks with long, multibyte, control-bearing and whitespace-run rows,
-    /// repeated turns, events on and off retained turns, and tool hits.
-    fn blocks(seed: u64) -> Vec<Block> {
-        let mut state = seed;
-        let mut next = move |n: u64| {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            (state >> 33) % n
-        };
-        const WORDS: [&str; 8] = [
-            "release",
-            "café 界",
-            "  spaced\t\tout ",
-            "\u{1b}[31mred",
-            "workflow",
-            "🙂",
-            "x",
-            "\n",
-        ];
-        let mut blocks = Vec::new();
-        for b in 0..1 + next(5) {
-            let session = format!("session-{seed}-{b}");
-            let center = 3 + next(4) as i64;
-            let mut rows = Vec::new();
-            for turn in center - 2..=center + 2 {
-                for part in 0..1 + next(2) {
-                    let mut words = Vec::new();
-                    let length = if next(4) == 0 { next(300) } else { next(30) };
-                    for _ in 0..length {
-                        words.push(WORDS[next(WORDS.len() as u64) as usize]);
-                    }
-                    let text = words.join(" ");
-                    rows.push(Row {
-                        session: session.clone(),
-                        turn,
-                        who: if part == 0 { "user" } else { "agent" }.into(),
-                        ts: turn * 10 + part as i64,
-                        source_chars: text.chars().count() + next(3) as usize,
-                        text,
-                        model: String::new(),
-                        model_source: String::new(),
-                        source: 1,
-                    });
-                }
-            }
-            let mut events = Vec::new();
-            for i in 0..next(6) {
-                let input = "ls -la ".repeat(1 + next(900) as usize);
-                events.push(evidence::Event {
-                    turn: center - 3 + next(7) as i64,
-                    ts: i as i64,
-                    name: "shell".into(),
-                    kind: "tool".into(),
-                    input_chars: input.chars().count() + next(2) as usize,
-                    input,
-                    output: "ok".into(),
-                    output_chars: 2 + next(2) as usize,
-                    output_bytes: Some(2),
-                    ok: Some(true),
-                    identity: format!("event-{i}"),
-                    text: String::new(),
-                    raw: json!({}),
-                });
-            }
-            let tool = next(3) == 0;
-            blocks.push(Block {
-                hit_turns: BTreeSet::from([center]),
-                hit: Hit {
-                    session: session.clone(),
-                    agent: "pi".into(),
-                    project: "/work/agrep".into(),
-                    turn: center,
-                    ts: 1_700_000_000_000,
-                    who: if tool { "tool" } else { "user" }.into(),
-                    snippet: "release workflow café 界 ".repeat(1 + next(20) as usize),
-                    matched: if tool { "phrase" } else { "all-terms" }.into(),
-                    handle: format!("@{session}:{center}.abcd"),
-                    score: 1.5,
-                    ..Default::default()
-                },
-                window: Window {
-                    target: session.clone(),
-                    session,
-                    agent: "pi".into(),
-                    project: "/work/agrep".into(),
-                    title: String::new(),
-                    family: String::new(),
-                    side: false,
-                    center,
-                    radius: Some(2),
-                    latest: false,
-                    first: 0,
-                    last: center + 2,
-                    rows,
-                    events,
-                    notes: vec![],
-                    claim: None,
-                },
-            });
-        }
-        blocks
+        let query_of = HashMap::from([
+            ("@chat-a:10.abcd".to_owned(), 1),
+            ("@chat-b:4.abcd".to_owned(), 0),
+            ("@chat-a:2.abcd".to_owned(), 0),
+        ]);
+        let merged = merge_chats(
+            vec![
+                (hit("chat-a", 10), window("chat-a", 10, 8..=12)),
+                (hit("chat-b", 4), window("chat-b", 4, 3..=5)),
+                (hit("chat-a", 2), window("chat-a", 2, 1..=3)),
+                (hit("chat-a", 12), window("chat-a", 12, 11..=13)),
+            ],
+            &query_of,
+        );
+        assert_eq!(merged.len(), 2);
+        let b = &merged[0];
+        assert_eq!(b.hit_turns, BTreeSet::from([2, 10, 12]));
+        assert_eq!(b.queries, [1, 0, 0]);
+        assert_eq!(
+            b.window.rows.iter().map(|r| r.turn).collect::<Vec<_>>(),
+            [1, 2, 3, 8, 9, 10, 11, 12, 13]
+        );
+        let queries = ["turn".to_owned(), "turn".to_owned()];
+        let text = page::text(&page::Page::new(&merged[..1], &queries, 0), false).unwrap();
+        assert!(
+            text.contains(
+                "     3 user: turn 3\n       [turns 4-7 not shown]\n     8 user: turn 8\n"
+            ),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1079,42 +942,6 @@ mod tests {
                         .unwrap();
                     assert_eq!(key(&selected), expected, "depth {depth} target {target}");
                 }
-            }
-        }
-    }
-
-    #[test]
-    fn incremental_pages_match_full_rerendering_at_every_budget() {
-        let outcome = |r: Result<String>| r.map_err(|e| e.to_string());
-        for seed in 0..10 {
-            let full = text_page(&mut blocks(seed), 0, false).unwrap().len();
-            let json_full = json_page(&mut json!({"hits":[]}), &mut blocks(seed), 0)
-                .unwrap()
-                .len();
-            for budget in (0..=full + 64).step_by(full / 32 + 1).chain([64, 65, 100]) {
-                for color in [false, true] {
-                    assert_eq!(
-                        outcome(text_page(&mut blocks(seed), budget, color)),
-                        outcome(rerendered_text(&mut blocks(seed), budget, color)),
-                        "seed {seed} budget {budget}"
-                    );
-                }
-            }
-            for budget in (0..=json_full + 64)
-                .step_by(json_full / 32 + 1)
-                .chain([2048, 4096])
-            {
-                let envelope =
-                    || json!({"query":"release","hits":[],"freshness":{"checked":false}});
-                assert_eq!(
-                    outcome(json_page(&mut envelope(), &mut blocks(seed), budget)),
-                    outcome(reserialized_json(
-                        &mut envelope(),
-                        &mut blocks(seed),
-                        budget
-                    )),
-                    "seed {seed} budget {budget}"
-                );
             }
         }
     }

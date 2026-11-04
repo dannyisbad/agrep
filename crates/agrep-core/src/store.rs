@@ -141,7 +141,6 @@ CREATE TABLE IF NOT EXISTS session_sources(agent TEXT NOT NULL,session TEXT NOT 
 CREATE INDEX IF NOT EXISTS session_sources_source ON session_sources(source);
 CREATE TABLE IF NOT EXISTS reply_shapes(source INTEGER NOT NULL,session TEXT NOT NULL,turn INTEGER NOT NULL,body TEXT NOT NULL,PRIMARY KEY(source,session,turn)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS reply_shapes_session ON reply_shapes(session,source,turn);
-CREATE TABLE IF NOT EXISTS family_stats(agent TEXT NOT NULL,family TEXT NOT NULL,body BLOB NOT NULL,PRIMARY KEY(agent,family)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS term_stats(token TEXT PRIMARY KEY,n INTEGER NOT NULL,s INTEGER NOT NULL) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY,value TEXT NOT NULL) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS source_directories(path TEXT PRIMARY KEY,agent TEXT NOT NULL,mtime INTEGER NOT NULL,dirs BLOB NOT NULL,files BLOB NOT NULL) WITHOUT ROWID;
@@ -676,7 +675,6 @@ fn refresh_inner(
         tx.execute("DELETE FROM tool_blocks", [])?;
         for table in [
             "reply_shapes",
-            "family_stats",
             "term_stats",
             "parser_cursors",
             "parser_graph",
@@ -722,6 +720,7 @@ fn refresh_inner(
         }
         tx.execute("DELETE FROM sources WHERE path=?", [key])?;
     }
+    let mut pages = crate::incremental::GraphPages::default();
     for (adapter, b) in batches {
         let adapter_write_start = Instant::now();
         for key in &b.retired {
@@ -826,6 +825,7 @@ fn refresh_inner(
                     s.reset_nodes,
                     session,
                     &s.events,
+                    &mut pages,
                 )?;
                 info.node_chunks_ms += phase.elapsed().as_secs_f64() * 1000.;
             }
@@ -837,6 +837,9 @@ fn refresh_inner(
         info.adapter_write_ms
             .insert(adapter, adapter_write_start.elapsed().as_secs_f64() * 1000.);
     }
+    let phase = Instant::now();
+    pages.finish(&tx)?;
+    info.node_chunks_ms += phase.elapsed().as_secs_f64() * 1000.;
     for s in stamps {
         let error = errors
             .get(&s.path)
@@ -1047,16 +1050,13 @@ fn build_fts(tx: &Transaction<'_>) -> Result<Option<crate::tool_index::Presence>
                             queued += 1;
                         }
                     }
-                    for batch in prepared.chunks(64) {
-                        let sql = format!(
-                            "INSERT INTO {table}_fts(rowid,text) VALUES {}",
-                            vec!["(?,?)"; batch.len()].join(",")
-                        );
-                        let bind = batch.iter().flat_map(|(id, text)| {
-                            [id as &dyn rusqlite::ToSql, text as &dyn rusqlite::ToSql]
-                        });
-                        tx.prepare_cached(&sql)?
-                            .execute(rusqlite::params_from_iter(bind))?;
+                    // A multi-row statement opens a savepoint, and FTS5 flushes its
+                    // pending terms to a new segment at every savepoint.
+                    let mut insert = tx.prepare_cached(&format!(
+                        "INSERT INTO {table}_fts(rowid,text) VALUES(?1,?2)"
+                    ))?;
+                    for (id, text) in &prepared {
+                        insert.execute(params![id, text])?;
                     }
                 }
                 Ok(())

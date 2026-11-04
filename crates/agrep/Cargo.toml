@@ -9,6 +9,7 @@ clap = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+regex = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 [dev-dependencies]
 flate2 = { workspace = true }

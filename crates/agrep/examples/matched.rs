@@ -1,7 +1,9 @@
 //! Matched full-process comparison of agrep 0.4.9 (the reference) and this build (the
 //! candidate) on the same corpus, machine and load. Samples alternate reference and
 //! candidate, every sample is kept and verified, and a case is won only when the
-//! candidate's median and p95 are both below the reference's.
+//! candidate's median and p95 are both below the reference's. A completely separated case
+//! stops early (support/matched.rs); a candidate sampling alone after the reference stopped
+//! still refreshes every appended turn the reference's sample would have appended.
 //!
 //! Minimal mappings where one command line cannot serve both versions:
 //! - Each lane has its own temporary AGREP_DATA_DIR; both read the same agent stores.
@@ -394,64 +396,101 @@ impl Bench {
         let mut exits_ms = [vec![], vec![]];
         let mut last = [Value::Null, Value::Null];
         let mut drains = [vec![], vec![]];
-        for i in 0..runs {
-            if case.kind == Kind::Changed {
-                append_turn(
-                    session.context("changed-source case without a session")?,
-                    &format!("changed-{i}"),
-                    &format!("active session update {i}"),
-                )?;
+        let mut unpaired = vec![];
+        let mut appended = 0;
+        // The reference's index misses turns appended while the candidate sampled alone.
+        let mut reference_behind = false;
+        loop {
+            let (k, paired) = match matched::next(runs, &lanes[0].samples_ms, &lanes[1].samples_ms)
+            {
+                matched::Next::Done => break,
+                matched::Next::Reference => (0, true),
+                matched::Next::Candidate { paired } => (1, paired),
+            };
+            let lane = &self.lanes[k];
+            let i = lanes[k].samples_ms.len();
+            if k == 0 && reference_behind {
+                self.prepare(lane, &["index"])?;
+                reference_behind = false;
             }
-            for (k, lane) in self.lanes.iter().enumerate() {
-                match case.kind {
-                    Kind::FirstIndex => {
-                        ended[k] += lane.end()?;
-                        lane.reset()?;
+            if !paired {
+                unpaired.push(i);
+            }
+            match case.kind {
+                Kind::FirstIndex => {
+                    ended[k] += lane.end()?;
+                    lane.reset()?;
+                }
+                Kind::Cold => ended[k] += lane.end()?,
+                Kind::Refresh => {
+                    let session = session.context("refresh case without a session")?;
+                    if !paired {
+                        // Alone, the candidate still refreshes the turn the reference's
+                        // sample would have appended.
+                        append_turn(
+                            session,
+                            &format!("refresh-reference-alone-{i}"),
+                            &format!("one changed session incremental probe reference alone {i}"),
+                        )?;
+                        reference_behind = true;
                     }
-                    Kind::Cold => ended[k] += lane.end()?,
-                    Kind::Refresh => append_turn(
-                        session.context("refresh case without a session")?,
+                    append_turn(
+                        session,
                         &format!("refresh-{}-{i}", lane.name()),
                         &format!("one changed session incremental probe {} {i}", lane.name()),
-                    )?,
-                    Kind::Warm | Kind::Changed => {}
+                    )?;
                 }
-                let s = self.invoke(lane, &case.args, case.profile)?;
-                let lane_oracle = if lane.role == Role::Candidate {
-                    oracle
-                } else {
-                    None
-                };
-                let mut verified = s.settled
-                    && s.exit == case.expected_exit
-                    && matched::sample_verified(&case.name, &case.args, &s.evidence, lane_oracle);
-                if !verified {
-                    self.diagnose(lane, &format!("{} sample {i}", case.name), &s);
+                // One appended turn per pair, or per candidate sample taken alone.
+                Kind::Changed if k == 0 || !paired => {
+                    append_turn(
+                        session.context("changed-source case without a session")?,
+                        &format!("changed-{appended}"),
+                        &format!("active session update {appended}"),
+                    )?;
+                    appended += 1;
+                    reference_behind |= !paired;
                 }
-                if case.kind == Kind::Changed {
-                    // The next pair starts from a refreshed index; a failed refresh fails the sample.
-                    let drain = self.invoke(lane, &["index".into()], "classic")?;
-                    if drain.exit != 0 || !drain.settled {
-                        self.diagnose(lane, &format!("{} drain {i}", case.name), &drain);
-                        verified = false;
-                    }
-                    drains[k].push(drain.ms);
+                Kind::Warm | Kind::Changed => {}
+            }
+            let s = self.invoke(lane, &case.args, case.profile)?;
+            let lane_oracle = if lane.role == Role::Candidate {
+                oracle
+            } else {
+                None
+            };
+            let mut verified = s.settled
+                && s.exit == case.expected_exit
+                && matched::sample_verified(&case.name, &case.args, &s.evidence, lane_oracle);
+            if !verified {
+                self.diagnose(lane, &format!("{} sample {i}", case.name), &s);
+            }
+            if case.kind == Kind::Changed {
+                // The next sample starts from a refreshed index; a failed refresh fails the sample.
+                let drain = self.invoke(lane, &["index".into()], "classic")?;
+                if drain.exit != 0 || !drain.settled {
+                    self.diagnose(lane, &format!("{} drain {i}", case.name), &drain);
+                    verified = false;
                 }
-                lanes[k].record(s.ms, s.exit, verified);
-                loads[k].push(s.load);
-                exits_ms[k].push(s.exit_ms);
-                last[k] = summary(&s.evidence);
-                if lane_oracle.is_none() {
-                    if let Some(o) = oracle {
-                        last[k]["oracle_match"] = json!(matched::sample_verified(
-                            &case.name,
-                            &case.args,
-                            &s.evidence,
-                            Some(o)
-                        ));
-                    }
+                drains[k].push(drain.ms);
+            }
+            lanes[k].record(s.ms, s.exit, verified);
+            loads[k].push(s.load);
+            exits_ms[k].push(s.exit_ms);
+            last[k] = summary(&s.evidence);
+            if lane_oracle.is_none() {
+                if let Some(o) = oracle {
+                    last[k]["oracle_match"] = json!(matched::sample_verified(
+                        &case.name,
+                        &case.args,
+                        &s.evidence,
+                        Some(o)
+                    ));
                 }
             }
+        }
+        if reference_behind {
+            // The next case starts from an index that holds every appended turn.
+            self.prepare(self.reference(), &["index"])?;
         }
         for (k, lane) in self.lanes.iter().enumerate() {
             ended[k] += lane.end()?;
@@ -473,13 +512,13 @@ impl Bench {
             entry["last_result"] = last[k].clone();
             entry["background_processes_ended"] = json!(ended[k]);
         }
+        value["candidate"]["unpaired_samples"] = json!(unpaired);
         value["name"] = json!(case.name);
         value["args"] = json!(case.shown);
         value["profile"] = json!(case.profile);
         value["expected_exit"] = json!(case.expected_exit);
-        value["samples_per_lane"] = json!(runs);
         let line = format!(
-            "{:28} ref {:>10.2} / {:>10.2}  cand {:>9.2} / {:>9.2} ms  ratio {:>6.3} / {:>6.3}  {}",
+            "{:28} ref {:>10.2} / {:>10.2}  cand {:>9.2} / {:>9.2} ms  ratio {:>6.3} / {:>6.3}  {} ({} after {}/{} samples)",
             case.name,
             value["reference"]["median_ms"].as_f64().unwrap_or(f64::NAN),
             value["reference"]["p95_ms"].as_f64().unwrap_or(f64::NAN),
@@ -488,6 +527,9 @@ impl Bench {
             value["median_ratio"].as_f64().unwrap_or(f64::NAN),
             value["p95_ratio"].as_f64().unwrap_or(f64::NAN),
             value["verdict"].as_str().unwrap_or("?"),
+            value["schedule"]["stop"].as_str().unwrap_or("?"),
+            lanes[0].samples_ms.len(),
+            lanes[1].samples_ms.len(),
         );
         eprintln!("{line}");
         self.trace(&value)?;
@@ -559,6 +601,18 @@ fn summary(evidence: &Value) -> Value {
     for key in ["indexed", "total"] {
         if let Some(n) = evidence["semantic_coverage"][key].as_u64() {
             value[format!("semantic_{key}")] = json!(n);
+        }
+    }
+    // An index run prints its phase timings: the only way to see where a hosted
+    // runner spends a slow build.
+    if let Some(fields) = evidence.as_object() {
+        for (key, number) in fields {
+            if number.is_number()
+                && (key.ends_with("_ms")
+                    || matches!(key.as_str(), "sources" | "parsed" | "changed_rows"))
+            {
+                value[format!("index_{key}")] = number.clone();
+            }
         }
     }
     value
@@ -1116,12 +1170,14 @@ fn measure(
         "versions": versions,
         "host": {"os": std::env::consts::OS, "arch": std::env::consts::ARCH,
                  "cpus": std::thread::available_parallelism().map_or(0, |n| n.get())},
-        "scope": "fresh processes through full exit, reference then candidate per sample, every sample kept; index samples of the reference end when its queued search-database build is served; one recorded warm-up per lane before warm cases; background processes of both lanes ended between cases",
-        "gate": "every case: candidate median < reference median and candidate p95 < reference p95, with every sample of both lanes verified",
+        "scope": "fresh processes through full exit, samples alternating reference and candidate, every sample kept; index samples of the reference end when its queued search-database build is served; one recorded warm-up per lane before warm cases; background processes of both lanes ended between cases",
+        "schedule": "runs (build_runs for first builds and first hybrid queries) samples per lane, unless the first min(5, ceil(runs/2)) pairs are completely separated: every candidate sample slower than every reference sample ends the case; every candidate sample faster stops the reference while the candidate completes its samples alone, and the case ends when all of them stay faster than every reference sample, else the reference resumes to its full count",
+        "gate": "every case: candidate median < reference median and candidate p95 < reference p95 over the samples taken, with every sample of both lanes verified and each lane holding exactly the samples its schedule asked for",
         "preparation": preparation,
         "summary": {
             "cases": cases.len(),
             "wins": count("win"),
+            "wins_over_degraded_reference": count("win_over_degraded_reference"),
             "losses": count("loss"),
             "reference_failures": count("reference_failure"),
             "candidate_failures": count("candidate_failure"),
@@ -1137,8 +1193,9 @@ fn measure(
         println!("{text}");
     }
     eprintln!(
-        "{} cases: {} wins, {} losses, {} reference failures, {} candidate failures, {} both failed",
-        report["summary"]["cases"], report["summary"]["wins"], report["summary"]["losses"],
+        "{} cases: {} wins, {} wins over degraded 0.4.9 answers, {} losses, {} reference failures, {} candidate failures, {} both failed",
+        report["summary"]["cases"], report["summary"]["wins"],
+        report["summary"]["wins_over_degraded_reference"], report["summary"]["losses"],
         report["summary"]["reference_failures"], report["summary"]["candidate_failures"],
         report["summary"]["both_failed"]
     );

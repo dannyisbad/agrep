@@ -528,6 +528,47 @@ fn event_blob(
         Ok(None)
     }
 }
+/// Saved graph pages, packed in parallel batches: one parallel pack per small
+/// source left the writer waiting on the pool for every source. A refresh saves
+/// each source at most once, so no save reads a page that is still batched.
+#[derive(Default)]
+pub(crate) struct GraphPages {
+    batch: Vec<(i64, i64, Graph)>,
+    nodes: usize,
+}
+impl GraphPages {
+    const BATCH_NODES: usize = 8_192;
+    fn queue(
+        &mut self,
+        tx: &Transaction<'_>,
+        source: i64,
+        pages: BTreeMap<i64, Graph>,
+    ) -> Result<()> {
+        for (bucket, graph) in pages {
+            self.nodes += graph.len();
+            self.batch.push((source, bucket, graph));
+        }
+        if self.nodes >= Self::BATCH_NODES {
+            self.flush(tx)?;
+        }
+        Ok(())
+    }
+    fn flush(&mut self, tx: &Transaction<'_>) -> Result<()> {
+        let packed: Vec<(i64, i64, Vec<u8>)> = std::mem::take(&mut self.batch)
+            .into_par_iter()
+            .map(|(source, bucket, graph)| Ok((source, bucket, pack_graph(&graph)?)))
+            .collect::<Result<_>>()?;
+        self.nodes = 0;
+        for (source, bucket, body) in packed {
+            tx.prepare_cached("INSERT INTO parser_graph VALUES(?1,?2,?3) ON CONFLICT(source,bucket) DO UPDATE SET body=excluded.body")?.execute(params![source,bucket,body])?;
+        }
+        Ok(())
+    }
+    /// Inserts every batched page; required before the transaction commits.
+    pub(crate) fn finish(mut self, tx: &Transaction<'_>) -> Result<()> {
+        self.flush(tx)
+    }
+}
 pub(crate) fn save_nodes(
     tx: &Transaction<'_>,
     source: i64,
@@ -535,6 +576,7 @@ pub(crate) fn save_nodes(
     reset: bool,
     session: Option<(&str, &str)>,
     events: &[Event],
+    pages: &mut GraphPages,
 ) -> Result<()> {
     if reset {
         tx.execute("DELETE FROM parser_graph WHERE source=?", [source])?;
@@ -692,25 +734,22 @@ pub(crate) fn save_nodes(
         }
         let key = bucket(&node.id);
         if let std::collections::btree_map::Entry::Vacant(e) = changed.entry(key) {
-            e.insert(graph(tx, source, key)?);
+            e.insert(if reset {
+                Graph::new()
+            } else {
+                graph(tx, source, key)?
+            });
         }
         changed.get_mut(&key).unwrap().insert(
-            node.id.clone(),
+            node.id,
             GraphNode {
-                parent: node.parent.clone(),
+                parent: node.parent,
                 ordinal: node.ordinal,
                 record,
             },
         );
     }
-    let packed: Vec<(i64, Vec<u8>)> = changed
-        .into_par_iter()
-        .map(|(bucket, graph)| Ok((bucket, pack_graph(&graph)?)))
-        .collect::<Result<_>>()?;
-    for (bucket, body) in packed {
-        tx.prepare_cached("INSERT INTO parser_graph VALUES(?1,?2,?3) ON CONFLICT(source,bucket) DO UPDATE SET body=excluded.body")?.execute(params![source,bucket,body])?;
-    }
-    Ok(())
+    pages.queue(tx, source, changed)
 }
 pub fn supports(agent: &str, path: &Path) -> bool {
     matches!(agent, "pi" | "claude" | "codex") && path.extension().is_some_and(|s| s == "jsonl")

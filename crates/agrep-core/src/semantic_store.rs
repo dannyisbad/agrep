@@ -264,25 +264,23 @@ pub struct Block {
     pub map: memmap2::Mmap,
     pub rows: usize,
 }
+const RECORD: usize = DIM * 3 + 4;
 impl Block {
-    pub fn exact_score(&self, slot: usize, query: &[f32]) -> f32 {
-        let start = slot * (DIM * 3 + 4) + DIM + 4;
-        let mut dot = 0f32;
-        let mut norm = 0f32;
-        for (bytes, q) in self.map[start..start + DIM * 2].chunks_exact(2).zip(query) {
-            let v = half::f16::from_le_bytes([bytes[0], bytes[1]]).to_f32();
-            dot += v * q;
-            norm += v * v;
-        }
-        dot / norm.sqrt()
-    }
-    pub fn candidates(&self, query: &[i8], query_scale: f32, floor: f32) -> Vec<(usize, f32)> {
+    /// Rows whose quantized upper bound reaches `floor`, with that bound and the
+    /// exact F16 cosine.
+    pub fn candidates(
+        &self,
+        query: &[i8],
+        query_scale: f32,
+        exact_query: &[f32],
+        floor: f32,
+    ) -> Vec<(usize, f32, f32)> {
         let root_dim = (DIM as f32).sqrt();
         let query_error = root_dim * query_scale * 0.5;
-        self.map
-            .chunks_exact(DIM * 3 + 4)
-            .enumerate()
-            .filter_map(|(i, r)| {
+        let record = |i: usize| &self.map[i * RECORD..(i + 1) * RECORD];
+        let mut found: Vec<(usize, f32, f32)> = (0..self.rows)
+            .filter_map(|i| {
+                let r = record(i);
                 let row_scale = f32::from_le_bytes(r[..4].try_into().unwrap());
                 let row = unsafe { std::slice::from_raw_parts(r[4..].as_ptr().cast::<i8>(), DIM) };
                 let score = crate::semantic_q8::dot(row, query) as f32 * row_scale * query_scale;
@@ -290,21 +288,51 @@ impl Block {
                 // 0.002 covers normalized IEEE f16 rounding and F32 accumulation.
                 let upper =
                     score + query_error + (1. + query_error) * root_dim * row_scale * 0.5 + 0.002;
-                (upper >= floor).then_some((i, upper))
+                (upper >= floor).then_some((i, upper, 0.))
             })
-            .collect()
+            .collect();
+        for group in found.chunks_mut(LANES) {
+            // A short final group repeats its last row; the extra lanes are dropped.
+            let rows = std::array::from_fn(|j| &record(group[j.min(group.len() - 1)].0)[DIM + 4..]);
+            for (candidate, exact) in group.iter_mut().zip(exact_cosines(rows, exact_query)) {
+                candidate.2 = exact;
+            }
+        }
+        found
     }
 }
-pub fn blocks(root: &DataRoot, c: &Connection) -> Result<Vec<Block>> {
-    use rayon::prelude::*;
+const LANES: usize = 8;
+/// Cosines of stored F16 vectors with the query, one row per lane. Every lane
+/// accumulates in F32 in dimension order without fused multiply-adds, so each
+/// result equals the row-at-a-time loop bit for bit; the lanes only add parallelism.
+fn exact_cosines(rows: [&[u8]; LANES], query: &[f32]) -> [f32; LANES] {
+    let mut dot = [0f32; LANES];
+    let mut norm = [0f32; LANES];
+    for (k, q) in query.iter().enumerate() {
+        let column: [f32; LANES] = std::array::from_fn(|j| {
+            half::f16::from_le_bytes([rows[j][2 * k], rows[j][2 * k + 1]]).to_f32()
+        });
+        for ((d, n), v) in dot.iter_mut().zip(&mut norm).zip(column) {
+            *d += v * q;
+            *n += v * v;
+        }
+    }
+    std::array::from_fn(|j| dot[j] / norm[j].sqrt())
+}
+/// The snapshot's published blocks in name order; only this step needs the connection.
+pub fn block_list(c: &Connection) -> Result<Vec<(String, usize)>> {
     if !has_schema(c)? {
         return Ok(vec![]);
     }
     let mut s = c.prepare("SELECT name,rows FROM semantic_blocks ORDER BY name")?;
-    let values: Vec<_> = s
+    let values = s
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, usize>(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    values
+    Ok(values)
+}
+pub fn open_blocks(root: &DataRoot, listed: Vec<(String, usize)>) -> Result<Vec<Block>> {
+    use rayon::prelude::*;
+    listed
         .into_par_iter()
         .map(|(name, rows)| {
             if name.len() != 70
@@ -315,7 +343,7 @@ pub fn blocks(root: &DataRoot, c: &Connection) -> Result<Vec<Block>> {
             }
             let f = File::open(root.path().join("vectors").join(&name))
                 .context("read semantic vector block")?;
-            if f.metadata()?.len() as usize != rows * (DIM * 3 + 4) {
+            if f.metadata()?.len() as usize != rows * RECORD {
                 bail!("invalid semantic vector block length");
             }
             // Published blocks are immutable and remain valid while any SQLite reader uses them.
@@ -325,6 +353,9 @@ pub fn blocks(root: &DataRoot, c: &Connection) -> Result<Vec<Block>> {
             Ok(Block { name, map, rows })
         })
         .collect()
+}
+pub fn blocks(root: &DataRoot, c: &Connection) -> Result<Vec<Block>> {
+    open_blocks(root, block_list(c)?)
 }
 
 #[cfg(test)]
@@ -351,6 +382,52 @@ mod tests {
             .unwrap()
             .to_string()
             .contains("invalid semantic block name"));
+    }
+    #[test]
+    fn lane_cosines_equal_the_row_at_a_time_loop_bit_for_bit() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let unit = (state >> 40) as f32 / (1u64 << 24) as f32 * 2. - 1.;
+            // Subnormal and large F16 components as well as ordinary ones.
+            unit * [1e-6, 9., 1., 1., 0.1][(state % 5) as usize]
+        };
+        let query: Vec<f32> = (0..DIM).map(|_| next()).collect();
+        let rows = LANES + 3;
+        let mut bytes = Vec::new();
+        let mut expected = Vec::new();
+        for _ in 0..rows {
+            let vector: Vec<f32> = (0..DIM).map(|_| next()).collect();
+            let (q, scale) = quantize(&vector).unwrap();
+            bytes.extend_from_slice(&scale.to_le_bytes());
+            bytes.extend(q.into_iter().map(|x| x as u8));
+            let (mut dot, mut norm) = (0f32, 0f32);
+            for (x, q) in vector.iter().zip(&query) {
+                let v = half::f16::from_f32(*x);
+                bytes.extend_from_slice(&v.to_le_bytes());
+                dot += v.to_f32() * q;
+                norm += v.to_f32() * v.to_f32();
+            }
+            expected.push(dot / norm.sqrt());
+        }
+        let mut map = memmap2::MmapMut::map_anon(bytes.len()).unwrap();
+        map.copy_from_slice(&bytes);
+        let block = Block {
+            name: String::new(),
+            map: map.make_read_only().unwrap(),
+            rows,
+        };
+        let (q, scale) = quantize(&query).unwrap();
+        let found = block.candidates(&q, scale, &query, f32::NEG_INFINITY);
+        assert_eq!(
+            found.iter().map(|c| c.0).collect::<Vec<_>>(),
+            (0..rows).collect::<Vec<_>>()
+        );
+        for (candidate, expected) in found.iter().zip(&expected) {
+            assert_eq!(candidate.2.to_bits(), expected.to_bits());
+        }
     }
     fn root() -> (tempfile::TempDir, DataRoot) {
         let t = tempfile::tempdir().unwrap();
