@@ -78,7 +78,9 @@ visible prose, visible tool and source-error counts.
 - `Refresh` reports `sources`, `parsed`, `changed_rows`, `errors`, `resumed_sources`,
   `bytes_read`, `bytes_parsed` and timings (`census_ms`, `open_ms` for the writer
   connection with any WAL recovery, `parse_ms`, `write_ms`, `bounds_ms`, `stats_ms`,
-  `commit_ms`, `total_ms`, and per-adapter maps).
+  `commit_ms`, `total_ms`, and per-adapter maps). File sources parse while earlier ones
+  are written, so `parse_ms` is discovery plus the writer's waits for a parse and
+  `write_ms` excludes those waits.
 - `Explorer::with_freshness` takes a closure that runs the census and returns the
   pending-source count; `agrep serve` and `agrep ui` pass the command line's own, so the
   explorer reports the same count as the terminal.

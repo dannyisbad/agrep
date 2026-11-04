@@ -91,6 +91,32 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<String> {
     Ok(String::from_utf8(out)?)
 }
 
+/// A tool text as its blob stores it: plain, encoded by the writer only when no stored
+/// blob has its digest, or digested and encoded beforehand, off the writer's thread.
+pub(crate) enum Text<'a> {
+    Plain(&'a str),
+    Encoded {
+        digest: [u8; 32],
+        ascii: bool,
+        body: Vec<u8>,
+    },
+}
+/// An event's searchable text, prepared for [`Writer::event`].
+pub(crate) struct Prepared {
+    pub separator: Option<usize>,
+    pub text: Text<'static>,
+}
+pub(crate) fn prepare(e: &Event) -> Result<Prepared> {
+    let (text, separator) = crate::tool_text::format(e);
+    Ok(Prepared {
+        separator,
+        text: Text::Encoded {
+            digest: Sha256::digest(text.as_bytes()).into(),
+            ascii: text.is_ascii(),
+            body: encode(&text)?,
+        },
+    })
+}
 #[derive(Default)]
 pub(crate) struct Writer {
     symbols: HashMap<String, i64>,
@@ -148,8 +174,16 @@ impl Writer {
         self.sessions.insert(key, id);
         Ok(id)
     }
-    pub(crate) fn blob(&mut self, tx: &Transaction<'_>, source: i64, text: &str) -> Result<i64> {
-        let key: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+    pub(crate) fn blob(
+        &mut self,
+        tx: &Transaction<'_>,
+        source: i64,
+        text: Text<'_>,
+    ) -> Result<i64> {
+        let key: [u8; 32] = match &text {
+            Text::Plain(text) => Sha256::digest(text.as_bytes()).into(),
+            Text::Encoded { digest, .. } => *digest,
+        };
         let id = if let Some(id) = self.blobs.get(&key) {
             *id
         } else {
@@ -160,13 +194,14 @@ impl Writer {
             let id = if let Some(id) = existing {
                 id
             } else {
-                let encoded = encode(text)?;
+                let (ascii, encoded) = match text {
+                    Text::Plain(text) => (text.is_ascii(), encode(text)?),
+                    Text::Encoded { ascii, body, .. } => (ascii, body),
+                };
                 tx.prepare_cached(
                     "INSERT INTO tool_blobs(digest,ascii,body) VALUES(?1,?2,?3) RETURNING id",
                 )?
-                .query_row(params![key.as_slice(), text.is_ascii(), encoded], |r| {
-                    r.get(0)
-                })?
+                .query_row(params![key.as_slice(), ascii, encoded], |r| r.get(0))?
             };
             self.blobs.insert(key, id);
             id
@@ -184,7 +219,7 @@ impl Writer {
         turn: i64,
         separator: Option<usize>,
         project: &str,
-        text: Option<&str>,
+        text: Option<Text<'_>>,
         bulk: bool,
     ) -> Result<Changed> {
         let session = self.session(tx, e.agent, &e.session)?;

@@ -2107,7 +2107,7 @@ pub fn collect(cache: &mut crate::intake_batch::IntakeBatch) -> (Vec<Message>, V
         "gemini",
         &files,
         &retired,
-        |path| parse_file(path, &projects),
+        move |path| parse_file(path, &projects),
     );
     (pass.messages, pass.events)
 }

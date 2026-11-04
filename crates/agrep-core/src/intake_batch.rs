@@ -4,6 +4,7 @@ use rayon::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
+    sync::Arc,
     time::SystemTime,
 };
 #[derive(Debug, Clone)]
@@ -154,6 +155,30 @@ pub struct IntakeBatch {
     pub tokens: HashMap<String, String>,
     pub cursors: HashMap<String, Vec<u8>>,
     pub database: Option<PathBuf>,
+    /// File sources go to `pending` unparsed, for a caller that parses each one only
+    /// as it is ready to write it.
+    pub defer: bool,
+    pub pending: Vec<Pending>,
+}
+type Parse = dyn Fn(&Path) -> (Vec<Message>, Vec<Event>, Option<ReadOutcome>) + Send + Sync;
+/// A changed file source and everything its parse needs.
+pub struct Pending {
+    pub path: PathBuf,
+    agent: &'static str,
+    cursor: Option<Vec<u8>>,
+    database: Option<PathBuf>,
+    parse: Arc<Parse>,
+}
+impl Pending {
+    pub fn parse(self) -> SourceBatch {
+        parse_source(
+            self.agent,
+            &self.path,
+            self.cursor.as_deref(),
+            self.database.as_deref(),
+            &*self.parse,
+        )
+    }
 }
 impl IntakeBatch {
     pub fn preflight_source_paths(&self, root: &Path) -> Option<Vec<PathBuf>> {
@@ -238,8 +263,8 @@ pub fn collect_cached_retiring_for<F, R>(
     p: F,
 ) -> Pass
 where
-    F: Fn(&Path) -> R + Sync,
-    R: IntoParsed,
+    F: Fn(&Path) -> R + Send + Sync + 'static,
+    R: IntoParsed + 'static,
 {
     c.retired
         .extend(retired.iter().map(|p| p.to_string_lossy().into_owned()));
@@ -247,85 +272,110 @@ where
 }
 pub fn collect_cached_for<F, R>(c: &mut IntakeBatch, a: &'static str, f: &[PathBuf], p: F) -> Pass
 where
-    F: Fn(&Path) -> R + Sync,
-    R: IntoParsed,
+    F: Fn(&Path) -> R + Send + Sync + 'static,
+    R: IntoParsed + 'static,
 {
+    let parse: Arc<Parse> = Arc::new(move |path: &Path| p(path).into_parsed());
+    let cursor = |path: &Path| c.cursors.get(path.to_string_lossy().as_ref());
+    if c.defer {
+        let pending: Vec<_> = f
+            .iter()
+            .filter(|p| c.changed.contains(*p))
+            .map(|path| Pending {
+                path: path.clone(),
+                agent: a,
+                cursor: cursor(path).cloned(),
+                database: c.database.clone(),
+                parse: parse.clone(),
+            })
+            .collect();
+        c.pending.extend(pending);
+        return Pass::default();
+    }
     let batches: Vec<_> = f
         .par_iter()
         .filter(|p| c.changed.contains(*p))
         .map(|path| {
-            let started = std::time::Instant::now();
-            crate::intake::take_diagnostics();
-            let mut delta = None;
-            let ((m, e, o), bad) = crate::intake::scoped(|| {
-                match crate::ingest::parse_guard::isolate(a, path, || {
-                    if crate::incremental::supports(a, path) {
-                        match crate::incremental::parse(
-                            a,
-                            path,
-                            c.cursors
-                                .get(path.to_string_lossy().as_ref())
-                                .map(Vec::as_slice),
-                            c.database.as_deref(),
-                        ) {
-                            Ok(mut parsed) => {
-                                let rows = (
-                                    std::mem::take(&mut parsed.messages),
-                                    std::mem::take(&mut parsed.events),
-                                    Some(parsed.outcome),
-                                );
-                                delta = Some(parsed);
-                                rows
-                            }
-                            Err(e) => {
-                                crate::intake::diagnostic(format_args!("source parse failed: {e}"));
-                                (vec![], vec![], Some(ReadOutcome::Invalid))
-                            }
-                        }
-                    } else {
-                        p(path).into_parsed()
-                    }
-                }) {
-                    Ok(v) => v,
-                    Err(_) => (vec![], vec![], Some(ReadOutcome::Invalid)),
-                }
-            });
-            let diagnostics = crate::intake::take_diagnostics();
-            let error = if !diagnostics.is_empty()
-                || crate::intake::errors(&bad)
-                || o.is_some_and(|o| !o.licenses_replacement())
-            {
-                Some(
-                    crate::ingest::take_read_failure(path)
-                        .unwrap_or_else(|| format!("source parse incomplete: {}", path.display())),
-                )
-            } else {
-                None
-            };
-            let mut batch = SourceBatch {
-                key: path.to_string_lossy().into(),
-                agent: a.into(),
-                messages: m,
-                events: e,
-                error,
-                parse_ms: started.elapsed().as_secs_f64() * 1000.,
-                ..Default::default()
-            };
-            if batch.error.is_none() {
-                if let Some(delta) = delta {
-                    batch.cursor = Some(delta.cursor);
-                    batch.nodes = delta.nodes;
-                    batch.append = delta.append;
-                    batch.reset_nodes = delta.reset_nodes;
-                    batch.bytes_read = delta.bytes_read;
-                    batch.bytes_parsed = delta.bytes_parsed;
-                }
-            }
-            batch
+            parse_source(
+                a,
+                path,
+                cursor(path).map(Vec::as_slice),
+                c.database.as_deref(),
+                &*parse,
+            )
         })
         .collect();
     c.batches.extend(batches);
     Pass::default()
+}
+fn parse_source(
+    a: &'static str,
+    path: &Path,
+    cursor: Option<&[u8]>,
+    database: Option<&Path>,
+    p: &Parse,
+) -> SourceBatch {
+    let started = std::time::Instant::now();
+    crate::intake::take_diagnostics();
+    let mut delta = None;
+    let ((m, e, o), bad) = crate::intake::scoped(|| {
+        match crate::ingest::parse_guard::isolate(a, path, || {
+            if crate::incremental::supports(a, path) {
+                match crate::incremental::parse(a, path, cursor, database) {
+                    Ok(mut parsed) => {
+                        let rows = (
+                            std::mem::take(&mut parsed.messages),
+                            std::mem::take(&mut parsed.events),
+                            Some(parsed.outcome),
+                        );
+                        delta = Some(parsed);
+                        rows
+                    }
+                    Err(e) => {
+                        crate::intake::diagnostic(format_args!("source parse failed: {e}"));
+                        (vec![], vec![], Some(ReadOutcome::Invalid))
+                    }
+                }
+            } else {
+                p(path)
+            }
+        }) {
+            Ok(v) => v,
+            Err(_) => (vec![], vec![], Some(ReadOutcome::Invalid)),
+        }
+    });
+    let diagnostics = crate::intake::take_diagnostics();
+    let error = if !diagnostics.is_empty()
+        || crate::intake::errors(&bad)
+        || o.is_some_and(|o| !o.licenses_replacement())
+    {
+        Some(
+            crate::ingest::take_read_failure(path)
+                .unwrap_or_else(|| format!("source parse incomplete: {}", path.display())),
+        )
+    } else {
+        None
+    };
+    let mut batch = SourceBatch {
+        key: path.to_string_lossy().into(),
+        agent: a.into(),
+        messages: m,
+        events: e,
+        error,
+        parse_ms: started.elapsed().as_secs_f64() * 1000.,
+        ..Default::default()
+    };
+    if batch.error.is_none() {
+        if let Some(delta) = delta {
+            batch.cursor = Some(delta.cursor);
+            batch.nodes = delta.nodes;
+            batch.append = delta.append;
+            batch.reset_nodes = delta.reset_nodes;
+            batch.bytes_read = delta.bytes_read;
+            batch.bytes_parsed = delta.bytes_parsed;
+        }
+    }
+    batch
 }
 
 /// Reconcile an adapter-wide dependency unit before it reaches the row store.

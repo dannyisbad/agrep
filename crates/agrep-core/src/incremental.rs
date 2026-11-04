@@ -371,7 +371,13 @@ fn reference_text(
         let right = &text[text.trim_end().len()..];
         (id, start, len, left, right)
     } else {
-        (writer.blob(tx, source, &text)?, 0, text.len(), "", "")
+        (
+            writer.blob(tx, source, crate::tool_store::Text::Plain(&text))?,
+            0,
+            text.len(),
+            "",
+            "",
+        )
     };
     writer.own_blob(tx, source, id)?;
     *value = serde_json::json!({"__agrep_text_ref":[id,start,len,left,right]});
@@ -529,13 +535,21 @@ fn event_blob(
 /// Saved graph pages, packed in parallel batches: one parallel pack per small
 /// source left the writer waiting on the pool for every source. A refresh saves
 /// each source at most once, so no save reads a page that is still batched.
-#[derive(Default)]
 pub(crate) struct GraphPages {
+    /// Idle while sources parse on threads of their own, whose work fills the global pool.
+    pool: &'static rayon::ThreadPool,
     batch: Vec<(i64, i64, Graph)>,
     nodes: usize,
 }
 impl GraphPages {
     const BATCH_NODES: usize = 8_192;
+    pub(crate) fn new(pool: &'static rayon::ThreadPool) -> Self {
+        Self {
+            pool,
+            batch: Vec::new(),
+            nodes: 0,
+        }
+    }
     fn queue(
         &mut self,
         tx: &Transaction<'_>,
@@ -552,10 +566,13 @@ impl GraphPages {
         Ok(())
     }
     fn flush(&mut self, tx: &Transaction<'_>) -> Result<()> {
-        let packed: Vec<(i64, i64, Vec<u8>)> = std::mem::take(&mut self.batch)
-            .into_par_iter()
-            .map(|(source, bucket, graph)| Ok((source, bucket, pack_graph(&graph)?)))
-            .collect::<Result<_>>()?;
+        let batch = std::mem::take(&mut self.batch);
+        let packed: Vec<(i64, i64, Vec<u8>)> = self.pool.install(|| {
+            batch
+                .into_par_iter()
+                .map(|(source, bucket, graph)| Ok((source, bucket, pack_graph(&graph)?)))
+                .collect::<Result<_>>()
+        })?;
         self.nodes = 0;
         for (source, bucket, body) in packed {
             tx.prepare_cached("INSERT INTO parser_graph VALUES(?1,?2,?3) ON CONFLICT(source,bucket) DO UPDATE SET body=excluded.body")?.execute(params![source,bucket,body])?;
@@ -843,18 +860,32 @@ pub fn parse(
     let mut nodes = vec![];
     let mut branched = false;
     if agent == "pi" {
+        // Records parse independently, so a large source spreads over the pool; the
+        // header, leaf and graph below still follow file order.
+        let base = old.as_ref().map_or(0, |c| c.records);
+        let lines: Vec<&str> = data.lines().collect();
+        let records: Vec<Result<Option<(serde_json::Value, String)>>> = lines
+            .par_iter()
+            .enumerate()
+            .map(|(n, line)| {
+                if line.trim().is_empty() {
+                    return Ok(None);
+                }
+                let mut value: serde_json::Value = serde_json::from_str(line)
+                    .with_context(|| format!("invalid JSONL record {}", n + 1))?;
+                value = ingest::pi::compact_record(value);
+                value["__agrep_ordinal"] = serde_json::json!(base + n);
+                let encoded = serde_json::to_string(&value)?;
+                Ok(Some((value, encoded)))
+            })
+            .collect();
+        drop(lines);
         let mut normalized = String::new();
-        for (n, line) in data.lines().enumerate() {
-            if line.trim().is_empty() {
+        for (n, record) in records.into_iter().enumerate() {
+            let Some((value, encoded)) = record? else {
                 normalized.push('\n');
                 continue;
-            }
-            let mut value: serde_json::Value = serde_json::from_str(line)
-                .with_context(|| format!("invalid JSONL record {}", n + 1))?;
-            value = ingest::pi::compact_record(value);
-            let ordinal = old.as_ref().map_or(0, |c| c.records) + n;
-            value["__agrep_ordinal"] = serde_json::json!(ordinal);
-            let encoded = serde_json::to_string(&value)?;
+            };
             if value["type"] == "session" {
                 header = encoded.clone();
             } else if let Some(entry) = value.get("id").and_then(|v| v.as_str()) {
@@ -869,7 +900,7 @@ pub fn parse(
                 nodes.push(Node {
                     id: entry.into(),
                     parent,
-                    ordinal,
+                    ordinal: base + n,
                     body: value,
                 });
             }

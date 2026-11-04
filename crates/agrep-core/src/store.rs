@@ -632,6 +632,7 @@ fn refresh_inner(
                     force: full,
                     cursors: cursors.clone(),
                     database: Some(root.db()),
+                    defer: true,
                     source_paths: stamps
                         .iter()
                         .filter(|s| s.agent == a.name())
@@ -687,13 +688,9 @@ fn refresh_inner(
         .iter()
         .map(|(name, ms, _)| (name.clone(), *ms))
         .collect();
-    info.adapter_source_parse_ms = batches
-        .iter()
-        .map(|(name, _, b)| (name.clone(), b.batches.iter().map(|s| s.parse_ms).sum()))
-        .collect();
     info.adapter_sources = batches
         .iter()
-        .map(|(name, _, b)| (name.clone(), b.batches.len()))
+        .map(|(name, _, b)| (name.clone(), b.batches.len() + b.pending.len()))
         .collect();
     let batches = batches.into_iter().map(|(name, _, batch)| (name, batch));
     let write_start = Instant::now();
@@ -766,7 +763,9 @@ fn refresh_inner(
         }
         tx.execute("DELETE FROM sources WHERE path=?", [key])?;
     }
-    let mut pages = crate::incremental::GraphPages::default();
+    let mut pages = crate::incremental::GraphPages::new(parsers);
+    let sizes: HashMap<&str, u64> = stamps.iter().map(|s| (s.path.as_str(), s.size)).collect();
+    let mut parse_wait = std::time::Duration::ZERO;
     for (adapter, b) in batches {
         let adapter_write_start = Instant::now();
         for key in &b.retired {
@@ -803,7 +802,10 @@ fn refresh_inner(
         for issue in b.issues {
             errors.insert(issue.path.to_string_lossy().into_owned(), issue.reason);
         }
-        for mut s in b.batches {
+        let tokens = &b.tokens;
+        let mut source_parse_ms = 0.;
+        let mut write = |(mut s, prepared): Parsed| -> Result<()> {
+            source_parse_ms += s.parse_ms;
             s.messages =
                 crate::row_class::normalize_messages(std::mem::take(&mut s.messages), &harness);
             if s.key.starts_with('@') {
@@ -812,11 +814,11 @@ fn refresh_inner(
             info.parsed += 1;
             if let Some(error) = s.error {
                 if s.key.starts_with('@') || s.key.starts_with("token:") {
-                    let token = b.tokens.get(&s.key).cloned().unwrap_or_default();
+                    let token = tokens.get(&s.key).cloned().unwrap_or_default();
                     tx.execute("INSERT INTO sources VALUES(?1,?2,0,0,?3,?4) ON CONFLICT(path) DO UPDATE SET change_token=?3,last_error=?4", params![s.key,s.agent,token,error])?;
                 }
                 errors.insert(s.key.clone(), error);
-                continue;
+                return Ok(());
             }
             if !s.append {
                 source_sessions(&tx, &s.key, &mut canonical_sessions)?;
@@ -847,7 +849,7 @@ fn refresh_inner(
                     .iter()
                     .map(|e| (e.agent.to_string(), e.session.clone())),
             );
-            let changed_rows = replace(&tx, &s, &mut changes, first)?;
+            let changed_rows = replace(&tx, &s, prepared, &mut changes, first)?;
             info.changed_rows += changed_rows;
             info.bytes_read += s.bytes_read;
             info.bytes_parsed += s.bytes_parsed;
@@ -876,10 +878,17 @@ fn refresh_inner(
                 info.node_chunks_ms += phase.elapsed().as_secs_f64() * 1000.;
             }
             if s.key.starts_with('@') || s.key.starts_with("token:") {
-                let token = b.tokens.get(&s.key).cloned().unwrap_or_default();
+                let token = tokens.get(&s.key).cloned().unwrap_or_default();
                 tx.execute("INSERT INTO sources VALUES(?1,?2,0,0,?3,NULL) ON CONFLICT(path) DO UPDATE SET change_token=?3,last_error=NULL",params![s.key,s.agent,token])?;
             }
+            Ok(())
+        };
+        for s in b.batches {
+            write((s, Vec::new()))?;
         }
+        parse_wait += parse_ahead(parsers.current_num_threads(), b.pending, &sizes, &mut write)?;
+        info.adapter_source_parse_ms
+            .insert(adapter.clone(), source_parse_ms);
         info.adapter_write_ms
             .insert(adapter, adapter_write_start.elapsed().as_secs_f64() * 1000.);
     }
@@ -942,7 +951,14 @@ fn refresh_inner(
     let phase = Instant::now();
     crate::tool_index::refresh(&tx, first || rebuild, presence)?;
     info.dictionary_ms = phase.elapsed().as_secs_f64() * 1000.;
-    info.write_ms = write_start.elapsed().as_secs_f64() * 1000.;
+    // Sources parse while earlier ones are written; only the writer's waits for a
+    // parse count as parsing.
+    info.parse_ms += parse_wait.as_secs_f64() * 1000.;
+    info.write_ms = write_start
+        .elapsed()
+        .saturating_sub(parse_wait)
+        .as_secs_f64()
+        * 1000.;
     let phase = Instant::now();
     update_blocks(&tx, &changes.blocks, append_from)?;
     tx.execute("DELETE FROM bound_updates", [])?;
@@ -1001,6 +1017,93 @@ fn refresh_inner(
     info.total_ms = start.elapsed().as_secs_f64() * 1000.;
     drop(lock);
     Ok(info)
+}
+/// A parsed source and the texts of its events, prepared beside the parse.
+type Parsed = (SourceBatch, Vec<Option<crate::tool_store::Prepared>>);
+/// Hands `pending` to `write` in order while `parsers` threads parse the sources after it,
+/// up to AHEAD_BYTES of them, so a refresh holds a bounded slice of its history's parse
+/// whatever the history's size. Returns how long `write` waited for a parse.
+///
+/// Each source parses start to finish on a thread of its own; only the work inside one
+/// source goes to the rayon pool. As pool tasks, a source waiting on its own parallel
+/// work would run later sources on top of itself, and the writer would wait for them.
+fn parse_ahead(
+    parsers: usize,
+    pending: Vec<crate::intake_batch::Pending>,
+    sizes: &HashMap<&str, u64>,
+    mut write: impl FnMut(Parsed) -> Result<()>,
+) -> Result<std::time::Duration> {
+    const AHEAD_BYTES: u64 = 512 << 20;
+    type Job = (
+        crate::intake_batch::Pending,
+        std::sync::mpsc::SyncSender<Parsed>,
+    );
+    if pending.is_empty() {
+        return Ok(std::time::Duration::ZERO);
+    }
+    let parsers = parsers.clamp(1, pending.len());
+    let mut pending = pending.into_iter().map(|source| {
+        let size = sizes
+            .get(source.path.to_string_lossy().as_ref())
+            .copied()
+            .unwrap_or(0);
+        (size.max(64 << 10), source)
+    });
+    let (queue, jobs) = std::sync::mpsc::channel::<Job>();
+    let jobs = std::sync::Mutex::new(jobs);
+    std::thread::scope(|scope| {
+        for _ in 0..parsers {
+            scope.spawn(|| loop {
+                let Ok(Ok((source, send))) = jobs.lock().map(|jobs| jobs.recv()) else {
+                    break;
+                };
+                let source = source.parse();
+                // Digesting and compressing tool text here keeps it off the writer;
+                // a text that fails to prepare is formatted again, in order, there.
+                let prepared = source
+                    .events
+                    .par_iter()
+                    .map(|e| {
+                        (source.error.is_none() && e.kind != "control")
+                            .then(|| crate::tool_store::prepare(e).ok())
+                            .flatten()
+                    })
+                    .collect();
+                let _ = send.send((source, prepared));
+            });
+        }
+        // Owning the queue, the writer closes it however it returns, which ends the
+        // parser threads once they drain what it queued.
+        let queue = queue;
+        let mut parsing = std::collections::VecDeque::new();
+        let mut ahead = 0;
+        let mut waited = std::time::Duration::ZERO;
+        loop {
+            while ahead < AHEAD_BYTES {
+                let Some((size, source)) = pending.next() else {
+                    break;
+                };
+                let (send, receive) = std::sync::mpsc::sync_channel(1);
+                queue
+                    .send((source, send))
+                    .map_err(|_| anyhow::anyhow!("source parsers ended"))?;
+                ahead += size;
+                parsing.push_back((size, receive));
+            }
+            let Some((size, receive)) = parsing.pop_front() else {
+                break;
+            };
+            let tick = Instant::now();
+            // A parse that panicked sent nothing; the scope rethrows its panic.
+            let parsed = receive
+                .recv()
+                .map_err(|_| anyhow::anyhow!("source parse ended"))?;
+            waited += tick.elapsed();
+            ahead -= size;
+            write(parsed)?;
+        }
+        Ok(waited)
+    })
 }
 type FtsInput = Vec<(i64, Vec<u8>)>;
 type FtsPrepared = Vec<(i64, String)>;
@@ -1295,10 +1398,15 @@ fn set_visibility(
             changes.fts.delete(table, id);
         }
     }
-    tx.execute(
-        &format!("UPDATE {table} SET visible=?2,position=?3 WHERE id=?1"),
-        params![id, visible, position],
-    )?;
+    // The tools view's INSTEAD OF trigger makes the same event_rows write, after
+    // materializing the whole view row, tool text included.
+    let sql = if table == "tools" {
+        "UPDATE event_rows SET visible=?2,position=?3 WHERE tool_id=?1 AND active=1"
+    } else {
+        "UPDATE prose SET visible=?2,position=?3 WHERE id=?1"
+    };
+    tx.prepare_cached(sql)?
+        .execute(params![id, visible, position])?;
     changes.blocks.insert(if table == "tools" {
         -1 - id / BLOCK
     } else {
@@ -1309,7 +1417,9 @@ fn set_visibility(
 fn refresh_session_bounds(tx: &Transaction<'_>, agent: &str, session: &str) -> Result<()> {
     // 0.4.9 bounded a chat by its turns alone: a tool row never moves first_ts/last_ts,
     // and a turn without a timestamp (0) is skipped rather than taken as the minimum.
-    tx.prepare_cached("UPDATE sessions SET first_ts=coalesce((SELECT min(ts) FROM prose WHERE agent=?1 AND session=?2 AND visible=1 AND ts>0),0),last_ts=coalesce((SELECT max(ts) FROM prose WHERE agent=?1 AND session=?2 AND visible=1 AND ts>0),0),title=coalesce((SELECT substr(CAST(text AS TEXT),1,CASE WHEN instr(CAST(text AS TEXT),char(10))>0 THEN min(160,instr(CAST(text AS TEXT),char(10))-1) ELSE 160 END) FROM prose WHERE agent=?1 AND session=?2 AND visible=1 AND who!='agent' ORDER BY position,id LIMIT 1),'') WHERE agent=?1 AND id=?2")?.execute(params![agent,session])?;
+    // Left to itself the planner answers min/max(ts) by walking prose_scope through the
+    // agent's whole history, testing each row's session.
+    tx.prepare_cached("UPDATE sessions SET first_ts=coalesce((SELECT min(ts) FROM prose INDEXED BY prose_session WHERE agent=?1 AND session=?2 AND visible=1 AND ts>0),0),last_ts=coalesce((SELECT max(ts) FROM prose INDEXED BY prose_session WHERE agent=?1 AND session=?2 AND visible=1 AND ts>0),0),title=coalesce((SELECT substr(CAST(text AS TEXT),1,CASE WHEN instr(CAST(text AS TEXT),char(10))>0 THEN min(160,instr(CAST(text AS TEXT),char(10))-1) ELSE 160 END) FROM prose INDEXED BY prose_session WHERE agent=?1 AND session=?2 AND visible=1 AND who!='agent' ORDER BY position,id LIMIT 1),'') WHERE agent=?1 AND id=?2")?.execute(params![agent,session])?;
     Ok(())
 }
 /// Chats in `table` (with its session id in `column`) that hold no turn.
@@ -1728,7 +1838,7 @@ fn store_event(
     turn: i64,
     separator: Option<usize>,
     project: &str,
-    text: Option<&str>,
+    text: Option<crate::tool_store::Text<'_>>,
     bulk: bool,
     changes: &mut Changes,
 ) -> Result<usize> {
@@ -1832,9 +1942,12 @@ fn upsert(
     });
     Ok(1)
 }
+/// `prepared` holds the texts of `s.events` by index, where they were prepared off the
+/// writer's thread; the rest are formatted here.
 fn replace(
     tx: &Transaction<'_>,
     s: &SourceBatch,
+    mut prepared: Vec<Option<crate::tool_store::Prepared>>,
     changes: &mut Changes,
     bulk: bool,
 ) -> Result<usize> {
@@ -2017,7 +2130,7 @@ fn replace(
     }
 
     let mut anonymous: HashMap<String, u32> = HashMap::new();
-    for e in &s.events {
+    for (index, e) in s.events.iter().enumerate() {
         let call_id = if e.call_id.trim().is_empty() {
             let identity = digest(
                 &serde_json::json!([
@@ -2078,7 +2191,15 @@ fn replace(
         let event_call_id = call_id.clone();
         let extra = call_id;
         event_keys.insert((e.session.clone(), turn, "tool".into(), extra.clone()));
-        let (text, separator) = crate::tool_text::format(e);
+        let formatted;
+        let (separator, text) = match prepared.get_mut(index).and_then(Option::take) {
+            Some(p) => (p.separator, p.text),
+            None => {
+                let (text, separator) = crate::tool_text::format(e);
+                formatted = text;
+                (separator, crate::tool_store::Text::Plain(&formatted))
+            }
+        };
         count += store_event(
             tx,
             &mut event_writer,
@@ -2088,7 +2209,7 @@ fn replace(
             turn,
             separator,
             project,
-            Some(&text),
+            Some(text),
             bulk,
             changes,
         )?;
@@ -2891,7 +3012,10 @@ mod row_diff_tests {
                     }],
                     ..Default::default()
                 };
-                assert_eq!(super::replace(&tx, &source, &mut changes, true).unwrap(), 1);
+                assert_eq!(
+                    super::replace(&tx, &source, Vec::new(), &mut changes, true).unwrap(),
+                    1
+                );
             }
             counts.push(operations.load(Ordering::Relaxed));
         }
@@ -2982,7 +3106,7 @@ mod event_contract_tests {
             ],
             ..Default::default()
         };
-        replace(&tx, &source, &mut changes, false).unwrap();
+        replace(&tx, &source, Vec::new(), &mut changes, false).unwrap();
         for name in ["compaction", "shell"] {
             let body: String = tx
                 .query_row("SELECT body FROM events WHERE call_id=?", [name], |r| {

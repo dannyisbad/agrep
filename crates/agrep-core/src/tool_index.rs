@@ -13,11 +13,14 @@ use std::{
     ptr,
 };
 
+/// Mirrors each new dictionary word into the lexicon, except while a first build
+/// writes both itself.
+const WORD_INSERT: &str = "CREATE TRIGGER IF NOT EXISTS tool_word_insert AFTER INSERT ON tool_words BEGIN INSERT INTO tool_lexicon(rowid,term) VALUES(new.id,new.term); END;";
 pub(crate) fn schema(c: &Connection) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS tool_words(id INTEGER PRIMARY KEY,term TEXT NOT NULL UNIQUE,doc INTEGER NOT NULL,blocks BLOB NOT NULL DEFAULT x'');
-CREATE VIRTUAL TABLE IF NOT EXISTS tool_lexicon USING fts5(term,content='',contentless_delete=1,tokenize='trigram case_sensitive 1',detail=none);
-CREATE TRIGGER IF NOT EXISTS tool_word_insert AFTER INSERT ON tool_words BEGIN INSERT INTO tool_lexicon(rowid,term) VALUES(new.id,new.term); END;
-CREATE TABLE IF NOT EXISTS tool_word_dirty(id INTEGER PRIMARY KEY);
+CREATE VIRTUAL TABLE IF NOT EXISTS tool_lexicon USING fts5(term,content='',contentless_delete=1,tokenize='trigram case_sensitive 1',detail=none);")?;
+    c.execute_batch(WORD_INSERT)?;
+    c.execute_batch("CREATE TABLE IF NOT EXISTS tool_word_dirty(id INTEGER PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS tool_word_old(id INTEGER PRIMARY KEY,text BLOB NOT NULL);
 CREATE VIRTUAL TABLE IF NOT EXISTS tool_word_batch USING fts5(text,content='',contentless_delete=1,tokenize='unicode61 remove_diacritics 0',detail=none);
 CREATE VIRTUAL TABLE IF NOT EXISTS tool_word_batch_vocab USING fts5vocab(tool_word_batch,row);
@@ -366,31 +369,36 @@ pub(crate) fn refresh(
             None => presence(tx)?,
         };
         tx.execute_batch("INSERT INTO tool_lexicon(tool_lexicon,rank) VALUES('automerge',0);INSERT INTO tool_lexicon(tool_lexicon,rank) VALUES('crisismerge',64);INSERT INTO tool_lexicon(tool_lexicon,rank) VALUES('hashsize',16777216);")?;
+        // Through tool_word_insert, each word's statement would open a savepoint, and
+        // FTS5 flushes tool_lexicon's pending terms into a new segment at every one.
+        tx.execute_batch("DROP TRIGGER tool_word_insert")?;
         let mut sums = vec![0i64; 36 * 36 * 36];
         {
             let mut vocabulary =
                 tx.prepare("SELECT term,doc FROM tools_vocab WHERE length(term)>=3")?;
             let mut rows = vocabulary.query([])?;
-            let mut insert = tx.prepare("INSERT INTO tool_words(term,doc,blocks) VALUES(?1,?2,?3) ON CONFLICT(term) DO UPDATE SET doc=excluded.doc,blocks=excluded.blocks")?;
+            let mut insert =
+                tx.prepare("INSERT INTO tool_words(term,doc,blocks) VALUES(?1,?2,?3)")?;
+            let mut lexicon = tx.prepare("INSERT INTO tool_lexicon(rowid,term) VALUES(?1,?2)")?;
             while let Some(row) = rows.next()? {
-                let term = row.get_ref(0)?.as_bytes()?;
-                let blocks = shards[shard(term)].remove(term).unwrap_or_default();
+                let term = row.get_ref(0)?.as_str()?;
+                let blocks = shards[shard(term.as_bytes())]
+                    .remove(term.as_bytes())
+                    .unwrap_or_default();
                 let doc: i64 = row.get(1)?;
                 // Every word the index holds came from a visible row's tokens.
                 ensure!(
                     doc == 0 || !blocks.is_empty(),
                     "tool word presence is incomplete"
                 );
-                for code in trigrams(term) {
+                for code in trigrams(term.as_bytes()) {
                     sums[code as usize] += doc;
                 }
-                insert.execute(params![
-                    row.get_ref(0)?.as_str()?,
-                    doc,
-                    encode_blocks(&blocks)
-                ])?;
+                insert.execute(params![term, doc, encode_blocks(&blocks)])?;
+                lexicon.execute(params![tx.last_insert_rowid(), term])?;
             }
         }
+        tx.execute_batch(WORD_INSERT)?;
         let mut insert = tx.prepare("INSERT INTO tool_trigrams(gram,doc) VALUES(?1,?2) ON CONFLICT(gram) DO UPDATE SET doc=excluded.doc")?;
         for (code, &doc) in sums.iter().enumerate() {
             if doc != 0 {
