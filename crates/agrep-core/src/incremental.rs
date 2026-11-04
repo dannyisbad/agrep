@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::OpenOptions,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom},
     path::Path,
 };
 
@@ -111,9 +111,7 @@ fn verify_chunks(file: &std::fs::File, cursor: &Cursor) -> Result<(bool, Vec<u8>
 }
 /// Packed native graph pages use DEFLATE; row text uses its independent codec.
 pub fn pack_node(bytes: &[u8]) -> Result<Vec<u8>> {
-    let mut encoder = flate2::write::ZlibEncoder::new(b"G2".to_vec(), flate2::Compression::new(1));
-    encoder.write_all(bytes)?;
-    Ok(encoder.finish()?)
+    crate::compression::deflate(b"G2", bytes)
 }
 pub fn unpack_node(bytes: &[u8]) -> Result<Vec<u8>> {
     let input = bytes

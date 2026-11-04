@@ -2,13 +2,9 @@
 //! The two read views retain the public row columns used by command readers.
 use crate::model::Event;
 use anyhow::{Context, Result};
-use flate2::{write::ZlibEncoder, Compression};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
-use std::{
-    collections::{HashMap, HashSet},
-    io::Write,
-};
+use std::collections::{HashMap, HashSet};
 
 // Candidate streams already carry IDs or a block range. Keep that access path
 // ahead of broad agent/session predicates, and do not join stored text here.
@@ -77,9 +73,7 @@ pub(crate) fn encode(text: &str) -> Result<Vec<u8>> {
     if text.len() < 128 {
         return Ok(fast);
     }
-    let mut encoder = ZlibEncoder::new(vec![1], Compression::new(1));
-    encoder.write_all(text.as_bytes())?;
-    let dense = encoder.finish()?;
+    let dense = crate::compression::deflate(&[1], text.as_bytes())?;
     Ok(if dense.len() + 16 < fast.len() {
         dense
     } else {
