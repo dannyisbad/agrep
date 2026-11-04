@@ -322,6 +322,16 @@ fn audit_without_source_files_certifies_nothing() {
         v["problems"][0]["reason"],
         "no source file census completed; audit cannot certify completeness"
     );
+    // `--agent agy` is antigravity's alias, refused by name before any index exists.
+    let t = TempDir::new().unwrap();
+    fs::create_dir_all(t.path().join("home")).unwrap();
+    let out = run(&t, &["audit", "--agent", "agy"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "audit unavailable: no antigravity source files were found; no completeness claim was made.\n"
+    );
+    assert!(!t.path().join("data").exists());
     let t = fixture();
     let out = run(&t, &["audit", "--agent", "codex"]);
     assert_eq!(out.status.code(), Some(2));
@@ -362,7 +372,11 @@ fn doctor_reports_and_fixes_source_parse_errors() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|s| s["path"] == bad.display().to_string() && s["last_error"].is_string()));
+        .any(|s| {
+            // Path equality treats `/` and `\` alike on Windows; the rendered strings differ.
+            s["path"].as_str().map(std::path::Path::new) == Some(bad.as_path())
+                && s["last_error"].is_string()
+        }));
     let out = ok(run(&t, &["doctor"]));
     assert!(String::from_utf8_lossy(&out.stdout).starts_with("doctor: action needed\n"));
     assert_eq!(run(&t, &["audit"]).status.code(), Some(2));
@@ -1312,6 +1326,229 @@ fn run_owns_a_pipeline_agent_and_ends_its_descendants() {
     assert!(ended, "descendant {descendant} outlived agrep run");
     // As in 0.4.9, a pipeline stage runs detached: the terminal stays with the whole job.
     assert_eq!(terminal, "detached");
+}
+
+#[cfg(unix)]
+#[test]
+fn run_follows_shell_job_control() {
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::{net::UnixStream, process::CommandExt};
+    use std::time::{Duration, Instant};
+    struct Shell {
+        process: std::process::Child,
+        master: Option<fs::File>,
+        seen: Vec<u8>,
+        from: usize,
+    }
+    impl Shell {
+        fn type_line(&mut self, line: &str) {
+            self.press(format!("{line}\n").as_bytes());
+        }
+        fn press(&mut self, keys: &[u8]) {
+            self.master.as_mut().unwrap().write_all(keys).unwrap();
+        }
+        /// Reads the terminal until `needle` appears after the previous match.
+        fn expect(&mut self, needle: &str) {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let master = self.master.as_mut().unwrap();
+            let at = loop {
+                let unread = &self.seen[self.from..];
+                if let Some(at) = unread
+                    .windows(needle.len())
+                    .position(|w| w == needle.as_bytes())
+                {
+                    break at;
+                }
+                let mut poll = libc::pollfd {
+                    fd: master.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let left = deadline.saturating_duration_since(Instant::now());
+                let ready = unsafe { libc::poll(&mut poll, 1, left.as_millis() as libc::c_int) };
+                let mut chunk = [0; 4096];
+                let read = if ready > 0 {
+                    master.read(&mut chunk).unwrap_or(0)
+                } else {
+                    0
+                };
+                assert!(
+                    read > 0,
+                    "the terminal never showed {needle:?}: {:?}",
+                    String::from_utf8_lossy(&self.seen)
+                );
+                self.seen.extend_from_slice(&chunk[..read]);
+            };
+            self.from += at + needle.len();
+        }
+    }
+    impl Drop for Shell {
+        fn drop(&mut self) {
+            // Hanging up the terminal ends the shell, which hangs up its jobs.
+            self.master.take();
+            if !exit::wait(self.process.id(), Duration::from_secs(10)).unwrap_or(false) {
+                let _ = self.process.kill();
+            }
+            let _ = self.process.wait();
+        }
+    }
+    let t = fixture();
+    let (mut master, mut slave) = (-1, -1);
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        },
+        0
+    );
+    for fd in [master, slave] {
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
+    }
+    let master = unsafe { fs::File::from_raw_fd(master) };
+    let slave = unsafe { fs::File::from_raw_fd(slave) };
+    // The agent's gate is descriptor 3 of the shell, and through agrep, of the agent.
+    let (gate, theirs) = UnixStream::pair().unwrap();
+    let held = theirs.as_raw_fd();
+    // An interactive job-control shell on its own terminal; -b reports a stopped job at once.
+    let mut command = Command::new("/bin/bash");
+    command
+        .args(["--norc", "--noprofile", "-ib"])
+        .env_clear()
+        .env("HOME", t.path().join("home"))
+        .env("AGREP_HOME", t.path().join("home"))
+        .env("AGREP_DATA_DIR", t.path().join("data"))
+        .env("PATH", t.path().join("bin"))
+        .env("OUTPUT", t.path().join("argv.txt"))
+        .env("CLI", support::binary())
+        .env("PS1", "shell> ")
+        .stdin(slave.try_clone().unwrap())
+        .stdout(slave.try_clone().unwrap())
+        .stderr(slave);
+    unsafe {
+        command.pre_exec(move || {
+            let gate = || {
+                if held == 3 {
+                    libc::fcntl(3, libc::F_SETFD, 0)
+                } else {
+                    libc::dup2(held, 3)
+                }
+            };
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 || gate() < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut shell = Shell {
+        process: command.spawn().unwrap(),
+        master: Some(master),
+        seen: vec![],
+        from: 0,
+    };
+    drop((command, theirs));
+    // Every job starts in the background: bash 3.2 also hands a foreground job the terminal
+    // from the parent after the fork, which can land after agrep lent it to the agent.
+    // Input is typed once bash, running `fg`, has printed the job: bash reads no further,
+    // so the line waits for the agent.
+    let fg = |shell: &mut Shell| {
+        shell.type_line("fg; printf 'fg-status:%s\\n' \"$?\"");
+        shell.expect("fg-status:%s");
+        shell.expect("\"$CLI\" run codex");
+    };
+    // The agent reads at once, so it stops in the background and agrep's job stops with
+    // it; `fg` continues agrep as the terminal's foreground. Its own SIGTTIN later stands
+    // for terminal access a beat before a handoff landed: holding the terminal, it goes on.
+    fake_agent(
+        &t,
+        "codex",
+        "read answer; kill -TTIN $$; printf '%s' \"$answer\" > \"$OUTPUT\"",
+    );
+    shell.expect("shell> ");
+    shell.type_line("\"$CLI\" run codex &");
+    shell.expect("Stopped");
+    fg(&mut shell);
+    shell.type_line("typed after fg");
+    shell.expect("fg-status:0");
+    assert_eq!(
+        fs::read_to_string(t.path().join("argv.txt")).unwrap(),
+        "typed after fg"
+    );
+    // agrep alone is stopped, by its agent so that bash is idle to report it, while the
+    // agent runs on. Released before `fg`, the agent then reads the terminal, and gets it
+    // once `fg` continues agrep, whenever that read lands.
+    fake_agent(
+        &t,
+        "codex",
+        "kill -STOP $PPID; read go <&3; read answer; printf '%s' \"$answer\" > \"$OUTPUT\"",
+    );
+    shell.expect("shell> ");
+    shell.type_line("\"$CLI\" run codex &");
+    shell.expect("Stopped");
+    (&gate).write_all(b"go\n").unwrap();
+    fg(&mut shell);
+    shell.type_line("typed after a running agent was brought forward");
+    shell.expect("fg-status:0");
+    assert_eq!(
+        fs::read_to_string(t.path().join("argv.txt")).unwrap(),
+        "typed after a running agent was brought forward"
+    );
+    // Once the agent has read from the terminal `fg` lent it, Ctrl-Z stops the agent and
+    // the job with it; `bg` continues agrep in the background, where it must neither hand
+    // the agent the terminal nor take it or reset its modes when the agent exits. A mode
+    // set after `bg` stands for the shell's own.
+    fake_agent(
+        &t,
+        "codex",
+        "read line; printf 'ready\\n'; read go <&3; exit 0",
+    );
+    shell.expect("shell> ");
+    shell.type_line("\"$CLI\" run codex &");
+    shell.expect("Stopped");
+    fg(&mut shell);
+    shell.type_line("line");
+    shell.expect("ready");
+    shell.press(b"\x1a");
+    shell.expect("Stopped");
+    shell.type_line("bg");
+    shell.expect("run codex &");
+    shell.expect("shell> ");
+    let terminal = shell.master.as_ref().unwrap().as_raw_fd();
+    let mut modes: libc::termios = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::tcgetattr(terminal, &mut modes) }, 0);
+    modes.c_lflag |= libc::ECHOPRT;
+    assert_eq!(
+        unsafe { libc::tcsetattr(terminal, libc::TCSANOW, &modes) },
+        0
+    );
+    (&gate).write_all(b"go\n").unwrap();
+    shell.expect("Done");
+    assert_eq!(unsafe { libc::tcgetattr(terminal, &mut modes) }, 0);
+    assert_ne!(
+        modes.c_lflag & libc::ECHOPRT,
+        0,
+        "agrep reset the shell's modes"
+    );
+    shell.type_line("printf 'shell-%s\\n' ok");
+    shell.expect("shell-ok");
+    // An agent configuring the terminal from the background stops there instead of changing
+    // it under the shell. Whether the change then succeeds or reports the interruption is
+    // up to stty on each platform.
+    fake_agent(&t, "codex", "exec /bin/stty -echo");
+    shell.expect("shell> ");
+    shell.type_line("\"$CLI\" run codex &");
+    shell.expect("Stopped");
+    fg(&mut shell);
+    shell.expect("fg-status:");
 }
 
 #[cfg(unix)]

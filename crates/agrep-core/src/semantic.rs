@@ -9,7 +9,7 @@ use anyhow::{bail, Result};
 use rusqlite::{params, Connection};
 pub use semantic_model::{installed, provision};
 pub use semantic_policy::{eligible, FLOOR, STRONG};
-pub use semantic_store::{coverage, initialize, reclaim, reset, Coverage};
+pub use semantic_store::{coverage, reclaim, reset, Coverage};
 use std::{
     collections::HashSet,
     sync::{
@@ -65,9 +65,6 @@ pub fn schedule(root: &DataRoot) -> Result<()> {
         return Ok(());
     }
     let embeddings = root.config()?.embeddings != "off" && installed(root);
-    if embeddings {
-        initialize(root)?;
-    }
     let embedding_pending = embeddings && semantic_store::pending(&store::reader(root)?)?;
     let maintenance_pending = post_index_pending(root)?;
     let archive_due = crate::archive::due(root)?;
@@ -116,7 +113,6 @@ fn drain_with(
     how: Drain,
     mut embed: impl FnMut(&[String]) -> Result<Vec<Vec<f32>>>,
 ) -> Result<bool> {
-    semantic_store::initialize_wait(root)?;
     if !semantic_store::pending(&store::reader(root)?)? {
         return Ok(false);
     }
@@ -730,7 +726,6 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let r = DataRoot::open(t.path().join("data"), true).unwrap();
         store::writer(&r).unwrap();
-        initialize(&r).unwrap();
         let o = Options {
             pattern: "connection pool timeout".into(),
             regex: false,

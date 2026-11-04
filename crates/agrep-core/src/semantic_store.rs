@@ -39,66 +39,9 @@ impl Coverage {
         self.partial() && (self.embedded as f64) < self.total as f64 * 0.99
     }
 }
-pub fn has_schema(c: &Connection) -> Result<bool> {
-    Ok(c.query_row(
-        "SELECT 1 FROM sqlite_master WHERE name='semantic_queue'",
-        [],
-        |_| Ok(()),
-    )
-    .optional()?
-    .is_some())
-}
-pub fn initialize(root: &DataRoot) -> Result<()> {
-    initialize_with(root, false)
-}
-pub fn initialize_wait(root: &DataRoot) -> Result<()> {
-    initialize_with(root, true)
-}
-fn initialize_with(root: &DataRoot, blocking: bool) -> Result<()> {
-    let reader = store::reader(root)?;
-    let counted = reader.query_row(
-        "SELECT EXISTS(SELECT 1 FROM state WHERE key='semantic_ref_count')",
-        [],
-        |r| r.get::<_, bool>(0),
-    )?;
-    if has_schema(&reader)? && counted {
-        return Ok(());
-    }
-    drop(reader);
-    let Some(_lock) = root.lock(blocking)? else {
-        return Ok(());
-    };
-    let c = store::writer(root)?;
-    c.execute_batch("BEGIN IMMEDIATE;
-CREATE INDEX IF NOT EXISTS prose_model ON prose(model);
-CREATE TABLE IF NOT EXISTS semantic_queue(row_id INTEGER PRIMARY KEY,digest TEXT NOT NULL,ts INTEGER NOT NULL);
-CREATE INDEX IF NOT EXISTS semantic_queue_time ON semantic_queue(ts DESC);
-CREATE TABLE IF NOT EXISTS semantic_refs(row_id INTEGER PRIMARY KEY,digest TEXT NOT NULL,content_key TEXT NOT NULL);
-CREATE INDEX IF NOT EXISTS semantic_refs_content ON semantic_refs(content_key);
-CREATE TABLE IF NOT EXISTS semantic_blocks(name TEXT PRIMARY KEY,rows INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS semantic_chunks(content_key TEXT NOT NULL,ordinal INTEGER NOT NULL,block TEXT NOT NULL,slot INTEGER NOT NULL,PRIMARY KEY(content_key,ordinal)) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS semantic_chunks_location ON semantic_chunks(block,slot);
-INSERT OR IGNORE INTO state SELECT 'semantic_ref_count',COUNT(*) FROM semantic_refs;
-CREATE TRIGGER IF NOT EXISTS semantic_ref_insert AFTER INSERT ON semantic_refs BEGIN
-UPDATE state SET value=CAST(value AS INTEGER)+1 WHERE key='semantic_ref_count'; END;
-CREATE TRIGGER IF NOT EXISTS semantic_ref_delete AFTER DELETE ON semantic_refs BEGIN
-UPDATE state SET value=CAST(value AS INTEGER)-1 WHERE key='semantic_ref_count'; END;
-CREATE TRIGGER IF NOT EXISTS semantic_insert AFTER INSERT ON prose WHEN new.visible=1 BEGIN
-INSERT OR REPLACE INTO semantic_queue VALUES(new.id,new.digest,new.ts); END;
-CREATE TRIGGER IF NOT EXISTS semantic_update AFTER UPDATE OF text,digest,visible,who,agent ON prose BEGIN
-DELETE FROM semantic_refs WHERE row_id=new.id;
-DELETE FROM semantic_queue WHERE row_id=new.id;
-INSERT INTO semantic_queue SELECT new.id,new.digest,new.ts WHERE new.visible=1; END;
-CREATE TRIGGER IF NOT EXISTS semantic_delete AFTER DELETE ON prose BEGIN
-DELETE FROM semantic_refs WHERE row_id=old.id; DELETE FROM semantic_queue WHERE row_id=old.id; END;
-INSERT OR IGNORE INTO semantic_queue SELECT id,digest,ts FROM prose WHERE visible=1 AND NOT EXISTS(SELECT 1 FROM semantic_refs r WHERE r.row_id=prose.id AND r.digest=prose.digest);
-COMMIT;")?;
-    Ok(())
-}
 /// Invalidate all derived vectors after an explicitly requested full rebuild.
 pub fn reset(root: &DataRoot) -> Result<()> {
     let _work = root.work_lock(true)?;
-    initialize_wait(root)?;
     let _lock = root.lock(true)?;
     let mut c = store::writer(root)?;
     let tx = c.transaction()?;
@@ -112,21 +55,14 @@ pub fn coverage(c: &Connection) -> Result<Coverage> {
         [],
         |r| r.get(0),
     )?;
-    let embedded = if has_schema(c)? {
-        c.query_row(
-            "SELECT CAST(value AS INTEGER) FROM state WHERE key='semantic_ref_count'",
-            [],
-            |r| r.get(0),
-        )?
-    } else {
-        0
-    };
+    let embedded = c.query_row(
+        "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM state WHERE key='semantic_ref_count'),0)",
+        [],
+        |r| r.get(0),
+    )?;
     Ok(Coverage { embedded, total })
 }
 pub fn pending(c: &Connection) -> Result<bool> {
-    if !has_schema(c)? {
-        return Ok(false);
-    }
     Ok(
         c.query_row("SELECT EXISTS(SELECT 1 FROM semantic_queue)", [], |r| {
             r.get(0)
@@ -333,9 +269,6 @@ fn exact_cosines(rows: [&[u8]; LANES], query: &[f32]) -> [f32; LANES] {
 }
 /// The snapshot's published blocks in name order; only this step needs the connection.
 pub fn block_list(c: &Connection) -> Result<Vec<(String, usize)>> {
-    if !has_schema(c)? {
-        return Ok(vec![]);
-    }
     let mut s = c.prepare("SELECT name,rows FROM semantic_blocks ORDER BY name")?;
     let values = s
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, usize>(1)?)))?
@@ -463,7 +396,6 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let root = DataRoot::open(t.path().join("data"), true).unwrap();
         store::writer(&root).unwrap();
-        initialize(&root).unwrap();
         (t, root)
     }
     fn row(root: &DataRoot, text: &str) {
@@ -543,7 +475,6 @@ mod tests {
         let new = vec![(pending[0].key.clone(), 0)];
         publish(&r, &pending, &new, std::slice::from_ref(&vector)).unwrap();
         publish(&r, &pending, &new, std::slice::from_ref(&vector)).unwrap();
-        initialize(&r).unwrap();
         let snapshot = store::reader(&r).unwrap();
         assert_eq!(coverage(&snapshot).unwrap().embedded, 1);
         let mut writer = store::writer(&r).unwrap();
@@ -576,9 +507,6 @@ pub fn reclaim(root: &DataRoot) -> Result<usize> {
     let referenced = {
         let _lock = root.lock(true)?;
         let mut c = store::writer(root)?;
-        if !has_schema(&c)? {
-            return Ok(0);
-        }
         let tx = c.transaction()?;
         tx.execute("DELETE FROM semantic_chunks WHERE NOT EXISTS(SELECT 1 FROM semantic_refs r WHERE r.content_key=semantic_chunks.content_key)", [])?;
         tx.execute("DELETE FROM semantic_blocks WHERE NOT EXISTS(SELECT 1 FROM semantic_chunks c WHERE c.block=semantic_blocks.name)", [])?;
@@ -617,7 +545,6 @@ mod reclamation_tests {
         let t = tempfile::tempdir().unwrap();
         let root = DataRoot::open(t.path().join("data"), true).unwrap();
         store::writer(&root).unwrap();
-        initialize(&root).unwrap();
         let dir = root.path().join("vectors");
         fs::create_dir(&dir).unwrap();
         for name in ["held", "recent", "orphan"] {

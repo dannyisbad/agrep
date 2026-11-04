@@ -308,7 +308,7 @@ fn parse_with_limits(
     gzip_decompressed_max_bytes: u64,
 ) -> Parsed {
     // seen = JSONL records, matching every other line-oriented adapter
-    let tally = crate::intake::file(agent, path);
+    let tally = crate::intake::tally();
     parse_with_tally(
         agent,
         path,
@@ -384,7 +384,7 @@ pub(crate) fn resume_parse(
         "pi",
         path,
         side_parent(path),
-        crate::intake::file("pi", path),
+        crate::intake::tally(),
         data,
         state,
     );
@@ -1004,7 +1004,7 @@ fn collect_store(
     let files = cache
         .preflight_source_paths(root)
         .unwrap_or_else(|| session_files(agent, root));
-    let pass = crate::intake_batch::collect_cached_for(cache, agent, root, &files, parse);
+    let pass = crate::intake_batch::collect_cached_for(cache, agent, &files, parse);
     (pass.messages, pass.events)
 }
 

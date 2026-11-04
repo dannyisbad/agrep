@@ -233,7 +233,7 @@ fn parse_task(dir: &Path, meta: Option<&TaskMeta>) -> DetailedRead {
         }
     }
     // seen = messages in api_conversation_history.json
-    let tally = crate::intake::file("cline", &path);
+    let tally = crate::intake::tally();
     let data = match crate::ingest::read_lossy(&path) {
         Ok(d) => d,
         Err(e) => {

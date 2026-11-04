@@ -2,14 +2,10 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::unicode_v16;
-
-pub const PROTOCOL_VERSION: u32 = 2;
-const PARALLEL_MIN_ITEMS: usize = 512;
 
 pub type Span = [i64; 2];
 pub type Stats = HashMap<String, StatValue>;
@@ -45,7 +41,7 @@ pub struct PreparedQuery {
     terms: Vec<BoundaryTerm>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BoundaryScore {
     pub factor: f64,
     pub qualities: Vec<f64>,
@@ -65,103 +61,10 @@ impl fmt::Display for BoundaryError {
 
 impl std::error::Error for BoundaryError {}
 
-#[derive(Debug, Deserialize)]
-pub struct BatchRequest {
-    pub protocol: u32,
-    pub query: String,
-    #[serde(default)]
-    pub stats: Stats,
-    #[serde(default)]
-    pub compact: bool,
-    #[serde(default)]
-    pub decut: bool,
-    pub items: Vec<BatchItem>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct BatchItem {
-    pub text: String,
-    #[serde(default)]
-    pub spans: Option<Vec<Option<Span>>>,
-    #[serde(default = "default_validate_spans")]
-    pub validate_spans: bool,
-}
-
-fn default_validate_spans() -> bool {
-    true
-}
-
-#[derive(Debug, Serialize)]
-pub struct BatchResponse {
-    pub protocol: u32,
-    pub results: Vec<BatchEvaluation>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(untagged)]
-pub enum BatchEvaluation {
-    Score(BoundaryScore),
-    CompactScore(CompactBoundaryScore),
-    Error { error: String },
-}
-
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct CompactBoundaryScore {
     pub factor: f64,
     pub match_class: &'static str,
-}
-
-pub fn evaluate_batch(request: BatchRequest) -> Result<BatchResponse, BoundaryError> {
-    if request.protocol != PROTOCOL_VERSION {
-        return Err(BoundaryError("unsupported boundary-rank protocol"));
-    }
-    let prepared = prepare_query(&request.query, &request.stats);
-    let compact = request.compact;
-    let decut = request.decut;
-    let results = if compact && request.items.len() >= PARALLEL_MIN_ITEMS {
-        request
-            .items
-            .into_par_iter()
-            .map(|item| evaluate_item(&prepared, item, compact, decut))
-            .collect()
-    } else {
-        request
-            .items
-            .into_iter()
-            .map(|item| evaluate_item(&prepared, item, compact, decut))
-            .collect()
-    };
-    Ok(BatchResponse {
-        protocol: PROTOCOL_VERSION,
-        results,
-    })
-}
-
-fn evaluate_item(
-    prepared: &PreparedQuery,
-    item: BatchItem,
-    compact: bool,
-    decut: bool,
-) -> BatchEvaluation {
-    let text = if decut {
-        decut_text(&item.text, item.spans.is_none())
-    } else {
-        Cow::Borrowed(item.text.as_str())
-    };
-    if compact {
-        return match prepared.evaluate_compact(&text, item.spans.as_deref(), item.validate_spans) {
-            Ok(score) => BatchEvaluation::CompactScore(score),
-            Err(error) => BatchEvaluation::Error {
-                error: error.to_string(),
-            },
-        };
-    }
-    match prepared.evaluate(&text, item.spans.as_deref(), item.validate_spans) {
-        Ok(score) => BatchEvaluation::Score(score),
-        Err(error) => BatchEvaluation::Error {
-            error: error.to_string(),
-        },
-    }
 }
 
 pub(crate) fn decut_text(text: &str, pad_edges: bool) -> Cow<'_, str> {
@@ -1535,11 +1438,7 @@ mod separator_span_tests {
                 let q = prepare_query("error workflow", &Stats::new());
                 let fast = q.evaluate(&text, None, true).unwrap();
                 let full = q.evaluate_unicode(&text, None, true).unwrap();
-                assert_eq!(
-                    serde_json::to_value(fast).unwrap(),
-                    serde_json::to_value(full).unwrap(),
-                    "{text}"
-                );
+                assert_eq!(fast, full, "{text}");
             }
         }
     }

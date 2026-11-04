@@ -1756,7 +1756,7 @@ fn parse_jsonl(
 }
 
 fn parse_file(path: &Path, projects: &Projects) -> (Vec<Message>, Vec<Event>, ReadOutcome) {
-    parse_with_tally(path, projects, &crate::intake::file("gemini", path))
+    parse_with_tally(path, projects, &crate::intake::tally())
 }
 
 fn parse_with_tally(
@@ -2105,7 +2105,6 @@ pub fn collect(cache: &mut crate::intake_batch::IntakeBatch) -> (Vec<Message>, V
     let pass = crate::intake_batch::collect_cached_retiring_for(
         cache,
         "gemini",
-        &root,
         &files,
         &retired,
         |path| parse_file(path, &projects),

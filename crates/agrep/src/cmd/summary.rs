@@ -12,7 +12,7 @@ use std::{
 /// A family member: its session, its rows after self-exclusion, and its events.
 type FamilyMember<'a> = (&'a h::Session, Vec<h::Row>, Vec<Value>);
 const METRIC: &str = "estimated active time";
-fn duration(s: &str) -> Result<i64> {
+fn duration(s: &str) -> Option<i64> {
     for (unit, mul) in [
         ("ms", 1),
         ("s", 1000),
@@ -21,14 +21,10 @@ fn duration(s: &str) -> Result<i64> {
         ("d", 86400000),
     ] {
         if let Some(n) = s.strip_suffix(unit) {
-            let n: i64 = n.parse().context("invalid idle cap")?;
-            if n <= 0 {
-                bail!("idle cap must be positive")
-            }
-            return n.checked_mul(mul).context("idle cap is too large");
+            return n.parse::<i64>().ok().filter(|n| *n > 0)?.checked_mul(mul);
         }
     }
-    bail!("invalid idle cap")
+    None
 }
 fn label(ms: i64) -> String {
     let minutes = (ms.max(0) as f64 / 60000.).round_ties_even() as i64;
@@ -137,9 +133,20 @@ fn pending_line(item: &Value, indent: &str) -> String {
     )
 }
 pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
-    let (root, census) = ready(no_auto)?;
-    let c = store::reader(&root)?;
-    let all = h::sessions(&c)?;
+    // 0.4.9's usage checks, in its order and all before the index
+    // (py/summary.py:2036-2059).
+    if args.group.is_some() && args.mode.as_deref() != Some("time") {
+        return Err(usage::refusal(
+            "agrep summary",
+            "--group applies to `agrep summary time`",
+        ));
+    }
+    let cap = duration(&args.idle_cap).ok_or_else(|| {
+        usage::refusal(
+            "agrep summary",
+            "--idle-cap must be a positive duration like 5m, 20m or 1h",
+        )
+    })?;
     let now = chrono::Utc::now().timestamp_millis();
     let until_arg = args
         .until
@@ -147,12 +154,6 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
         .map(|u| usage::date(u, now))
         .transpose()?;
     let until = until_arg.unwrap_or(now);
-    if args.group.is_some() && args.mode.as_deref() != Some("time") {
-        bail!("--group requires summary time")
-    }
-    if args.max.is_some() && args.mode.is_some() {
-        bail!("--max is only used by the project briefing")
-    }
     let mode = args.mode.as_deref().unwrap_or("briefing");
     let group = args.group.as_deref().unwrap_or("day");
     let max = args.max.unwrap_or(5);
@@ -165,7 +166,9 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
     if let (Some(since_arg), Some(until_arg)) = (args.since.as_deref(), args.until.as_deref()) {
         usage::window(since_arg, since, until_arg, until)?;
     }
-    let cap = duration(&args.idle_cap)?;
+    let (root, census) = ready(no_auto)?;
+    let c = store::reader(&root)?;
+    let all = h::sessions(&c)?;
     let filters = Filters {
         project: args.project.clone(),
         agent: args.agent.clone(),

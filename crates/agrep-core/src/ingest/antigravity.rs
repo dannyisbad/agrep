@@ -226,7 +226,7 @@ fn collect_mailbox(brain_dir: &Path, session: &str, evts: &mut Vec<Event>) -> bo
             continue;
         }
         // seen = this mailbox JSON record
-        let tally = crate::intake::file("antigravity", &p);
+        let tally = crate::intake::tally();
         tally.seen();
         let data = match crate::ingest::read_lossy(&p) {
             Ok(d) => d,
@@ -321,7 +321,7 @@ fn parse_session(brain_dir: &Path) -> (Vec<Message>, Vec<Event>, bool) {
         }
     }
     // seen = non-blank transcript.jsonl events
-    let tally = crate::intake::file("antigravity", &transcript);
+    let tally = crate::intake::tally();
     let data = match crate::ingest::read_lossy(&transcript) {
         Ok(d) => d,
         Err(e) => {

@@ -76,7 +76,15 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
     };
     let (root, census) = {
         let _span = agrep_core::semantic_profile::span("freshness_prepare");
-        ready(no_auto)?
+        match ready(no_auto) {
+            Ok(ready) => ready,
+            Err(e) => {
+                if let Some(error) = super::usage::recorded(&e) {
+                    stop(error)?;
+                }
+                return Err(e);
+            }
+        }
     };
     let c = store::reader(&root)?;
     let coverage = agrep_core::coverage::dimensions(&c, &f)?;
@@ -122,7 +130,7 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
     };
     let include_self = s.scope.include_self || (s.scope.chat.is_some() && !s.scope.no_self);
     let options = caller::options(&options, &caller, include_self, s.scope.no_self);
-    let automatic = !s.semantic
+    let wants_meaning = !s.semantic
         && !s.lexical
         && !s.regex
         && !s.word
@@ -131,8 +139,8 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
         && f.who.as_deref() != Some("tool")
         && compact_page
         && root.config()?.embeddings != "off"
-        && semantic::eligible(&pattern)
-        && semantic::installed(&root);
+        && semantic::eligible(&pattern);
+    let automatic = wants_meaning && semantic::installed(&root);
     if timing {
         eprintln!(
             "{}",
@@ -381,6 +389,32 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
     if let Some(line) = agrep_core::query::meta_notice(result.meta_dropped, result.meta_retained) {
         eprintln!("{line}");
     }
+    // 0.4.9's automatic lane answered keyword-only without a model, and said so beside the
+    // page or a filtered miss, or as an unfiltered miss's verdict (py/search.py:8063-8104).
+    let filtered = s.scope.here
+        || [
+            &s.scope.chat,
+            &s.scope.agent,
+            &s.scope.project,
+            &s.scope.model,
+            &s.scope.since,
+            &s.scope.until,
+            &s.scope.who,
+            &s.scope.no_who,
+        ]
+        .iter()
+        .any(|v| v.is_some());
+    let keyword_only_miss = wants_meaning
+        && !automatic
+        && result.total == 0
+        && result.total_basis == "exact"
+        && !filtered
+        && excluded.unwrap_or(0) == 0;
+    if wants_meaning && !automatic && !keyword_only_miss {
+        eprintln!(
+            "meaning unavailable; keyword-only (semantic model not installed: run agrep setup)"
+        );
+    }
     // The block follows the page (py/search.py:8371-8380, 8415-8417), or on a miss the
     // lines explaining it (py/search.py:8139-8157).
     let coverage_block = coverage_hits
@@ -417,7 +451,25 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
     let empty_dimension = coverage["empty_dimensions"]
         .as_array()
         .is_some_and(|d| !d.is_empty());
-    if result.total == 0 && !s.json && !s.count && !s.count_by_tier && !empty_dimension {
+    if keyword_only_miss {
+        // 0.4.9's `miss_verdict` and `miss_zero_render` (py/surface_policy.py:2912-2958):
+        // the stale-history hedge outranks the keyword-only tail.
+        let n: i64 = c.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
+        if n == 0 {
+            eprintln!("no match - nothing is indexed yet");
+        } else {
+            eprintln!(
+                "no match across {} session{} - {}",
+                agrep_core::surface::number(n as usize),
+                if n == 1 { "" } else { "s" },
+                if no_auto {
+                    render::NO_AUTO_STALE
+                } else {
+                    "meaning unavailable; keyword-only"
+                }
+            );
+        }
+    } else if result.total == 0 && !s.json && !s.count && !s.count_by_tier && !empty_dimension {
         // 0.4.9's matcher_empty_line (py/display_policy.py:1358-1370) names the matcher and
         // its corpus: one message record per user-side row, its reply attached
         // (py/common.py:290-298 sums sessions.jsonl's per-session `n`).
@@ -447,7 +499,7 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
             eprintln!("{line}");
         }
     }
-    render::note_no_auto(no_auto);
+    render::note_no_auto(no_auto && !keyword_only_miss);
     Ok(if result.total != 0 {
         0
     } else if !style.checked && !style.semantic {

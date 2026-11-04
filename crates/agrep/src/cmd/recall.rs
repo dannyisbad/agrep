@@ -780,11 +780,21 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
     let mut meanings: Vec<Vec<Hit>> = Vec::new();
     let (root, census) = {
         let _span = agrep_core::semantic_profile::span("freshness_prepare");
-        ready(no_auto)?
+        match ready(no_auto) {
+            Ok(ready) => ready,
+            Err(e) => {
+                if let Some(error) = super::usage::recorded(&e) {
+                    stop("query:error", error)?;
+                }
+                return Err(e);
+            }
+        }
     };
     let c = store::reader(&root)?;
     let mut semantic_ran = false;
     let mut semantic_failed = false;
+    // An automatic meaning lane a query wanted with no model installed to run it.
+    let mut model_missing = false;
     // An explicit `-s` lane that did not answer, and whether one failed rather than
     // refused its query (py/recall.py:2273-2282).
     let (mut semantic_unavailable, mut semantic_runtime) = (false, false);
@@ -978,15 +988,15 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
         } else {
             None
         };
-        let lane = if a.semantic
-            || (!semantic_failed
-                && !a.lexical
-                && !tools_only
-                && (a.probe || meaning_room)
-                && semantic::eligible(query)
-                && semantic::installed(&root)
-                && root.config()?.embeddings != "off")
-        {
+        let wanted = !semantic_failed
+            && !a.lexical
+            && !tools_only
+            && (a.probe || meaning_room)
+            && semantic::eligible(query)
+            && root.config()?.embeddings != "off";
+        let installed = semantic::installed(&root);
+        model_missing |= !a.semantic && wanted && !installed;
+        let lane = if a.semantic || (wanted && installed) {
             Some(semantic::begin(
                 &root,
                 &c,
@@ -1255,7 +1265,7 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
         .iter()
         .any(|(_, status, _)| status["fallback_recommended"] == true);
     let exit = if blocks.is_empty() {
-        if checked && !semantic_unavailable && !meaning_down {
+        if checked && !semantic_unavailable && !meaning_down && !model_missing {
             1
         } else {
             2
@@ -1327,6 +1337,13 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
         } else {
             2
         });
+    }
+    // 0.4.9's lane-down disclosure (py/recall.py:2601-2616): recall never goes silently
+    // keyword-only.
+    if model_missing {
+        eprintln!(
+            "meaning unavailable; keyword-only (semantic model not installed: run agrep setup)"
+        );
     }
     let color = color == "always" || (color == "auto" && std::io::stdout().is_terminal());
     let page = page::Page::new(&blocks, &queries, a.budget);

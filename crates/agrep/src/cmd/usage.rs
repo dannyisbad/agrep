@@ -72,6 +72,16 @@ pub(crate) fn refusal(prog: &str, message: impl std::fmt::Display) -> anyhow::Er
 fn coded(code: &'static str, message: String) -> anyhow::Error {
     anyhow::Error::new(Refusal(message, Some(code)))
 }
+/// 0.4.9's `ensure_index(auto=False)` refusal (py/indexd_runtime.py:5700-5706): `--no-auto`
+/// found no index, and built none.
+pub(crate) fn no_index() -> anyhow::Error {
+    coded(
+        "index-unavailable",
+        "no index yet (--no-auto skipped the build). next: run `agrep setup` to make this \
+         machine's agent history searchable."
+            .to_owned(),
+    )
+}
 /// The code and reason of a refusal 0.4.9 reported in a `--json` record: an unreadable
 /// time names no reason, an empty window names itself.
 pub(crate) fn recorded(e: &anyhow::Error) -> Option<(&'static str, Option<&str>)> {
@@ -85,7 +95,8 @@ pub(crate) fn recorded(e: &anyhow::Error) -> Option<(&'static str, Option<&str>)
 
 /// 0.4.9's `_json_error` record of a command that stopped before it searched
 /// (py/search.py:7502-7520, py/recall.py:1785-1807). Search's leads with `kind` and
-/// carries an empty completeness in `unit`s; recall's and pack's have neither.
+/// carries an empty completeness in `unit`s; recall's and pack's have neither. Without an
+/// index there is no engine, caller or freshness to report.
 pub(crate) fn stopped(
     unit: Option<&str>,
     query: serde_json::Value,
@@ -95,6 +106,7 @@ pub(crate) fn stopped(
     no_auto: bool,
 ) -> Result<()> {
     use serde_json::{json, Value};
+    let unavailable = code == "index-unavailable";
     let mut error = json!({ "code": code });
     if let Some(reason) = reason {
         error["reason"] = json!(agrep_core::render::safe(reason));
@@ -104,11 +116,25 @@ pub(crate) fn stopped(
         out.insert("kind".into(), json!("agrep-meta"));
     }
     out.insert("query".into(), query);
-    out.insert("engine".into(), json!(engine));
+    out.insert(
+        "engine".into(),
+        json!(if unavailable {
+            "index:unavailable"
+        } else {
+            engine
+        }),
+    );
     out.insert("hits".into(), json!([]));
     out.insert("error".into(), error);
     let agent_context = agrep_core::caller::Identity::detect().agent_context;
-    out.insert("self_exclusion".into(), request.unresolved(agent_context));
+    out.insert(
+        "self_exclusion".into(),
+        if unavailable {
+            json!({"active":false,"reason":"index-unavailable"})
+        } else {
+            request.unresolved(agent_context)
+        },
+    );
     if let Some(unit) = unit {
         out.insert("completeness".into(), json!({"shown":0,"total":0,"total_basis":"floor","unit":unit,"truncated":true,"action_unavailable_reason":"the query did not produce a result set"}));
     }
@@ -116,7 +142,9 @@ pub(crate) fn stopped(
     let checked = agrep_core::render::checked(no_auto);
     out.insert(
         "freshness".into(),
-        if checked {
+        if unavailable {
+            json!({"state":"unavailable","failing":false,"checked":false,"may_be_stale":true,"code":"index-unavailable"})
+        } else if checked {
             agrep_core::render::freshness(true, 0)
         } else {
             json!({"state":"unchecked","failing":false,"checked":false,"may_be_stale":true})
@@ -347,7 +375,7 @@ fn stray_words(argv: &[String], specs: &HashMap<String, (String, bool)>) -> Vec<
         index += 1;
         if token == "--" {
             if run == Some(true) {
-                stray.extend_from_slice(&argv[index..]);
+                stray.extend_from_slice(&argv[index - 1..]);
             }
             break;
         }
@@ -384,6 +412,95 @@ fn stray_words(argv: &[String], specs: &HashMap<String, (String, bool)>) -> Vec<
         }
     }
     stray
+}
+/// 0.4.9's search options (py/surface_policy.py:132-147): the flags, then the options
+/// that take a value.
+const SEARCH_FLAGS: [&str; 24] = [
+    "-E",
+    "-c",
+    "-i",
+    "-l",
+    "-s",
+    "-w",
+    "--all-side-chats",
+    "--classic",
+    "--count",
+    "--count-by-tier",
+    "--coverage",
+    "--flat",
+    "--here",
+    "--ignore-case",
+    "--json",
+    "--lexical",
+    "--model-soft",
+    "--no-auto",
+    "--no-meta",
+    "--no-self",
+    "--no-side",
+    "--self",
+    "--semantic",
+    "--soft",
+];
+const SEARCH_VALUES: [&str; 15] = [
+    "-n",
+    "--agent",
+    "--before",
+    "--chat",
+    "--color",
+    "--exclude-project",
+    "--max",
+    "--model",
+    "--no-who",
+    "--project",
+    "--session",
+    "--since",
+    "--sort",
+    "--until",
+    "--who",
+];
+/// 0.4.9's `_search_shaped_argv` (py/surface_policy.py:178-220): whether a command's
+/// words, typed after `agrep search WORD`, would all read as a search's.
+fn search_shaped(argv: &[String]) -> bool {
+    let mut index = 0;
+    while index < argv.len() {
+        let token = &argv[index];
+        if token == "--" {
+            return index + 1 < argv.len();
+        }
+        let (option, attached) = match token.split_once('=') {
+            Some((option, value)) => (option, Some(value)),
+            None => (token.as_str(), None),
+        };
+        if SEARCH_FLAGS.contains(&option) {
+            if attached.is_some() {
+                return false;
+            }
+        } else if SEARCH_VALUES.contains(&option) {
+            let value = match attached {
+                Some(value) => value,
+                None => {
+                    index += 1;
+                    match argv.get(index) {
+                        Some(value) if !value.starts_with('-') => value,
+                        _ => return false,
+                    }
+                }
+            };
+            let valid = match option {
+                "--color" => ["auto", "always", "never"].contains(&value),
+                "--sort" => ["score", "time", "position"].contains(&value),
+                "-n" | "--max" => value.parse::<i64>().is_ok_and(|n| n >= 0),
+                _ => !value.is_empty(),
+            };
+            if !valid {
+                return false;
+            }
+        } else if token.starts_with('-') {
+            return false;
+        }
+        index += 1;
+    }
+    true
 }
 /// The command line as parsed: which options were typed and the command's own words.
 pub(crate) struct Invocation {
@@ -423,10 +540,27 @@ impl Invocation {
         if stray.is_empty() {
             return Ok(());
         }
-        Err(refusal(
-            prog,
-            format!("unrecognized arguments: {}", stray.join(" ")),
-        ))
+        let mut message = format!("unrecognized arguments: {}", stray.join(" "));
+        // 0.4.9's `reserved_search_hint` (py/surface_policy.py:223-235): a command word
+        // meant as a query gets the search that keeps every word, if it prints as typed.
+        let words: Vec<String> = ["agrep", "search", command]
+            .into_iter()
+            .map(str::to_owned)
+            .chain(argv.iter().cloned())
+            .collect();
+        if command != "search"
+            && search_shaped(&argv)
+            && self.argv.iter().all(|a| a.to_str().is_some())
+            && words
+                .iter()
+                .all(|w| !w.contains('\0') && agrep_core::render::safe(w) == *w)
+        {
+            message += &format!(
+                "; to search for the word \"{command}\": {}",
+                agrep_core::surface::shell(&words)
+            );
+        }
+        Err(refusal(prog, message))
     }
     /// 0.4.9's `option_gate_error` (py/surface_policy.py:1198-1219): the first refused
     /// option, and a copyable command that clears every gate.
@@ -510,9 +644,43 @@ fn specs(command: &str) -> HashMap<String, (String, bool)> {
     }
     specs
 }
-/// py/search.py:7253-7373, in 0.4.9's order.
+/// 0.4.9's `filter_value_error` (py/surface_policy.py:747-825): the first filter flag
+/// typed with a blank value, `filters` listed in its order. A blank `--agent` never gets
+/// here: 0.4.9 refused it before reading the command's arguments, as `main` does.
+fn blank(prog: &str, filters: &[(&str, &Option<String>)]) -> Result<()> {
+    match filters
+        .iter()
+        .find(|(_, value)| value.as_ref().is_some_and(|v| v.trim().is_empty()))
+    {
+        Some((flag, _)) => Err(refusal(prog, agrep_core::coverage::blank_notice(flag))),
+        None => Ok(()),
+    }
+}
+fn scope_blank(prog: &str, s: &crate::Scope) -> Result<()> {
+    blank(
+        prog,
+        &[
+            ("--project", &s.project),
+            ("--exclude-project", &s.exclude_project),
+            ("--model", &s.model),
+            ("--who", &s.who),
+            ("--no-who", &s.no_who),
+            ("--chat", &s.chat),
+            ("--since", &s.since),
+            ("--until", &s.until),
+        ],
+    )
+}
+/// py/search.py:7233-7373, in 0.4.9's order: the filters, then the option gates.
 pub(crate) fn search(s: &Search, invocation: &Invocation) -> Result<()> {
     invocation.one_run("agrep")?;
+    scope_blank("agrep", &s.scope)?;
+    let mut speakers = agrep_core::query::Filters {
+        who: s.scope.who.clone(),
+        no_who: s.scope.no_who.clone(),
+        ..Default::default()
+    };
+    agrep_core::coverage::validate(&mut speakers).map_err(|e| refusal("agrep", e))?;
     let fail = |message: &str| Err(refusal("agrep", message));
     if s.more.is_some() && (s.count || s.count_by_tier) {
         return fail("-c/--count-by-tier cannot be combined with --more");
@@ -615,9 +783,11 @@ pub(crate) fn doctor(invocation: &Invocation) -> Result<()> {
 pub(crate) fn tail(invocation: &Invocation) -> Result<()> {
     invocation.gates(TAIL_GATES)
 }
-/// py/recall.py:1682-1703, in 0.4.9's order.
+/// py/recall.py:1672-1703, in 0.4.9's order.
 pub(crate) fn recall(a: &Recall, invocation: &Invocation, prog: &str) -> Result<()> {
     let prog = format!("agrep {prog}");
+    invocation.one_run(&prog)?;
+    scope_blank(&prog, &a.scope)?;
     let fail = |message: &str| Err(refusal(&prog, message));
     if a.hits == Some(0) {
         return fail("--hits must be at least 1");
@@ -632,6 +802,37 @@ pub(crate) fn recall(a: &Recall, invocation: &Invocation, prog: &str) -> Result<
         return fail("--probe emits a pointer line and cannot be combined with --json");
     }
     invocation.gates(RECALL_GATES)
+}
+/// py/search.py:8728-8733, in 0.4.9's order.
+pub(crate) fn chats(a: &crate::Chats, invocation: &Invocation) -> Result<()> {
+    invocation.one_run("agrep chats")?;
+    if a.pattern.iter().any(|word| word.trim().is_empty()) {
+        return Err(refusal(
+            "agrep chats",
+            "pattern arguments must not be empty",
+        ));
+    }
+    let s = &a.scope;
+    blank(
+        "agrep chats",
+        &[
+            ("--project", &s.project),
+            ("--exclude-project", &s.exclude_project),
+            ("--since", &s.since),
+            ("--until", &s.until),
+        ],
+    )
+}
+/// py/summary.py:2033-2035.
+pub(crate) fn summary(a: &crate::Summary) -> Result<()> {
+    blank(
+        "agrep summary",
+        &[
+            ("--project", &a.project),
+            ("--since", &a.since),
+            ("--until", &a.until),
+        ],
+    )
 }
 /// py/around.py:808-853, in 0.4.9's order.
 pub(crate) fn around(a: &Around, invocation: &Invocation) -> Result<()> {

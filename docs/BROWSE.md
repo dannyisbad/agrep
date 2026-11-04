@@ -40,7 +40,11 @@ launches prefer the spelling requested, with the sibling as a PATH fallback.
 `run` and `resume` pass arguments directly to native processes. POSIX launches
 use a private process group. With a terminal on both stdin and stdout the agent
 is lent the terminal's foreground; otherwise it runs in a session of its own, so
-the terminal stays with the caller's pipeline. Launches forward termination
+the terminal stays with the caller's pipeline. When `fg` brings a still-running
+background launch forward, the agent gets the terminal the first time it reads or
+configures it, or when agrep is next signalled, where 0.4.9 checked every 50 ms:
+a shell's `fg` sends a running job no signal, and 0.5 waits on the agent instead
+of polling. Launches forward termination
 signals, return the first signal's conventional exit code, restore terminal
 ownership/attributes, and terminate remaining descendants. Windows binds the
 wrapper and descendants to a kill-on-close Job Object before spawning. A
@@ -80,3 +84,7 @@ links in an agent's store. `doctor --fix` does not download the semantic model a
 per-agent evidence-book table, and a source written since the last refresh is a gap
 where 0.4.9 called it live evidence: 0.5 keeps no evidence book and compares the
 index with the sources themselves.
+The explorer refuses a meaning search with no model installed (`semantic model not
+installed: run agrep setup`, HTTP 400), where 0.4.9's answered it as unavailable and
+its page said to try grep: 0.5 installs the model only through `agrep setup`, and the
+search command's `-s` says the same.

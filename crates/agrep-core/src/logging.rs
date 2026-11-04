@@ -3,13 +3,16 @@ use crate::{
     data::{self, DataRoot},
     surface,
 };
-use anyhow::Result;
+use anyhow::{bail, Result};
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
 };
 
 pub fn open(root: &DataRoot) -> Result<File> {
+    if data::read_only() {
+        bail!("data directory is read-only");
+    }
     let directory = root.path().join("log");
     data::private_dir(&directory)?;
     let path = directory.join("agrep.log");
@@ -23,6 +26,13 @@ pub fn open(root: &DataRoot) -> Result<File> {
     Ok(OpenOptions::new().create(true).append(true).open(path)?)
 }
 pub fn semantic_failure(root: &DataRoot, error: &anyhow::Error) {
+    if data::read_only() {
+        eprintln!(
+            "semantic search failed; returning keyword results: {}",
+            surface::safe(&format!("{error:#}"), false)
+        );
+        return;
+    }
     let full = format!("semantic search failed: {error:#}");
     let logged = open(root).and_then(|mut file| {
         writeln!(file, "{full}")?;

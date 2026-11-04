@@ -21,23 +21,11 @@ CREATE TABLE IF NOT EXISTS tool_word_dirty(id INTEGER PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS tool_word_old(id INTEGER PRIMARY KEY,text BLOB NOT NULL);
 CREATE VIRTUAL TABLE IF NOT EXISTS tool_word_batch USING fts5(text,content='',contentless_delete=1,tokenize='unicode61 remove_diacritics 0',detail=none);
 CREATE VIRTUAL TABLE IF NOT EXISTS tool_word_batch_vocab USING fts5vocab(tool_word_batch,row);
-CREATE TABLE IF NOT EXISTS tool_trigrams(gram INTEGER PRIMARY KEY,doc INTEGER NOT NULL);")?;
-    let compact: bool = c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='event_rows')",
-        [],
-        |r| r.get(0),
-    )?;
-    c.execute_batch(if compact {
-        "CREATE TRIGGER IF NOT EXISTS tool_word_old_update BEFORE UPDATE OF blob,visible,active ON event_rows WHEN old.blob IS NOT NULL AND old.visible=1 AND old.active=1 AND (old.blob IS NOT new.blob OR old.visible!=new.visible OR old.active!=new.active) BEGIN INSERT OR IGNORE INTO tool_word_old SELECT old.tool_id,body FROM tool_blobs WHERE id=old.blob; END;
+CREATE TABLE IF NOT EXISTS tool_trigrams(gram INTEGER PRIMARY KEY,doc INTEGER NOT NULL);
+CREATE TRIGGER IF NOT EXISTS tool_word_old_update BEFORE UPDATE OF blob,visible,active ON event_rows WHEN old.blob IS NOT NULL AND old.visible=1 AND old.active=1 AND (old.blob IS NOT new.blob OR old.visible!=new.visible OR old.active!=new.active) BEGIN INSERT OR IGNORE INTO tool_word_old SELECT old.tool_id,body FROM tool_blobs WHERE id=old.blob; END;
 CREATE TRIGGER IF NOT EXISTS tool_word_old_delete BEFORE DELETE ON event_rows WHEN old.blob IS NOT NULL AND old.visible=1 AND old.active=1 BEGIN INSERT OR IGNORE INTO tool_word_old SELECT old.tool_id,body FROM tool_blobs WHERE id=old.blob; END;
 CREATE TRIGGER IF NOT EXISTS tool_word_dirty_insert AFTER INSERT ON event_rows WHEN new.blob IS NOT NULL AND new.visible=1 AND new.active=1 BEGIN INSERT OR IGNORE INTO tool_word_dirty VALUES(new.tool_id); END;
-CREATE TRIGGER IF NOT EXISTS tool_word_dirty_update AFTER UPDATE OF blob,visible,active ON event_rows WHEN new.blob IS NOT NULL AND new.visible=1 AND new.active=1 AND (old.blob IS NOT new.blob OR old.visible!=new.visible OR old.active!=new.active) BEGIN INSERT OR IGNORE INTO tool_word_dirty VALUES(new.tool_id); END;"
-    } else {
-        "CREATE TRIGGER IF NOT EXISTS tool_word_old_update BEFORE UPDATE OF text,visible ON tools WHEN old.visible=1 BEGIN INSERT OR IGNORE INTO tool_word_old VALUES(old.id,old.text); END;
-CREATE TRIGGER IF NOT EXISTS tool_word_old_delete BEFORE DELETE ON tools WHEN old.visible=1 BEGIN INSERT OR IGNORE INTO tool_word_old VALUES(old.id,old.text); END;
-CREATE TRIGGER IF NOT EXISTS tool_word_dirty_insert AFTER INSERT ON tools WHEN new.visible=1 BEGIN INSERT OR IGNORE INTO tool_word_dirty VALUES(new.id); END;
-CREATE TRIGGER IF NOT EXISTS tool_word_dirty_update AFTER UPDATE OF text,visible ON tools WHEN new.visible=1 BEGIN INSERT OR IGNORE INTO tool_word_dirty VALUES(new.id); END;"
-    })?;
+CREATE TRIGGER IF NOT EXISTS tool_word_dirty_update AFTER UPDATE OF blob,visible,active ON event_rows WHEN new.blob IS NOT NULL AND new.visible=1 AND new.active=1 AND (old.blob IS NOT new.blob OR old.visible!=new.visible OR old.active!=new.active) BEGIN INSERT OR IGNORE INTO tool_word_dirty VALUES(new.tool_id); END;")?;
     Ok(())
 }
 /// The unicode61 tokenizer module that `tools_fts` uses, borrowed from a connection.
@@ -590,25 +578,41 @@ pub(crate) fn index_text(text: &str) -> std::borrow::Cow<'_, str> {
 }
 
 #[cfg(test)]
+mod fixture {
+    use super::*;
+    pub(super) fn open() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        store::schema(&c).unwrap();
+        c.execute("INSERT INTO event_sessions VALUES(1,'pi','fixture')", [])
+            .unwrap();
+        c
+    }
+    pub(super) fn insert(tx: &Transaction<'_>, id: i64, text: &str, visible: bool) {
+        tx.execute(
+            "INSERT INTO tool_blobs(id,digest,body) VALUES(?1,CAST(?1 AS BLOB),?2)",
+            params![id, store::encode_tool(text).unwrap()],
+        )
+        .unwrap();
+        tx.execute("INSERT INTO event_rows(id,tool_id,source,session_key,call_id,kind_key,name_key,ts,native_turn,position,input_chars,output_chars,output_bytes,child_session,meta,state,project_key,blob,visible) VALUES(?1,?1,1,1,?1,0,0,0,0,0,0,0,0,'','','',0,?1,?2)", params![id, visible]).unwrap();
+        if visible {
+            tx.execute(
+                "INSERT INTO tools_fts(rowid,text) VALUES(?1,?2)",
+                params![id, index_text(&store::normalize(text)).as_ref()],
+            )
+            .unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn dictionary_keeps_substrings_past_sqlite_token_limit() {
-        let mut c = Connection::open_in_memory().unwrap();
-        c.execute_batch("CREATE TABLE tools(id INTEGER PRIMARY KEY,text BLOB,visible INTEGER);CREATE VIRTUAL TABLE tools_fts USING fts5(text,content='',tokenize='unicode61 remove_diacritics 0');CREATE VIRTUAL TABLE tools_vocab USING fts5vocab(tools_fts,row);").unwrap();
-        schema(&c).unwrap();
+        let mut c = fixture::open();
         let text = format!("{}needle{}", "x".repeat(40_000), "y".repeat(40_000));
         let tx = c.transaction().unwrap();
-        tx.execute(
-            "INSERT INTO tools VALUES(1,?,1)",
-            [store::encode_tool(&text).unwrap()],
-        )
-        .unwrap();
-        tx.execute(
-            "INSERT INTO tools_fts(rowid,text) VALUES(1,?)",
-            [index_text(&text).as_ref()],
-        )
-        .unwrap();
+        fixture::insert(&tx, 1, &text, true);
         refresh(&tx, true, None).unwrap();
         tx.commit().unwrap();
         let words = expand(&c, "needle").unwrap().unwrap();
@@ -636,21 +640,10 @@ mod frequency_tests {
     use super::*;
     #[test]
     fn cached_frequency_tracks_deletion_and_reintroduction() {
-        let mut c = Connection::open_in_memory().unwrap();
-        c.execute_batch("CREATE TABLE tools(id INTEGER PRIMARY KEY,text BLOB,visible INTEGER);CREATE VIRTUAL TABLE tools_fts USING fts5(text,content='',contentless_delete=1,tokenize='unicode61 remove_diacritics 0');CREATE VIRTUAL TABLE tools_vocab USING fts5vocab(tools_fts,row);").unwrap();
-        schema(&c).unwrap();
+        let mut c = fixture::open();
         for (id, first) in [(1, true), (2, false)] {
             let tx = c.transaction().unwrap();
-            tx.execute(
-                "INSERT INTO tools VALUES(?1,?2,1)",
-                rusqlite::params![id, store::encode_tool("needle").unwrap()],
-            )
-            .unwrap();
-            tx.execute(
-                "INSERT INTO tools_fts(rowid,text) VALUES(?1,'needle')",
-                [id],
-            )
-            .unwrap();
+            fixture::insert(&tx, id, "needle", true);
             refresh(&tx, first, None).unwrap();
             tx.commit().unwrap();
             assert_eq!(
@@ -677,26 +670,6 @@ mod frequency_tests {
 mod presence_tests {
     use super::*;
     use std::collections::BTreeSet;
-    fn fixture() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        c.execute_batch("CREATE TABLE tools(id INTEGER PRIMARY KEY,text BLOB,visible INTEGER);CREATE VIRTUAL TABLE tools_fts USING fts5(text,content='',contentless_delete=1,tokenize='unicode61 remove_diacritics 0');CREATE VIRTUAL TABLE tools_vocab USING fts5vocab(tools_fts,row);").unwrap();
-        schema(&c).unwrap();
-        c
-    }
-    fn insert(tx: &Transaction<'_>, id: i64, text: &str, visible: bool) {
-        tx.execute(
-            "INSERT INTO tools VALUES(?1,?2,?3)",
-            params![id, store::encode_tool(text).unwrap(), visible],
-        )
-        .unwrap();
-        if visible {
-            tx.execute(
-                "INSERT INTO tools_fts(rowid,text) VALUES(?1,?2)",
-                params![id, index_text(&store::normalize(text)).as_ref()],
-            )
-            .unwrap();
-        }
-    }
     /// Exact blocks of every dictionary word, taken from the FTS index itself.
     fn truth(c: &Connection) -> Vec<(String, BTreeSet<u32>)> {
         let words: Vec<String> = c
@@ -753,7 +726,7 @@ mod presence_tests {
         }
     }
     fn check_presence(collect: bool) {
-        let mut c = fixture();
+        let mut c = fixture::open();
         // Unicode letters, combining marks, private-use and number forms all
         // take unicode61's own token rules; the windowed long word crosses blocks.
         let texts = [
@@ -770,7 +743,7 @@ mod presence_tests {
             } else {
                 format!("{} row{}", texts[(id % 4) as usize], id % 37)
             };
-            insert(&tx, id, &text, id % 11 != 5);
+            fixture::insert(&tx, id, &text, id % 11 != 5);
         }
         let collected = if collect {
             let tokenizers = Tokenizers::new(&tx).unwrap();
@@ -813,7 +786,7 @@ mod presence_tests {
         }
         sums(&c);
         let tx = c.transaction().unwrap();
-        insert(&tx, 2100, "brandnewword release", true);
+        fixture::insert(&tx, 2100, "brandnewword release", true);
         tx.execute("DELETE FROM tools_fts WHERE rowid=4", [])
             .unwrap();
         tx.execute("DELETE FROM tools WHERE id=4", []).unwrap();

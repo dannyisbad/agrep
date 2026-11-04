@@ -655,21 +655,8 @@ fn side_context(path: &Path) -> Option<String> {
     comps.get(sub.checked_sub(1)?).map(|s| s.to_string())
 }
 
-fn parse_file_stamped(
-    path: &Path,
-    mtime_ns: i64,
-    size: u64,
-) -> (Vec<Message>, Vec<Event>, crate::intake_batch::ReadOutcome) {
-    parse_file_with_tally(
-        path,
-        crate::intake::file_stamped("claude", path, mtime_ns, size),
-    )
-}
-
-fn parse_file_with_tally(
-    path: &Path,
-    tally: std::sync::Arc<crate::intake::Tally>,
-) -> (Vec<Message>, Vec<Event>, crate::intake_batch::ReadOutcome) {
+fn parse_file(path: &Path) -> (Vec<Message>, Vec<Event>, crate::intake_batch::ReadOutcome) {
+    let tally = crate::intake::tally();
     let data = match crate::ingest::read_lossy(path) {
         Ok(d) => d,
         Err(e) => {
@@ -716,7 +703,7 @@ pub(crate) fn resume_parse(
     String,
 )> {
     let state = previous.map(serde_json::from_str).transpose()?;
-    let ((m, e, o), next) = parse_data(path, crate::intake::file("claude", path), data, state);
+    let ((m, e, o), next) = parse_data(path, crate::intake::tally(), data, state);
     Ok((m, e, o, serde_json::to_string(&next)?))
 }
 fn parse_data(
@@ -1174,7 +1161,6 @@ fn parse_data(
 /// Walk all real project dirs and collect the user's Claude messages + tool events.
 pub fn collect(cache: &mut crate::intake_batch::IntakeBatch) -> (Vec<Message>, Vec<Event>) {
     let root = crate::ingest::home().join(".claude").join("projects");
-    let mut discovered_mtimes = None;
     let files = cache.preflight_source_paths(&root).unwrap_or_else(|| {
         let mut files = Vec::new();
         let dirs = match fs::symlink_metadata(&root) {
@@ -1221,20 +1207,11 @@ pub fn collect(cache: &mut crate::intake_batch::IntakeBatch) -> (Vec<Message>, V
             }
             files.sort_unstable();
         }
-        let (files, mtimes): (Vec<_>, Vec<_>) = files.into_iter().unzip();
         warn_foreign_links(&root, &files, links);
-        discovered_mtimes = Some(mtimes);
         files
     });
 
-    let pass = crate::intake_batch::collect_cached_stamped_hinted_for(
-        cache,
-        "claude",
-        &root,
-        &files,
-        discovered_mtimes.as_deref(),
-        parse_file_stamped,
-    );
+    let pass = crate::intake_batch::collect_cached_for(cache, "claude", &files, parse_file);
     (pass.messages, pass.events)
 }
 
@@ -1244,7 +1221,7 @@ pub fn collect(cache: &mut crate::intake_batch::IntakeBatch) -> (Vec<Message>, V
 /// Links are collected for `warn_foreign_links`, which needs the finished file set.
 fn gather_jsonl(
     dir: &Path,
-    files: &mut Vec<(std::path::PathBuf, i64)>,
+    files: &mut Vec<std::path::PathBuf>,
     links: &mut Vec<std::path::PathBuf>,
     depth: u8,
 ) {
@@ -1281,7 +1258,7 @@ fn gather_jsonl(
     enum EntryKind {
         Directory,
         Link,
-        Jsonl(i64),
+        Jsonl,
         Other,
         Error(String),
     }
@@ -1297,12 +1274,7 @@ fn gather_jsonl(
                     if metadata.is_file()
                         && path.extension().and_then(|e| e.to_str()) == Some("jsonl") =>
                 {
-                    let mtime = metadata
-                        .modified()
-                        .ok()
-                        .and_then(crate::intake_batch::epoch_ns)
-                        .unwrap_or(0);
-                    EntryKind::Jsonl(mtime)
+                    EntryKind::Jsonl
                 }
                 Ok(None) => EntryKind::Link,
                 Ok(Some(_)) => EntryKind::Other,
@@ -1315,7 +1287,7 @@ fn gather_jsonl(
         match kind {
             EntryKind::Directory => gather_jsonl(&path, files, links, depth + 1),
             EntryKind::Link => links.push(path),
-            EntryKind::Jsonl(mtime) => files.push((path, mtime)),
+            EntryKind::Jsonl => files.push(path),
             EntryKind::Other => {}
             EntryKind::Error(error) => crate::ingest::warn_source_skip("claude", &path, error),
         }

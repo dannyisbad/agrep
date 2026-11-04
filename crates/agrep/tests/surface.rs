@@ -2278,6 +2278,17 @@ fn usage_errors_exit_and_read_as_0_4_9() {
         (&["search", "--no-auto", "foo", "-s", "bar"], 2, "agrep: unrecognized arguments: bar"),
         (&["--no-auto", "foo", "-n", "5", "bar"], 2, "agrep: unrecognized arguments: bar"),
         (&["--no-auto", "foo", "--json", "bar", "baz"], 2, "agrep: unrecognized arguments: bar baz"),
+        (&["--no-auto", "foo", "--json", "--", "bar"], 2, "agrep: unrecognized arguments: -- bar"),
+        (&["chats", "retry", "--json", "bar"], 2, "agrep chats: unrecognized arguments: bar; to search for the word \"chats\": agrep search chats retry --json bar"),
+        (&["chats", "retry", "-n", "3", "bar", "baz"], 2, "agrep chats: unrecognized arguments: bar baz; to search for the word \"chats\": agrep search chats retry -n 3 bar baz"),
+        (&["chats", "retry", "-n2", "bar"], 2, "agrep chats: unrecognized arguments: bar"),
+        (&["recall", "retry", "--json", "--", "bar"], 2, "agrep recall: unrecognized arguments: -- bar; to search for the word \"recall\": agrep search recall retry --json -- bar"),
+        (&["recall", "a b", "--json", "c'd"], 2, "agrep recall: unrecognized arguments: c'd; to search for the word \"recall\": agrep search recall 'a b' --json 'c'\"'\"'d'"),
+        (&["recall", "retry", "--hits", "2", "bar"], 2, "agrep recall: unrecognized arguments: bar"),
+        (&["pack", "retry", "--json", "bar"], 2, "agrep pack: unrecognized arguments: bar; to search for the word \"pack\": agrep search pack retry --json bar"),
+        (&["summary", "--group", "day"], 2, "agrep summary: --group applies to `agrep summary time`"),
+        (&["summary", "time", "--idle-cap", "0m", "--group", "day"], 2, "agrep summary: --idle-cap must be a positive duration like 5m, 20m or 1h"),
+        (&["summary", "--idle-cap", "xyz", "--since", "bad"], 2, "agrep summary: --idle-cap must be a positive duration like 5m, 20m or 1h"),
         (&["retry", "-c", "-s"], 2, "agrep: -c cannot be combined with --semantic; semantic totals are bounded"),
         (&["retry", "-c", "--no-meta"], 2, "agrep: --no-meta cannot narrow -c/--count-by-tier; machine counts keep grep parity"),
         (&["retry", "--agent", "nosuch"], 2, "unknown agent 'nosuch' - valid: claude, codex, opencode, antigravity, agy, kimi, cline, gemini, crush, cursor, pi, omp"),
@@ -2397,6 +2408,21 @@ fn speaker_and_blank_filter_refusals_read_as_0_4_9() {
         (&["retry", "--exclude-project="], format!("agrep: --exclude-project needs a value ({project}) - an empty value would silently exclude nothing")),
         (&["retry", "--model="], "agrep: --model needs a value (an exact model name; --soft substring-matches) - an empty value would silently match every model".into()),
         (&["retry", "--chat="], "agrep: --chat needs a value (an 8-char id prefix (as shown) or a full session uuid) - an empty value would silently match every chat".into()),
+        (&["retry", "--since="], "agrep: --since needs a value (7d / 24h / 2w / 30m, or 2026-06-01) - an empty value would silently match the whole history".into()),
+        (&["recall", "retry", "--until", " "], "agrep recall: --until needs a value (7d / 24h / 2w / 30m, or 2026-06-01) - an empty value would silently match the whole history".into()),
+        (&["chats", "--until="], "agrep chats: --until needs a value (7d / 24h / 2w / 30m, or 2026-06-01) - an empty value would silently match the whole history".into()),
+        (&["summary", "--since="], "agrep summary: --since needs a value (7d / 24h / 2w / 30m, or 2026-06-01) - an empty value would silently match the whole history".into()),
+        (&["chats", "--project="], format!("agrep chats: --project needs a value ({project}) - an empty value would silently match every project")),
+        (&["summary", "--project", " "], format!("agrep summary: --project needs a value ({project}) - an empty value would silently match every project")),
+        (&["chats", ""], "agrep chats: pattern arguments must not be empty".into()),
+        // 0.4.9 checked the filters, in their order, before its option gates.
+        (&["chats", "--project=", "--since="], format!("agrep chats: --project needs a value ({project}) - an empty value would silently match every project")),
+        (&["summary", "--group", "day", "--since=", "--project="], format!("agrep summary: --project needs a value ({project}) - an empty value would silently match every project")),
+        (&["retry", "--who=", "--since", "bad"], format!("agrep: --who needs a value ({speakers}) - an empty value would silently include every speaker")),
+        (&["retry", "--soft", "--project="], format!("agrep: --project needs a value ({project}) - an empty value would silently match every project")),
+        (&["retry", "--soft", "--who", "bogus"], format!("agrep: unknown speaker 'bogus' (choose from {speakers})")),
+        (&["retry", "-c", "--json", "--who", "user", "--no-who", "tool"], "agrep: --who and --no-who are mutually exclusive".into()),
+        (&["recall", "retry", "--hits", "0", "--project="], format!("agrep recall: --project needs a value ({project}) - an empty value would silently match every project")),
     ];
     for (args, stderr) in &cases {
         let o = cli(&h, &d, args, &[]);
@@ -2434,6 +2460,114 @@ fn speaker_and_blank_filter_refusals_read_as_0_4_9() {
         &["around", "@01930000:2.18ba", "--who", "you"],
         &[],
     ));
+}
+// agrep 0.4.9 matched a word-less `chats` pattern such as `-` against chat identity alone
+// (py/search.py:8764-8801): every fixture chat id holds a `-`.
+#[test]
+fn chats_matches_a_pattern_without_words_by_identity() {
+    let (_t, h, d) = pi();
+    let rows = values(&ok(cli(&h, &d, &["chats", "-", "--json"], &[])));
+    assert_eq!(rows[0]["completeness"]["total"], 4);
+    let sessions: Vec<&str> = rows[1..]
+        .iter()
+        .map(|r| {
+            assert_eq!(r["match_source"], "identity");
+            r["session"].as_str().unwrap()
+        })
+        .collect();
+    assert_eq!(
+        sessions,
+        [
+            "01950000-0000-7000-8000-000000000005",
+            "01940000-0000-7000-8000-000000000003",
+            "01930000-0000-7000-8000-000000000001",
+            "01920000-0000-7000-8000-000000000002",
+        ]
+    );
+}
+
+// agrep 0.4.9's refusal of `--no-auto` without an index, and its record under `--json`
+// less the publication age (py/indexd_runtime.py:5700-5706, py/search.py:7606-7612).
+#[test]
+fn no_auto_without_an_index_reads_as_0_4_9() {
+    let t = TempDir::new().unwrap();
+    let (h, d) = (t.path().join("h"), t.path().join("d"));
+    let missing = "no index yet (--no-auto skipped the build). next: run `agrep setup` to make this machine's agent history searchable.";
+    for args in [
+        &["retry", "--no-auto"][..],
+        &["chats", "--no-auto", "--json"],
+        &["summary", "--no-auto"],
+        &["around", "01930000", "0", "--no-auto"],
+    ] {
+        let o = cli(&h, &d, args, &[]);
+        assert_eq!(
+            (
+                o.status.code(),
+                String::from_utf8_lossy(&o.stderr).trim_end()
+            ),
+            (Some(2), missing),
+            "{args:?}"
+        );
+        assert!(o.stdout.is_empty(), "{args:?}");
+    }
+    let unavailable = serde_json::json!({"query":"retry","engine":"index:unavailable","hits":[],"error":{"code":"index-unavailable"},"self_exclusion":{"active":false,"reason":"index-unavailable"},"filter_coverage":{"empty_dimensions":[],"checked":false,"reason":"the query returned before the index was filtered"},"freshness":{"state":"unavailable","failing":false,"checked":false,"may_be_stale":true,"code":"index-unavailable"},"semantic_coverage":null});
+    let mut search = unavailable.clone();
+    search["kind"] = "agrep-meta".into();
+    search["completeness"] = serde_json::json!({"shown":0,"total":0,"total_basis":"floor","unit":"row","truncated":true,"action_unavailable_reason":"the query did not produce a result set"});
+    let mut pack = unavailable.clone();
+    pack["query"] = serde_json::json!(["retry", "cap"]);
+    for (args, record) in [
+        (&["retry", "--no-auto", "--json"][..], search),
+        (&["recall", "retry", "--no-auto", "--json"], unavailable),
+        (&["pack", "retry", "cap", "--no-auto", "--json"], pack),
+    ] {
+        let o = cli(&h, &d, args, &[]);
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
+        assert_eq!(values(&o), [record], "{args:?}");
+        assert_eq!(String::from_utf8_lossy(&o.stderr).trim_end(), missing);
+    }
+    assert!(!d.exists());
+}
+
+// agrep 0.4.9's lines when a page's automatic meaning lane had no model to run
+// (py/search.py:8063-8104, py/surface_policy.py:2912-2958, py/recall.py:2601-2616).
+#[test]
+fn a_missing_model_reads_keyword_only_as_0_4_9() {
+    let t = TempDir::new().unwrap();
+    let (h, d) = (t.path().join("h"), t.path().join("d"));
+    let dir = h.join(".pi/agent/sessions/-work-plain");
+    fs::create_dir_all(&dir).unwrap();
+    let id = "01970000-0000-7000-8000-000000000001";
+    let lines = [
+        serde_json::json!({"type":"session","id":id,"version":3,"cwd":"/work/plain","timestamp":"2026-01-02T03:04:05.000Z"}),
+        serde_json::json!({"type":"message","id":"u1","parentId":null,"timestamp":"2026-01-02T03:04:06.000Z","message":{"role":"user","content":[{"type":"text","text":"database migration failure in the staging cluster"}]}}),
+    ];
+    fs::write(
+        dir.join(format!("2026-01-02T03-04-05-000Z_{id}.jsonl")),
+        lines.iter().map(|l| format!("{l}\n")).collect::<String>(),
+    )
+    .unwrap();
+    ok(cli(&h, &d, &["index"], &[]));
+    let notice =
+        "meaning unavailable; keyword-only (semantic model not installed: run agrep setup)";
+    let compact = [("AGREP_PROFILE", "compact")];
+    for (args, code, stderr) in [
+        (&["database migration failure"][..], 0, notice.to_owned()),
+        (&["zebra unicorn quantum"], 1, "no match across 1 session - meaning unavailable; keyword-only".to_owned()),
+        (&["zebra unicorn quantum", "--no-auto"], 2, "no match across 1 session - history may be stale: automatic freshness checks are disabled by --no-auto".to_owned()),
+        (&["zebra unicorn quantum", "--who", "user"], 1, format!("{notice}\nkeyword: 0 matching rows across 1 indexed messages")),
+        (&["database migration failure", "--lexical"], 0, String::new()),
+        (&["recall", "database migration failure"], 0, notice.to_owned()),
+        (&["recall", "zebra unicorn quantum"], 2, format!("{notice}\nno hits across 1 indexed session.")),
+        (&["recall", "zebra unicorn quantum", "--lexical"], 1, "no hits across 1 indexed session.".to_owned()),
+    ] {
+        let o = cli(&h, &d, args, &compact);
+        assert_eq!(
+            (o.status.code(), String::from_utf8_lossy(&o.stderr).trim_end()),
+            (Some(code), stderr.as_str()),
+            "{args:?}"
+        );
+    }
 }
 
 // Expected values are agrep 0.4.9's output on this fixture: a chat whose only user record

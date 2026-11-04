@@ -755,8 +755,8 @@ fn stable_token_snapshot(
     })
 }
 
-fn record_census(path: &std::path::Path, census: &CursorCensus) {
-    let tally = crate::intake::keyed_token("cursor", path, CENSUS_SESSION, census.token.clone());
+fn record_census(census: &CursorCensus) {
+    let tally = crate::intake::tally();
     tally.seen_n(census.composer_rows + census.unreferenced_bubbles);
     tally.skip_n(crate::intake::Skip::Meta, census.composer_rows);
     tally.skip_n(
@@ -827,13 +827,11 @@ fn tool_event(session: &str, bubble_id: &str, ts: i64, tf: &serde_json::Value) -
 /// conversation order and fetching each bubble row. Missing or NULL bubbles are skipped.
 fn parse_session(
     conn: &Connection,
-    db_path: &std::path::Path,
     projects: &HashMap<String, String>,
     cid: &str,
-    token: &str,
 ) -> (Vec<Message>, Vec<Event>, bool) {
     // seen = bubble rows iterated within this conversation
-    let tally = crate::intake::keyed_token("cursor", db_path, cid, token.to_string());
+    let tally = crate::intake::tally();
     let cd = match kv_text_checked(conn, "cursorDiskKV", &format!("composerData:{cid}")) {
         Ok(Some(cd)) => cd,
         Ok(None) => {
@@ -1121,13 +1119,11 @@ fn collect_discovered(
         },
         _ => None,
     };
-    if let (Some(path), Some(census)) = (
-        db_path.as_deref(),
-        snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.census.as_ref()),
-    ) {
-        record_census(path, census);
+    if let Some(census) = snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.census.as_ref())
+    {
+        record_census(census);
     }
     // An unenumerable store lists no conversation, so its list may not be read as the whole
     // set: already-indexed conversations are preserved instead of pruned as deleted.
@@ -1141,8 +1137,6 @@ fn collect_discovered(
     } else {
         snapshot.map(|snapshot| snapshot.sessions)
     };
-    let token_by_session: HashMap<String, String> =
-        tokens.as_ref().into_iter().flatten().cloned().collect();
     let empty_projects = HashMap::new();
     let projects = projects.unwrap_or(&empty_projects);
     let parse_issues = std::cell::RefCell::new(Vec::new());
@@ -1168,9 +1162,8 @@ fn collect_discovered(
             let path = db_path
                 .as_deref()
                 .expect("open connection has a database path");
-            let token = token_by_session.get(sid).map(String::as_str).unwrap_or("");
             match crate::ingest::parse_guard::isolate("cursor", path, || {
-                parse_session(c, path, projects, sid, token)
+                parse_session(c, projects, sid)
             }) {
                 Ok((messages, events, true)) => (messages, events, ReadOutcome::Complete),
                 // The composer failed whole: none of its rows are vouched for, and the record

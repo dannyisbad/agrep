@@ -661,12 +661,14 @@ impl Matcher {
         let mut stats = Stats::new();
         for token in boundary_rank::query_tokens(&o.pattern) {
             let normalized = store::normalize(token);
-            let v = c.query_row(
-                "SELECT n,s FROM term_stats WHERE token=?",
-                [&normalized],
-                |r| Ok([r.get(0)?, r.get(1)?]),
-            );
-            if let Ok(v) = v {
+            let v = c
+                .query_row(
+                    "SELECT n,s FROM term_stats WHERE token=?",
+                    [&normalized],
+                    |r| Ok([r.get(0)?, r.get(1)?]),
+                )
+                .optional()?;
+            if let Some(v) = v {
                 stats.insert(normalized, boundary_rank::StatValue::Pair(v));
             }
         }
@@ -3155,7 +3157,7 @@ fn search_pass(
                         .unwrap_or((0, text.chars().count()));
                     format!(
                         "{target}:{turn}.{digest}~{}:{start}-{end}",
-                        event_id(&session, ts, &text),
+                        crate::handles::event_id(&session, ts, &text),
                     )
                 };
                 let self_marker = o.filters.caller.as_ref().is_some_and(|caller| {
@@ -3272,21 +3274,6 @@ pub fn content_digest(s: &str) -> String {
     }
     format!("{h:04x}")
 }
-fn event_id(session: &str, ts: i64, text: &str) -> String {
-    let mut state = blake2b_simd::Params::new()
-        .hash_length(12)
-        .personal(b"agrep-event-v1")
-        .to_state();
-    for v in [
-        session.as_bytes(),
-        ts.to_string().as_bytes(),
-        text.as_bytes(),
-    ] {
-        state.update(&(v.len() as u64).to_le_bytes());
-        state.update(v);
-    }
-    state.finalize().to_hex().to_string()
-}
 /// A meaning match's snippet. 0.4.9 served the matched row's text as it is stored
 /// (py/segment_query.py:650, py/search.py:1012), leaving control characters for the
 /// sanitizer to quote.
@@ -3382,7 +3369,9 @@ mod window_tests {
             tools: false,
             filters: Filters::default(),
         };
-        let mut m = Matcher::new(&options, &Connection::open_in_memory().unwrap()).unwrap();
+        let c = Connection::open_in_memory().unwrap();
+        crate::store::schema(&c).unwrap();
+        let mut m = Matcher::new(&options, &c).unwrap();
         (m.phase, m.partial) = (phase, partial);
         if partial {
             m.terms = content_terms(pattern);
@@ -3524,6 +3513,7 @@ mod matcher_cache_tests {
     #[test]
     fn passes_share_one_compiled_matcher() {
         let c = Connection::open_in_memory().unwrap();
+        crate::store::schema(&c).unwrap();
         let mut o = Options {
             pattern: "cobalt lantern".into(),
             regex: false,
@@ -3548,5 +3538,41 @@ mod matcher_cache_tests {
         assert_eq!(second.terms.len(), 2);
         o.pattern = "deployment".into();
         assert_eq!(cache.matcher(&o, &c).unwrap().terms.len(), 1);
+    }
+}
+#[cfg(test)]
+mod term_stats_tests {
+    use super::*;
+    // A term without statistics ranks with the cold prior; a statistics row that cannot
+    // be read fails the search instead of silently ranking as if it were absent.
+    #[test]
+    fn unreadable_term_statistics_fail_the_matcher() {
+        let c = Connection::open_in_memory().unwrap();
+        crate::store::schema(&c).unwrap();
+        let options = Options {
+            pattern: "cobalt".into(),
+            regex: false,
+            word: false,
+            sort: "score".into(),
+            limit: 10,
+            exact: false,
+            count_only: false,
+            count_by_tier: false,
+            content: false,
+            chats: false,
+            tools: false,
+            filters: Filters::default(),
+        };
+        Matcher::new(&options, &c).unwrap();
+        c.execute("INSERT INTO term_stats VALUES('cobalt','many',1)", [])
+            .unwrap();
+        let error = Matcher::new(&options, &c).err().unwrap();
+        assert!(
+            matches!(
+                error.downcast_ref::<rusqlite::Error>(),
+                Some(rusqlite::Error::InvalidColumnType(0, ..))
+            ),
+            "{error:#}"
+        );
     }
 }

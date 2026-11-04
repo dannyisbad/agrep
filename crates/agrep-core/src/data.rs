@@ -66,6 +66,9 @@ impl DataRoot {
     pub fn validate(&self, initialize: bool) -> Result<()> {
         match fs::read(self.0.join("FORMAT")) {
             Ok(v) if v == FORMAT => {
+                if read_only() {
+                    return Ok(());
+                }
                 private_dir(&self.0)?;
                 for name in ["archive", "model", "log"] {
                     let path = self.0.join(name);

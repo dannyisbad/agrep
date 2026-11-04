@@ -133,7 +133,7 @@ fn register_functions(c: &Connection) -> Result<()> {
     )?;
     Ok(())
 }
-fn schema(c: &Connection) -> Result<()> {
+pub(crate) fn schema(c: &Connection) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS sources(path TEXT PRIMARY KEY,agent TEXT NOT NULL,size INTEGER NOT NULL,mtime_ns INTEGER NOT NULL,change_token TEXT NOT NULL,last_error TEXT);
 CREATE TABLE IF NOT EXISTS sessions(agent TEXT NOT NULL,id TEXT NOT NULL,project TEXT NOT NULL,cwd TEXT NOT NULL DEFAULT '',parent TEXT NOT NULL,family TEXT NOT NULL,side INTEGER NOT NULL,title TEXT NOT NULL,first_ts INTEGER NOT NULL,last_ts INTEGER NOT NULL,PRIMARY KEY(agent,id)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS sessions_project ON sessions(project);
@@ -187,6 +187,18 @@ CREATE TRIGGER IF NOT EXISTS prose_user_count_visibility AFTER UPDATE OF visible
     c.execute_batch("CREATE TABLE IF NOT EXISTS bound_updates(id INTEGER PRIMARY KEY);
 CREATE TRIGGER IF NOT EXISTS prose_bound_update AFTER UPDATE ON prose BEGIN INSERT OR IGNORE INTO bound_updates VALUES(old.id); END;
 CREATE TRIGGER IF NOT EXISTS prose_bound_delete BEFORE DELETE ON prose BEGIN INSERT OR IGNORE INTO bound_updates VALUES(old.id); END;")?;
+    c.execute_batch("CREATE TABLE IF NOT EXISTS semantic_queue(row_id INTEGER PRIMARY KEY,digest TEXT NOT NULL,ts INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS semantic_queue_time ON semantic_queue(ts DESC);
+CREATE TABLE IF NOT EXISTS semantic_refs(row_id INTEGER PRIMARY KEY,digest TEXT NOT NULL,content_key TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS semantic_refs_content ON semantic_refs(content_key);
+CREATE TABLE IF NOT EXISTS semantic_blocks(name TEXT PRIMARY KEY,rows INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS semantic_chunks(content_key TEXT NOT NULL,ordinal INTEGER NOT NULL,block TEXT NOT NULL,slot INTEGER NOT NULL,PRIMARY KEY(content_key,ordinal)) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS semantic_chunks_location ON semantic_chunks(block,slot);
+CREATE TRIGGER IF NOT EXISTS semantic_ref_insert AFTER INSERT ON semantic_refs BEGIN INSERT INTO state(key,value) VALUES('semantic_ref_count',1) ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1; END;
+CREATE TRIGGER IF NOT EXISTS semantic_ref_delete AFTER DELETE ON semantic_refs BEGIN UPDATE state SET value=CAST(value AS INTEGER)-1 WHERE key='semantic_ref_count'; END;
+CREATE TRIGGER IF NOT EXISTS semantic_insert AFTER INSERT ON prose WHEN new.visible=1 BEGIN INSERT OR REPLACE INTO semantic_queue VALUES(new.id,new.digest,new.ts); END;
+CREATE TRIGGER IF NOT EXISTS semantic_update AFTER UPDATE OF text,digest,visible,who,agent ON prose BEGIN DELETE FROM semantic_refs WHERE row_id=new.id; DELETE FROM semantic_queue WHERE row_id=new.id; INSERT INTO semantic_queue SELECT new.id,new.digest,new.ts WHERE new.visible=1; END;
+CREATE TRIGGER IF NOT EXISTS semantic_delete AFTER DELETE ON prose BEGIN DELETE FROM semantic_refs WHERE row_id=old.id; DELETE FROM semantic_queue WHERE row_id=old.id; END;")?;
     crate::prose_index::schema(c)?;
     crate::tool_index::schema(c)?;
     Ok(())
@@ -488,6 +500,9 @@ fn refresh_inner(
             "tool_word_dirty_update",
             "tool_word_old_update",
             "tool_word_old_delete",
+            "semantic_insert",
+            "semantic_update",
+            "semantic_delete",
         ] {
             c.execute_batch(&format!("DROP TRIGGER IF EXISTS {name}"))?;
         }
@@ -951,6 +966,10 @@ fn refresh_inner(
             tx.execute("INSERT INTO state(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key, value])?;
         }
         tx.execute("INSERT INTO state(key,value) SELECT 'tools_count',count(*) FROM tools WHERE visible=1 ON CONFLICT(key) DO UPDATE SET value=excluded.value",[])?;
+        tx.execute(
+            "INSERT INTO semantic_queue SELECT id,digest,ts FROM prose WHERE visible=1",
+            [],
+        )?;
     }
     info.stats_ms = phase.elapsed().as_secs_f64() * 1000.;
     // 0.4.9 listed a chat only through its turns (py/corpusdb.py:2221-2234).

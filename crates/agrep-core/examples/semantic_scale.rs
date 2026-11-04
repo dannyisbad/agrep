@@ -47,7 +47,6 @@ fn main() -> Result<()> {
         file.flush()?;
     }
     let refresh = store::refresh(&root, true, false)?;
-    semantic::initialize(&root)?;
     let mut c = store::writer(&root)?;
     let rows: Vec<(i64, String, Vec<u8>)> = c
         .prepare("SELECT id,digest,text FROM prose WHERE visible=1 ORDER BY id")?

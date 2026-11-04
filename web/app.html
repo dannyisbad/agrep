@@ -575,6 +575,7 @@
                       aria-pressed="true">recent history</button>
               <div class="mode-switch" aria-label="Search mode">
                 <button type="button" data-mode="keyword" aria-pressed="true">grep</button>
+                <button type="button" data-mode="semantic" aria-pressed="false">meaning</button>
               </div>
               <div class="sort-switch" id="sort-switch"
                    aria-label="Search result order" hidden>
@@ -919,6 +920,7 @@
 
     function meaningSuffix(semantic) {
       if (!semantic) return "";
+      if (semantic.fallback_recommended) return " · meaning unavailable";
       return ` · meaning ${Number(semantic.indexed || 0).toLocaleString()} of ${Number(semantic.total || 0).toLocaleString()} rows`;
     }
 
@@ -936,6 +938,9 @@
 
     function emptySearchMessage(payload) {
       const semantic = payload.semantic;
+      if (state.mode === "semantic" && semantic?.fallback_recommended) {
+        return "Meaning search is unavailable for this query. Try Grep.";
+      }
       if (state.mode === "semantic" && semantic && !semantic.complete
           && Number(semantic.total || 0) > 0) {
         return `No meaning matches in ${Number(semantic.indexed || 0).toLocaleString()} of ${Number(semantic.total).toLocaleString()} indexed rows.`;
@@ -958,8 +963,10 @@
         const message = emptySearchMessage(payload);
         showRailNotice(message);
         showReaderNotice("Nothing to open.", message);
+        if (payload.notice) results.prepend(node("div", "notice warn", payload.notice));
         return;
       }
+      if (payload.notice) results.append(node("div", "notice warn", payload.notice));
       state.hits.forEach((hit, index) => {
         const button = node("button", "result");
         button.type = "button";

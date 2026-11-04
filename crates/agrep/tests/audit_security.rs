@@ -75,10 +75,9 @@ fn digestless_handles_are_rejected_but_positional_navigation_remains() {
     ok(&t, &["around", "secure-session", "0"]);
 }
 #[test]
-fn installed_corruption_is_disclosed_logged_and_reported_by_diagnostics() {
+fn installed_corruption_is_disclosed_and_reported_by_diagnostics() {
     let t = fixture();
     let root = DataRoot(t.path().join("data"));
-    agrep_core::semantic::initialize(&root).unwrap();
     store::writer(&root)
         .unwrap()
         .execute(
@@ -115,6 +114,8 @@ fn installed_corruption_is_disclosed_logged_and_reported_by_diagnostics() {
         );
         let text = String::from_utf8_lossy(&out.stderr);
         assert!(text.contains("semantic search failed"), "{text}");
+        // Under AGREP_DATA_READONLY the cause rides on the stderr line, not the log.
+        assert!(text.contains("SHA-256 mismatch"), "{text}");
         assert_eq!(text.lines().count(), 1);
         assert!(String::from_utf8_lossy(&out.stdout).contains("database migration failure"));
         if args.contains(&"--json") {
@@ -238,9 +239,7 @@ fn installed_corruption_is_disclosed_logged_and_reported_by_diagnostics() {
         assert_eq!(value["semantic_coverage"], Value::Null);
         assert_eq!(value["error"], json!({"code":"semantic-unavailable"}));
     }
-    assert!(fs::read_to_string(root.path().join("log/agrep.log"))
-        .unwrap()
-        .contains("SHA-256 mismatch"));
+    assert!(!root.path().join("log").exists());
     let status: Value = serde_json::from_slice(&ok(&t, &["status", "--json"]).stdout).unwrap();
     assert!(status["semantic"]["integrity_error"]
         .as_str()
@@ -268,7 +267,6 @@ fn full_reindex_clears_vector_references_and_queues_every_visible_row() {
         "embeddings = off  (off disables model downloads and meaning search)\n"
     );
     let root = DataRoot(t.path().join("data"));
-    agrep_core::semantic::initialize(&root).unwrap();
     let c = store::writer(&root).unwrap();
     c.execute_batch("INSERT INTO semantic_refs SELECT id,digest,digest FROM prose; INSERT INTO semantic_blocks VALUES('old',1); INSERT INTO semantic_chunks SELECT digest,0,'old',0 FROM prose LIMIT 1; DELETE FROM semantic_queue;").unwrap();
     drop(c);
@@ -301,6 +299,33 @@ fn full_reindex_clears_vector_references_and_queues_every_visible_row() {
             .get::<_, usize>(0))
             .unwrap()
     );
+}
+#[test]
+fn first_build_queues_every_visible_row_and_its_triggers_queue_later_rows() {
+    let t = fixture();
+    let root = DataRoot(t.path().join("data"));
+    let counts = || {
+        let c = store::reader(&root).unwrap();
+        let count = |sql: &str| c.query_row(sql, [], |r| r.get::<_, usize>(0)).unwrap();
+        (
+            count("SELECT count(*) FROM prose WHERE visible=1"),
+            count("SELECT count(*) FROM semantic_queue"),
+            count("SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name IN ('semantic_insert','semantic_update','semantic_delete')"),
+        )
+    };
+    let (rows, queued, triggers) = counts();
+    assert!(rows > 0);
+    assert_eq!((queued, triggers), (rows, 3));
+    let session = t
+        .path()
+        .join("home/.pi/agent/sessions/project/session.jsonl");
+    let mut text = fs::read_to_string(&session).unwrap();
+    text.push_str(&format!("{}\n", json!({"type":"message","id":"m2","parentId":"m1","timestamp":"2026-10-29T10:02:00Z","message":{"role":"user","content":[{"type":"text","text":"a second question for the queue"}]}})));
+    fs::write(&session, text).unwrap();
+    ok(&t, &["index"]);
+    assert_eq!(counts(), (rows + 1, rows + 1, 3));
+    let c = store::reader(&root).unwrap();
+    assert_eq!(agrep_core::semantic::coverage(&c).unwrap().embedded, 0);
 }
 #[test]
 fn stale_first_build_is_distinguished_from_a_live_one() {
@@ -422,6 +447,17 @@ fn owned_directories_are_private_and_exposure_is_reported() {
     let mode = |path: &std::path::Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(root.path()), 0o700);
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    let out = command(&t)
+        .env("AGREP_DATA_READONLY", "1")
+        .args(["search", "database migration failure"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(mode(root.path()), 0o755);
     let out = command(&t).args(["doctor", "--json"]).output().unwrap();
     assert_eq!(out.status.code(), Some(0));
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();

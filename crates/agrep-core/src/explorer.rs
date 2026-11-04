@@ -215,18 +215,6 @@ impl Explorer {
     }
     /// The CLI supplies its normal freshness entry point; HTTP reads use the
     /// same census and query APIs as command-line history.
-    pub fn with_refresh(
-        mut self,
-        freshen: impl Fn() -> Result<()> + Send + Sync + 'static,
-    ) -> Self {
-        Arc::get_mut(&mut self.state)
-            .expect("server not yet shared")
-            .freshen = Some(Arc::new(move || {
-            freshen()?;
-            Ok(0)
-        }));
-        self
-    }
     pub fn with_freshness(
         mut self,
         freshen: impl Fn() -> Result<usize> + Send + Sync + 'static,
@@ -502,15 +490,21 @@ impl State {
                 if !["keyword", "semantic"].contains(&mode.as_str()) {
                     return Ok(Response::error(400, "mode must be keyword or semantic"));
                 }
+                let sort = param("sort", "score");
+                if !["score", "time"].contains(&sort.as_str()) {
+                    return Ok(Response::error(400, "sort must be score or time"));
+                }
+                if mode == "semantic" && sort != "score" {
+                    return Ok(Response::error(
+                        400,
+                        "meaning search is relevance-ordered; use sort=score",
+                    ));
+                }
                 if mode == "semantic" && !crate::semantic::installed(&self.root) {
                     return Ok(Response::error(
                         400,
                         "semantic model not installed: run agrep setup",
                     ));
-                }
-                let sort = param("sort", "score");
-                if !["score", "time"].contains(&sort.as_str()) {
-                    return Ok(Response::error(400, "sort must be score or time"));
                 }
 
                 let n = match param("n", "40").parse::<i64>() {
@@ -532,7 +526,7 @@ impl State {
                     filters: Filters::default(),
                 };
                 let mut fallback = None;
-                let mut coverage = None;
+                let mut semantic = None;
                 let config = self.root.config()?;
                 let use_semantic = mode == "semantic"
                     || (sort == "score"
@@ -554,13 +548,24 @@ impl State {
                             // Semantic mode always names its coverage, as 0.4.9's explorer
                             // did; automatic hybrid only a gap the CLI would also name.
                             if mode == "semantic" || found.coverage.gap() {
-                                coverage = Some(found.coverage);
+                                semantic = Some(json!(found.coverage));
                             }
                             if mode == "semantic" {
                                 found.result
                             } else {
                                 crate::hybrid::merge(keyword, Some(found.result), n, true)
                             }
+                        }
+                        // An explicit meaning search never answers with keyword rows: 0.4.9's
+                        // explorer returned none, with a state that sends the reader to grep
+                        // and without the cause, since the browser gets no local paths
+                        // (py/server.py:142-159, 513-515; py/search.py:581-599).
+                        Err(error) if mode == "semantic" => {
+                            let status = crate::semantic::failed(&error);
+                            semantic = Some(
+                                json!({"state":status["state"],"complete":false,"partial":status["partial"]==true,"indexed":0,"total":0,"pending":0,"fallback_recommended":true,"truncated":false}),
+                            );
+                            query::Results::default()
                         }
                         Err(error) => {
                             crate::logging::semantic_failure(&self.root, &error);
@@ -573,7 +578,7 @@ impl State {
                 };
                 Ok(Response::json(
                     200,
-                    json!({"query":q,"mode":mode,"sort":sort,"engine":if result.hits.iter().any(|h| h.matched=="semantic"){"keyword+semantic"}else{"keyword"},"notice":fallback,"semantic":coverage,"freshness":crate::render::freshness(pending.is_some(),pending.unwrap_or(0)),"total":result.total,"totals_exact":result.total_basis=="exact","hits":result.hits}),
+                    json!({"query":q,"mode":mode,"sort":sort,"engine":if result.hits.iter().any(|h| h.matched=="semantic"){"keyword+semantic"}else{"keyword"},"notice":fallback,"semantic":semantic,"freshness":crate::render::freshness(pending.is_some(),pending.unwrap_or(0)),"total":result.total,"totals_exact":result.total_basis=="exact","hits":result.hits}),
                 ))
             }
             _ => Ok(Response::error(404, "not found")),
@@ -692,7 +697,6 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let root = DataRoot::open(t.path().join("data"), true).unwrap();
         let c = store::writer(&root).unwrap();
-        crate::semantic::initialize(&root).unwrap();
         c.execute_batch("INSERT INTO sessions VALUES('pi','session-one','demo','/work/demo','','session-one',0,'Title',1,100);INSERT INTO prose(source,agent,session,project,turn,who,model,model_source,ts,text,digest,extra,position,visible) VALUES(1,'pi','session-one','demo',0,'user','model','',1,'database migration failure','x','',0,1);").unwrap();
         // With no row embedded the lane loads no weights, so files of the right sizes
         // stand in for an installed model.
@@ -719,6 +723,69 @@ mod tests {
         }
     }
     #[test]
+    fn a_failed_meaning_lane_never_answers_semantic_mode_with_keyword_rows() {
+        let t = tempfile::tempdir().unwrap();
+        let root = DataRoot::open(t.path().join("data"), true).unwrap();
+        let c = store::writer(&root).unwrap();
+        c.execute_batch("INSERT INTO sessions VALUES('pi','session-one','demo','/work/demo','','session-one',0,'Title',1,100);INSERT INTO prose(source,agent,session,project,turn,who,model,model_source,ts,text,digest,extra,position,visible) VALUES(1,'pi','session-one','demo',0,'user','model','',1,'database migration failure','x','',0,1);INSERT INTO semantic_refs SELECT id,digest,digest FROM prose;").unwrap();
+        // An embedded row makes the lane load the weights, which zero-filled files of the
+        // right sizes fail.
+        let model = crate::semantic_model::directory(&root);
+        std::fs::create_dir_all(&model).unwrap();
+        for (name, size, _) in crate::semantic_model::FILES {
+            std::fs::File::create(model.join(name))
+                .unwrap()
+                .set_len(size)
+                .unwrap();
+        }
+        let server = Explorer::bind(root, 0).unwrap();
+        let s = &server.state;
+        let headers = format!("Authorization: Bearer {}\r\n", s.auth);
+        let search = |query: &str| {
+            let r = s.route(&req(
+                server.port(),
+                "GET",
+                &format!("/api/search?{query}"),
+                &headers,
+            ));
+            (r.code, serde_json::from_slice::<Value>(&r.body).unwrap())
+        };
+        for (query, state, partial) in [
+            (
+                "q=database+migration+failure&mode=semantic",
+                "unavailable",
+                true,
+            ),
+            ("q=!!&mode=semantic", "query-rejected", false),
+        ] {
+            let (code, body) = search(query);
+            assert_eq!(code, 200, "{query}");
+            assert_eq!(body["hits"], json!([]), "{query}: {body}");
+            assert_eq!(body["total"], 0, "{query}");
+            assert_eq!(body["totals_exact"], false, "{query}");
+            assert_eq!(body["notice"], Value::Null, "{query}");
+            assert_eq!(
+                body["semantic"],
+                json!({"state":state,"complete":false,"partial":partial,"indexed":0,"total":0,"pending":0,"fallback_recommended":true,"truncated":false}),
+                "{query}"
+            );
+        }
+        // Automatic hybrid answers from the keyword lane and says why no meaning row joined.
+        let (code, body) = search("q=database+migration+failure");
+        assert_eq!(code, 200);
+        assert_eq!(body["semantic"], Value::Null, "{body}");
+        assert_eq!(
+            body["notice"],
+            "meaning search unavailable; showing keyword matches"
+        );
+        let (code, body) = search("q=database&mode=semantic&sort=time");
+        assert_eq!(code, 400);
+        assert_eq!(
+            body["error"],
+            "meaning search is relevance-ordered; use sort=score"
+        );
+    }
+    #[test]
     fn query_decoder_and_duplicate_headers() {
         let r = request(
             "GET /api/search?q=hello+%E4%B8%96%E7%95%8C HTTP/1.1\r\nHost: localhost:1\r\n\r\n",
@@ -741,9 +808,9 @@ mod freshness_tests {
         store::writer(&root).unwrap();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count = calls.clone();
-        let server = Explorer::bind(root, 0).unwrap().with_refresh(move || {
+        let server = Explorer::bind(root, 0).unwrap().with_freshness(move || {
             count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(())
+            Ok(0)
         });
         let s = &server.state;
         let r = request(&format!(
@@ -806,9 +873,9 @@ mod boundary_tests {
         let root = DataRoot::open(temp.path(), true).unwrap();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = calls.clone();
-        let server = Explorer::bind(root, 0).unwrap().with_refresh(move || {
+        let server = Explorer::bind(root, 0).unwrap().with_freshness(move || {
             seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(())
+            Ok(0)
         });
         let s = &server.state;
         let legacy = format!(
@@ -828,7 +895,7 @@ mod boundary_tests {
     fn refreshing_preserves_error_class_and_cause() {
         let temp = tempfile::tempdir().unwrap();
         let root = DataRoot::open(temp.path(), true).unwrap();
-        let server = Explorer::bind(root, 0).unwrap().with_refresh(|| {
+        let server = Explorer::bind(root, 0).unwrap().with_freshness(|| {
             Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "cannot read fixture transcript",

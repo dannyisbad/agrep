@@ -40,10 +40,6 @@ pub enum Fingerprint {
 /// provisional. The publication guard admits it without a material verdict for its path.
 pub const ATTRIBUTION_ISSUE_KIND: &str = "attribution-unreadable";
 
-pub fn attribution_only_issue(kind: &str) -> bool {
-    kind == ATTRIBUTION_ISSUE_KIND
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TokenAvailability {
     Data(Vec<(String, String)>),
@@ -119,16 +115,6 @@ impl TokenAvailability {
             Self::Unreadable(issues)
         } else {
             Self::Partial { tokens, issues }
-        }
-    }
-
-    /// The listed conversations and the issues scoping what stayed unlisted.
-    pub fn into_parts(self) -> (Vec<(String, String)>, Vec<TokenReadIssue>) {
-        match self {
-            Self::Data(tokens) => (tokens, Vec::new()),
-            Self::Empty => (Vec::new(), Vec::new()),
-            Self::Partial { tokens, issues } => (tokens, issues),
-            Self::Unreadable(issues) => (Vec::new(), issues),
         }
     }
 }
@@ -385,24 +371,6 @@ pub fn metadata_change_token_with_file_identity(
         )
     })?;
     Ok((token, identity))
-}
-
-#[cfg(windows)]
-pub fn content_sha256_with_file_identity(
-    path: &Path,
-    metadata: &fs::Metadata,
-) -> std::io::Result<([u8; 32], WindowsFileIdentity)> {
-    let (token, identity) = windows_metadata_identity(path, metadata, true, true)?;
-    let ChangeToken::ContentSha256(digest) = token else {
-        unreachable!("forced content hashing returned metadata identity")
-    };
-    let identity = identity.ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "filesystem did not provide a stable file identity",
-        )
-    })?;
-    Ok((digest, identity))
 }
 
 #[cfg(windows)]
@@ -1090,70 +1058,6 @@ pub fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> std::io::Result
     read_bounded_regular_file_from_meta(path, max_bytes, before).map(Some)
 }
 
-pub fn read_bounded_regular_file_snapshot(
-    path: &Path,
-    max_bytes: u64,
-) -> std::io::Result<Option<BoundedRegularFileSnapshot>> {
-    let before = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    read_bounded_regular_file_snapshot_from_meta(path, max_bytes, before).map(Some)
-}
-
-/// Copy one exact plain-file generation to a caller-owned private path.
-///
-/// The source is opened no-follow, verified against its path before and after
-/// the streaming copy, and never hard-linked. This is intentionally separate
-/// from ordinary reads: SQLite ownership probes use it to inspect a private
-/// main/journal/WAL family without exposing live WAL or SHM bytes to SQLite.
-pub fn copy_regular_file_snapshot(path: &Path, target: &Path) -> std::io::Result<bool> {
-    let before = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    let mut source = open_regular_snapshot(path, &before)?;
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut output = options.open(target)?;
-    let copied = std::io::copy(&mut source, &mut output)?;
-    if copied != before.len() {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidData,
-            "source length changed while copying",
-        ));
-    }
-    output.sync_all()?;
-    verify_regular_snapshot(path, &source, &before)?;
-    if output.metadata()?.len() != copied {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidData,
-            "private snapshot length does not match its source",
-        ));
-    }
-    Ok(true)
-}
-
-pub fn regular_file_equals(path: &Path, expected: &[u8]) -> std::io::Result<bool> {
-    let before = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    if metadata_is_link(&before) || !before.is_file() || before.len() != expected.len() as u64 {
-        return Ok(false);
-    }
-    read_bounded_regular_file_from_meta(path, expected.len() as u64, before)
-        .map(|body| body == expected)
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RegularFileEdgeSnapshot {
     pub len: u64,
@@ -1161,111 +1065,6 @@ pub struct RegularFileEdgeSnapshot {
     pub change_token: ChangeToken,
     pub head: Vec<u8>,
     pub tail: Vec<u8>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RegularFileReaderIdentity {
-    pub len: u64,
-    pub modified_ns: u64,
-    pub changed_ns: u64,
-    pub device: u64,
-    pub inode: u64,
-}
-
-#[cfg(unix)]
-fn regular_file_reader_identity_from_file(
-    file: &fs::File,
-) -> std::io::Result<RegularFileReaderIdentity> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = file.metadata()?;
-    let to_ns = |seconds: i64, nanos: i64| {
-        u64::try_from(i128::from(seconds) * 1_000_000_000 + i128::from(nanos)).map_err(|_| {
-            std::io::Error::new(
-                ErrorKind::InvalidData,
-                "file timestamp is outside proof range",
-            )
-        })
-    };
-    Ok(RegularFileReaderIdentity {
-        len: metadata.len(),
-        modified_ns: to_ns(metadata.mtime(), metadata.mtime_nsec())?,
-        changed_ns: to_ns(metadata.ctime(), metadata.ctime_nsec())?,
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
-}
-
-#[cfg(windows)]
-fn windows_reader_identity(
-    state: WindowsHandleState,
-) -> std::io::Result<RegularFileReaderIdentity> {
-    const WINDOWS_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
-    let modified_ns = state
-        .last_write
-        .checked_sub(WINDOWS_EPOCH_TICKS)
-        .and_then(|ticks| ticks.checked_mul(100))
-        .ok_or_else(|| {
-            std::io::Error::new(ErrorKind::InvalidData, "file mtime is outside proof range")
-        })?;
-    let changed_ns = state.change_time.checked_mul(100).ok_or_else(|| {
-        std::io::Error::new(
-            ErrorKind::InvalidData,
-            "file change time is outside proof range",
-        )
-    })?;
-    Ok(RegularFileReaderIdentity {
-        len: state.size,
-        modified_ns,
-        changed_ns,
-        device: state.legacy_volume,
-        inode: state.legacy_inode,
-    })
-}
-
-#[cfg(windows)]
-fn regular_file_reader_identity_from_file(
-    file: &fs::File,
-) -> std::io::Result<RegularFileReaderIdentity> {
-    use std::os::windows::io::AsRawHandle;
-
-    windows_reader_identity(windows_handle_state(file.as_raw_handle())?)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn regular_file_reader_identity_from_file(
-    file: &fs::File,
-) -> std::io::Result<RegularFileReaderIdentity> {
-    let metadata = file.metadata()?;
-    let modified_ns = metadata
-        .modified()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| std::io::Error::new(ErrorKind::InvalidData, "file mtime predates epoch"))?
-        .as_nanos()
-        .try_into()
-        .map_err(|_| std::io::Error::new(ErrorKind::InvalidData, "file mtime is too large"))?;
-    Ok(RegularFileReaderIdentity {
-        len: metadata.len(),
-        modified_ns,
-        changed_ns: 0,
-        device: 0,
-        inode: 0,
-    })
-}
-
-pub fn regular_file_reader_identity(
-    path: &Path,
-) -> std::io::Result<Option<RegularFileReaderIdentity>> {
-    let before = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let file = open_regular_snapshot(path, &before)?;
-    let identity = regular_file_reader_identity_from_file(&file)?;
-    verify_regular_snapshot(path, &file, &before)?;
-    Ok(Some(identity))
 }
 
 #[cfg(windows)]

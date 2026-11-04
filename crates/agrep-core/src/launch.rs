@@ -137,7 +137,7 @@ pub fn run(exe: &Path, args: &[OsString], cwd: &Path) -> Result<i32> {
         .spawn()
         .with_context(|| format!("could not launch {}", exe.display()))?;
     #[cfg(unix)]
-    signals.foreground(child.id());
+    signals.started(child.id())?;
     #[cfg(windows)]
     signals.child(child.id());
     #[cfg(unix)]
@@ -189,18 +189,23 @@ mod unix {
             }
         }
     }
+    /// Interrupts the wait when this process is continued, perhaps as the terminal's new
+    /// foreground. macOS does not wake a stopped parent's waitid for a child that stops
+    /// meanwhile, so this is also the wakeup that notices such a stop.
+    extern "C" fn wake(_: i32) {}
+    fn holds_terminal() -> bool {
+        unsafe { libc::tcgetpgrp(0) == libc::getpgrp() }
+    }
     pub struct Signals {
         old: Vec<(i32, libc::sigaction)>,
-        pgrp: i32,
-        tty: bool,
+        interactive: bool,
         termios: Option<libc::termios>,
     }
     impl Signals {
         pub fn install(interactive: bool) -> Result<Self> {
             let mut s = Self {
                 old: vec![],
-                pgrp: unsafe { libc::tcgetpgrp(0) },
-                tty: interactive && unsafe { libc::tcgetpgrp(0) == libc::getpgrp() },
+                interactive,
                 termios: {
                     let mut t = unsafe { std::mem::zeroed() };
                     if unsafe { libc::tcgetattr(0, &mut t) } == 0 {
@@ -211,41 +216,65 @@ mod unix {
                 },
             };
             SIGNAL.store(0, Ordering::SeqCst);
-            for sig in [
-                libc::SIGINT,
-                libc::SIGTERM,
-                libc::SIGHUP,
-                libc::SIGQUIT,
-                libc::SIGTTOU,
-            ] {
-                let mut new: libc::sigaction = unsafe { std::mem::zeroed() };
-                new.sa_sigaction = if sig == libc::SIGTTOU {
-                    libc::SIG_IGN
-                } else {
-                    relay as *const () as usize
-                };
-                unsafe { libc::sigemptyset(&mut new.sa_mask) };
-                let mut old = unsafe { std::mem::zeroed() };
-                if unsafe { libc::sigaction(sig, &new, &mut old) } != 0 {
-                    return Err(std::io::Error::last_os_error().into());
-                }
-                s.old.push((sig, old));
+            for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+                s.handle(sig, relay as *const () as usize)?;
             }
+            s.handle(libc::SIGCONT, wake as *const () as usize)?;
             Ok(s)
         }
-        pub fn foreground(&mut self, pid: u32) {
-            PID.store(pid as i32, Ordering::SeqCst);
-            if self.tty {
-                unsafe {
-                    libc::tcsetpgrp(0, pid as i32);
-                    // A fast reader may have received SIGTTIN before the parent handed over the terminal.
-                    libc::kill(-(pid as i32), libc::SIGCONT);
-                }
+        fn handle(&mut self, sig: i32, action: libc::sighandler_t) -> Result<()> {
+            let mut new: libc::sigaction = unsafe { std::mem::zeroed() };
+            new.sa_sigaction = action;
+            unsafe { libc::sigemptyset(&mut new.sa_mask) };
+            let mut old = unsafe { std::mem::zeroed() };
+            if unsafe { libc::sigaction(sig, &new, &mut old) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
             }
+            self.old.push((sig, old));
+            Ok(())
+        }
+        /// Ignoring SIGTTOU lets this process take the terminal back from the agent's group.
+        /// It starts only after the spawn, because an ignored signal survives exec and the
+        /// agent must stop, as under 0.4.9, when it touches the terminal from the background.
+        pub fn started(&mut self, pid: u32) -> Result<()> {
+            self.foreground(pid);
+            self.handle(libc::SIGTTOU, libc::SIG_IGN)
+        }
+        /// True when it lent the terminal, which also continues the agent.
+        fn foreground(&mut self, pid: u32) -> bool {
+            PID.store(pid as i32, Ordering::SeqCst);
+            let lent = self.lend(pid);
             let sig = self.signal();
             if sig != 0 {
                 unsafe {
                     libc::kill(-(pid as i32), sig);
+                }
+            }
+            lent
+        }
+        /// Lends the terminal to the agent's group while this process holds it, and continues
+        /// the group: a member may have stopped touching the terminal before the handoff. `fg`
+        /// hands a running background job the terminal without signalling it, so every wakeup
+        /// asks again, as 0.4.9's poll did. True when it lent the terminal.
+        fn lend(&self, pid: u32) -> bool {
+            let group = pid as i32;
+            if !self.interactive || !holds_terminal() || unsafe { libc::tcsetpgrp(0, group) } != 0 {
+                return false;
+            }
+            unsafe {
+                libc::kill(-group, libc::SIGCONT);
+            }
+            true
+        }
+        fn holds(&self, pid: u32) -> bool {
+            self.interactive && unsafe { libc::tcgetpgrp(0) } == pid as i32
+        }
+        /// Takes the terminal back from the agent's group only: with SIGTTOU ignored, a
+        /// background agrep could otherwise take it from the shell.
+        fn take_back(&self, pid: u32) {
+            if self.holds(pid) {
+                unsafe {
+                    libc::tcsetpgrp(0, libc::getpgrp());
                 }
             }
         }
@@ -267,6 +296,7 @@ mod unix {
                 {
                     let error = std::io::Error::last_os_error();
                     if error.kind() == std::io::ErrorKind::Interrupted {
+                        self.lend(pid);
                         continue;
                     }
                     return Err(error.into());
@@ -275,14 +305,32 @@ mod unix {
                     let mut status = 0;
                     unsafe {
                         libc::waitpid(pid as i32, &mut status, libc::WUNTRACED);
-                        if self.tty {
-                            libc::tcsetpgrp(0, self.pgrp);
+                    }
+                    // Reading or configuring the terminal outside its foreground stopped the
+                    // agent; once the terminal is this job's, the agent just goes on.
+                    if libc::WIFSTOPPED(status)
+                        && matches!(libc::WSTOPSIG(status), libc::SIGTTIN | libc::SIGTTOU)
+                    {
+                        if self.lend(pid) {
+                            continue;
                         }
+                        if self.holds(pid) {
+                            unsafe {
+                                libc::kill(-(pid as i32), libc::SIGCONT);
+                            }
+                            continue;
+                        }
+                    }
+                    self.take_back(pid);
+                    unsafe {
                         libc::raise(libc::SIGTSTP);
                     }
-                    self.foreground(pid);
-                    unsafe {
-                        libc::kill(-(pid as i32), libc::SIGCONT);
+                    // One SIGCONT only: on macOS, a second one right after the lend's now and
+                    // then left the agent ignoring its next Ctrl-Z.
+                    if !self.foreground(pid) {
+                        unsafe {
+                            libc::kill(-(pid as i32), libc::SIGCONT);
+                        }
                     }
                 } else {
                     return Ok(());
@@ -290,11 +338,7 @@ mod unix {
             }
         }
         pub fn finish(&mut self, pid: u32) {
-            if self.tty && self.pgrp > 0 {
-                unsafe {
-                    libc::tcsetpgrp(0, self.pgrp);
-                }
-            }
+            self.take_back(pid);
             // wait_for_exit uses WNOWAIT: this child still reserves the PID,
             // even on systems where getpgid no longer resolves an exited leader.
             unsafe {
@@ -314,16 +358,12 @@ mod unix {
                 unsafe {
                     libc::kill(-pid, libc::SIGKILL);
                 }
+                self.take_back(pid as u32);
             }
-            if let Some(t) = self.termios.as_ref() {
+            // In the background the modes are the shell's, which it may have changed since.
+            if let Some(t) = self.termios.as_ref().filter(|_| holds_terminal()) {
                 unsafe {
                     libc::tcsetattr(0, libc::TCSANOW, t);
-                }
-            }
-
-            if self.tty && self.pgrp > 0 {
-                unsafe {
-                    libc::tcsetpgrp(0, self.pgrp);
                 }
             }
             for (sig, old) in &self.old {

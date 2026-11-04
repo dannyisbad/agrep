@@ -32,13 +32,6 @@ pub fn disk_usage(path: &Path) -> Result<(u64, u64)> {
     }
     Ok((bytes, files))
 }
-pub fn table_exists(c: &Connection, name: &str) -> Result<bool> {
-    Ok(c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
-        [name],
-        |r| r.get(0),
-    )?)
-}
 pub fn state(c: &Connection, key: &str) -> Result<Option<String>> {
     Ok(
         c.query_row("SELECT value FROM state WHERE key=?1", [key], |r| r.get(0))

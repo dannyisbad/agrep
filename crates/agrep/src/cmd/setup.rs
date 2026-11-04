@@ -96,7 +96,6 @@ pub fn run(o: Options) -> Result<i32> {
     }
     match store::refresh(&root, true, false) {
         Ok(refresh) => {
-            agrep_core::coverage::initialize(&root)?;
             if refresh.changed_rows > 0 {
                 agrep_core::semantic::mark_index_changed(&root)?;
             }

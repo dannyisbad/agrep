@@ -42,7 +42,6 @@ fn partial_semantic_zero_exits_one_and_reports_numbers() {
     let t = tempfile::tempdir().unwrap();
     let r = DataRoot::open(t.path().join("data"), true).unwrap();
     let c = store::writer(&r).unwrap();
-    semantic::initialize(&r).unwrap();
     c.execute("INSERT INTO prose(source,agent,session,project,turn,who,model,model_source,ts,text,digest,extra) VALUES(1,'codex','session','p',1,'user','',0,0,'text','digest','')",[]).unwrap();
     // Empty coverage never loads weights. Sparse file sizes exercise that path
     // without network, model initialization or embedding fabricated evidence.
@@ -86,7 +85,6 @@ fn explicit_semantic_refuses_an_identifier_query_as_0_4_9() {
     let t = tempfile::tempdir().unwrap();
     let r = DataRoot::open(t.path().join("data"), true).unwrap();
     let c = store::writer(&r).unwrap();
-    semantic::initialize(&r).unwrap();
     c.execute("INSERT INTO prose(source,agent,session,project,turn,who,model,model_source,ts,text,digest,extra) VALUES(1,'codex','session','p',1,'user','',0,0,'foo_bar text','digest','')",[]).unwrap();
     fs::create_dir(t.path().join("model")).unwrap();
     for (name, size, _) in agrep_core::semantic_model::FILES {
@@ -156,7 +154,6 @@ fn optional_model_failure_keeps_a_completed_keyword_answer() {
         String::from_utf8_lossy(&out.stderr)
     );
     let r = DataRoot::open(t.path().join("data"), false).unwrap();
-    semantic::initialize(&r).unwrap();
     store::writer(&r)
         .unwrap()
         .execute(
@@ -171,6 +168,13 @@ fn optional_model_failure_keeps_a_completed_keyword_answer() {
             .set_len(size)
             .unwrap();
     }
+    let failure = |out: &Output| -> Vec<String> {
+        String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .filter(|line| line.starts_with("semantic search failed"))
+            .map(str::to_owned)
+            .collect()
+    };
     let out = run(&t, &["search", "--no-auto", "database migration failure"]);
     assert_eq!(
         out.status.code(),
@@ -179,7 +183,31 @@ fn optional_model_failure_keeps_a_completed_keyword_answer() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("database migration failure"));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("semantic search failed"));
+    // A read-only root is never written, so the cause rides on the one failure line.
+    let lines = failure(&out);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].starts_with("semantic search failed; returning keyword results: "),
+        "{lines:?}"
+    );
+    assert!(lines[0].contains("SHA-256 mismatch"), "{lines:?}");
+    assert!(!t.path().join("data/log").exists());
+    let out = agrep(&t)
+        .env("AGREP_PROFILE", "compact")
+        .args(["search", "--no-auto", "database migration failure"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("database migration failure"));
+    assert_eq!(
+        failure(&out),
+        ["semantic search failed; returning keyword results (details in log/agrep.log)"]
+    );
     assert!(fs::read_to_string(t.path().join("data/log/agrep.log"))
         .unwrap()
         .contains("SHA-256 mismatch"));
@@ -336,7 +364,6 @@ fn recall_with_a_failed_meaning_lane_and_no_match_is_unverified() {
         String::from_utf8_lossy(&out.stderr)
     );
     let r = DataRoot::open(t.path().join("data"), false).unwrap();
-    semantic::initialize(&r).unwrap();
     // Every row embedded, so no worker starts and the lane loads the model.
     store::writer(&r)
         .unwrap()
@@ -394,7 +421,6 @@ fn compact_profile_machine_surfaces_never_start_the_meaning_lane() {
         String::from_utf8_lossy(&out.stderr)
     );
     let r = DataRoot::open(t.path().join("data"), false).unwrap();
-    semantic::initialize(&r).unwrap();
     store::writer(&r)
         .unwrap()
         .execute(

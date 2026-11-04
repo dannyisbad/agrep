@@ -20,7 +20,8 @@ or a non-empty root without a marker, are refused with one line naming the path.
 the root and its `archive`, `model` and `log` directories are created with mode 0700,
 and validation tightens existing ones. With `AGREP_DATA_READONLY` set (to anything but
 empty, `0`, `false` or `off`), commands skip the census, report freshness as unchecked,
-and fail instead of taking a lock or writing.
+and fail instead of taking a lock or writing: validation leaves directory modes as they
+are, and nothing is logged.
 
 | Path | Contents |
 |---|---|
@@ -139,8 +140,9 @@ How commands use it (`ready` and `finish_census` in `crates/agrep/src/main.rs`):
      trigram counts and family token statistics;
    - the deletion of sessions left without rows, and the refresh time.
 6. For the first build, writes `index.building.db` with a rollback journal and creates
-   secondary indexes and triggers after the bulk insert. On commit it switches to WAL,
-   renames the file to `index.db` and fsyncs the directory.
+   secondary indexes and triggers after the bulk insert, then queues every visible row
+   for embedding. On commit it switches to WAL, renames the file to `index.db` and
+   fsyncs the directory.
 
 ## Row storage and compression
 

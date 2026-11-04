@@ -64,7 +64,7 @@ struct Wire {
 fn parse_wire(path: &Path) -> (Wire, bool) {
     let mut w = Wire::default();
     // seen = non-blank lines of wire.jsonl
-    let tally = crate::intake::file("kimi", path);
+    let tally = crate::intake::tally();
     let data = match crate::ingest::read_lossy(path) {
         Ok(d) => d,
         Err(e) => {
@@ -153,7 +153,7 @@ fn parse_session(dir: &Path, project: &str, parent: &str) -> (Vec<Message>, Vec<
         }
     }
     // seen = non-blank lines of context.jsonl
-    let tally = crate::intake::file("kimi", &context);
+    let tally = crate::intake::tally();
     let data = match crate::ingest::read_lossy(&context) {
         Ok(d) => d,
         Err(e) => {

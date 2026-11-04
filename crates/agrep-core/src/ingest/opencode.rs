@@ -354,7 +354,7 @@ const CHILD_SQL_V2: &str = "SELECT id, parent_id, COALESCE(title,''), time_creat
 /// Pull messages and tool events from one opencode database in one scan.
 fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>, ReadOutcome) {
     // seen = message-query part rows plus inspected child-session rows
-    let tally = crate::intake::file("opencode", path);
+    let tally = crate::intake::tally();
     let conn = match crate::ingest::open_sqlite_ro(path) {
         Ok(c) => c,
         Err(e) => {
@@ -761,8 +761,7 @@ pub fn collect(cache: &mut crate::intake_batch::IntakeBatch) -> (Vec<Message>, V
                 seen.push(path.clone());
             }
         }
-        let pass =
-            crate::intake_batch::collect_cached_for(cache, "opencode", &dir, &files, collect_db);
+        let pass = crate::intake_batch::collect_cached_for(cache, "opencode", &files, collect_db);
         messages.extend(pass.messages);
         events.extend(pass.events);
     }
@@ -772,8 +771,7 @@ pub fn collect(cache: &mut crate::intake_batch::IntakeBatch) -> (Vec<Message>, V
         } else {
             &[]
         };
-        let pass =
-            crate::intake_batch::collect_cached_for(cache, "opencode", &path, files, collect_db);
+        let pass = crate::intake_batch::collect_cached_for(cache, "opencode", files, collect_db);
         messages.extend(pass.messages);
         events.extend(pass.events);
     }

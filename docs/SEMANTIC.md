@@ -69,7 +69,8 @@ none of `--json`, `--flat`, `-l`, `--lexical`, `-w`, `-E`, `-c`, `--count-by-tie
 Without the model, automatic hybrid quietly stays keyword-only and `status` says so;
 `-s` prints `semantic model not installed: run agrep setup` and exits 2. In automatic
 hybrid, a failure of an installed model prints one stderr line, logs the cause to
-`log/agrep.log` and keeps the keyword results. An explicit `-s` never answers with keyword
+`log/agrep.log` (under `AGREP_DATA_READONLY`, the line carries the cause instead) and
+keeps the keyword results. An explicit `-s` never answers with keyword
 rows: a failed lane, or a query the meaning policy refuses, prints `semantic search
 unavailable: <reason>` (under `--json`, a record with `error.code` `semantic-unavailable`)
 and exits 2. A semantic-only search that finds nothing exits 1, also when coverage is
@@ -79,7 +80,9 @@ partial.
 
 - Prose triggers keep `semantic_queue` current in the same transaction as the rows: a
   visible row is queued on insert and re-queued when its text, digest, visibility,
-  speaker or agent changes; a deleted row leaves the queue and its references.
+  speaker or agent changes; a deleted row leaves the queue and its references. A first
+  build runs without them and queues every visible row in one statement before it
+  commits.
 - The worker embeds the queue newest-first in batches of 128 rows, and stops between
   batches while a writer or an explicit command waits. Identical content
   reuses its existing chunks: `semantic_chunks` is keyed by a content key (the row

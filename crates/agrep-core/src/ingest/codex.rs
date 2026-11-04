@@ -828,21 +828,8 @@ fn parse_call_output(v: &serde_json::Value) -> (String, usize, usize, Option<boo
 /// plus the two meta line types (and web_search_call, whose call_id is not guaranteed).
 /// The reasoning items that dominate rollout bytes match none and are skipped without
 /// touching serde; an unquoted-needle false positive just costs one wasted parse.
-fn parse_file_stamped(
-    path: &Path,
-    mtime_ns: i64,
-    size: u64,
-) -> (Vec<Message>, Vec<Event>, crate::intake_batch::ReadOutcome) {
-    parse_file_with_tally(
-        path,
-        crate::intake::file_stamped("codex", path, mtime_ns, size),
-    )
-}
-
-fn parse_file_with_tally(
-    path: &Path,
-    tally: std::sync::Arc<crate::intake::Tally>,
-) -> (Vec<Message>, Vec<Event>, crate::intake_batch::ReadOutcome) {
+fn parse_file(path: &Path) -> (Vec<Message>, Vec<Event>, crate::intake_batch::ReadOutcome) {
+    let tally = crate::intake::tally();
     let data = match crate::ingest::read_lossy(path) {
         Ok(d) => d,
         Err(e) => {
@@ -893,7 +880,7 @@ pub(crate) fn resume_parse(
     String,
 )> {
     let state = previous.map(serde_json::from_str).transpose()?;
-    let ((m, e, o), next) = parse_data(path, crate::intake::file("codex", path), data, state);
+    let ((m, e, o), next) = parse_data(path, crate::intake::tally(), data, state);
     Ok((m, e, o, serde_json::to_string(&next)?))
 }
 fn parse_data(
@@ -1690,13 +1677,7 @@ pub fn collect(cache: &mut crate::intake_batch::IntakeBatch) -> (Vec<Message>, V
         files
     });
 
-    let pass = crate::intake_batch::collect_cached_stamped_for(
-        cache,
-        "codex",
-        &root,
-        &files,
-        parse_file_stamped,
-    );
+    let pass = crate::intake_batch::collect_cached_for(cache, "codex", &files, parse_file);
     (pass.messages, pass.events)
 }
 

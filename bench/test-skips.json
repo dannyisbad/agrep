@@ -71,6 +71,13 @@
       "reason": "Uses POSIX PTYs, termios, signals or executable shell fixtures; Windows console behavior is covered separately."
     },
     {
+      "test": "crates/agrep/tests/browse.rs::run_follows_shell_job_control",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Drives POSIX job control (background jobs, stops, fg and bg) through bash on a PTY; Windows consoles have no background jobs or foreground process groups."
+    },
+    {
       "test": "crates/agrep/tests/browse.rs::a_spawned_worker_holds_no_pipe_of_the_caller",
       "gates": [
         "cfg(unix)"

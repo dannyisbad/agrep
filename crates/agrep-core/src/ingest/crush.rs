@@ -520,13 +520,11 @@ fn conversation_digest(conn: &Connection, session: &str) -> Option<String> {
 /// their tool_call by id (they may share a message or arrive in a later one).
 fn parse_session(
     conn: &Connection,
-    db_path: &Path,
     project: &str,
     session: &str,
-    token: &str,
 ) -> (Vec<Message>, Vec<Event>, bool) {
     // seen = message rows in this conversation
-    let tally = crate::intake::keyed_token("crush", db_path, session, token.to_string());
+    let tally = crate::intake::tally();
     let mut stmt = match conn.prepare(MESSAGES_QUERY) {
         Ok(s) => s,
         Err(e) => {
@@ -915,15 +913,6 @@ fn collect_discovered(
             });
         }
     }
-    let mut token_by_cache = HashMap::new();
-    if let Some(opened) = opened.as_ref() {
-        token_by_cache.extend(
-            opened
-                .tokens
-                .iter()
-                .map(|(cache_id, _, token)| (cache_id.clone(), token.clone())),
-        );
-    }
     let all_failed = opened
         .as_ref()
         .is_some_and(|opened| opened.databases.is_empty() && !opened.unavailable.is_empty());
@@ -988,13 +977,7 @@ fn collect_discovered(
             };
             let (database, connection) = &opened.databases[index];
             let parsed = crate::ingest::parse_guard::isolate("crush", &database.path, || {
-                parse_session(
-                    connection,
-                    &database.path,
-                    &database.project,
-                    session,
-                    token_by_cache.get(id).map(String::as_str).unwrap_or(""),
-                )
+                parse_session(connection, &database.project, session)
             });
             match parsed {
                 Ok((messages, events, true)) => {

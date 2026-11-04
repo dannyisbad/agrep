@@ -67,6 +67,10 @@ pub fn blank_notice(flag: &str) -> String {
             "an 8-char id prefix (as shown) or a full session uuid",
             "match every chat",
         ),
+        "--since" | "--until" => (
+            "7d / 24h / 2w / 30m, or 2026-06-01",
+            "match the whole history",
+        ),
         other => unreachable!("{other} is not a filter flag"),
     };
     format!("{flag} needs a value ({vocabulary}) - an empty value would silently {effect}")
@@ -303,13 +307,6 @@ pub fn disclose(coverage: &Value) {
             );
         }
     }
-}
-/// Small covering index for model validation; built by explicit indexing/setup.
-pub fn initialize(root: &crate::data::DataRoot) -> Result<()> {
-    let _lock = root.lock(true)?;
-    crate::store::writer(root)?
-        .execute_batch("CREATE INDEX IF NOT EXISTS prose_model ON prose(model)")?;
-    Ok(())
 }
 
 #[cfg(test)]

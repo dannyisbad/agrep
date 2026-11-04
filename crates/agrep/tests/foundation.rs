@@ -599,7 +599,7 @@ fn a_source_under_a_directory_turned_file_is_removed_by_the_refresh() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|s| s["path"] == source.display().to_string()));
+        .any(|s| s["path"].as_str().map(Path::new) == Some(source.as_path())));
 }
 // A directory the census cannot list is recorded with its error, and once it lists again
 // that record names no source: the census asks for a refresh, and the refresh drops it.

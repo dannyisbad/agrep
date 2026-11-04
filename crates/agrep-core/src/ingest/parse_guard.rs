@@ -23,8 +23,8 @@ pub(crate) struct ParserPanic {
     pub(crate) reason: String,
 }
 
-/// Run one source's parse. A panic is caught, its half-counted intake tallies are withdrawn and
-/// it comes back as [`ParserPanic`]; the caller then treats the source as unreadable this pass.
+/// Run one source's parse. A panic is caught and comes back as [`ParserPanic`]; the caller then
+/// treats the source as unreadable this pass, whatever its intake tallies counted.
 pub(crate) fn isolate<T>(
     agent: &str,
     source: &Path,
@@ -33,18 +33,14 @@ pub(crate) fn isolate<T>(
     route_guarded_panics();
     PANIC_SITE.with(Cell::take);
     // AssertUnwindSafe: the parse owns its working state. The one shared structure it writes,
-    // the intake run book, is repaired below; its locks are never held across parser code.
-    let (result, opened) = crate::intake::scoped(|| {
-        GUARD_DEPTH.with(|depth| depth.set(depth.get() + 1));
-        let result = panic::catch_unwind(AssertUnwindSafe(parse));
-        GUARD_DEPTH.with(|depth| depth.set(depth.get() - 1));
-        result
-    });
+    // its intake tallies, never holds a lock across parser code.
+    GUARD_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    let result = panic::catch_unwind(AssertUnwindSafe(parse));
+    GUARD_DEPTH.with(|depth| depth.set(depth.get() - 1));
     let payload = match result {
         Ok(value) => return Ok(value),
         Err(payload) => payload,
     };
-    crate::intake::discard(&opened);
     let site = PANIC_SITE.with(Cell::take);
     let reason = panic_reason(payload.as_ref(), site.as_deref());
     crate::ingest::warn_source_skip(agent, source, &reason);

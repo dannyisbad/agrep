@@ -10,14 +10,11 @@ pub(crate) fn run(full: bool, with_semantic: bool) -> Result<i32> {
     let refresh = store::refresh(&root, true, full)?;
     let after = Instant::now();
     report(&root, &refresh, first)?;
-    agrep_core::coverage::initialize(&root)?;
-    semantic::initialize(&root)?;
     if refresh.changed_rows > 0 {
         semantic::mark_index_changed(&root)?;
     }
     if with_semantic {
         semantic::provision(&root)?;
-        semantic::initialize(&root)?;
         let drain = semantic::Drain {
             explicit: true,
             ..Default::default()
@@ -54,11 +51,9 @@ pub(crate) fn reindex(full: bool, max_new: Option<i64>) -> Result<i32> {
     if full {
         semantic::reset(&root)?;
     }
-    agrep_core::coverage::initialize(&root)?;
     if refresh.changed_rows > 0 {
         semantic::mark_index_changed(&root)?;
     }
-    semantic::initialize(&root)?;
     let coverage = semantic::coverage(&store::reader(&root)?)?;
     let rows = coverage.total;
     let embedding = if root.config()?.embeddings == "off" {

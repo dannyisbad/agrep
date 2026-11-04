@@ -55,6 +55,11 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   whose lanes failed for different causes says `semantic search unavailable: the meaning
   lane did not answer` without 0.4.9's `; it retries automatically`: 0.5 has no daemon to
   retry the lane.
+- A page or recall whose automatic meaning lane has no model to run says `meaning
+  unavailable; keyword-only (semantic model not installed: run agrep setup)` every time,
+  where 0.4.9 named its own cause (its model cache or embedding backlog) once per notice
+  window and the bare line after that: 0.5 keeps no notice state between commands, and
+  the missing model is its only such cause.
 - A meaning row's `sem_score` can differ from 0.4.9's in the fourth decimal (0.882033
   where 0.4.9 said 0.881866): 0.5 embeds with the model's full-precision weights, where
   0.4.9 ran reduced-precision (int8 or fp16) copies.
@@ -138,7 +143,8 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   and exit lines wherever the command behaves the same; the refusals 0.4.9 worded itself
   (option gates, time windows, `--more`, unknown agents) keep their wording, without the
   `; to search for the word "tail": agrep search tail …` hint argparse appended to a
-  subcommand's refusal; and every argument error still exits 2, as 0.4.9's did.
+  subcommand's refusal, which only the `unrecognized arguments` refusal of `chats`, `recall`
+  and `pack` keeps; and every argument error still exits 2, as 0.4.9's did.
 - `status`, `resume`, `ui` and `serve` also accept `--no-auto`, which 0.4.9 refused with
   exit 2: in 0.5 each of them checks the agent stores for changes itself, as search does,
   where 0.4.9 left that to its daemon. `index --semantic` is new: it downloads the model if

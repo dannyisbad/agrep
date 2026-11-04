@@ -10,9 +10,7 @@ pub struct Record {
     pub family: String,
     pub score: f64,
     pub lane: String,
-    #[serde(default)]
     pub tool: bool,
-    #[serde(default)]
     pub identity: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -24,11 +22,9 @@ pub struct Frozen {
     pub shown: usize,
     pub requested: Option<usize>,
     pub chat_scoped: bool,
-    #[serde(default)]
     pub full_argv: Vec<String>,
     /// Whether `-c` can count a floor total exactly: not for a `--no-meta` page that
     /// dropped rows.
-    #[serde(default)]
     pub exhaustible: bool,
 }
 #[derive(Debug)]

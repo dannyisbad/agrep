@@ -933,13 +933,15 @@ fn compact(classic: bool) -> bool {
 }
 type CensusTask = std::thread::JoinHandle<Result<agrep_core::freshness::Pending>>;
 fn ready(no_auto: bool) -> Result<(DataRoot, Option<CensusTask>)> {
-    let no_auto = no_auto || agrep_core::data::read_only();
     let root = DataRoot::discover()?;
+    if no_auto && !root.db().exists() {
+        return Err(cmd::usage::no_index());
+    }
+    let no_auto = no_auto || agrep_core::data::read_only();
     root.validate(!no_auto)?;
     // A first build runs inline; its census then finds the sources it just read.
     if !no_auto && !root.db().exists() {
         store::refresh(&root, true, false)?;
-        semantic::initialize(&root)?;
     }
     let census = (!no_auto).then(|| {
         let copy = root.clone();
@@ -1014,10 +1016,12 @@ fn run(cli: Cli, invocation: &cmd::usage::Invocation) -> Result<i32> {
         Some(Command::Serve { port, no_auto }) => cmd::serve::run(port, no_auto),
         Some(Command::Ui { port, no_auto }) => cmd::ui::run(port, no_auto),
         Some(Command::Chats(s)) => {
+            cmd::usage::chats(&s, invocation)?;
             let (no_auto, color) = (s.no_auto, s.color.clone());
             cmd::chats::run(s, no_auto, &color)
         }
         Some(Command::Summary(s)) => {
+            cmd::usage::summary(&s)?;
             let (no_auto, color) = (s.no_auto, s.color.clone());
             cmd::summary::run(s, no_auto, &color)
         }

@@ -4,20 +4,18 @@ use agrep_core::{
     query::{self, Options},
     render, store,
 };
-use anyhow::{bail, Result};
+use anyhow::Result;
 use serde_json::json;
 use std::collections::HashMap;
 
 pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
-    if args.pattern.iter().any(|s| s.trim().is_empty()) {
-        bail!("pattern arguments must not be empty")
-    }
+    // 0.4.9 read the time bounds before it checked the index (py/search.py:8743-8758).
+    let mut filters = args.scope.filters()?;
+    h::validate_filters(&filters)?;
     let (root, census) = ready(no_auto)?;
     let c = store::reader(&root)?;
     let tools = root.config()?.tools;
     let all = h::sessions(&c)?;
-    let mut filters = args.scope.filters()?;
-    h::validate_filters(&filters)?;
     let pattern = args.pattern.join(" ");
     if args.pattern.len() == 1 && pattern.starts_with('@') && pattern.contains(':') {
         agrep_core::handles::parse(&pattern)?;
@@ -53,7 +51,9 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
         !args.scope.include_self && (args.scope.no_self || (!pattern.is_empty() && !direct));
     let mut hits = HashMap::new();
     let mut exact = true;
-    if !pattern.is_empty() && !direct {
+    // 0.4.9's content lookup found nothing for a pattern without a word, such as `-`, and
+    // still matched it against chat identity (py/search.py:8764-8801).
+    if !direct && !agrep_core::boundary_rank::query_tokens(&pattern).is_empty() {
         let options = Options {
             pattern: pattern.clone(),
             regex: false,

@@ -53,19 +53,6 @@ impl SourceReadIssue {
         self.moving = true;
         self
     }
-
-    /// Whether this records material the read could not take for a durable reason (not an
-    /// absence, a failure a retry may clear, a source that moved under the read, nor a parser
-    /// panic, which a fixed build reads): what a rebuild may publish without once a later pass
-    /// sees it fail the same way.
-    pub fn unreadable_material(&self) -> bool {
-        self.kind == "source-read-failed"
-            && !self.retryable
-            && !self.moving
-            && !self
-                .reason
-                .starts_with(crate::ingest::parse_guard::PANIC_REASON_PREFIX)
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -243,23 +230,9 @@ pub fn racy_stamp(stamp: i64, start: i64, now: i64) -> bool {
     let margin = granule.max(20_000_000);
     stamp > start.saturating_sub(margin) && stamp <= now.saturating_add(2_000_000_000)
 }
-pub fn collect_cached_for<F, R>(
-    c: &mut IntakeBatch,
-    a: &'static str,
-    r: &Path,
-    f: &[PathBuf],
-    p: F,
-) -> Pass
-where
-    F: Fn(&Path) -> R + Sync,
-    R: IntoParsed,
-{
-    collect_cached_stamped_hinted_for(c, a, r, f, None, |p1, _, _| p(p1))
-}
 pub fn collect_cached_retiring_for<F, R>(
     c: &mut IntakeBatch,
     a: &'static str,
-    r: &Path,
     f: &[PathBuf],
     retired: &HashSet<PathBuf>,
     p: F,
@@ -270,18 +243,11 @@ where
 {
     c.retired
         .extend(retired.iter().map(|p| p.to_string_lossy().into_owned()));
-    collect_cached_for(c, a, r, f, p)
+    collect_cached_for(c, a, f, p)
 }
-pub fn collect_cached_stamped_hinted_for<F, R>(
-    c: &mut IntakeBatch,
-    a: &'static str,
-    _: &Path,
-    f: &[PathBuf],
-    _: Option<&[i64]>,
-    p: F,
-) -> Pass
+pub fn collect_cached_for<F, R>(c: &mut IntakeBatch, a: &'static str, f: &[PathBuf], p: F) -> Pass
 where
-    F: Fn(&Path, i64, u64) -> R + Sync,
+    F: Fn(&Path) -> R + Sync,
     R: IntoParsed,
 {
     let batches: Vec<_> = f
@@ -289,13 +255,6 @@ where
         .filter(|p| c.changed.contains(*p))
         .map(|path| {
             let started = std::time::Instant::now();
-            let meta = std::fs::metadata(path).ok();
-            let mt = meta
-                .as_ref()
-                .and_then(|m| m.modified().ok())
-                .and_then(epoch_ns)
-                .unwrap_or(0);
-            let len = meta.as_ref().map_or(0, |m| m.len());
             crate::intake::take_diagnostics();
             let mut delta = None;
             let ((m, e, o), bad) = crate::intake::scoped(|| {
@@ -324,7 +283,7 @@ where
                             }
                         }
                     } else {
-                        p(path, mt, len).into_parsed()
+                        p(path).into_parsed()
                     }
                 }) {
                     Ok(v) => v,
@@ -367,19 +326,6 @@ where
         .collect();
     c.batches.extend(batches);
     Pass::default()
-}
-pub fn collect_cached_stamped_for<F, R>(
-    c: &mut IntakeBatch,
-    a: &'static str,
-    r: &Path,
-    f: &[PathBuf],
-    p: F,
-) -> Pass
-where
-    F: Fn(&Path, i64, u64) -> R + Sync,
-    R: IntoParsed,
-{
-    collect_cached_stamped_hinted_for(c, a, r, f, None, p)
 }
 
 /// Reconcile an adapter-wide dependency unit before it reaches the row store.

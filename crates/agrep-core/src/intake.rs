@@ -141,16 +141,6 @@ impl Tally {
             *slot = Some(capped);
         }
     }
-
-    pub fn test_record_counts(&self, skip: Skip) -> (u64, u64, u64, u64, u64) {
-        (
-            self.seen.load(Ordering::Relaxed),
-            self.rows.load(Ordering::Relaxed),
-            self.agent_rows.load(Ordering::Relaxed),
-            self.skips[skip.index()].load(Ordering::Relaxed),
-            self.errors.load(Ordering::Relaxed),
-        )
-    }
 }
 
 /// Truncate at the largest char boundary <= `max_bytes`. Error samples clip raw store
@@ -181,15 +171,7 @@ pub(crate) fn scoped<T>(f: impl FnOnce() -> T) -> (T, Vec<Arc<Tally>>) {
     });
     (v, t)
 }
-pub(crate) fn discard(_: &[Arc<Tally>]) {}
-pub fn forget(_: &Path) {}
-pub fn file(a: &'static str, p: &Path) -> Arc<Tally> {
-    keyed(a, &p.to_string_lossy(), String::new())
-}
-pub fn file_stamped(a: &'static str, p: &Path, _: i64, _: u64) -> Arc<Tally> {
-    file(a, p)
-}
-pub fn keyed(_: &'static str, _: &str, _: String) -> Arc<Tally> {
+pub(crate) fn tally() -> Arc<Tally> {
     let t = Arc::new(Tally::default());
     SCOPES.with(|s| {
         if let Some(v) = s.borrow_mut().last_mut() {
@@ -198,14 +180,8 @@ pub fn keyed(_: &'static str, _: &str, _: String) -> Arc<Tally> {
     });
     t
 }
-pub fn keyed_token(a: &'static str, p: &Path, s: &str, f: String) -> Arc<Tally> {
-    keyed(a, &token_id(p, s), f)
-}
 pub fn token_id(p: &Path, s: &str) -> String {
     serde_json::to_string(&(p.to_string_lossy(), s)).unwrap()
-}
-pub fn parse_token_id(s: &str) -> Option<(String, String)> {
-    serde_json::from_str(s).ok()
 }
 pub(crate) fn errors(t: &[Arc<Tally>]) -> bool {
     t.iter().any(|v| v.errors.load(Ordering::Relaxed) > 0)
