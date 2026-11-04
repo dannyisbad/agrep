@@ -32,12 +32,14 @@ all-terms and labeled content-term fallback; meaning rows are labeled meaning
 matches. `--lexical` keeps keyword search, `-s` requests meaning search explicitly.
 
 Completeness uses `shown`, `total`, `unit`, `total_basis` and `truncated`.
-`total_basis` distinguishes exact, measured floor and unknown. A page length is
-not a corpus total. Omit unmeasured tool counts. A continuation uses
-`more_command`/`more_argv`; a broader rerun is identified as such. Exhausted exact
+`total_basis` is `exact`, or `floor` for a measured lower bound. A page length is
+not a corpus total. Unmeasured tool counts are omitted: with a floor total, JSON
+drops `tool_rows` and sets `tool_rows_basis` to `unknown`. A cut page names a
+bounded larger page as `more_command` (`more_command_kind: "broader-rerun"`) and
+the exhaustive keyword rerun as `full_command`; piped text says the same in one
+`showing N of M` line. Exhausted exact
 pages do not suggest more results. `--more` reads frozen rows, rather than silently
-rerunning a query against a changed corpus. The old hidden `--deeper` interface
-is removed.
+rerunning a query against a changed corpus.
 
 Normal commands check source files and answer from a committed snapshot.
 `--no-auto` suppresses automatic freshness work and marks freshness unchecked.

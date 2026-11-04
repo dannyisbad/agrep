@@ -19,7 +19,13 @@ pub struct Coverage {
 }
 impl Serialize for Coverage {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        serde_json::json!({"indexed":self.embedded,"total":self.total,"pending":self.total.saturating_sub(self.embedded),"fraction":if self.total==0 {1.0}else{self.embedded as f64/self.total as f64},"complete":!self.partial(),"order":"newest-first"}).serialize(serializer)
+        // 0.4.9 rounded the fraction to six places (py/semantic.py:341).
+        let fraction = if self.total == 0 {
+            1.0
+        } else {
+            crate::window::round6(self.embedded as f64 / self.total as f64)
+        };
+        serde_json::json!({"indexed":self.embedded,"total":self.total,"pending":self.total.saturating_sub(self.embedded),"fraction":fraction,"complete":!self.partial(),"order":"newest-first"}).serialize(serializer)
     }
 }
 impl Coverage {

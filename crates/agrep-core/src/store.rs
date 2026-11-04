@@ -53,6 +53,8 @@ pub struct Refresh {
     pub dictionary_ms: f64,
     pub node_chunks_ms: f64,
     pub commit_ms: f64,
+    /// Opening the writer connection, WAL recovery included.
+    pub open_ms: f64,
 }
 thread_local! {
     static WRITE_TIMES: std::cell::Cell<(u64,u64)> = const { std::cell::Cell::new((0,0)) };
@@ -447,11 +449,13 @@ fn refresh_inner(
             }
         }
     }
+    let opening = Instant::now();
     let mut c = if first {
         open_writer(&initial, false)?
     } else {
         writer(root)?
     };
+    let open_ms = opening.elapsed().as_secs_f64() * 1000.;
     if first {
         search_indexes(&c, false)?;
         // Initial rows are invisible until the final commit. Build their derived
@@ -526,6 +530,7 @@ fn refresh_inner(
     let mut info = Refresh {
         sources: stamps.len(),
         census_ms,
+        open_ms,
         ..Default::default()
     };
     if changed.is_empty() && removed.is_empty() && !first {
@@ -948,6 +953,12 @@ fn refresh_inner(
     if first {
         c.execute_batch("PRAGMA journal_mode=WAL;")?;
         c.close().map_err(|(_, e)| e)?;
+        // A connection that has not used the FTS tables caches none of their structures.
+        let mut sealing = open_writer(&initial, true)?;
+        let tx = sealing.transaction()?;
+        crate::fts_segments::seal(&tx)?;
+        tx.commit()?;
+        sealing.close().map_err(|(_, e)| e)?;
         fs::rename(&initial, root.db())?;
         #[cfg(unix)]
         fs::File::open(root.path())?.sync_all()?;

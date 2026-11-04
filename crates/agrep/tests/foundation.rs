@@ -3124,6 +3124,110 @@ fn a_refresh_adds_one_segment_per_text_index_and_the_worker_merges_them() {
     );
 }
 
+/// `index` within `limit`, its output read to the end as a capturing caller reads it.
+fn index_output(h: &Path, d: &Path, limit: std::time::Duration) -> Output {
+    let child = Command::new(support::binary())
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", h)
+        .env("AGREP_HOME", h)
+        .env("AGREP_DATA_DIR", d)
+        .env("AGREP_PROFILE", "classic")
+        .arg("index")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || sender.send(child.wait_with_output()));
+    // A watchdog, not synchronization: output held open by a waiting merger never closes.
+    receiver
+        .recv_timeout(limit)
+        .expect("index's output stayed open after it exited")
+        .unwrap()
+}
+
+/// std's CreateProcess on Windows passes every inheritable handle to the child, and a
+/// command's standard handles are inheritable when its caller passed pipes. The merger
+/// `index` starts waits here while an explicit command runs; had it inherited the
+/// pipes, the output would stay open until that command ended.
+#[test]
+fn index_output_closes_while_the_merger_it_started_waits() {
+    use serde_json::json;
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let d = t.path().join("d");
+    let path = transcript(&h, &["prose turn marker"]);
+    ok(cli(&h, &d, &["index"]));
+    for (id, parent) in [("u0", "m0"), ("u1", "u0"), ("u2", "u1")] {
+        write_records(
+            &path,
+            &[
+                json!({"type":"message","id":id,"parentId":parent,"timestamp":"2026-10-30T12:00:00Z","message":{"role":"user","content":format!("change {id} cobalt")}}),
+            ],
+            true,
+        );
+        if id != "u2" {
+            ok(cli(&h, &d, &["__work", "refresh"]));
+        }
+    }
+    let c =
+        Connection::open_with_flags(d.join("index.db"), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    assert!(agrep_core::fts_segments::pending(&c).unwrap());
+    drop(c);
+    let root = DataRoot::open(&d, false).unwrap();
+    let command = root.foreground().unwrap();
+    ok(index_output(&h, &d, std::time::Duration::from_secs(300)));
+    drop(command);
+}
+
+/// The first build leaves one segment per text index; later refreshes' smaller segments
+/// merge below it instead of rewriting it, until the cap forces a whole-table merge.
+/// FTS5 moves a segment no larger than a newly written one down beside it, so the
+/// fixture's first build outweighs a refresh.
+#[test]
+fn the_first_build_segment_stays_out_of_the_merges_of_later_refreshes() {
+    use serde_json::json;
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let d = t.path().join("d");
+    let turns: Vec<String> = (0..2000)
+        .map(|i| format!("prose turn {i} marker word{i}x"))
+        .collect();
+    let path = transcript(&h, &turns.iter().map(String::as_str).collect::<Vec<_>>());
+    ok(cli(&h, &d, &["index"]));
+    let sealed = || {
+        let c = Connection::open_with_flags(d.join("index.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+        let levels = agrep_core::fts_segments::levels(&c, "prose_fts").unwrap();
+        let top = levels.iter().rposition(|l| !l.pages.is_empty()).unwrap();
+        (top, levels[top].pages.clone())
+    };
+    let first = sealed();
+    assert!(first.0 >= 5 && first.1[0] > 1, "{first:?}");
+    let mut parent = "m1999".to_string();
+    for round in 0..4 {
+        let id = format!("r{round}");
+        write_records(
+            &path,
+            &[
+                json!({"type":"message","id":&id,"parentId":&parent,"timestamp":"2026-10-30T12:00:00Z","message":{"role":"user","content":format!("round {round} novel{round}")}}),
+            ],
+            true,
+        );
+        parent = id;
+        ok(cli(&h, &d, &["__work", "refresh"]));
+        ok(cli(&h, &d, &["__work", "merge"]));
+        assert_eq!(sealed(), first, "round {round}");
+        assert!(fts_segments(&d)
+            .iter()
+            .all(|&n| n <= agrep_core::fts_segments::CAP));
+    }
+    let full = t.path().join("full");
+    ok(cli(&h, &full, &["index"]));
+    assert_eq!(fts_contents(&d), fts_contents(&full));
+}
+
 /// A merger mid-merge holds merge.lock and starts no step while a writer is queued.
 /// The test holds both, so an `index` that merged inline or waited for the merger
 /// would merge here or never return.

@@ -1,69 +1,143 @@
-# In-process semantic search
+# Meaning search
 
-The embedding implementation uses pinned Candle 0.9.2 and the checkpoint's ModernBERT architecture. Every numerical change is checked against the unchanged full-precision oracle. macOS CPU inference keeps F32 weights and uses tiled Accelerate attention without a full score matrix, fused residual normalization, and GeGLU with vectorized exponential evaluation. Two interleaved input streams share the same bounded Rayon pool; they do not create two pools. Other CPU targets retain the portable tensor operations.
+Meaning search runs a pinned embedding model inside agrep itself, with no model server,
+IPC or Python. A search embeds its query on the CPU in the command's own process; the
+detached `agrep __work` process embeds indexed rows in the background. Keyword
+machinery is described in [ENGINE.md](ENGINE.md), output contracts in
+[OUTPUT_CONTRACTS.md](OUTPUT_CONTRACTS.md), and how meaning rows join a keyword page in
+[SEARCH_RANKING.md](SEARCH_RANKING.md).
 
-Metal keeps F16 weights and intermediate buffers in a reusable private workspace. It uses packed QKV rotary embedding, fused embedding/residual normalization and GeGLU, and Candle's full SDPA with finite GPU-generated masks. Short sequences use the custom masked attention kernel. The normal layer loop allocates no tensor buffers and performs no explicit host readback; the output is converted and read once after the batch. Synchronized per-operation diagnostics deliberately add waits and are not throughput measurements. No MLX or ONNX Runtime is linked or loaded by the product.
+## Model and provisioning
 
-Background inference selects Metal when a device opens and F32 CPU elsewhere. Direct and detached `__work` both use background priority; CPU work uses at most half the logical CPUs and one BLAS thread to prevent nested oversubscription. On macOS the CPU links Apple's Accelerate framework. The semantic dependencies require no additional C compiler, external BLAS installation, Python, daemon, or IPC service.
+- The model is `ibm-granite/granite-embedding-small-english-r2` at revision
+  `2ab6fa8ea2d674564defd37171ae19079b864b33` (ModernBERT, 384 dimensions), run with
+  Candle 0.9.2. On macOS Candle uses Accelerate on the CPU and Metal on the GPU.
+- `semantic_model::FILES` pins the length and SHA-256 of `config.json`, `tokenizer.json`
+  and `model.safetensors`. They live in `model/granite-embedding-small-english-r2/`
+  under the data root, or in `AGREP_MODEL_DIR`.
+- Only `agrep setup` (after consent) and `agrep index --semantic` download the model
+  (`semantic::provision`). Automatic hybrid search never downloads. The files come from
+  huggingface.co over HTTPS (ureq with rustls), each into a `.partial` file that is
+  fsynced and verified before it is renamed; a failed download leaves verified files in
+  place. `download.lock` serializes provisioning.
+- Provisioning records the verified files' sizes, times and identities in
+  `verified.json`, so later loads hash again only when that metadata changed. It also
+  writes F32 and F16 safetensors, a compact tokenizer and the query tokenizer's tables,
+  bound to their sources by `converted.json`.
+- `agrep set embeddings off` turns off automatic hybrid search and background embedding;
+  `-s` still searches the vectors already stored, and `index --semantic` still embeds.
 
-The pinned IBM revision is `2ab6fa8ea2d674564defd37171ae19079b864b33`. `semantic_model::FILES` records exact SHA-256 digests and lengths of its config, tokenizer and weights. Provisioning serializes downloads, verifies temporary files before renaming them, and preserves prior verified files on a failed download. It records the pinned hashes with file sizes, timestamps and file identity in `verified.json`; unchanged files reuse that verification. Any metadata mismatch triggers full hashing before inference. Explicit provisioning also writes F32/F16 safetensors, compact tokenizer JSON and the query tokenizer's BPE tables. `converted.json` binds those files to the verified sources and their output file metadata. Unchanged converted files avoid per-query BF16 conversion; a stale or missing conversion falls back to the verified source without writing. Tokenizer and model construction overlap. The cache is written only during explicit provisioning, and read-only queries do not update it. `AGREP_MODEL_DIR` names the actual model directory; otherwise it is `<data root>/model/granite-embedding-small-english-r2`.
+## Text preparation
 
-`index --semantic` explicitly provisions and drains the embedding queue. Setup calls the same `semantic::provision` API after consent. Automatic hybrid never downloads. A missing model stays quiet in automatic search; explicit `-s` prints `semantic model not installed: run agrep setup` and exits 2. A failed installed-model lane discloses one stderr line, logs its cause, and returns keyword results for both automatic and explicit requests. A successful semantic-only zero exits 1, including when coverage is partial. Coverage is always numeric: `semantic N/M rows`, and `semantic_coverage: {indexed, total, pending, fraction, complete, order}` in JSON.
+- Inputs are NFC-normalized, framed with CLS/SEP and truncated on the right at 1,024
+  tokens. The first token's final hidden state is the embedding, L2-normalized.
+- A prose row is split into windows of at most 1,022 NFC UTF-8 bytes, preferring a
+  newline in the window's second half, overlapping by up to 102 characters. A row with
+  more than 32 windows keeps the first eight and 24 sampled evenly from the rest, the
+  last included. A pi recap drops the preamble before a setext heading found in its
+  first 4,096 characters.
+- Bulk embedding sorts inputs by token count and batches them under a padded-token
+  budget, an attention budget and at most 25% padding, then restores input order.
 
-## Preparation and publication
+## Query path
 
-Inputs have no query/document prefix. The pinned tokenizer applies NFC, right truncation at 1024 total tokens including CLS/SEP, and right padding. Final hidden-state token zero is pooled and L2 normalized to 384 dimensions. Inputs are bucketed by token count and restored to original order, including odd-sized parallel inputs. CPU and Metal arena batches allow 16,384 padded tokens, with attention-cell caps of 4,194,304 and 8,388,608 respectively. A batch also limits padding waste to 25%. Full-length batches contain at most four CPU rows per stream or eight Metal rows. The older Metal tensor path retains its smaller scheduling budget. These limits control scheduling; the 1,024-token input window is unchanged.
+Search uses the meaning lane when asked (`-s`) or automatically. Automatic hybrid runs
+on the compact agent page for a natural-language query (`semantic::eligible`: two or
+more ordinary words of four or more letters, or one with an acronym, identifier or
+number) when the model is installed, `embeddings` is not off, the sort is by score, and
+none of `--json`, `--flat`, `-l`, `--lexical`, `-w`, `-E`, `-c`, `--count-by-tier`,
+`--coverage` or `--who tool` is given.
 
-Indexing uses the reference's text windows: at most 1022 NFC UTF-8 bytes, a preferred newline in the latter half, up to 102 characters of overlap, and at most 32 chunks (first eight contiguous, then uniform endpoints-inclusive sampling). Pi recap preambles are stripped only before a recognized setext heading in the first 4096 characters.
+- The lane starts on its own thread while the keyword lane runs. It lists the snapshot's
+  vector blocks and maps them while the query model loads; then it embeds the query,
+  scans, and, if the keyword lane is still running, pre-reads the rows it will resolve.
+- The query model runs on the CPU in F32. With converted weights it reads the projection
+  and token-embedding matrices in place from the mapped file and uses the query
+  tokenizer tables; its vectors equal the bulk CPU model's bit for bit.
+- Before freshness work starts, a read-ahead thread samples the model's mapped pages and
+  asks the kernel to load them when some are not resident (Unix only).
+- Meaning rows come only from visible prose rows whose digest still matches the embedded
+  text; control, synthetic, recap and harness rows are left out unless `--who` names
+  them. Filters and caller exclusion apply as in the keyword lane.
+- By default one result is kept per conversation family; `--all-side-chats` keeps one
+  per session. A meaning row is labeled `meaning match`.
+- `semantic_policy::FLOOR` (0.82) is the lowest cosine that can be shown. Merging
+  meaning rows into a keyword page (`hybrid::merge`) takes at most three, needs 0.84
+  unless the page has strong keyword evidence, and makes the total a floor; see
+  [SEARCH_RANKING.md](SEARCH_RANKING.md).
 
-`semantic_queue`, `semantic_refs`, `semantic_chunks`, and `semantic_blocks` live in `index.db`. Prose insert/update/delete triggers maintain the queue and invalidate references inside the same transaction as source changes. The content key combines the full source text's digest with its preparation variant. A completed inference attaches only when the same row ID and digest are still visible. A row changed during inference stays queued with its new digest. Identical text/preparation reuses existing chunks.
+Without the model, automatic hybrid quietly stays keyword-only and `status` says so;
+`-s` prints `semantic model not installed: run agrep setup` and exits 2. A failure of an
+installed model prints one stderr line, logs the cause to `log/agrep.log` and returns
+keyword results, for `-s` too. A semantic-only search that finds nothing exits 1, also
+when coverage is partial.
 
-Reference insert/delete triggers maintain an exact coverage count in the same transaction, including rollbacks and replacement publications. Queries use a point lookup instead of scanning the reference table. Best-effort read-ahead of nonresident model pages starts on its own thread before freshness checks, because Darwin pages a WillNeed range in before the advice returns; it samples 256 pages of the ranges a query reads and requests them only when a sampled page is missing. Vector mappings also request read-ahead. Neither path writes a converted model during a query.
+## Vector storage and scan
 
-The query model never copies its weights. With converted weights it reads the F32 projection matrices and the token embedding rows it needs where the file is mapped, through the same BLAS call and arguments Candle's CPU `Linear` uses (Accelerate `sgemm` on macOS, the `gemm` crate elsewhere), so a query vector equals the bulk CPU model's vector for the same text bit for bit. While the tokenizer loads, the loading thread faults in the mapped projection pages (`MADV_POPULATE_READ` on Linux). Bulk embedding rebuilds the tokenizer from the same JSON through the library's own BPE deserializer and builder calls, without the buffered untagged pass `Tokenizer::from_file` makes over the whole model; its serialization equals the library loader's. A query instead reads `tokenizer-query.bin`: the tokenizer JSON without its model, the vocabulary in id and byte order, and the merge map the library's builder makes, all written by explicit provisioning. Its BPE model binary-searches those tables with the library's merge order (lowest rank, then leftmost), and the library still normalizes, pre-tokenizes, matches added tokens and applies the template, so no process builds 50,000-entry maps for one query. The query's matrix products run on its own thread; `projection` splits inputs of 256 rows or more across the Rayon pool, and scans of fewer than 32,768 vectors or opens of fewer than 32 blocks stay on the calling thread. `semantic_eval MODEL_DIR cpu` checks both tokenizers' parity, the query tables against the library on the oracle texts and every vocabulary entry, the query path's token ids and its 40 single-text vectors against the bulk model and the oracle. Bulk `__work` keeps copied F32 (CPU) or F16 (Metal) weights.
+- Prose triggers keep `semantic_queue` current in the same transaction as the rows: a
+  visible row is queued on insert and re-queued when its text, digest, visibility,
+  speaker or agent changes; a deleted row leaves the queue and its references.
+- The worker embeds the queue newest-first in batches of 128 rows. Identical content
+  reuses its existing chunks: `semantic_chunks` is keyed by a content key (the row
+  digest plus its preparation variant), and `semantic_refs` maps each row to it.
+- A batch's vectors go into one immutable block file `vectors/<sha256>.q8f16`, named by
+  the SHA-256 of its bytes. Each record is a little-endian F32 scale, 384 int8 values
+  and 384 F16 values. The file is written as `.pending`, fsynced and renamed (and the
+  directory fsynced on Unix) before one transaction under `writer.lock` records the
+  block and attaches the batch's rows. A row attaches only if its id and digest are
+  unchanged and it is still visible; otherwise it stays queued.
+- Coverage is the trigger-maintained `semantic_ref_count` over the visible prose rows. A
+  row counts once every chunk is published. Partial coverage is a number
+  (`semantic N/M rows` on stderr; `semantic_coverage` with `indexed`, `total`,
+  `pending`, `fraction`, `complete` and `order` in JSON), never an error.
+- The scan quantizes the query to int8 and takes int8 dot products with SIMD (AVX2 on
+  x86_64, NEON with or without the dot-product extension on aarch64). A Cauchy-Schwarz
+  bound covers both quantization errors; each row whose bound reaches the floor gets its
+  exact cosine from the F16 copy, computed eight rows at a time with the same result as
+  a row-at-a-time loop. Scans of 32,768 vectors or more use the Rayon pool.
+- Candidates are resolved in descending bound order against the command's snapshot and
+  the scan stops once no remaining bound can enter the page (`want` is the page size, at
+  most 200), which makes the total a floor.
+- `reclaim` deletes chunks no row references, blocks left without chunks, and block
+  files nothing references once they are ten minutes old, so older snapshots can finish
+  reading them. `reindex --full` drops every reference and block record and re-queues
+  all visible rows.
 
-Blocks contain scaled signed int8 vectors and F16 rerank vectors. The block is written, synced and renamed before the referencing SQLite transaction commits. The caller's connection lists the snapshot's blocks; the semantic lane maps them while the model loads, then scans them in parallel using the existing SIMD int8 dot product (including a guarded ARM dot-product path) and conservative Cauchy-Schwarz error bounds. The same pass computes each candidate's exact F16 cosine, eight rows per kernel call. Every row accumulates in F32 in dimension order, so scores are bit-identical to a row-at-a-time loop. A fixed candidate count never truncates a filter/family search. Refinement resolves candidates in bound order against the caller's snapshot. While the keyword lane is still running, the semantic lane runs the same resolution on its own read snapshot and discards the result. That only pages in the rows refinement will read, and it stops as soon as the caller waits. The retained ranked list is bounded by the requested result count, while admissible quantization-error bounds determine when scanning can stop and ties remain deterministic across agents. Published blocks remain immutable so a WAL reader can finish against its snapshot. Background work reclaims unreferenced blocks, including files left before reference publication, only after their modification time is more than ten minutes old.
+## Quality gates
 
-Queries of an existing index overlap a read-only source census with snapshot retrieval. They report pending sources and defer parsing to the shared worker. `__work` runs its selected tasks in order: refresh under `work.lock`, FTS segment merging under `merge.lock` only, then semantic embedding, vector reclamation, archive capture and post-index hooks under `work.lock` again. Embedding loads weights once, selects newest queue rows, uses length-bucketed batches, and acquires `writer.lock` only while publishing each batch. Commands with pending work start this same detached coordinator. On Unix it gets its own process group through `posix_spawn`, so the command never waits for the child to be scheduled. Normal output contains no process coordination state. Failures go to a bounded `log/agrep.log` with one rotated copy.
+- `cargo test --workspace` runs `crates/agrep-core/tests/semantic_quality.rs` on a
+  committed oracle (`tests/fixtures/semantic-eval.json`: 40 public synthetic texts with
+  their token ids and full-precision ONNX vectors). For the ten labeled queries over 20
+  documents, the int8 scan with F16 rerank must reproduce the exact ordered top five,
+  and recall@5 must be 1.0. Chunking must match the reference windows in
+  `semantic-chunks.json` exactly.
+- `cargo run --release -p agrep-core --example semantic_eval -- MODEL_DIR provision`
+  downloads the pinned model into an explicit directory. It never uses a user's data
+  root.
+- `semantic_eval MODEL_DIR cpu` checks the real model against the oracle: identical
+  token ids, minimum cosine 0.99999999999, ordered top-five agreement on all ten
+  queries, recall@5 of 1.0, rank one on the four tasks in
+  `semantic-recall-reference.json`, and ten of ten long-document cases. It also checks
+  that the query path maps its weights, that its tokenizer tables agree with the
+  library, and that its vectors equal the bulk model's bit for bit. CI runs it on every
+  target and it blocks.
+- `semantic_eval MODEL_DIR metal` checks the F16 Metal path with a minimum cosine of
+  0.9999 and the same recall checks. `semantic_eval MODEL_DIR cpu batch` measures bulk
+  throughput on `fixtures/semantic-batch.json`; it is not a gate.
+- `bench/semantic_owner.py` builds a store of at least 200,000 vector references with
+  `semantic_scale` (synthetic vectors derived from the oracle) and runs 20 fresh
+  semantic and hybrid queries with the real query model. Every query must return meaning
+  rows; latency is printed against `docs/perf-budgets.json` and does not fail the check.
+  Speed is gated by the matched comparison in [DISTRIBUTION.md](DISTRIBUTION.md).
+- The Metal kernels have GPU-only tests; see the release check in
+  [DISTRIBUTION.md](DISTRIBUTION.md).
 
-`reindex --full` resets references, chunks and block metadata under the work and writer locks, then queues every visible row again. The transactional reference count resets with those references. This prevents an in-flight batch from republishing stale vectors after a full rebuild.
+## Limits
 
-## Retrieval and integration surface
-
-`semantic::search(root, options, family_diverse)` returns normal `query::Results` and numeric coverage; it requires no change to `Filters`, `Options` or `Hit`. It honors scope, role/model/date filters and side-family diversity. The semantic default excludes control, synthetic, recap and harness roles, which remain available through an explicit `--who`.
-
-The automatic lane runs on a thread alongside `query::search` for eligible natural language in compact agent output. Identifier-only patterns, explicit matchers, lexical/count/coverage output, tools-only scope and non-score sorts stay lexical. The reference's floor 0.82 and strong threshold 0.84 remain unchanged. The merge preserves strong lexical leads, deduplicates rows/text/families, allows strong meaning rows to lead scattered lexical results, and never converts a lexical zero into success using only sub-strong neighbors.
-
-CLI command modules are `cmd/search.rs`, `cmd/index.rs`, and `cmd/work.rs`. The main module's shared changes are their dispatch, the `index --semantic` flag, optional search maximum (40 keyword / 10 semantic), semantic count conflicts, automatic scheduling in the search/index/status commands and after reindex/settings, and status coverage. `render::emit_semantic` adds coverage, `lane: semantic`, `sem_score`, chat units and visible `meaning match` labels. `Style` gains `semantic: bool`.
-
-The caller-identity slice must carry its final self/family exclusions through semantic options too. The integration/setup slice must invoke `semantic::provision` after accepted model consent. No legacy semantic storage or process state is read.
-
-## Reproduction
-
-All commands require an isolated `AGREP_HOME` and `AGREP_DATA_DIR`. Build/test commands use `nice -n 10`.
-
-- `cargo test --workspace` includes stale-inference publication, invalidation, queue ordering/locking, scope/family retrieval, missing-model output, numeric partial-zero output, reference chunking, and the frozen labeled F32-to-q8/F16 recall gate.
-- `cargo run --release -p agrep-core --example semantic_eval -- MODEL_DIR cpu` compares real model token IDs, vectors and top five neighbors with the committed full-precision ONNX oracle. `metal` checks the F16 device path. It also runs the four labeled reference recall tasks.
-- Append `batch` to measure the committed 128-row, 200-token corpus. An additional token-limit argument is experimental measurement only; the product keeps 1024.
-- `semantic_scale DATA_DIR 200000` constructs a disclosed synthetic vector scale fixture from deterministic perturbations of the ONNX corpus. It does not claim to have run 200,000 model inferences. The separate labeled model gate establishes retrieval quality.
-
-The committed oracle contains 40 public synthetic strings, their token IDs and 384-dimensional full-precision ONNX vectors. Ten queries label the corresponding ten document sessions; required recall@5 is 1.0. The reference's four-task fixture is also committed. On this oracle, q8 alone changed three ordered top-five lists (one top-five membership); this is why F16 refinement is present.
-
-## Measured model and fixture parity
-
-The actual optimized CPU model produced minimum cosine **0.9999999999982052** against the 40-text full-precision ONNX oracle, with identical token IDs, 10/10 ordered top-five lists, labeled recall@5 1.0, all four reference task labels at rank one, and 10/10 long-tail labels at rank one. The actual F16 Metal model also preserved token IDs, all ten top-five lists and the four reference rank-one labels; minimum cosine was 0.9999823635014371. `measurements/semantic-integration/quality-*.json` retains the merged-source reports. The executable quality gate checks both CPU and Metal cosine thresholds and all three labeled recall sets.
-
-The same 20 native pi fixture conversations were ingested independently by 0.4.9 and 0.5.0. Their explicit semantic CLI queries produced the same top handles:
-
-| Query | Both versions' top handle | 0.4.9 cosine | 0.5.0 cosine |
-|---|---|---:|---:|
-| connection pool timeout | `@semantic-fixture-000:0.d9df` | 0.915167 | 0.921074 |
-| Rust borrow checker | `@semantic-fixture-001:0.3325` | 0.898544 | 0.909298 |
-| database migration failure | `@semantic-fixture-002:0.e956` | 0.879869 | 0.885142 |
-| Metal attention NaNs | `@semantic-fixture-004:0.27b8` | 0.916306 | 0.927193 |
-
-The score differences are expected: 0.4.9 uses quantized ONNX, while this profile uses F32 query inference and F16-stored Candle document vectors. Both versions report 20/20 covered rows, chat result units, matching full-text handles, and exit 0. Raw JSONL and stderr are retained in `measurements/side-by-side.json`, `reference-semantic.jsonl`, and `reference-cases.json`. A fresh index with the final optimized binary again matched all four reference handles; `final-cli-fixture.json` retains those final scores and also verifies detached queue draining after `status` exits.
-
-Coverage counts canonical prose rows; all chunks of a row must be present before that row counts as embedded. This makes the numerator auditable against the transactional source table rather than counting multiple chunk vectors as separate conversations.
-
-Current performance measurements, per-stage profiles, resource policy and retained attempts are documented in [SEMANTIC-PERFORMANCE.md](SEMANTIC-PERFORMANCE.md). Historical measurements below are not a claim that the current performance gates pass.
+- English model; the query window is 1,024 tokens and a long row is represented by at
+  most 32 windows.
+- Coverage grows in the background, newest rows first; until a row is embedded it is
+  found only by keywords.
+- Tool output is not embedded.
+- Background embedding uses Metal only on Apple GPUs that support every kernel the lane
+  needs; other machines embed on the CPU.

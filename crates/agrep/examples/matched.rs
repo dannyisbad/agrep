@@ -308,13 +308,41 @@ impl Bench {
             command.env("AGREP_MODEL_DIR", model);
         }
         command.envs(self.env.iter().map(|(k, v)| (k, v)));
-        command.args(args).stdin(Stdio::null());
+        command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let load = load_average();
         let start = Instant::now();
-        let out = command
-            .output()
+        let mut child = command
+            .spawn()
             .with_context(|| format!("starting {}", lane.bin.display()))?;
+        let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+            std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+                let mut bytes = Vec::new();
+                if let Some(mut pipe) = pipe {
+                    std::io::Read::read_to_end(&mut pipe, &mut bytes)?;
+                }
+                Ok(bytes)
+            })
+        };
+        let stdout = drain(child.stdout.take().map(|p| Box::new(p) as _));
+        let stderr = drain(child.stderr.take().map(|p| Box::new(p) as _));
+        let status = child.wait()?;
+        // A process that leaves its output open to a child it started keeps a caller that
+        // reads to the end waiting after it exited: samples count until the output closes.
         let exit_ms = millis(start);
+        let out = std::process::Output {
+            status,
+            stdout: stdout
+                .join()
+                .map_err(|_| anyhow::anyhow!("stdout reader"))??,
+            stderr: stderr
+                .join()
+                .map_err(|_| anyhow::anyhow!("stderr reader"))??,
+        };
+        let closed_ms = millis(start);
         let exit = out.status.code().unwrap_or(-1);
         let index = args.first().is_some_and(|a| a == "index");
         let settled = if index && lane.role == Role::Reference {
@@ -322,7 +350,7 @@ impl Bench {
         } else {
             true
         };
-        let ms = if index { millis(start) } else { exit_ms };
+        let ms = if index { millis(start) } else { closed_ms };
         Ok(Sample {
             ms,
             exit_ms,
@@ -406,6 +434,7 @@ impl Bench {
         let mut loads = [vec![], vec![]];
         let mut exits_ms = [vec![], vec![]];
         let mut last = [Value::Null, Value::Null];
+        let mut phases = [vec![], vec![]];
         let mut drains = [vec![], vec![]];
         let mut unpaired = vec![];
         let mut appended = 0;
@@ -488,6 +517,9 @@ impl Bench {
             loads[k].push(s.load);
             exits_ms[k].push(s.exit_ms);
             last[k] = summary(&s.evidence);
+            if case.is_index() {
+                phases[k].push(summary(&s.evidence));
+            }
             if lane_oracle.is_none() {
                 if let Some(o) = oracle {
                     last[k]["oracle_match"] = json!(matched::sample_verified(
@@ -515,6 +547,7 @@ impl Bench {
             entry["load_averages"] = json!(loads[k]);
             if case.is_index() {
                 entry["process_exit_ms"] = json!(exits_ms[k]);
+                entry["samples_phases"] = json!(phases[k]);
             }
             if case.kind == Kind::Changed {
                 entry["drain_ms"] = json!(drains[k]);

@@ -1,103 +1,94 @@
-# Keyword engine integration surface
+# Engine library surface
 
-The engine work on `w05` keeps the columns of `sources`, `sessions`, `prose`, `tools`, `events`, and `reply_shapes`, and keeps `store::reader`, `store::decode`, and `query::search` signatures. FTS, bounds and parser-state tables are engine internals and require a fresh index for this iteration.
+`crates/agrep-core` is the engine; `crates/agrep` is the command-line binary built on
+it. This page lists what the binary, the explorer and the examples rely on. Everything
+not listed here (FTS tables, block bounds, parser state, dictionaries, statistics) is
+private and may change with the format marker; see [ENGINE.md](ENGINE.md).
 
-Additions for the other slices:
+## Reader tables
 
-- `Results.pending_sources: usize`: number of source fingerprints differing from the committed snapshot. The CLI fills this after its census; presentation owns how to show it.
-- `Filters.caller: Option<CallerFilter>`. CallerFilter has `agent`, `session`, `family`, `exclude_from_turn: Option<i64>`, `exclude_family: bool`, and `excluded_sessions: Vec<String>`. The session list excludes live descendants before candidate selection. Set a window start to exclude that session's positions at or after it. Set `exclude_family` for `--no-self`; leave both exclusions unset for `--self`. Returned rows in the caller session carry `Hit.self_marker`. Identity detection remains the presentation slice's job.
-- `freshness::pending(&DataRoot) -> Result<Pending>` with `changed_sources` and `census_ms`. This stats inputs without parsing or taking a writer lock.
-- `freshness::spawn(&DataRoot, &Path) -> Result<bool>` launches the passed binary's detached `__work` when the work lock is free; `freshness::spawn_merge` launches a detached `__work merge` when `fts_segments::pending` reports merge work and `merge.lock` is free.
-- `cmd::work` owns the detached task list: refresh under `work.lock` (taking `writer.lock`), then FTS merging under `merge.lock` alone, then semantic work, reclamation, scheduled archive and the post-index hook under `work.lock` again. `__work` accepts a task list, defaulting to every task. Explicit `index` and `reindex` run every task but the merge inline and leave the merge to `spawn_merge`.
+Open a snapshot with `store::reader(&DataRoot)`: a read-only connection inside one
+transaction. Commands read these tables and views:
 
-Normal reads build inline only when no index exists. Subsequent reads census, schedule work, and read the committed snapshot. Explicit `index` and `reindex` still refresh synchronously. `__census` is an internal full-process benchmark entry point, returning Pending JSON without scheduling work.
+- `sources(path, agent, size, mtime_ns, change_token, last_error)`: one row per source
+  file. Paths beginning with `@` or `token:` name sources that are not single files (a
+  whole store, or a keyed entry inside one).
+- `sessions(agent, id, project, cwd, parent, family, side, title, first_ts, last_ts)`.
+- `prose(id, source, agent, session, project, turn, who, model, model_source, ts, text, digest, extra, position, visible)`:
+  `text` is UTF-8 bytes, `digest` its SHA-256 in hex, `turn` the source's own turn and
+  `position` the canonical one. Only `visible = 1` rows are canonical.
+- `tools`: a view with the same columns for tool calls (`who` is `tool`, `extra` the
+  call id).
+- `events(source, session, call_id, body, id, ts, position, visible, text)`: a view.
+  `body` is JSON with `kind`, `name`, `input_chars`, `output_chars`, `output_bytes`,
+  `ok`, `call_id`, `child_session`, `meta`, `state`, `ts`, `native_turn`, `visible`,
+  `turn`, `position`, `input_end` and `output_start`.
+- `reply_shapes(source, session, turn, body)`.
 
-Current internal storage uses positional trigrams for prose and positional words plus a trigram word dictionary for tools, over already normalized text, with compressed per-gram block postings. The external tables and text codec are unchanged. Exact literal counts use FTS without hydrating text when all terms are indexable. Coverage scoring weights terms using inverse document frequency from the least-common constituent trigram and uses conservative block bounds.
+Tool text in `tools.text` and `events.text` is encoded; decode it with
+`store::decode("tools", bytes)` (`store::encode_tool` is the inverse, for fixtures). A
+tool event's text (`tool_text::format`) is a head, the tool name marked `[failed]` for a
+failed call, then `: ` and the input, then a newline and the output when there is one.
+`input_end` is the character offset of that newline and `output_start` the offset after
+it (0 when there is no head or input); both are null without output, and offsets count
+Unicode scalar values. `tool_text::split` recovers the parts.
 
-Parser checkpoint additions: `Refresh.resumed_sources`, `bytes_read`, and `bytes_parsed`; private `parser_cursors` and `parser_graph` tables. `Event.turn: Option<u32>` carries native ordering when known, avoiding timestamp-tie attribution. Existing event-table columns are unchanged.
+`store::digest` returns a text's SHA-256 as hex. `store::counts` returns the session,
+visible prose, visible tool and source-error counts.
 
-Append refresh parses only new JSONL bytes and carries the current row, pending calls, reply ordering, model and lineage. Pi branches replay persisted native entries instead of rereading the source. File identity/length/edge guards reject common rewrites; SHA-256 verification of the old prefix detects an arbitrary interior rewrite combined with growth. This exact verification reads prior bytes and is a known latency constraint, distinct from parsing.
+## Retrieval
 
-The CLI overlaps census and retrieval. `pending_sources` is the census observation; another process may commit after that observation. FTS candidate clauses are ordered by document-frequency estimates, and a proven tiny posting stream can be exhausted directly.
+- `query::search(&Connection, &Options) -> Result<Results>` runs a keyword search;
+  `query::search_with` also takes `query::Plans`, which keeps word expansions and term
+  estimates across searches of one pattern over different scopes.
+- `query::coverage(&Connection, &Options)` is the explicit IDF-weighted content-terms
+  lane. It refuses `-w`, `-E`, counts and non-score sorts.
+- `Filters.caller: Option<CallerFilter>` withholds the caller's rows: `agent`,
+  `session`, `family`, `exclude_from_turn` (withhold that session's rows at or after
+  this position), `exclude_family`, and `excluded_sessions` (withhold these sessions of
+  the agent). `caller::options` fills it from a resolved `caller::Caller`;
+  `query::caller_allows` applies the same predicate to a hit, and `caller::excludes` to
+  a session list. `caller::search` and `caller::search_with` search with it and set each
+  hit's `handle` and `self` marker.
+- `Filters.session_rows` restricts a scope to one session from a position on, and
+  `Filters.sessions` to a list of sessions; both read through the session indexes.
+- `Results.total_basis` is `exact` or `floor`. `Results.pending_sources` is filled by
+  the binary from its census. `Results.timings` has `plan_ms`, `sqlite_ms`,
+  `hydrate_ms`, `score_ms` and `total_ms`, without text or identifiers.
+- `Hit.meta_marker` serializes as `meta`, only when true: the row is the sole proven
+  `~meta` evidence `--no-meta` retained.
+- `semantic::search(&DataRoot, &Options, family_diverse)`, or `semantic::begin` and
+  `semantic::finish` around a keyword search, return `semantic::SearchResults`: normal
+  `Results` and a numeric `Coverage`. `hybrid::merge` combines a keyword and a meaning
+  result for display.
 
-Family-statistic maintenance now uses private `row_stats`, `stats_dirty`, `family_token_counts`, and `session_sources` tables. No stable table columns changed. The workspace SHA-256 dependency is 0.11; `store::digest` remains the string-returning helper for callers.
+## Freshness and refresh
 
-Tool dictionary tables (`tool_words`, `tool_lexicon`, `tool_word_dirty`, `tool_word_batch`) are private. ASCII alphanumeric substring counts expand to complete word postings; other literals use verified block scans. The stable row columns and tool-text decoder are unchanged.
+- `freshness::pending(&DataRoot) -> Result<Pending>` runs the stat-only census without a
+  lock. `Pending` has `changed_sources` and `merge_pending`, plus diagnostic timings and
+  counts: `census_ms`, `read_ms`, `listing_ms`, `stat_ms`, `comparison_ms`,
+  `listed_directories`, `cached_directories` and `stat_files`. `agrep __census` prints
+  it as JSON without scheduling anything.
+- `freshness::spawn(&DataRoot, binary)` starts a detached `__work` when `work.lock` is
+  free; `freshness::spawn_merge` starts `__work merge` when `merge.lock` is free.
+  Callers spawn a merger only when `fts_segments::pending` reports merge work.
+- `store::refresh(&DataRoot, explicit, full)` and `store::reindex` refresh the index;
+  `store::refresh_session(&DataRoot, agent, session)` refreshes only the sources already
+  attributed to that session, leaving other sources' fingerprints alone.
+- `Refresh` reports `sources`, `parsed`, `changed_rows`, `errors`, `resumed_sources`,
+  `bytes_read`, `bytes_parsed` and timings (`census_ms`, `open_ms` for the writer
+  connection with any WAL recovery, `parse_ms`, `write_ms`, `bounds_ms`, `stats_ms`,
+  `commit_ms`, `total_ms`, and per-adapter maps). `surface::refresh_json(refresh, extra)`
+  is the line `index` and `reindex` print once they finish; it omits `skipped_lock` and
+  appends `extra`: `data::lock_waits()` (`wait_foreground_lock_ms`,
+  `wait_writer_queue_ms`, `wait_writer_lock_ms`, `wait_work_lock_ms`, the time the whole
+  process was blocked on each lock file) and `after_refresh_ms`, the time from the
+  refresh's end to the line.
+- `Explorer::with_freshness` takes a closure that runs the census and returns the
+  pending-source count; `agrep serve` and `agrep ui` pass the command line's own, so the
+  explorer reports the same count as the terminal.
 
-Every `events.body` now carries `ts` (milliseconds), `native_turn`, and assigned `turn`/`position`. Canonical replay resolution updates the assigned fields together. Control events retain these fields even when no tool row is emitted. For tool events, `input_end` is the character offset of the separating newline and `output_start` is the following character offset; both are null when there is no output. Offsets count Unicode scalar values in the stored tool text. When the prefix is empty, output starts at zero after trimming.
+## Profiling
 
-First-build profiling adds aggregate `Refresh` fields: `row_diff_ms`, `fts_ms`, `secondary_indexes_ms`, `canonical_ms`, `dictionary_ms`, `node_chunks_ms`, `commit_ms`, `adapter_parse_ms`, `adapter_source_parse_ms`, `adapter_sources`, and `adapter_write_ms`. Per-adapter wall times overlap under parallel parsing; source-parse sums describe work rather than elapsed time. Row/FTS/dictionary/node timings are subdivisions of `write_ms`.
-
-The native graph uses private `parser_graph` pages keyed by source and hash bucket. Lossless integer/string tuples retain entry identity, parent and order; only parser-consumed payload survives. Tool inputs and outputs refer to immutable typed event revisions and shared compressed text. Branch replay reads these pages and revisions, without reparsing the source prefix. `parser_cursors` contains the resumable parser state, without duplicate prefix/tail guards; exact SHA-256 prefix verification remains.
-
-`Results.timings` adds aggregate `plan_ms`, `sqlite_ms`, `hydrate_ms`, `score_ms`, and `total_ms` for retrieval diagnostics; no source text or identifiers are included.
-
-`freshness::Pending` additionally reports numeric `read_ms`, `listing_ms`, `stat_ms`, and `comparison_ms`. They partition its stat-only census time: opening the reader, reading the cached directory listings, the walk (each directory's stat or relisting together with its sources' stats; the index's fingerprints are read meanwhile), and the remaining sorting and fingerprint comparison.
-
-`Hit.meta_marker` is serialized as `meta` only when true. The `--no-meta` query policy checks structured tool-call lineage, preserves ordinary control rows, and retains one marked row when it is the only observed evidence. Counts with this policy are rejected. Unknown command wrappers remain eligible.
-
-`query::coverage(&Connection, &Options) -> Results` is the explicit IDF-weighted recovery lane; it returns labeled content-term hits independently of the primary page. Presentation keeps its output separate and preserves the primary exit status. All scope and caller predicates apply.
-
-Directory cache columns and tool dictionary frequency columns are private. The directory cache stores relative entry names in length-prefixed blobs and streams the sorted source comparison. Tool document frequencies are updated from the old and new changed-row terms within the same transaction.
-
-`prose_terms` is a private exact trigram document-frequency cache for the normal-text prose FTS field. Initial construction snapshots `fts5vocab`; changed visible rows update its counts transactionally before `stats_dirty` is cleared. Query planning no longer counts the common prose posting streams.
-
-`tools` and `events` retain their read columns as SQLite views over private integer-keyed `event_rows`, `event_sessions`, `symbols`, and `tool_blobs`. Readers must continue using `store::decode("tools", bytes)`; tool bytes now carry a codec discriminator for lossless LZ4 or DEFLATE. `store::encode_tool` is available for fixtures and controlled codec experiments. The event body still exposes `ts`, `native_turn`, assigned `turn`/`position`, and Unicode-scalar `input_end`/`output_start`. Old native revisions and their text remain available while a parser branch can reference them.
-
-Block posting keys pack lowercase ASCII letters and digits into integers. Other characters use a conservative universal bound; their complete FTS and verification semantics are unchanged. Per-block key lists and posting deltas are compressed private blobs, not reader-facing tables.
-
-Each private gram posting now carries its matching-row maximum timestamp and role weight. Query clock and tie-time ceilings therefore exclude unrelated rows in the same physical block. The postings codec changed and requires a fresh index (or the isolated diagnostic bounds rebuild); no compatibility reader was added. The matching-row metadata does not change any public table column.
-
-OS lock contention is recognized by the platform error returned by `fs2`, as well as `WouldBlock`. This covers Windows `ERROR_LOCK_VIOLATION`; lock files remain empty, and no reader accesses their locked byte range.
-
-Merged command additions:
-
-- `store::refresh_session(&DataRoot, agent, session)` refreshes only already indexed source paths for the caller. Other source stamps and global harness-policy state do not advance.
-- `events` additionally exposes `id`, `ts`, `position`, `visible`, and encoded `text`. Its prior four read columns remain. `body` also retains `visible`. The indexed `(session_key, position, ts)` access path avoids materializing unrelated event text.
-- `tool_text` formats and splits canonical tool text using the recorded Unicode-scalar boundary; all event readers share it.
-- Explorer `with_freshness` supplies the same pending-source count as terminal queries.
-
-The private block tables additionally store `all_ascii`, determined from original
-text before normalization. It permits an attainable all-terms span ceiling;
-Unicode blocks keep the universal bound. Prose phrase candidates use positional
-term order before canonical verification. These derived-table changes require a
-fresh index and do not change the stable row or result types.
-
-Bounded candidate retrieval uses the prose primary key and a private integer-ID
-projection of tool events. This prevents broad metadata indexes from being
-rescanned for each block; the stable `prose`, `tools`, and `events` read columns
-and the `query::search` signature are unchanged. The semantic merge adds a
-trigger-maintained reference count in private state; keyword readers do not
-scan the semantic reference table on startup.
-
-V7 keeps the reader tables, `Filters`/`Options`/`Hit`/`Results`, and retrieval
-function signatures unchanged. `freshness::Pending` adds
-`listed_directories`, `cached_directories`, and `stat_files` counters. These
-are diagnostic counts and do not change the meaning of `pending_sources`.
-
-The private cursor replaces its single prefix hash with `prefix_chunks`, a
-sequence of SHA-256 digests for 1 MiB chunks. Every prior byte is verified using
-parallel positional reads; the final partial chunk is reused when advancing
-the cursor. An older private cursor falls back to full parsing. Digest handle
-bytes and their encoding are unchanged by the sha2 0.11 dependency update.
-
-Private storage adds `tool_blobs.ascii` and `bound_updates(id)`. The first lets
-positional tool queries use a row-specific ASCII span bound. The second tracks
-existing prose row updates/deletes so append-only block updates can merge
-maxima without reading unchanged text. Both remain internal; `tools`/`events`
-view columns and `store::decode` retain their contract. The DEFLATE encoder is
-unchanged; the lossless decoder implementation now uses zlib-rs.
-
-Opt-in profiling includes process entry/exit timestamps, `cli_parse`,
-`reader_open`, `reader_pragmas`, and `reader_schema` spans, and aggregate query
-phase counters. Normal commands do not force the diagnostic schema read.
-
-The private tool dictionary adds `tool_words.blocks` and `tool_trigrams(gram,
-doc)`. `blocks` lists the 512-row tool blocks whose visible rows contain the
-word, taken from the same unicode61 tokens FTS5 stores (through the FTS5
-tokenizer API); removed rows may leave a block listed, never omit one.
-`tool_trigrams` holds, per lowercase ASCII trigram, the summed frequency of the
-dictionary words containing it, so a three-character term is planned without
-expanding it. Both require a fresh index; an index without the column fails
-loudly. Reader tables, `query::search`, `Options`, `Hit` and `Results` are
-unchanged.
+`AGREP_QUERY_TIMING` prints phase timings as JSON lines on stderr; `AGREP_SEM_PROFILE`
+adds model and batch detail. Normal commands print neither.

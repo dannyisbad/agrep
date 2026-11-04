@@ -134,6 +134,82 @@ fn optional_model_failure_keeps_a_completed_keyword_answer() {
         .contains("SHA-256 mismatch"));
 }
 
+// 0.4.9 served the compact page, and so the automatic meaning lane, only on the default row
+// surface (py/compact.py:128-139, py/search.py:7375-7381, 7653-7658): `--json`, `--flat`, `-l`
+// and `-c` stay keyword-only for an agent, and `-l` keeps its chat listing.
+#[test]
+fn compact_profile_machine_surfaces_never_start_the_meaning_lane() {
+    let t = tempfile::tempdir().unwrap();
+    let dir = t.path().join(".pi/agent/sessions/fixture");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("case.jsonl"), concat!(
+        "{\"type\":\"session\",\"id\":\"semantic-surface-fixture\",\"version\":3,\"cwd\":\"/fixture\",\"timestamp\":\"2026-10-29T10:00:00Z\"}\n",
+        "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-10-29T10:01:00Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"database migration failure\"}]}}\n"
+    )).unwrap();
+    let out = Command::new(support::binary())
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", t.path())
+        .env("AGREP_HOME", t.path())
+        .env("AGREP_DATA_DIR", t.path().join("data"))
+        .env("AGREP_MODEL_DIR", t.path().join("model"))
+        .arg("index")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let r = DataRoot::open(t.path().join("data"), false).unwrap();
+    semantic::initialize(&r).unwrap();
+    store::writer(&r)
+        .unwrap()
+        .execute(
+            "INSERT INTO semantic_refs SELECT id,digest,digest FROM prose",
+            [],
+        )
+        .unwrap();
+    // A started lane would fail on these weights and say so on stderr.
+    fs::create_dir(t.path().join("model")).unwrap();
+    for (name, size, _) in agrep_core::semantic_model::FILES {
+        fs::File::create(t.path().join("model").join(name))
+            .unwrap()
+            .set_len(size)
+            .unwrap();
+    }
+    let query = "database migration failure";
+    let json = run(&t, &["--no-auto", "search", "--json", query]);
+    let lines: Vec<serde_json::Value> = String::from_utf8_lossy(&json.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0]["engine"], "sqlite");
+    assert_eq!(lines[0]["semantic_coverage"], serde_json::Value::Null);
+    assert!(lines[0].get("semantic_partial").is_none());
+    assert!(lines[1].get("sem_score").is_none());
+    let listing = run(&t, &["--no-auto", "search", "-l", query]);
+    let listing = String::from_utf8_lossy(&listing.stdout).into_owned();
+    assert!(
+        listing.starts_with("pi · fixture  [@") && listing.contains(" · 1 hit · "),
+        "{listing}"
+    );
+    for out in [
+        json,
+        run(&t, &["--no-auto", "search", "-l", query]),
+        run(&t, &["--no-auto", "search", "--flat", query]),
+        run(&t, &["--no-auto", "search", "-c", query]),
+    ] {
+        assert_eq!(out.status.code(), Some(0));
+        assert!(
+            !String::from_utf8_lossy(&out.stderr).contains("semantic"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 #[test]
 fn first_missing_model_request_has_only_the_setup_instruction() {
     let t = tempfile::tempdir().unwrap();

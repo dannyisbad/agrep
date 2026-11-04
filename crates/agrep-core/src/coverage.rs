@@ -76,20 +76,57 @@ pub fn validate(f: &mut Filters) -> Result<()> {
     }
     Ok(())
 }
+/// 0.4.9's filter dimensions with their plural labels (py/surface_policy.py:843-848).
+const LABELS: [(&str, &str); 4] = [
+    ("agent", "agents"),
+    ("project", "projects"),
+    ("model", "models"),
+    ("who", "speakers"),
+];
 pub fn dimensions(c: &Connection, f: &Filters) -> Result<Value> {
     let mut absent = Vec::new();
     for (flag, dimension, col, value, table) in [
         ("--agent", "agent", "agent", &f.agent, "sessions"),
         ("--project", "project", "project", &f.project, "sessions"),
         ("--model", "model", "model", &f.model, "prose"),
+        ("--who", "who", "who", &f.who, "prose"),
     ] {
         let Some(value) = value else { continue };
+        let tools = || -> Result<bool> {
+            Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM tools)", [], |r| r.get(0))?)
+        };
+        // `who` has no index: a requested speaker that occurs ends its scan at the first
+        // row, so only an empty dimension pays for listing every speaker.
+        if dimension == "who" {
+            let mut any = false;
+            for speaker in value.split(',') {
+                any |= if speaker == "tool" {
+                    tools()?
+                } else {
+                    c.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM prose WHERE who=?1)",
+                        [speaker],
+                        |r| r.get(0),
+                    )?
+                };
+                if any {
+                    break;
+                }
+            }
+            if any {
+                continue;
+            }
+        }
         let mut q = c.prepare(&format!(
             "SELECT DISTINCT {col} FROM {table} WHERE {col}!='' ORDER BY {col}"
         ))?;
-        let values: Vec<String> = q
+        let mut values: Vec<String> = q
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
+        if dimension == "who" && tools()? {
+            values.push("tool".into());
+            values.sort();
+        }
         let pattern = if dimension == "model" && f.model_soft {
             format!("*{}*", value.to_lowercase())
         } else {
@@ -100,7 +137,7 @@ pub fn dimensions(c: &Connection, f: &Filters) -> Result<Value> {
             matcher.is_match(v.to_lowercase())
                 || (dimension == "project"
                     && matcher.is_match(crate::render::project(v).to_lowercase()))
-                || (dimension == "agent" && value.split(',').any(|a| a == v))
+                || (matches!(dimension, "agent" | "who") && value.split(',').any(|a| a == v))
         });
         if !found {
             absent.push(json!({"flag":flag,"dimension":dimension,"value":value,"indexed_values":values.len(),"known":values.iter().take(6).collect::<Vec<_>>(),"known_complete":values.len()<=6}));
@@ -108,22 +145,34 @@ pub fn dimensions(c: &Connection, f: &Filters) -> Result<Value> {
     }
     Ok(json!({"empty_dimensions":absent,"checked":true}))
 }
+/// 0.4.9's `empty_dimension_line` (py/surface_policy.py:896-910).
 pub fn disclose(coverage: &Value) {
     if let Some(rows) = coverage["empty_dimensions"].as_array() {
         for r in rows {
-            let values = r["known"]
-                .as_array()
-                .unwrap()
+            let dimension = r["dimension"].as_str().unwrap_or_default();
+            let label = LABELS
                 .iter()
+                .find(|(d, _)| *d == dimension)
+                .map_or(dimension, |(_, label)| label);
+            let known = r["known"]
+                .as_array()
+                .into_iter()
+                .flatten()
                 .filter_map(Value::as_str)
                 .collect::<Vec<_>>()
                 .join(", ");
+            let known = crate::surface::safe(&known, false);
+            let held = if known.is_empty() {
+                format!("the index holds no {label} at all")
+            } else if r["known_complete"] == true {
+                format!("indexed {label}: {known}")
+            } else {
+                format!("{} indexed {label}, closest: {known}", r["indexed_values"])
+            };
             eprintln!(
-                "{} {} isn't in the index - indexed {}: {}",
-                r["flag"].as_str().unwrap(),
-                crate::surface::safe(r["value"].as_str().unwrap(), false),
-                r["dimension"].as_str().unwrap(),
-                crate::surface::safe(&values, false)
+                "{} {} isn't in the index - {held}",
+                r["flag"].as_str().unwrap_or_default(),
+                crate::surface::safe(r["value"].as_str().unwrap_or_default(), false),
             );
         }
     }

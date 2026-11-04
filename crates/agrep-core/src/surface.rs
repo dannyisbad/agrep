@@ -8,11 +8,14 @@ pub fn write(value: &str) -> Result<()> {
         other => Ok(other?),
     }
 }
-/// Public indexing statistics omit internal lock coordination.
-pub fn refresh_json(refresh: &crate::store::Refresh) -> Result<String> {
+/// Public indexing statistics omit internal lock coordination; `extra`'s fields follow.
+pub fn refresh_json(refresh: &crate::store::Refresh, extra: serde_json::Value) -> Result<String> {
     let mut value = serde_json::to_value(refresh)?;
     if let Some(fields) = value.as_object_mut() {
         fields.shift_remove("skipped_lock");
+        if let serde_json::Value::Object(extra) = extra {
+            fields.extend(extra);
+        }
     }
     Ok(crate::json_output::to_string(&value)?)
 }

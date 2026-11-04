@@ -401,9 +401,34 @@ fn detached(
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x00000008 | 0x00000200);
+        keep_std_handles()?;
     }
     drop(guard);
     let child = cmd.spawn()?;
     crate::semantic_profile::event(serde_json::json!({"worker_started":{"pid":child.id()}}));
     Ok(true)
+}
+/// std's CreateProcess passes every inheritable handle to the child, and this process's
+/// standard handles are inheritable when its caller passed pipes. A worker holding the
+/// caller's pipes keeps them open until it exits, so a caller that reads the command's
+/// output to its end (any shell capture, an agent's tool call) would wait for the
+/// worker. Children that inherit stdio still get their own inheritable duplicates.
+#[cfg(windows)]
+fn keep_std_handles() -> Result<()> {
+    use windows_sys::Win32::Foundation::{
+        SetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        let handle = unsafe { GetStdHandle(id) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            continue;
+        }
+        if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
 }

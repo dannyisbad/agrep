@@ -47,10 +47,10 @@ open until process exit. No shell is used to assemble an argument string.
 `status` is a read-only snapshot, including when no index exists. It reports the
 format marker, recursive disk bytes without following links, canonical counts,
 refresh timestamp, per-source parse errors, semantic model/coverage/backlog,
-recorded integrations, archive presence, and version. Semantic publishers can
-publish their committed coverage as `state.semantic_rows`; diagnostics never
-load a model just to count coverage. Enrollment names resolve to known instruction
-files; status checks for the owned block and reports missing/drifted enrollment.
+recorded integrations, archive presence, and version. Coverage comes from the
+index's trigger-maintained counts; diagnostics never load a model to count it.
+Enrollment names resolve to known instruction files; status checks for the owned
+block and reports missing/drifted enrollment.
 
 `doctor` adds integrity checks, safe explicit refresh, integration setup replay
 on `--fix`, and corrupt-index rebuilding only after terminal confirmation. The
@@ -64,8 +64,4 @@ evidence/next_action object, naming index and source paths.
 Intentional 0.4.9 differences: full session ids are emitted instead of abbreviated
 ones, while both resolve; status/doctor omit all removed process/storage states;
 `why` describes the single SQLite snapshot; native launch never creates transcript
-links in an agent's store. Raw reference comparisons are in
-`measurements/browse-reference.json`. The metadata-only million-row benchmark is
-`cargo run --release -p agrep --example browse_bench -- target/release/agrep`.
-It measures complete new CLI processes and keeps every sample, including the
-first. It does not claim to measure keyword indexing or content-query throughput.
+links in an agent's store.

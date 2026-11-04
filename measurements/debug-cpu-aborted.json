@@ -1,1 +1,0 @@
-{"status": "incomplete diagnostic", "reason": "Stopped the unoptimized CPU diagnostic before the planned optimized measurement campaign; no result is counted as a pass.", "process": "50971 08:34   2:47.27 target/debug/examples/semantic_eval scratch/model cpu"}

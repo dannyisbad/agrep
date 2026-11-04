@@ -1,7 +1,0 @@
-{
-  "stopped_queued_profile": [
-    65742
-  ],
-  "reason": "Host restoration changed all file identities while retaining contents/mtime. Refresh the provisioned verification/conversion cache using the Rust provisioning command. Removed owned build tree; immutable before/after binaries retained.",
-  "uptime": "22:38  up  3:59, 2 users, load averages: 13.18 8.72 6.46"
-}

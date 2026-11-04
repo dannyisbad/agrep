@@ -8,7 +8,7 @@ use crate::{
 use anyhow::{bail, Result};
 use rusqlite::{params, Connection};
 pub use semantic_model::{installed, provision};
-pub use semantic_policy::eligible;
+pub use semantic_policy::{eligible, FLOOR, STRONG};
 pub use semantic_store::{coverage, initialize, reclaim, reset, Coverage};
 use std::{
     collections::HashSet,
@@ -293,6 +293,61 @@ pub fn finish(c: &Connection, work: QueryWork) -> Result<SearchResults> {
 pub fn search(root: &DataRoot, o: &Options, family_diverse: bool) -> Result<SearchResults> {
     let c = store::reader(root)?;
     finish(&c, begin(root, &c, o, family_diverse)?)
+}
+/// 0.4.9's `semantic_status` for one meaning lane: `found` is whether a row cleared the
+/// floor, and no coverage means the lane failed (py/search.py:563-599).
+pub fn status(coverage: Option<&Coverage>, found: bool) -> serde_json::Value {
+    let Some(coverage) = coverage else {
+        return serde_json::json!({"state":"unavailable","eligible":true,"reason":"retrieval-failed","min_score":FLOOR,"score_kind":"unavailable","coverage":null,"partial":true,"complete":false,"fallback_recommended":true});
+    };
+    let partial = coverage.partial();
+    // py/surface_policy.py:2839-2852: complete, or within the 1% live-update tail.
+    let usable = !partial
+        || (coverage.total > 0 && coverage.embedded as f64 >= coverage.total as f64 * 0.99);
+    serde_json::json!({"state":if found {"ready"} else {"no-confident-match"},"eligible":true,"reason":null,"min_score":FLOOR,"score_kind":"cosine","coverage":coverage,"partial":partial,"complete":!partial,"fallback_recommended":!found && !usable})
+}
+/// Marks 0.4.9's weak meaning rows (py/search.py:432-480, 632-636, 966-1036): a cosine
+/// below the strong band, less than half the query's terms, or a query none of whose
+/// first eight terms occurs in the lane's scope. A keyword lane that found rows in that
+/// scope already proves a term occurs, so only a lane without one probes.
+pub fn mark_weak(c: &Connection, o: &Options, hits: &mut [Hit], lexical_found: bool) -> Result<()> {
+    if hits.is_empty() {
+        return Ok(());
+    }
+    let terms = semantic_policy::query_terms(&o.pattern);
+    let unanchored = !lexical_found && !terms.is_empty() && {
+        let mut absent = true;
+        for term in terms.iter().take(8) {
+            let probe = Options {
+                pattern: term.clone(),
+                regex: false,
+                word: false,
+                sort: "score".into(),
+                limit: 1,
+                exact: false,
+                count_only: false,
+                count_by_tier: false,
+                content: false,
+                chats: false,
+                tools: o.tools,
+                filters: query::Filters {
+                    no_meta: false,
+                    ..o.filters.clone()
+                },
+            };
+            if !query::search(c, &probe)?.hits.is_empty() {
+                absent = false;
+                break;
+            }
+        }
+        absent
+    };
+    for h in hits.iter_mut().filter(|h| h.matched == "semantic") {
+        h.sem_weak = unanchored
+            || semantic_policy::term_weak(&terms, &h.text)
+            || h.score < semantic_policy::STRONG;
+    }
+    Ok(())
 }
 /// Public for reproducible retrieval tests using frozen normalized vectors.
 pub fn search_vector(

@@ -593,12 +593,15 @@ fn self_controls_and_invalid_filters_are_not_silent() {
     };
     let without = invoke(&["chats", "--json", "cache"]);
     assert_eq!(without.status.code(), Some(1));
+    // 0.4.9 marked `self` only on chats it judged against the caller's window, so an
+    // included window carries no mark (py/search.py:8838-8846).
     let with = records(&ok(invoke(&["chats", "--json", "--self", "cache"])));
     assert_eq!(with[1]["session"], "root-alpha-0001");
-    assert_eq!(with[1]["self"], true);
+    assert!(with[1].get("self").is_none());
     let no = records(&ok(invoke(&["chats", "--json", "--no-self", "--side"])));
     assert_eq!(no.len(), 2);
     assert_eq!(no[1]["session"], "root-alpha-0002");
+    assert_eq!(no[1]["self"], false);
     for args in [
         vec!["chats", "--model", "test"],
         vec!["chats", "--project", ""],

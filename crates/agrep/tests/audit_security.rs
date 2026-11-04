@@ -105,7 +105,7 @@ fn installed_corruption_is_disclosed_logged_and_reported_by_diagnostics() {
         assert!(String::from_utf8_lossy(&out.stdout).contains("database migration failure"));
         if args.contains(&"--json") {
             let value: Value = serde_json::from_slice(&out.stdout).unwrap();
-            assert_eq!(value["semantic_status"]["state"], "failed");
+            assert_eq!(value["semantic_status"]["state"], "unavailable");
         }
     }
     assert!(fs::read_to_string(root.path().join("log/agrep.log"))

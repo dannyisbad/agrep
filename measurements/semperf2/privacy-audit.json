@@ -1,6 +1,0 @@
-{
-  "files_checked": 71,
-  "private_content_findings": [],
-  "nonfinite_values": [],
-  "policy": "Aggregate timings, counts, public fixture IDs and hashes only; no rendered text, query strings, vectors or owner-store paths."
-}

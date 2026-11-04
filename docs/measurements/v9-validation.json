@@ -1,8 +1,0 @@
-{
-  "tests_passed": 65,
-  "tests_failed": 0,
-  "tests_ignored": 0,
-  "fmt_check": true,
-  "clippy_warnings_denied": true,
-  "privacy_worktree": true
-}

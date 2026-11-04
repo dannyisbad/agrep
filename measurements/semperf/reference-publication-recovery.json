@@ -1,9 +1,0 @@
-{
-  "failure": "Archived ingest outputs no longer matched publication identities after restoration.",
-  "fix": "Ran the unmodified 0.4.9 index --full against the isolated synthetic home/data, then republished through its native APIs. No proof or manifest was hand-edited.",
-  "indexed_rows": 200000,
-  "pending": 0,
-  "original_failure": "publish-reference-geometry.log",
-  "index_refresh": "reference-index-restored.log",
-  "successful_retry": "publish-reference-geometry-retry.log"
-}

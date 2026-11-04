@@ -1,5 +1,0 @@
-{"step": "profile-before", "exit": 0}
-{"step": "profile-after", "exit": 0}
-{"step": "profile-mixed-cpu", "exit": 0}
-{"step": "query-before", "exit": 1}
-{"step": "query-after", "exit": 1}

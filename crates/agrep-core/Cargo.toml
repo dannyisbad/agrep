@@ -71,6 +71,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_IO",
     "Win32_System_Ioctl",
     "Win32_System_SystemServices",
+    "Win32_System_Time",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

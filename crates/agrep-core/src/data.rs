@@ -36,6 +36,44 @@ impl Drop for WriterLock {
         let _ = self.0.unlock();
     }
 }
+/// Whether an explicit command is running, checked from inside a merge step.
+pub struct ForegroundProbe(File);
+impl ForegroundProbe {
+    pub fn active(&self) -> bool {
+        match self.0.try_lock() {
+            Ok(()) => {
+                let _ = self.0.unlock();
+                false
+            }
+            Err(_) => true,
+        }
+    }
+}
+const WAITED: [&str; 4] = [
+    "foreground.lock",
+    "writer.queue",
+    "writer.lock",
+    "work.lock",
+];
+static WAITED_NS: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// Time this process has spent blocked on each lock file.
+#[derive(Debug, Default, Serialize)]
+pub struct LockWaits {
+    pub wait_foreground_lock_ms: f64,
+    pub wait_writer_queue_ms: f64,
+    pub wait_writer_lock_ms: f64,
+    pub wait_work_lock_ms: f64,
+}
+pub fn lock_waits() -> LockWaits {
+    let ms = |i: usize| WAITED_NS[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+    LockWaits {
+        wait_foreground_lock_ms: ms(0),
+        wait_writer_queue_ms: ms(1),
+        wait_writer_lock_ms: ms(2),
+        wait_work_lock_ms: ms(3),
+    }
+}
 impl DataRoot {
     pub fn discover() -> Result<Self> {
         if let Some(p) = std::env::var_os("AGREP_DATA_DIR") {
@@ -136,11 +174,28 @@ impl DataRoot {
         let _queued = self.lock_named("writer.queue", true, true)?;
         self.lock_named("writer.lock", true, false)
     }
-    /// A place in the writer queue for an explicit command's whole run: no merge step
-    /// starts before it exits, so it waits for at most the step in progress.
+    /// Held shared by an explicit command for its whole run. A merge step starts only
+    /// while no such command runs and is rolled back as soon as one starts
+    /// ([`ForegroundProbe`]), so the command never waits for merge work, however long
+    /// the step a doclist forces.
     pub fn foreground(&self) -> Result<WriterLock> {
-        self.lock_named("writer.queue", true, true)?
-            .context("blocking queue lock")
+        self.lock_named("foreground.lock", true, true)?
+            .context("blocking foreground lock")
+    }
+    /// Blocks until no explicit command runs.
+    pub fn wait_for_foreground(&self) -> Result<()> {
+        drop(self.lock_named("foreground.lock", true, false)?);
+        Ok(())
+    }
+    pub fn foreground_probe(&self) -> Result<ForegroundProbe> {
+        Ok(ForegroundProbe(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(self.0.join("foreground.lock"))?,
+        ))
     }
     /// The writer lock for one background merge step, taken once no writer is queued.
     pub fn lock_behind_writers(&self) -> Result<WriterLock> {
@@ -169,6 +224,7 @@ impl DataRoot {
             .create(true)
             .truncate(false)
             .open(self.0.join(name))?;
+        let waited = std::time::Instant::now();
         if shared {
             f.lock_shared()?
         } else if blocking {
@@ -179,6 +235,12 @@ impl DataRoot {
                 Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
                 Err(e) => return Err(e.into()),
             }
+        }
+        if let Some(i) = WAITED.iter().position(|n| *n == name) {
+            WAITED_NS[i].fetch_add(
+                waited.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         Ok(Some(WriterLock(f)))
     }

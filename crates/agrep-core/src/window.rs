@@ -13,10 +13,20 @@ pub const CUT: char = '…';
 /// Python's `round(value, 4)` for a score: the multiple of 1e-4 nearest the exact binary
 /// value, ties to even, as the double nearest that decimal.
 pub fn round4(value: f64) -> f64 {
+    round_places(value, 4)
+}
+
+/// Python's `round(value, 6)`, which 0.4.9 applied to a meaning row's cosine.
+pub fn round6(value: f64) -> f64 {
+    round_places(value, 6)
+}
+
+fn round_places(value: f64, places: u32) -> f64 {
     if !value.is_finite() || value <= 0.0 {
         return value;
     }
-    let scaled = value * 1e4;
+    let unit = 10f64.powi(places as i32);
+    let scaled = value * unit;
     let floor = scaled.floor();
     let fraction = scaled - floor;
     // The product errs by about 1e-12 at most, so only a value that close to a tie needs
@@ -24,17 +34,17 @@ pub fn round4(value: f64) -> f64 {
     let up = if (fraction - 0.5).abs() > 1e-9 {
         fraction > 0.5
     } else {
-        match half_above(value, floor) {
+        match half_above(value, floor, places) {
             Ordering::Less => false,
             Ordering::Greater => true,
             Ordering::Equal => floor % 2.0 == 1.0,
         }
     };
-    (floor + f64::from(u8::from(up))) / 1e4
+    (floor + f64::from(u8::from(up))) / unit
 }
 
-/// How `value * 10^4` compares with `floor + 0.5`, exactly.
-fn half_above(value: f64, floor: f64) -> Ordering {
+/// How `value * 10^places` compares with `floor + 0.5`, exactly.
+fn half_above(value: f64, floor: f64, places: u32) -> Ordering {
     let bits = value.to_bits();
     let biased = ((bits >> 52) & 0x7ff) as i64;
     let fraction = u128::from(bits & ((1 << 52) - 1));
@@ -43,10 +53,10 @@ fn half_above(value: f64, floor: f64) -> Ordering {
     } else {
         (fraction | 1 << 52, biased - 1075)
     };
-    // value * 10^4 = mantissa * 625 * 2^(exponent + 4) and floor + 0.5 = (2 floor + 1) / 2.
-    let left = mantissa * 625;
+    // value * 10^p = mantissa * 5^p * 2^(exponent + p) and floor + 0.5 = (2 floor + 1) / 2.
+    let left = mantissa * 5u128.pow(places);
     let right = 2 * floor as u128 + 1;
-    let shift = exponent + 5;
+    let shift = exponent + i64::from(places) + 1;
     if shift >= 0 {
         if shift > 40 {
             return Ordering::Greater;
@@ -448,6 +458,23 @@ mod tests {
             (0.0, 0.0),
         ] {
             assert_eq!(round4(value), rounded, "{value}");
+        }
+    }
+    #[test]
+    fn cosines_round_to_six_places_as_python() {
+        // Expected values are Python's round(x, 6).
+        for (value, rounded) in [
+            (0.9637235, 0.963723),
+            (0.4774725, 0.477473),
+            (0.6678505, 0.667851),
+            (0.1844295, 0.184429),
+            (0.8818655, 0.881865),
+            (0.0000025, 0.000003),
+            (0.5000005, 0.5),
+            (0.869539, 0.869539),
+            (0.999999949999, 1.0),
+        ] {
+            assert_eq!(round6(value), rounded, "{value}");
         }
     }
 

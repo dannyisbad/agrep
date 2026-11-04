@@ -1,10 +1,17 @@
 use crate::{date, ready, Summary};
-use agrep_core::{briefing as b, history as h, query::Filters, render, store};
+use agrep_core::{
+    briefing as b, handles::SessionIndex, history as h, query::Filters, render, store, surface,
+};
 use anyhow::{bail, Context, Result};
 use chrono::{Datelike, TimeZone};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    io::IsTerminal,
+};
+/// A family member: its session, its rows after self-exclusion, and its events.
 type FamilyMember<'a> = (&'a h::Session, Vec<h::Row>, Vec<Value>);
+const METRIC: &str = "estimated active time";
 fn duration(s: &str) -> Result<i64> {
     for (unit, mul) in [
         ("ms", 1),
@@ -71,22 +78,92 @@ fn days(intervals: &[(i64, i64)], group: &str) -> Result<BTreeMap<String, i64>> 
     }
     Ok(out)
 }
+/// 0.4.9's `count_noun`.
+fn noun(n: usize, word: &str) -> String {
+    format!(
+        "{} {word}{}",
+        surface::number(n),
+        if n == 1 { "" } else { "s" }
+    )
+}
+/// The wording 0.4.9 gave a side chat's own signal (py/summary.py:1901-1952).
+fn side_signal(signal: &str) -> String {
+    match signal {
+        "no captured reply to the last turn" => {
+            "side chat has no captured reply to its last turn".into()
+        }
+        "reply ended before the turn's last tool call" => {
+            "side chat's reply ended before its last tool call".into()
+        }
+        _ => match signal.strip_prefix("last todo list") {
+            Some(rest) => format!("side chat todo list{rest}"),
+            None => format!("side chat's {signal}"),
+        },
+    }
+}
+/// 0.4.9's open-item line (py/summary.py:2355-2369).
+fn pending_line(item: &Value, indent: &str) -> String {
+    let text = |key: &str| item[key].as_str().unwrap_or_default();
+    let handle = [text("handle"), text("session_handle")]
+        .into_iter()
+        .find(|h| !h.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("session={}", text("session")));
+    let list = |key: &str| -> Vec<&str> {
+        item[key]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default()
+    };
+    let items = list("items");
+    let detail = if !items.is_empty() {
+        let mut detail = format!(
+            "{} open: {}",
+            items.len(),
+            items[..items.len().min(3)].join("; ")
+        );
+        if items.len() > 3 {
+            detail += &format!("; +{} more", items.len() - 3);
+        }
+        detail
+    } else if matches!(text("status"), "waiting_on_user" | "unknown")
+        && !text("evidence").is_empty()
+    {
+        format!(
+            "\u{201c}{}\u{201d}",
+            text("evidence").chars().take(120).collect::<String>()
+        )
+    } else {
+        list("signals").join("; ")
+    };
+    let source = if text("source") == "side-chat" {
+        "  [side chat]"
+    } else if item["parent_indexed"] == false {
+        "  [side chat; parent not indexed]"
+    } else {
+        ""
+    };
+    format!(
+        "{indent}{:<6} {:<21} {}{source}  {}",
+        text("confidence").to_uppercase(),
+        text("status"),
+        render::safe(&handle),
+        render::safe(&detail)
+    )
+}
 pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
     let (root, census) = ready(no_auto)?;
     let c = store::reader(&root)?;
     let all = h::sessions(&c)?;
-    let until = args
-        .until
-        .as_deref()
-        .map(date)
-        .transpose()?
-        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+    let until_arg = args.until.as_deref().map(date).transpose()?;
+    let until = until_arg.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
     if args.group.is_some() && args.mode.as_deref() != Some("time") {
         bail!("--group requires summary time")
     }
     if args.max.is_some() && args.mode.is_some() {
         bail!("--max is only used by the project briefing")
     }
+    let mode = args.mode.as_deref().unwrap_or("briefing");
     let group = args.group.as_deref().unwrap_or("day");
     let max = args.max.unwrap_or(5);
     let since_text = args.since.as_deref().unwrap_or("7d");
@@ -117,62 +194,91 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
     };
     let policy = caller.policy(request);
     let apply_self = !args.include_self;
-    let mut excluded = 0;
-    let mut unknown = 0;
-    let mut side_count = 0;
-    let mut families: BTreeMap<(String, String), Vec<FamilyMember<'_>>> = BTreeMap::new();
-    let active: std::collections::HashSet<_> = all
+    // 0.4.9 folded a side chat into its family root when that root is indexed; every other
+    // chat heads a family of its own, a side chat naming the parent it lacks, and families
+    // list in session-id order (py/summary.py:2099-2130).
+    let indexed: HashSet<(&str, &str)> = all
         .iter()
-        .filter(|s| s.first_ts < until && (s.last_ts == 0 || s.last_ts >= since))
-        .map(|s| (s.agent.clone(), s.family.clone()))
+        .map(|s| (s.agent.as_str(), s.id.as_str()))
         .collect();
+    let mut grouped: BTreeMap<(&str, &str), Vec<&h::Session>> = BTreeMap::new();
     for s in &all {
-        let owner = h::root(&all, s).unwrap_or(s);
-        if !h::in_scope(owner, &filters) || !active.contains(&(s.agent.clone(), s.family.clone())) {
-            continue;
-        }
-        let mut rows = h::rows(&c, s)?;
-        let original = rows.len();
-        if apply_self {
-            rows.retain(|r| {
-                !agrep_core::caller::excludes(
-                    &caller,
-                    &s.agent,
-                    &s.id,
-                    r.turn,
-                    args.include_self,
-                    args.no_self,
-                )
-            });
-        }
-        // 0.4.9 counted the root chats that lost turns; a side chat's rows fold into its root.
-        if rows.len() != original && !s.side {
-            excluded += 1;
-        }
-        if rows.is_empty() && original > 0 {
-            continue;
-        }
-        unknown += rows
-            .iter()
-            .filter(|r| b::is_turn(&rows, r) && r.ts <= 0)
-            .count();
-        let events = b::events(&c, s)?;
-        side_count += usize::from(s.side);
-        families
-            .entry((s.agent.clone(), s.family.clone()))
-            .or_default()
-            .push((s, rows, events));
+        let head = if s.side
+            && s.family != s.id
+            && indexed.contains(&(s.agent.as_str(), s.family.as_str()))
+        {
+            s.family.as_str()
+        } else {
+            s.id.as_str()
+        };
+        grouped.entry((head, s.agent.as_str())).or_default().push(s);
     }
+    let overlaps =
+        |s: &h::Session| s.last_ts >= since && (until_arg.is_none() || s.first_ts < until);
+    let (mut excluded, mut unknown, mut side_count) = (0, 0, 0);
+    let mut families: Vec<(Vec<FamilyMember<'_>>, bool)> = Vec::new();
+    'families: for ((head, _), sessions) in grouped {
+        let Some(&first) = sessions.iter().find(|s| s.id == head) else {
+            continue;
+        };
+        if !h::in_scope(first, &filters) || !sessions.iter().any(|s| overlaps(s)) {
+            continue;
+        }
+        let mut members = Vec::new();
+        let mut withheld = false;
+        for s in std::iter::once(first).chain(sessions.iter().copied().filter(|s| s.id != head)) {
+            let mut rows = h::rows(&c, s)?;
+            let original = rows.len();
+            if apply_self {
+                rows.retain(|r| {
+                    !agrep_core::caller::excludes(
+                        &caller,
+                        &s.agent,
+                        &s.id,
+                        r.turn,
+                        args.include_self,
+                        args.no_self,
+                    )
+                });
+            }
+            // 0.4.9 counted the root chats that lost turns, dropping one that lost them all
+            // with its family, and dropped a side chat that lost them all.
+            if rows.len() != original {
+                if s.id == head {
+                    excluded += 1;
+                    withheld = true;
+                }
+                if rows.is_empty() {
+                    if s.id == head {
+                        continue 'families;
+                    }
+                    continue;
+                }
+            }
+            unknown += rows
+                .iter()
+                .filter(|r| b::is_turn(&rows, r) && r.ts <= 0)
+                .count();
+            let events = b::events(&c, s)?;
+            members.push((s, rows, events));
+        }
+        side_count += members.len() - 1;
+        families.push((members, withheld));
+    }
+    let index = SessionIndex::load(&c)?;
+    let session_handle = |session: &str| format!("@{}", index.target(session));
+    let short = |handle: &str, session: &str| {
+        handle.replacen(&h::target(session), &session_handle(session), 1)
+    };
     let mut pending = vec![];
-    let mut project_rows = BTreeMap::<String, Value>::new();
+    let mut projects: Vec<Value> = Vec::new();
+    let mut project_at = HashMap::<String, usize>::new();
     let mut time = BTreeMap::<(String, String), (i64, usize)>::new();
     let mut dedup = 0;
     let mut total = 0;
-    for members in families.values() {
-        let root = members
-            .iter()
-            .find(|(s, _, _)| !s.side)
-            .unwrap_or(&members[0]);
+    for (members, withheld) in &families {
+        let root = &members[0];
+        let s = root.0;
         let mut intervals = vec![];
         let mut raw = 0;
         for (_, rows, events) in members {
@@ -192,17 +298,24 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
         total += ms;
         for (period, n) in days(&merged, group)? {
             let entry = time
-                .entry((period, h::project_leaf(&root.0.project)))
+                .entry((period, h::project_leaf(&s.project)))
                 .or_default();
             entry.0 += n;
             entry.1 += 1;
         }
-        if args.mode.as_deref() != Some("time") {
-            let mut returned = std::collections::HashSet::new();
-            returned.insert(root.0.id.clone());
+        let parent = (s.side && s.family != s.id).then(|| {
+            if s.parent.is_empty() {
+                s.family.clone()
+            } else {
+                s.parent.clone()
+            }
+        });
+        if mode != "time" {
+            let mut returned = HashSet::new();
+            returned.insert(s.id.clone());
             loop {
                 let prior = returned.len();
-                for (side, rows, events) in members.iter().filter(|(s, _, _)| s.side) {
+                for (side, rows, events) in members.iter().skip(1) {
                     if b::returned(rows, events)
                         || members.iter().any(|(holder, _, events)| {
                             returned.contains(&holder.id) && b::received(events, side, rows)
@@ -215,12 +328,12 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
                     break;
                 }
             }
-
-            let mut item = b::pending(&c, root.0, &root.1, &root.2)?;
+            let mut item = b::pending(&c, s, &root.1, &root.2)?;
             if item.is_none() {
                 for (side, rows, events) in members
                     .iter()
-                    .filter(|(s, _, _)| s.side && s.last_ts > root.0.last_ts)
+                    .skip(1)
+                    .filter(|(side, _, _)| side.last_ts > s.last_ts)
                 {
                     let delivered = returned.contains(&side.id)
                         || root.2.iter().any(|e| {
@@ -238,26 +351,56 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
                         ) {
                             continue;
                         }
+                        let signals: Vec<String> = i["signals"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .map(side_signal)
+                            .collect();
+                        i["signals"] = json!(signals);
                         i["source"] = json!("side-chat");
                         i["evidence_session"] = json!(side.id);
-                        i["session"] = json!(root.0.id);
-                        i["session_handle"] = json!(h::target(&root.0.id));
-                        i["project"] = json!(h::project_leaf(&root.0.project));
-                        i["project_label"] = json!(root.0.project);
-                        i["first_text"] = json!(root.0.title);
-                        i["last_ts"] = json!(root.0.last_ts);
+                        i["session"] = json!(s.id);
+                        i["project"] = json!(h::project_leaf(&s.project));
+                        i["project_label"] = json!(s.project);
+                        i["first_text"] = json!(s.title);
+                        i["last_ts"] = json!(s.last_ts);
                         item = Some(i);
                         break;
                     }
                 }
             }
-            if let Some(item) = item {
+            if let Some(mut item) = item {
+                item["session_handle"] = json!(session_handle(&s.id));
+                let evidence = item["evidence_session"]
+                    .as_str()
+                    .unwrap_or(&s.id)
+                    .to_owned();
+                let handle = short(item["handle"].as_str().unwrap_or_default(), &evidence);
+                item["handle"] = json!(handle);
+                if let Some(parent) = &parent {
+                    item["parent"] = json!(parent);
+                    item["parent_indexed"] = json!(false);
+                }
+                if item["caveats"].as_array().is_some_and(Vec::is_empty) {
+                    if let Some(fields) = item.as_object_mut() {
+                        fields.remove("caveats");
+                    }
+                }
                 pending.push(item);
             }
         }
-        let s = root.0;
         let project = h::project_leaf(&s.project);
-        let entry=project_rows.entry(project.clone()).or_insert_with(||json!({"kind":"project","project":project,"project_labels":[s.project],"estimated_active_ms":0,"chats":0,"turns":0,"last_ts":0,"worked_on":[],"open":[]}));
+        let at = *project_at.entry(project.clone()).or_insert_with(|| {
+            projects.push(json!({"kind":"project","project":project,"project_labels":[],"estimated_active_ms":0,"chats":0,"turns":0,"last_ts":0,"worked_on":[],"open":[]}));
+            projects.len() - 1
+        });
+        let entry = &mut projects[at];
+        let labels = entry["project_labels"].as_array_mut().unwrap();
+        if !labels.contains(&json!(s.project)) {
+            labels.push(json!(s.project));
+        }
         entry["estimated_active_ms"] =
             json!(entry["estimated_active_ms"].as_i64().unwrap_or(0) + ms);
         entry["chats"] = json!(entry["chats"].as_u64().unwrap_or(0) + 1);
@@ -268,7 +411,21 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
             .count();
         entry["turns"] = json!(entry["turns"].as_u64().unwrap_or(0) + turns as u64);
         entry["last_ts"] = json!(entry["last_ts"].as_i64().unwrap_or(0).max(s.last_ts));
-        entry["worked_on"].as_array_mut().unwrap().push(json!({"session":s.id,"session_handle":h::target(&s.id),"agent":s.agent,"project_label":s.project,"first_text":s.title,"last_ts":s.last_ts,"turns":turns,"estimated_active_ms":ms,"latest_handle":h::latest(&c,s)?.map(|r|h::handle(&s.id,&r)),"side_chats":members.len()-1}));
+        // 0.4.9 bound a chat's latest handle to its last prompt (py/summary.py:2008-2018).
+        let last = root
+            .1
+            .iter()
+            .filter(|r| b::is_turn(&root.1, r))
+            .max_by_key(|r| (r.turn, r.ts));
+        let mut chat = json!({"session":s.id,"session_handle":session_handle(&s.id),"agent":s.agent,"project_label":s.project,"first_text":s.title,"last_ts":s.last_ts,"turns":turns,"estimated_active_ms":ms,"latest_handle":last.map(|r| index.mint(&s.id, r.turn, &r.text)),"side_chats":members.len()-1});
+        if *withheld {
+            chat["self"] = json!(true);
+        }
+        if let Some(parent) = &parent {
+            chat["parent"] = json!(parent);
+            chat["parent_indexed"] = json!(false);
+        }
+        entry["worked_on"].as_array_mut().unwrap().push(chat);
     }
     pending.sort_by_key(|i| {
         (
@@ -281,30 +438,62 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
         )
     });
     for i in &pending {
-        if let Some(p) = project_rows.get_mut(i["project"].as_str().unwrap_or("")) {
-            p["open"].as_array_mut().unwrap().push(i.clone());
+        if let Some(&at) = project_at.get(i["project"].as_str().unwrap_or("")) {
+            projects[at]["open"].as_array_mut().unwrap().push(i.clone());
         }
     }
-    let rows:Vec<Value>=match args.mode.as_deref() {
-        Some("pending")=>pending,
-        Some("time")=>time.into_iter().map(|((period,project),(ms,chats))| json!({"kind":"time","period":period,"group":group,"project":project,"estimated_active_ms":ms,"estimated_active":label(ms),"chats":chats})).collect(),
-        _=> {
-            let mut rows:Vec<_>=project_rows.into_values().collect();
-            for entry in &mut rows {
-                entry["estimated_active"]=json!(label(entry["estimated_active_ms"].as_i64().unwrap_or(0)));
-                let worked=entry["worked_on"].as_array_mut().unwrap();
-                worked.sort_by_key(|i|-i["last_ts"].as_i64().unwrap_or(0));
-                if max>0 { worked.truncate(max); }
+    let rows: Vec<Value> = match mode {
+        "pending" => pending,
+        "time" => {
+            let mut rows: Vec<_> = time.into_iter().collect();
+            rows.sort_by(|((p1, n1), (a, _)), ((p2, n2), (b, _))| {
+                p1.cmp(p2).then(b.cmp(a)).then(n1.cmp(n2))
+            });
+            rows.into_iter().map(|((period,project),(ms,chats))| json!({"kind":"time","period":period,"group":group,"project":project,"estimated_active_ms":ms,"estimated_active":label(ms),"chats":chats})).collect()
+        }
+        _ => {
+            for entry in &mut projects {
+                entry["estimated_active"] =
+                    json!(label(entry["estimated_active_ms"].as_i64().unwrap_or(0)));
+                entry["last_age"] = json!(render::age(entry["last_ts"].as_i64().unwrap_or(0)));
+                let worked = entry["worked_on"].as_array_mut().unwrap();
+                worked.sort_by_key(|i| -i["last_ts"].as_i64().unwrap_or(0));
+                if max > 0 {
+                    worked.truncate(max);
+                }
             }
-            rows.sort_by_key(|r|(-r["estimated_active_ms"].as_i64().unwrap_or(0),-r["last_ts"].as_i64().unwrap_or(0)));
-            rows
+            projects.sort_by(|a, b| {
+                let key = |r: &Value| {
+                    (
+                        -r["estimated_active_ms"].as_i64().unwrap_or(0),
+                        -r["last_ts"].as_i64().unwrap_or(0),
+                    )
+                };
+                key(a)
+                    .cmp(&key(b))
+                    .then(a["project"].as_str().cmp(&b["project"].as_str()))
+            });
+            projects
         }
     };
-    let caveats=vec![format!("estimated active time is estimated from turn timestamps with a {} idle cap; it is not elapsed session span and not billable time",args.idle_cap),"side chats are folded into their family; overlapping minutes count once".into()];
+    let mut caveats=vec![format!("{METRIC} is estimated from turn timestamps with a {} idle cap; it is not elapsed session span and not billable time",args.idle_cap),"side chats are folded into their family; overlapping minutes count once".into()];
+    let unknown_line = format!(
+        "{} without a usable timestamp excluded from time and turn counts",
+        noun(unknown, "turn")
+    );
+    if unknown > 0 {
+        caveats.push(unknown_line.clone());
+    }
+    let timezone = render::timezone_label();
     let pending_sources = crate::finish_census(&root, census)?;
     let checked = agrep_core::render::checked(no_auto);
     if args.json {
-        let mut meta = json!({"kind":"agrep-meta","mode":args.mode,"window":{"since":since_text,"since_ts":since,"until":args.until,"until_ts":until},"timezone":chrono::Local::now().format("%Z %z").to_string(),"idle_cap":args.idle_cap,"idle_cap_ms":cap,"metric":"estimated active time","chats":families.len(),"side_chats":side_count,"unknown_timestamp_rows":unknown,"family_dedup_ms":dedup,"self_excluded":excluded,"self_exclusion":caller.metadata(request,None),"caveats":caveats,"freshness":render::freshness(checked,pending_sources),"total_estimated_active_ms":total});
+        // 0.5 never skips index rows or loses a chat's events, so its totals are exact.
+        let mut meta = json!({"kind":"agrep-meta","mode":mode,"window":{"since":since_text,"since_ts":since,"until":args.until,"until_ts":until_arg},"timezone":timezone,"idle_cap":args.idle_cap,"idle_cap_ms":cap,"metric":METRIC,"chats":families.len(),"side_chats":side_count,"unknown_timestamp_rows":unknown,"family_dedup_ms":dedup,"self_excluded":excluded,"self_exclusion":caller.metadata(request,None),"totals_exact":true,"events_unavailable_chats":0,"caveats":caveats,"freshness":render::machine_freshness(no_auto,pending_sources)});
+        if mode == "time" {
+            meta["group"] = json!(group);
+            meta["total_estimated_active_ms"] = json!(total);
+        }
         if rows.is_empty() {
             meta["hits"] = json!([])
         }
@@ -313,45 +502,132 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
             println!("{}", agrep_core::json_output::to_string(&row)?);
         }
     } else {
-        for row in &rows {
-            match row["kind"].as_str() {
-                Some("time") => println!(
-                    "{}  {}  {}  {} chats",
-                    row["period"].as_str().unwrap_or(""),
-                    super::paint(&render::safe(row["project"].as_str().unwrap_or("")), color),
-                    row["estimated_active"].as_str().unwrap_or(""),
-                    row["chats"]
-                ),
-                Some("pending") => print_pending(row, color),
-                _ => {
+        // 0.4.9's rendering (py/summary.py:2344-2404).
+        let on = color == "always" || (color == "auto" && std::io::stdout().is_terminal());
+        let head = |t: &str| {
+            if on {
+                format!("\x1b[1;36m{t}\x1b[0m")
+            } else {
+                t.to_owned()
+            }
+        };
+        let dim = |t: &str| {
+            if on {
+                format!("\x1b[2m{t}\x1b[0m")
+            } else {
+                t.to_owned()
+            }
+        };
+        let text = |v: &Value| v.as_str().unwrap_or_default().to_owned();
+        match mode {
+            "time" if !rows.is_empty() => {
+                let width = |key: &str, floor: usize| {
+                    rows.iter()
+                        .map(|r| text(&r[key]).chars().count())
+                        .max()
+                        .unwrap_or(0)
+                        .max(floor)
+                };
+                let (pw, lw) = (width("period", group.len()), width("project", 7));
+                println!(
+                    "{}",
+                    head(&format!(
+                        "{group:<pw$}  {:<lw$}  {:>7}  chats",
+                        "project", "time"
+                    ))
+                );
+                for row in &rows {
                     println!(
-                        "{} · estimated active time {} · {} chats",
-                        super::paint(&render::safe(row["project"].as_str().unwrap_or("")), color),
-                        row["estimated_active"].as_str().unwrap_or(""),
+                        "{:<pw$}  {:<lw$}  {:>7}  {}",
+                        text(&row["period"]),
+                        render::safe(&text(&row["project"])),
+                        text(&row["estimated_active"]),
                         row["chats"]
                     );
-                    for chat in row["worked_on"].as_array().unwrap() {
+                }
+                println!(
+                    "{}",
+                    dim(&format!(
+                        "{:<pw$}  {:<lw$}  {:>7}",
+                        "total",
+                        "",
+                        label(total)
+                    ))
+                );
+            }
+            "pending" => {
+                for item in &rows {
+                    println!(
+                        "{}  {}",
+                        pending_line(item, ""),
+                        dim(&render::safe(&text(&item["project"])))
+                    );
+                }
+            }
+            "time" => {}
+            _ => {
+                for entry in &rows {
+                    println!(
+                        "{}{}",
+                        head(&render::safe(&text(&entry["project"]))),
+                        dim(&format!(
+                            "  ·  {METRIC} {}  ·  {}  ·  {}  ·  last {}",
+                            text(&entry["estimated_active"]),
+                            noun(entry["chats"].as_u64().unwrap_or(0) as usize, "chat"),
+                            noun(entry["turns"].as_u64().unwrap_or(0) as usize, "turn"),
+                            text(&entry["last_age"])
+                        ))
+                    );
+                    println!("  worked on:");
+                    for chat in entry["worked_on"].as_array().into_iter().flatten() {
+                        let mut marks = String::new();
+                        if chat["self"] == true {
+                            marks += " ~self";
+                        }
+                        let sides = chat["side_chats"].as_u64().unwrap_or(0);
+                        if sides > 0 {
+                            marks += &format!(" (+{sides} side)");
+                        }
+                        if chat["parent_indexed"] == false {
+                            marks += " [side chat; parent not indexed]";
+                        }
+                        let tail = chat["latest_handle"]
+                            .as_str()
+                            .map(|handle| {
+                                format!(
+                                    " · {}",
+                                    surface::shell(&[
+                                        "agrep".to_owned(),
+                                        "around".to_owned(),
+                                        handle.to_owned()
+                                    ])
+                                )
+                            })
+                            .unwrap_or_default();
+                        let first: String = render::safe(&text(&chat["first_text"]))
+                            .chars()
+                            .take(96)
+                            .collect();
                         println!(
-                            "  {} {} · {}",
-                            chat["session_handle"].as_str().unwrap_or(""),
-                            chat["agent"].as_str().unwrap_or(""),
-                            render::safe(chat["first_text"].as_str().unwrap_or(""))
+                            "    {} {} {} {}t{marks}  {}",
+                            render::safe(&text(&chat["session_handle"])),
+                            render::safe(&text(&chat["agent"])),
+                            render::age(chat["last_ts"].as_i64().unwrap_or(0)),
+                            chat["turns"],
+                            dim(&(first + &tail))
                         );
                     }
-                    for item in row["open"].as_array().unwrap() {
-                        print_pending(item, color)
+                    let open = entry["open"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+                    if !open.is_empty() {
+                        println!("  open:");
+                        for item in open {
+                            println!("{}", pending_line(item, "    "));
+                        }
                     }
                 }
             }
         }
-        // 0.4.9's footer (py/summary.py:2207-2322): one line per mode.
-        let noun = |n: usize, word: &str| {
-            format!(
-                "{} {word}{}",
-                agrep_core::surface::number(n),
-                if n == 1 { "" } else { "s" }
-            )
-        };
+        // 0.4.9's footer (py/summary.py:2309-2337).
         let relative = regex::Regex::new(r"(?i)^\d+\s*[a-z]+$")?.is_match(since_text.trim());
         let window_text = match (&args.until, &args.since) {
             (Some(until), None) => format!("in the 7d before {until}"),
@@ -359,32 +635,37 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
             _ if relative => format!("in the last {since_text}"),
             _ => format!("since {since_text}"),
         };
-        match args.mode.as_deref() {
-            Some("pending") => eprintln!(
+        match mode {
+            "time" => eprintln!(
+                "{METRIC} for {} {window_text}, idle cap {}, local time {timezone} · not elapsed span, not billable",
+                noun(families.len(), "chat"),
+                args.idle_cap
+            ),
+            "pending" => eprintln!(
                 "{} across {} {window_text}, most confident first",
                 noun(rows.len(), "open item"),
                 noun(families.len(), "chat")
             ),
-            Some("time") => {
-                for caveat in &caveats {
-                    eprintln!("{caveat}");
-                }
-            }
             _ => eprintln!(
-                "{}, {} {window_text}, most active first · estimated active time with a {} idle cap, side chats folded into their family",
+                "{}, {} {window_text}, most active first · {METRIC} with a {} idle cap, side chats folded into their family",
                 noun(rows.len(), "project"),
                 noun(families.len(), "chat"),
                 args.idle_cap
             ),
         }
         if unknown > 0 {
+            eprintln!("{unknown_line}");
+        }
+        if dedup > 0 {
             eprintln!(
-                "{unknown} turns without a usable timestamp excluded from time and turn counts"
+                "overlap between chats and their side chats counted once ({} de-duplicated)",
+                label(dedup)
             );
         }
         if let Some(notice) = policy.and_then(|p| p.notice(excluded, "chat")) {
             eprintln!("{notice}");
         }
+        agrep_core::render::note_no_auto(no_auto);
     }
     Ok(if !rows.is_empty() {
         0
@@ -393,16 +674,4 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
     } else {
         2
     })
-}
-fn print_pending(row: &Value, color: &str) {
-    println!(
-        "  {} {} {} · {}",
-        super::paint(
-            &row["confidence"].as_str().unwrap_or("").to_uppercase(),
-            color
-        ),
-        row["status"].as_str().unwrap_or(""),
-        row["handle"].as_str().unwrap_or(""),
-        render::safe(row["evidence"].as_str().unwrap_or(""))
-    );
 }

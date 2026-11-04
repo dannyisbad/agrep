@@ -1,6 +1,0 @@
-{
-  "compared": "previous head binary vs this binary, same isolated real index, --no-auto, every case",
-  "identical": 62,
-  "total": 62,
-  "score_tolerance": "1e-5 relative (process clock recency)"
-}

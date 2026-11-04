@@ -1,5 +1,0 @@
-compile 0 
-23:22  up  3:14, 2 users, load averages: 18.15 27.24 37.34
-native=false seconds=0.189551041 sum=-10 different=23210 max_abs=0.000000059604645
-native=true seconds=0.044558125 sum=-10 different=23210 max_abs=0.000000059604645
-

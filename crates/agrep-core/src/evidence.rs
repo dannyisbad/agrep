@@ -149,7 +149,8 @@ fn load_in(c: &Connection, index: &SessionIndex, request: &Request) -> Result<Wi
                         holders.push(p)
                     }
                 }
-                match holders.len(){0=>bail!("result handle no longer names the cited content; rerun the search for a current handle"),1=>{center=holders[0];notes.push(json!({"kind":"content_moved","requested":requested,"served":center,"note":format!("handle content moved: turn {requested} → {center} (session was renumbered)")}));},_=>bail!("handle content is ambiguous in session {}: turns {}; rerun the search for a current handle",SessionIndex::default().target(&session),holders.iter().map(i64::to_string).collect::<Vec<_>>().join(", "))}
+                // py/surface_policy.py:2385-2393 names both causes rather than asserting one.
+                match holders.len(){0=>bail!("result handle no longer names the cited content; rerun the search for a current handle"),1=>{center=holders[0];notes.push(json!({"kind":"content_moved","requested":requested,"served":center,"note":format!("handle digest matches turn {center}, not turn {requested} - either the session was renumbered since the handle was minted, or the digest is wrong; verify the content before citing it")}));},_=>bail!("handle content is ambiguous in session {}: turns {}; rerun the search for a current handle",SessionIndex::default().target(&session),holders.iter().map(i64::to_string).collect::<Vec<_>>().join(", "))}
             }
         }
     }

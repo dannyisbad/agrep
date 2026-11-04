@@ -1,8 +1,0 @@
-{
-  "reason": "Quiet-start campaign was waiting at host load above 50; paused the wait to run separately labeled owner-scale CI gate. No active measurement was stopped.",
-  "load": [
-    90.39501953125,
-    41.27685546875,
-    40.48486328125
-  ]
-}

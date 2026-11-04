@@ -8,7 +8,7 @@ use agrep_core::{
     render, semantic, store, surface,
 };
 use anyhow::{bail, Result};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     io::IsTerminal,
@@ -25,8 +25,7 @@ struct Block {
 /// Bag-of-words scatter and sub-strong meaning matches: evidence that earns one line
 /// rather than a transcript.
 fn weak(h: &Hit) -> bool {
-    matches!(h.matched.as_str(), "all-terms" | "content-terms")
-        || (h.matched == "semantic" && h.score < 0.84)
+    scatter(h) || (h.matched == "semantic" && h.sem_weak)
 }
 /// Whether 0.4.9's recall read tool rows for a query: its prose lane ran first and fell
 /// back to tools when fewer than `target` chats (families, unless `by_session`) held a
@@ -67,7 +66,7 @@ fn tool_lane(
 }
 /// A block's head: handle · agent · project · when · meaning label · provenance marks.
 fn head(h: &Hit) -> String {
-    let meaning = if h.matched == "semantic" && h.score < 0.84 {
+    let meaning = if h.matched == "semantic" && h.sem_weak {
         "weak meaning match"
     } else if h.matched == "semantic" {
         "meaning match"
@@ -105,6 +104,12 @@ fn family_key(h: &Hit, per_session: bool) -> &str {
 /// 0.4.9's `_weak_scatter`: a bag-of-words row, never strong evidence.
 fn scatter(h: &Hit) -> bool {
     h.matched == "all-terms" || h.matched == "content-terms"
+}
+/// 0.4.9's `_meta_row` from stored provenance: machinery roles and spawned task prompts.
+fn meta_row(h: &Hit) -> bool {
+    h.meta_marker
+        || matches!(h.who.as_str(), "harness" | "synthetic")
+        || (h.who == "subagent" && h.turn == 0)
 }
 /// 0.4.9's recall under `--no-meta` selected from heads, not rows: the best row of each
 /// of up to `max(target, 40)` families (chats under `per_session`) from the prose lane,
@@ -226,6 +231,65 @@ fn select(
         }
     }
     (selected, exhausted)
+}
+/// 0.4.9's `_reserve_semantic_hits` for a pack (py/recall.py:891-932): a query whose
+/// selection holds no meaning row gets its best remaining one over its own family's row,
+/// in a free slot, or over its weakest row when it holds two.
+fn reserve(
+    mut out: Vec<(usize, Hit)>,
+    meanings: &[Vec<Hit>],
+    target: usize,
+    per_session: bool,
+) -> Vec<(usize, Hit)> {
+    if target <= meanings.len() {
+        return out;
+    }
+    for (query, ranked) in meanings.iter().enumerate() {
+        let positions: Vec<usize> = (0..out.len()).filter(|&i| out[i].0 == query).collect();
+        if positions.iter().any(|&i| out[i].1.matched == "semantic") {
+            continue;
+        }
+        let seen: HashSet<(&str, i64)> = out
+            .iter()
+            .map(|(_, h)| (h.session.as_str(), h.turn))
+            .collect();
+        let seen_text: HashSet<String> = out.iter().map(|(_, h)| hybrid::text_key(h)).collect();
+        let others: HashSet<&str> = (0..out.len())
+            .filter(|i| !positions.contains(i))
+            .map(|i| out[i].1.session.as_str())
+            .collect();
+        let Some(meaning) = ranked
+            .iter()
+            .find(|h| {
+                !others.contains(h.session.as_str())
+                    && !seen.contains(&(h.session.as_str(), h.turn))
+                    && {
+                        let key = hybrid::text_key(h);
+                        key.is_empty() || !seen_text.contains(&key)
+                    }
+            })
+            .cloned()
+        else {
+            continue;
+        };
+        let family = hybrid::family(&meaning, !per_session).to_owned();
+        if let Some(&i) = positions
+            .iter()
+            .find(|&&i| hybrid::family(&out[i].1, !per_session) == family)
+        {
+            out[i] = (query, meaning);
+        } else if out.len() < target {
+            out.push((query, meaning));
+        } else if positions.len() >= 2 {
+            let replace = positions
+                .iter()
+                .copied()
+                .max_by_key(|&i| (out[i].1.who == "tool", scatter(&out[i].1), i))
+                .unwrap_or_default();
+            out[replace] = (query, meaning);
+        }
+    }
+    out
 }
 /// `select` over ranking prefixes. A prefix selects exactly what its full
 /// ranking does unless selection ran past it; such a query's prefix, where
@@ -486,6 +550,117 @@ fn merge_chats(pairs: Vec<(Hit, Window)>, query_of: &HashMap<String, usize>) -> 
     }
     blocks
 }
+/// 0.4.9's disclosure that an explicit handle bypassed the supplied filters, naming those
+/// whose own predicates would have excluded it (py/recall.py:1540-1574,
+/// py/surface_policy.py:2424-2432).
+fn handle_filter_note(
+    flags: &[&str],
+    f: &agrep_core::query::Filters,
+    w: &Window,
+    ts: i64,
+) -> String {
+    use agrep_core::history::project_matches;
+    let mut mismatched = Vec::new();
+    if f.chat.as_deref().is_some_and(|chat| chat != w.session) {
+        mismatched.push("--chat");
+    }
+    if f.agent
+        .as_deref()
+        .is_some_and(|agent| !w.agent.to_lowercase().contains(&agent.to_lowercase()))
+    {
+        mismatched.push("--agent");
+    }
+    if f.project
+        .as_deref()
+        .is_some_and(|p| !project_matches(&w.project, p))
+    {
+        mismatched.push("--project");
+    }
+    if f.exclude_project
+        .as_deref()
+        .is_some_and(|p| project_matches(&w.project, p))
+    {
+        mismatched.push("--exclude-project");
+    }
+    if f.since.is_some_and(|since| ts < since) {
+        mismatched.push("--since");
+    }
+    if f.until.is_some_and(|until| ts >= until) {
+        mismatched.push("--until");
+    }
+    let mut line = format!(
+        "explicit result handle wins: {} not applied",
+        flags.join(", ")
+    );
+    if !mismatched.is_empty() {
+        line += &format!(" ({} would have excluded it)", mismatched.join(", "));
+    }
+    line
+}
+/// 0.4.9's envelope fields for the queries whose meaning lane ran (py/recall.py:2169-2238,
+/// 2572-2582): one query's status or the aggregate with the per-query list, and `hybrid`
+/// when a meaning row made the page; `reduce` keeps only the status of a keyword page whose
+/// meaning rows all lost the merge.
+fn semantic_meta(
+    runs: &[(String, Value, Option<semantic::Coverage>)],
+    multi: bool,
+    visible: bool,
+    reduce: bool,
+) -> serde_json::Map<String, Value> {
+    let mut meta = serde_json::Map::new();
+    let Some((_, first, _)) = runs.first() else {
+        return meta;
+    };
+    let all = |key: &str| runs.iter().all(|(_, s, _)| s[key] == true);
+    let kinds: BTreeSet<_> = runs
+        .iter()
+        .map(|(_, s, _)| s["score_kind"].as_str())
+        .collect();
+    let coverage = runs.iter().rev().find_map(|(_, _, c)| c.as_ref());
+    meta.insert(
+        "score_kind".into(),
+        if kinds.len() == 1 {
+            first["score_kind"].clone()
+        } else {
+            json!("mixed")
+        },
+    );
+    meta.insert("semantic_coverage".into(), json!(coverage));
+    meta.insert(
+        "partial".into(),
+        json!(coverage.is_none_or(|c| c.partial())),
+    );
+    let status = if runs.len() == 1 {
+        first.clone()
+    } else {
+        let states: BTreeSet<_> = runs.iter().map(|(_, s, _)| s["state"].as_str()).collect();
+        let mut status = json!({"state":if states.len() == 1 {first["state"].clone()} else {json!("mixed")},"complete":all("complete"),"fallback_recommended":all("fallback_recommended")});
+        let reasons: BTreeSet<_> = runs
+            .iter()
+            .filter(|(_, s, _)| s["fallback_recommended"] == true || s["state"] == "unavailable")
+            .filter_map(|(_, s, _)| s["reason"].as_str().filter(|r| !r.is_empty()))
+            .collect();
+        if reasons.len() == 1 {
+            status["reason"] = json!(reasons.first());
+        }
+        status
+    };
+    meta.insert("semantic_status".into(), status);
+    if multi {
+        meta.insert(
+            "semantic_queries".into(),
+            runs.iter()
+                .map(|(query, status, coverage)| json!({"query":query,"status":status,"coverage":coverage}))
+                .collect(),
+        );
+    }
+    if visible {
+        meta.insert("hybrid".into(), json!(true));
+    } else if reduce {
+        meta.retain(|key, _| key == "semantic_status");
+    }
+    meta
+}
 pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i32> {
     if a.query
         .iter()
@@ -528,14 +703,32 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
             })
             .max(queries.len())
     };
+    // 0.4.9 disclosed raising an explicit --hits to one slot per query (py/recall.py:1988-1997).
+    let hits_floored = a
+        .hits
+        .filter(|&n| !a.probe && queries.len() > n)
+        .map(|n| json!({"requested":n,"raised_to":queries.len()}));
+    if let Some(floored) = hits_floored.as_ref().filter(|_| !a.json) {
+        eprintln!(
+            "--hits {} raised to {}: pack reserves one slot per query",
+            floored["requested"], floored["raised_to"]
+        );
+    }
+    // 0.4.9 kept a lone query's meaning lane off a page too small to hold it beside its
+    // keyword lead, and never searched meaning for tool rows (py/recall.py:1999, 2331-2336).
+    let meaning_room = target >= queries.len().max(2);
+    // How deep 0.4.9 read each query's lanes (py/recall.py:2000-2001, 2255-2259).
+    let query_target = target.max(if a.scope.no_meta { 40 } else { 8 });
+    let mut meanings: Vec<Vec<Hit>> = Vec::new();
     let (root, census) = {
         let _span = agrep_core::semantic_profile::span("freshness_prepare");
         ready(no_auto)?
     };
     let c = store::reader(&root)?;
-    let mut semantic_coverage = None;
     let mut semantic_ran = false;
     let mut semantic_failed = false;
+    let mut hybrid_used = false;
+    let mut lane_runs: Vec<(String, Value, Option<semantic::Coverage>)> = Vec::new();
     let include_self = a.scope.include_self || (a.scope.chat.is_some() && !a.scope.no_self);
     let identity = Identity::detect();
     if !a.json && !a.scope.include_self && (a.scope.no_self || identity.agent_context) {
@@ -551,6 +744,7 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
     let mut excluded = None;
     let mut filters = a.scope.filters()?;
     agrep_core::coverage::validate(&mut filters)?;
+    let tools_only = filters.who.as_deref() == Some("tool");
     let coverage = agrep_core::coverage::dimensions(&c, &filters)?;
     if let Some(chat) = filters
         .chat
@@ -564,13 +758,13 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
         filters.chat = Some(ids[0].clone())
     }
     let direct_filters: Vec<_> = [
+        ("--chat", filters.chat.is_some()),
         ("--agent", filters.agent.is_some()),
         ("--project", filters.project.is_some()),
         ("--exclude-project", filters.exclude_project.is_some()),
         ("--model", filters.model.is_some()),
         ("--who", filters.who.is_some()),
         ("--no-who", filters.no_who.is_some()),
-        ("--chat", filters.chat.is_some()),
         ("--since", filters.since.is_some()),
         ("--until", filters.until.is_some()),
     ]
@@ -580,12 +774,8 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
     .collect();
     let override_filters =
         queries.iter().any(|q| handles::is_handle(q)) && !direct_filters.is_empty();
-    if override_filters && !a.json {
-        eprintln!(
-            "direct handle overrides filters: {}",
-            direct_filters.join(", ")
-        );
-    }
+    let mut filter_note: Option<String> = None;
+    let mut handle_notes: Vec<Value> = Vec::new();
     let handle_only = queries.iter().all(|q| handles::is_handle(q));
     let mut buckets = Vec::new();
     let mut known_sessions = HashSet::new();
@@ -595,6 +785,12 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
     for query in &queries {
         if handles::is_handle(query) {
             let w = evidence::load(&c, &Request::new(query, None, Some(a.context as i64)))?;
+            // 0.4.9 printed each way the served turn differs from the cited one, JSON or not,
+            // and carried them as `served` (py/recall.py:1941-1946, 2898-2902).
+            for note in &w.notes {
+                eprintln!("{}", note["note"].as_str().unwrap_or_default());
+            }
+            handle_notes.extend(w.notes.iter().cloned());
             let claim = handles::parse(query)?;
             let event = w.events.iter().find(|e| {
                 e.turn == w.center
@@ -618,6 +814,12 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
             } else {
                 bail!("handle has no indexed row")
             };
+            if override_filters && filter_note.is_none() {
+                filter_note = Some(handle_filter_note(&direct_filters, &filters, &w, ts));
+                if !a.json {
+                    eprintln!("{}", filter_note.as_deref().unwrap_or_default());
+                }
+            }
             let mut handle = handles::SessionIndex::load(&c)?.mint(&w.session, w.center, &text);
             if let Some(e) = event {
                 let (a, b) = claim.span.unwrap_or((0, e.text.chars().count()));
@@ -635,6 +837,7 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
                 snippet: text.split_whitespace().collect::<Vec<_>>().join(" "),
                 who,
                 matched: "phrase".into(),
+                score: 1.0,
                 handle,
                 self_marker: caller.resolved && caller.session == w.session,
                 ..Hit::default()
@@ -656,6 +859,7 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
             }
             buckets.push(if hidden { vec![] } else { vec![h] });
             deepen.push(None);
+            meanings.push(Vec::new());
             continue;
         }
         let options = Options {
@@ -712,6 +916,8 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
         let lane = if !semantic_failed
             && (a.semantic
                 || (!a.lexical
+                    && !tools_only
+                    && (a.probe || meaning_room)
                     && semantic::eligible(query)
                     && semantic::installed(&root)
                     && root.config()?.embeddings != "off"))
@@ -758,27 +964,36 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
             match lane.and_then(|work| semantic::finish(&c, work)) {
                 Ok(mut found) => {
                     semantic_ran = true;
-                    semantic_coverage = Some(found.coverage);
+                    hybrid_used |= !a.semantic && !found.result.hits.is_empty();
+                    lane_runs.push((
+                        query.clone(),
+                        semantic::status(Some(&found.coverage), !found.result.hits.is_empty()),
+                        Some(found.coverage),
+                    ));
                     caller::decorate_semantic(&c, &mut found.result, &caller)?;
+                    semantic::mark_weak(
+                        &c,
+                        &options,
+                        &mut found.result.hits,
+                        !keyword.hits.is_empty(),
+                    )?;
                     if a.semantic {
                         found.result
                     } else {
-                        hybrid::merge(
-                            keyword,
-                            Some(found.result),
-                            options.limit,
-                            !a.scope.all_side_chats,
-                            if pack {
-                                hybrid::Lane::Pack
-                            } else {
-                                hybrid::Lane::Recall
-                            },
-                        )
+                        // 0.4.9 read `query_target` meaning rows and ranked them lived
+                        // first, then strong first, each band by cosine
+                        // (py/recall.py:983-994).
+                        let mut rows = std::mem::take(&mut found.result.hits);
+                        rows.truncate(query_target);
+                        rows.sort_by_key(|h| (meta_row(h), h.sem_weak));
+                        meanings.push(rows);
+                        keyword
                     }
                 }
                 Err(error) => {
                     agrep_core::logging::semantic_failure(&root, &error);
                     semantic_failed = true;
+                    lane_runs.push((query.clone(), semantic::status(None, false), None));
                     if a.semantic {
                         caller::search(&c, &options, &caller, include_self, a.scope.no_self)?
                     } else {
@@ -812,8 +1027,12 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
                 excluded = Some(withheld.prose + if tools { withheld.tools } else { 0 });
             }
         }
-        totals_exact &= r.total_basis == "exact";
-        known_sessions.extend(r.hits.iter().map(|h| h.session.clone()));
+        if meanings.len() < buckets.len() + 1 {
+            meanings.push(Vec::new());
+        }
+        let meaning = meanings.last().map(Vec::as_slice).unwrap_or_default();
+        totals_exact &= r.total_basis == "exact" && meaning.is_empty();
+        known_sessions.extend(r.hits.iter().chain(meaning).map(|h| h.session.clone()));
         // A --no-meta bucket already holds every head 0.4.9 selected from.
         deepen.push(
             (meta.is_none() && depth < options.limit && r.hits.len() == depth).then_some(options),
@@ -827,16 +1046,59 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
         .flatten()
         .any(|h| h.matched == "all-terms" || h.matched == "content-terms")
         && !buckets.iter().flatten().any(|h| h.matched == "phrase");
-    let selected = select_deepening(
-        &mut buckets,
-        &mut deepen,
-        target,
-        a.scope.all_side_chats || filters.chat.is_some(),
-        |options| {
-            let _span = agrep_core::semantic_profile::span("keyword");
-            Ok(caller::search(&c, &options, &caller, include_self, a.scope.no_self)?.hits)
-        },
-    )?;
+    let per_session = a.scope.all_side_chats || filters.chat.is_some();
+    let lone_hybrid = queries.len() == 1 && meanings.iter().any(|m| !m.is_empty());
+    let selected = if lone_hybrid && a.probe {
+        // 0.4.9's probe judged the keyword lane's pick and the meaning lane's
+        // (py/recall.py:2552-2561).
+        let mut picked = select(&buckets, target, per_session).0;
+        picked.extend(select(&meanings, target, per_session).0);
+        picked
+    } else if lone_hybrid {
+        // A lone query's page is its keyword chats merged with its meaning rows
+        // (py/recall.py:883-890).
+        let mut lexical = Results::default();
+        lexical.hits = select(&buckets, query_target, per_session)
+            .0
+            .into_iter()
+            .map(|(_, h)| h)
+            .collect();
+        let mut meaning = Results::default();
+        meaning.hits = std::mem::take(&mut meanings[0]);
+        hybrid::merge(lexical, Some(meaning), target, !per_session)
+            .hits
+            .into_iter()
+            .map(|h| (0, h))
+            .collect()
+    } else {
+        // A pack ranks each query's meaning rows after its lived prose phrases, ahead of
+        // tool rows and bag-of-words scatter, then reserves a meaning slot per query
+        // (py/recall.py:983-994, 2566-2571).
+        for (bucket, meaning) in buckets.iter_mut().zip(&meanings) {
+            if !meaning.is_empty() {
+                bucket.extend(meaning.iter().cloned());
+                bucket.sort_by_key(|h| {
+                    (
+                        scatter(h),
+                        if h.matched == "semantic" {
+                            1
+                        } else if h.who == "tool" {
+                            2
+                        } else {
+                            0
+                        },
+                    )
+                });
+            }
+        }
+        let selected =
+            select_deepening(&mut buckets, &mut deepen, target, per_session, |options| {
+                let _span = agrep_core::semantic_profile::span("keyword");
+                Ok(caller::search(&c, &options, &caller, include_self, a.scope.no_self)?.hits)
+            })?;
+        reserve(selected, &meanings, target, per_session)
+    };
+    let hybrid_visible = selected.iter().any(|(_, h)| h.matched == "semantic");
     let requests: Vec<_> = selected
         .iter()
         .map(|(_, h)| Request::new(&h.handle, None, Some(a.context as i64)))
@@ -879,8 +1141,14 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
     if let Some(line) = agrep_core::query::meta_notice(meta_dropped, meta_retained) {
         eprintln!("{line}");
     }
-    if !a.json {
-        agrep_core::coverage::disclose(&coverage);
+    // 0.4.9 named an empty filter dimension after the page or its zero line.
+    let disclose = || {
+        if !a.json {
+            agrep_core::coverage::disclose(&coverage);
+        }
+    };
+    if a.probe {
+        disclose();
     }
     let pending_sources = {
         let _span = agrep_core::semantic_profile::span("freshness_join");
@@ -935,9 +1203,6 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
             )
         } else {
             let count: i64 = c.query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))?;
-            if !checked {
-                eprintln!("{}", render::NO_AUTO_STALE);
-            }
             format!("recall: no confident match in {count} past conversations")
         };
         if a.budget > 0 && line.len() + 1 > a.budget {
@@ -956,6 +1221,7 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
         } else {
             surface::line(&line)?
         }
+        render::note_no_auto(no_auto);
         return Ok(if confident.is_some() {
             0
         } else if checked {
@@ -967,23 +1233,61 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
     let color = color == "always" || (color == "auto" && std::io::stdout().is_terminal());
     let page = page::Page::new(&blocks, &queries, a.budget);
     if a.json {
-        let mut value = json!({"query":if pack{json!(queries)}else{json!(queries[0])},"engine":if handle_only{"handle"}else{"sqlite"},"hits":[],"semantic_status":{"state":if semantic_failed{"failed"}else if semantic_ran{"complete"}else{"not-run"},"reason":if semantic_failed{Some("retrieval-failed")}else if semantic_ran{None}else{Some(if handle_only{"handle-lookup"}else if a.lexical{"--lexical"}else if !semantic::installed(&root){"model-not-installed"}else{"query-ineligible"})}},"self_exclusion":caller.metadata(request,excluded),"filter_coverage":coverage,"freshness":render::freshness(checked,pending_sources),"semantic_coverage":semantic_coverage});
-        if override_filters {
-            value["filter_override"] = json!({"supplied":direct_filters,"reason":"direct-handle"});
+        let mut value = json!({"query":if pack{json!(queries)}else{json!(queries[0])},"engine":if handle_only{"handle"}else{"sqlite"},"hits":[]});
+        if !handle_notes.is_empty() {
+            value["served"] = json!({"served_as_requested":false,"divergences":handle_notes});
         }
+        if let Some(floored) = hits_floored {
+            value["hits_floored"] = floored;
+        }
+        let meta = semantic_meta(&lane_runs, queries.len() > 1, hybrid_visible, hybrid_used);
+        let lane_coverage = meta.get("semantic_coverage").cloned().unwrap_or_default();
+        for (key, field) in meta {
+            value[key] = field;
+        }
+        if lane_runs.is_empty() {
+            // 0.4.9 separated a lane that never ran from one that searched (py/recall.py:2662-2676).
+            let reason = if handle_only {
+                "handle-lookup"
+            } else if a.lexical {
+                "--lexical"
+            } else if tools_only {
+                "tool-lane"
+            } else if root.config()?.embeddings == "off" {
+                "embeddings-off"
+            } else if !semantic::installed(&root) {
+                "model-not-installed"
+            } else if !meaning_room {
+                "no-meaning-room"
+            } else {
+                "query-not-language-shaped"
+            };
+            value["semantic_status"] = json!({"state":"not-run","reason":reason});
+        }
+        value["self_exclusion"] = json!(caller.metadata(request, excluded));
+        value["filter_coverage"] = match &filter_note {
+            Some(note) => json!({"empty_dimensions":[],"checked":false,"reason":note}),
+            None => json!(coverage),
+        };
+        value["freshness"] = render::machine_freshness(no_auto, pending_sources);
+        value["semantic_coverage"] = lane_coverage;
         if fell_back {
             value["note"] = json!("no exact phrase match; showing hits containing all terms");
         }
         surface::write(&page::json(&page, &mut value)?)?;
     } else if blocks.is_empty() {
         let n: i64 = c.query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))?;
-        eprintln!("no hits across {n} indexed sessions.");
-        if !checked {
-            eprintln!("{}", render::NO_AUTO_STALE);
-        }
+        eprintln!(
+            "no hits across {} indexed session{}.",
+            surface::number(n.max(0) as usize),
+            if n == 1 { "" } else { "s" }
+        );
+        disclose();
     } else {
         surface::write(&page::text(&page, color)?)?;
+        disclose();
     }
+    render::note_no_auto(no_auto);
     if let Some(notice) = &notice {
         eprintln!("{notice}");
     }
@@ -995,6 +1299,120 @@ mod tests {
     use super::*;
     use agrep_core::evidence::Row;
 
+    fn coverage() -> semantic::Coverage {
+        semantic::Coverage {
+            embedded: 24,
+            total: 24,
+        }
+    }
+    fn pick(session: &str, turn: i64, matched: &str) -> Hit {
+        Hit {
+            session: session.into(),
+            family: session.into(),
+            turn,
+            matched: matched.into(),
+            who: "user".into(),
+            snippet: format!("{session} {turn}"),
+            ..Hit::default()
+        }
+    }
+    // py/recall.py:891-932: a query without a meaning row takes its best one over its own
+    // family's row, else over its weakest row once it holds two.
+    #[test]
+    fn packs_reserve_a_meaning_slot_per_query_as_0_4_9() {
+        let picked = vec![
+            (0, pick("s1", 0, "phrase")),
+            (1, pick("s2", 0, "phrase")),
+            (0, pick("s3", 0, "all-terms")),
+            (1, pick("s4", 0, "phrase")),
+        ];
+        let meanings = vec![
+            vec![pick("s2", 7, "semantic"), pick("s9", 1, "semantic")],
+            vec![pick("s2", 5, "semantic")],
+        ];
+        let out: Vec<(usize, String, i64)> = reserve(picked.clone(), &meanings, 4, false)
+            .into_iter()
+            .map(|(q, h)| (q, h.session, h.turn))
+            .collect();
+        assert_eq!(
+            out,
+            [
+                (0, "s1".to_owned(), 0),
+                (1, "s2".to_owned(), 5),
+                (0, "s9".to_owned(), 1),
+                (1, "s4".to_owned(), 0),
+            ]
+        );
+        let unchanged: Vec<_> = reserve(picked.clone(), &meanings, 2, false)
+            .into_iter()
+            .map(|(q, h)| (q, h.session))
+            .collect();
+        assert_eq!(
+            unchanged,
+            picked
+                .into_iter()
+                .map(|(q, h)| (q, h.session))
+                .collect::<Vec<_>>()
+        );
+    }
+    // Expected values are agrep 0.4.9's `recall --json` and `pack --json` output on a fixture
+    // with 24 embedded rows, without the keys PORTING.md lists as not carried.
+    #[test]
+    fn semantic_envelope_matches_0_4_9() {
+        let full = json!({"indexed":24,"total":24,"pending":0,"fraction":1.0,"complete":true,"order":"newest-first"});
+        let ready = json!({"state":"ready","eligible":true,"reason":null,"min_score":0.82,"score_kind":"cosine","coverage":full,"partial":false,"complete":true,"fallback_recommended":false});
+        assert_eq!(semantic::status(Some(&coverage()), true), ready);
+        let none = json!({"state":"no-confident-match","eligible":true,"reason":null,"min_score":0.82,"score_kind":"cosine","coverage":full,"partial":false,"complete":true,"fallback_recommended":false});
+        let runs = vec![(
+            "zebra quantum lighthouse marmalade".to_owned(),
+            semantic::status(Some(&coverage()), false),
+            Some(coverage()),
+        )];
+        assert_eq!(
+            Value::Object(semantic_meta(&runs, false, false, false)),
+            json!({"score_kind":"cosine","semantic_coverage":full,"partial":false,"semantic_status":none})
+        );
+        let runs = vec![
+            (
+                "how do we rotate secret credentials".to_owned(),
+                ready.clone(),
+                Some(coverage()),
+            ),
+            ("retry backoff".to_owned(), ready.clone(), Some(coverage())),
+        ];
+        assert_eq!(
+            Value::Object(semantic_meta(&runs, true, true, false)),
+            json!({"score_kind":"cosine","semantic_coverage":full,"partial":false,
+                "semantic_status":{"state":"ready","complete":true,"fallback_recommended":false},
+                "semantic_queries":[
+                    {"query":"how do we rotate secret credentials","status":ready,"coverage":full},
+                    {"query":"retry backoff","status":ready,"coverage":full}],
+                "hybrid":true})
+        );
+        // py/recall.py:2575-2580: meaning rows that lost the merge leave only the status.
+        assert_eq!(
+            Value::Object(semantic_meta(&runs[..1], false, false, true)),
+            json!({"semantic_status":ready})
+        );
+        // py/search.py:581-599: a lane that failed reports unavailable and partial.
+        let failed = vec![("q".to_owned(), semantic::status(None, false), None)];
+        let meta = semantic_meta(&failed, false, false, false);
+        assert_eq!(
+            (
+                &meta["score_kind"],
+                &meta["partial"],
+                &meta["semantic_coverage"]
+            ),
+            (&json!("unavailable"), &json!(true), &Value::Null)
+        );
+        assert_eq!(
+            (
+                &meta["semantic_status"]["state"],
+                &meta["semantic_status"]["fallback_recommended"]
+            ),
+            (&json!("unavailable"), &json!(true))
+        );
+    }
     fn row(session: &str, turn: i64, who: &str, text: &str) -> Row {
         Row {
             session: session.into(),

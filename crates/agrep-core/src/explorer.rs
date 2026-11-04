@@ -510,14 +510,19 @@ impl State {
                 let keyword = query::search(&c, &options)?;
                 let result = if let Some(lane) = lane {
                     match lane.and_then(|work| crate::semantic::finish(&c, work)) {
-                        Ok(found) if mode == "semantic" => found.result,
-                        Ok(found) => crate::hybrid::merge(
-                            keyword,
-                            Some(found.result),
-                            n,
-                            true,
-                            crate::hybrid::Lane::Compact,
-                        ),
+                        Ok(mut found) => {
+                            crate::semantic::mark_weak(
+                                &c,
+                                &options,
+                                &mut found.result.hits,
+                                !keyword.hits.is_empty(),
+                            )?;
+                            if mode == "semantic" {
+                                found.result
+                            } else {
+                                crate::hybrid::merge(keyword, Some(found.result), n, true)
+                            }
+                        }
                         Err(error) => {
                             crate::logging::semantic_failure(&self.root, &error);
                             fallback = Some("meaning search unavailable; showing keyword matches");

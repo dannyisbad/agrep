@@ -12,6 +12,10 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
     let query_start = std::time::Instant::now();
     let timing = agrep_core::semantic_profile::timing_enabled();
     let pattern = s.pattern.join(" ");
+    // 0.4.9's `profile_wants` (py/search.py:7375-7381): the compact page, and with it the
+    // automatic meaning lane, serves only the default row surface.
+    let compact_page =
+        compact(s.classic) && !(s.json || s.flat || s.chats || s.count || s.count_by_tier);
     if s.coverage
         && (s.json
             || s.flat
@@ -34,11 +38,9 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
         || (!s.lexical
             && !s.regex
             && !s.word
-            && !s.count
-            && !s.count_by_tier
             && !s.coverage
             && s.sort == "score"
-            && compact(s.classic)
+            && compact_page
             && semantic::eligible(&pattern))
     {
         let root = agrep_core::data::DataRoot::discover()?;
@@ -89,7 +91,7 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
             && !s.count
             && !s.count_by_tier
             && !s.chats
-            && (compact(s.classic) || std::io::stdout().is_terminal()),
+            && (compact_page || std::io::stdout().is_terminal()),
         chats: s.chats,
         tools: root.config()?.tools
             || f.who
@@ -103,12 +105,10 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
         && !s.lexical
         && !s.regex
         && !s.word
-        && !s.count
-        && !s.count_by_tier
         && !s.coverage
         && s.sort == "score"
         && f.who.as_deref() != Some("tool")
-        && compact(s.classic)
+        && compact_page
         && root.config()?.embeddings != "off"
         && semantic::eligible(&pattern)
         && semantic::installed(&root);
@@ -158,15 +158,26 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
         match lane.and_then(|work| semantic::finish(&c, work)) {
             Ok(mut found) => {
                 caller::decorate_semantic(&c, &mut found.result, &caller)?;
+                semantic::mark_weak(
+                    &c,
+                    &options,
+                    &mut found.result.hits,
+                    !keyword.hits.is_empty(),
+                )?;
                 let result = if s.semantic {
                     found.result
+                } else if keyword.hits.is_empty()
+                    && found.result.hits.iter().all(|h| h.score < semantic::STRONG)
+                {
+                    // 0.4.9 kept a page of only sub-strong neighbors a miss; `-s` shows
+                    // them (py/search.py:7956-7960).
+                    keyword
                 } else {
                     hybrid::merge(
                         keyword,
                         Some(found.result),
                         options.limit,
                         !s.scope.all_side_chats,
-                        hybrid::Lane::Compact,
                     )
                 };
                 (result, Some(found.coverage), false)
@@ -200,55 +211,71 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
     if timing {
         eprintln!("{}", serde_json::json!({"keyword_ms":keyword_ms}));
     }
-    let compact = compact(s.classic);
-    let mut full_argv = vec![
-        "agrep".to_string(),
-        "search".into(),
-        "--max".into(),
-        "0".into(),
-        "--sort".into(),
-        s.sort.clone(),
-        "--color".into(),
-        color.into(),
-    ];
+    let style_semantic = s.semantic && semantic_coverage.is_some();
+    if style_semantic && s.chats && s.sort == "score" {
+        meaning_heads(&mut result.hits, chrono::Utc::now().timestamp_millis());
+    }
+    // 0.4.9's reruns of this search (py/search.py:5926-6036): every filter as one token,
+    // then the page's own surface and a page size.
+    let mut base = vec!["agrep".to_string()];
+    if s.semantic {
+        base.push("-s".into());
+    } else if s.regex {
+        base.push("-E".into());
+    } else if s.word {
+        base.push("-w".into());
+    } else if s.lexical {
+        base.push("--lexical".into());
+    }
     for (flag, value) in [
         ("--agent", &s.scope.agent),
-        ("--project", &s.scope.project),
+        ("--project", &f.project),
         ("--exclude-project", &s.scope.exclude_project),
         ("--model", &s.scope.model),
         ("--who", &s.scope.who),
         ("--no-who", &s.scope.no_who),
-        ("--chat", &s.scope.chat),
+        ("--chat", &f.chat),
         ("--since", &s.scope.since),
         ("--until", &s.scope.until),
     ] {
         if let Some(v) = value {
-            full_argv.extend([flag.into(), v.clone()]);
+            base.push(format!("{flag}={v}"));
         }
     }
-    for (flag, on) in [
-        ("--here", s.scope.here),
-        ("--soft", s.scope.soft),
-        ("--no-meta", s.scope.no_meta),
-        ("--self", s.scope.include_self),
-        ("--no-self", s.scope.no_self),
-        ("--all-side-chats", s.scope.all_side_chats),
-        ("--no-side", s.scope.no_side),
-        ("--regex", s.regex),
-        ("--word", s.word),
-        ("--chats", s.chats),
-        ("--classic", s.classic),
-        ("--flat", s.flat),
-        ("--json", s.json),
-        ("--lexical", s.lexical),
-        ("--semantic", s.semantic),
-        ("--no-auto", no_auto),
-    ] {
-        if on {
-            full_argv.push(flag.into());
-        }
+    let self_flag = if s.scope.include_self {
+        Some("--self".to_string())
+    } else {
+        s.scope.no_self.then(|| "--no-self".into())
+    };
+    for flag in [
+        s.scope.soft.then(|| "--soft".to_string()),
+        s.scope.no_meta.then(|| "--no-meta".into()),
+        (s.sort != "score").then(|| format!("--sort={}", s.sort)),
+        self_flag,
+        s.scope.all_side_chats.then(|| "--all-side-chats".into()),
+        s.scope.no_side.then(|| "--no-side".into()),
+        no_auto.then(|| "--no-auto".into()),
+        (color != "auto").then(|| format!("--color={color}")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        base.push(flag);
     }
-    full_argv.extend(["--".into(), pattern.clone()]);
+    let surface: &[&str] = match (s.chats, s.json, s.flat) {
+        (true, true, _) => &["-l", "--json"],
+        (true, false, _) => &["-l"],
+        (false, true, _) => &["--json"],
+        (false, false, true) => &["--flat"],
+        _ => &["--classic"],
+    };
+    let rerun = |surface: &[&str], n: usize| -> Vec<String> {
+        base.iter()
+            .cloned()
+            .chain(surface.iter().map(|flag| flag.to_string()))
+            .chain(["-n".into(), n.to_string(), "--".into(), pattern.clone()])
+            .collect()
+    };
     let coverage_hits = if s.coverage {
         let mut recovered = agrep_core::query::coverage(&c, &options)?;
         recovered.hits.retain(|h| {
@@ -282,28 +309,53 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
         finish_census(&root, census)?
     };
     result.pending_sources = pending_sources;
-    // 0.4.9's `session_hits`: each listed chat's exact matching rows.
-    let session_hits = if s.chats && !s.count && !s.count_by_tier {
+    // 0.4.9's `session_hits`: each listed chat's exact matching rows, and on a meaning page
+    // the rows `_session_heads` counted per chat (py/search.py:2409-2427).
+    let session_hits = if style_semantic {
+        result
+            .hits
+            .iter()
+            .map(|h| {
+                result
+                    .hits
+                    .iter()
+                    .filter(|o| o.session == h.session)
+                    .count()
+            })
+            .collect()
+    } else if s.chats && !s.count && !s.count_by_tier {
         let _span = agrep_core::semantic_profile::span("session_hits");
         let sessions: Vec<String> = result.hits.iter().map(|h| h.session.clone()).collect();
         agrep_core::query::session_counts(&c, &options, &sessions, &mut plans)?
     } else {
         Vec::new()
     };
+    let exhaustible = !s.semantic && !result.hits.iter().any(|h| h.matched == "semantic");
+    let current = s.max.unwrap_or(40);
+    let larger = match s.max {
+        Some(0) => None,
+        _ if s.json => [80, 160, 200].into_iter().find(|&n| current < n),
+        _ => (current < 80).then_some(80),
+    };
     let style = Style {
         json: s.json,
         flat: s.flat
-            || (!compact
+            || (!compact_page
                 && !(color == "always" || (color == "auto" && std::io::stdout().is_terminal()))),
-        compact,
+        compact: compact_page,
         count: s.count,
         tiers: s.count_by_tier,
         chats: s.chats,
-        semantic: s.semantic && semantic_coverage.is_some(),
+        semantic: style_semantic,
         regex: s.regex,
         word: s.word,
         checked: agrep_core::render::checked(no_auto),
-        full_argv,
+        no_auto,
+        full_argv: rerun(&["--classic"], 0),
+        larger_argv: larger
+            .filter(|_| exhaustible || s.json)
+            .map(|n| rerun(surface, n)),
+        exhaustive_argv: (s.json && exhaustible && s.max != Some(0)).then(|| rerun(surface, 0)),
         color: color == "always" || (color == "auto" && std::io::stdout().is_terminal()),
         data_root: Some(root),
         requested: s.max,
@@ -347,7 +399,11 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
             }
         }
     }
-    if result.total == 0 && !s.json && !s.count && !s.count_by_tier {
+    // 0.4.9 let an empty filter dimension's line stand alone as the zero's explanation.
+    let empty_dimension = coverage["empty_dimensions"]
+        .as_array()
+        .is_some_and(|d| !d.is_empty());
+    if result.total == 0 && !s.json && !s.count && !s.count_by_tier && !empty_dimension {
         // 0.4.9's matcher_empty_line (py/display_policy.py:1358-1370) names the matcher and
         // its corpus: one message record per user-side row, its reply attached
         // (py/common.py:290-298 sums sessions.jsonl's per-session `n`).
@@ -367,9 +423,6 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
             "{label}: 0 matching rows across {} indexed messages{lever}",
             agrep_core::surface::number(n.max(0) as usize)
         );
-        if !style.checked {
-            eprintln!("{}", render::NO_AUTO_STALE);
-        }
     }
     if !s.json {
         agrep_core::coverage::disclose(&coverage);
@@ -377,6 +430,7 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
             eprintln!("{line}");
         }
     }
+    render::note_no_auto(no_auto);
     Ok(if result.total != 0 {
         0
     } else if !style.checked && !style.semantic {
@@ -399,4 +453,60 @@ pub(crate) fn more(handle: &str) -> Result<i32> {
         );
     }
     Ok(0)
+}
+/// 0.4.9's `-l` heads over a meaning page: lane confidence folds into score, and a meaning
+/// row's score is its keyword formula (py/search.py:1892-1898, 7584).
+fn meaning_heads(hits: &mut [agrep_core::query::Hit], now: i64) {
+    use agrep_core::query::meaning_score;
+    hits.sort_by(|a, b| {
+        meaning_score(b, now)
+            .total_cmp(&meaning_score(a, now))
+            .then(b.ts.cmp(&a.ts))
+            .then_with(|| a.session.cmp(&b.session))
+            .then(a.turn.cmp(&b.turn))
+            .then_with(|| a.who.cmp(&b.who))
+    });
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Expected order is agrep 0.4.9's `-s "how do we rotate secret credentials" -l --json`
+    // on a six-chat fixture; `now` reproduces that run's scores.
+    #[test]
+    fn meaning_chat_heads_rank_by_score_as_0_4_9() {
+        let mut hits: Vec<_> = [
+            ("f000", 1792058906000, 0.882),
+            ("f002", 1792231706000, 0.869),
+            ("f005", 1792490906000, 0.845),
+            ("f003", 1792318106000, 0.836),
+        ]
+        .map(|(session, ts, score)| agrep_core::query::Hit {
+            session: session.into(),
+            who: "agent".into(),
+            ts,
+            score,
+            matched: "semantic".into(),
+            ..Default::default()
+        })
+        .into();
+        meaning_heads(&mut hits, 1793787066000);
+        let heads: Vec<_> = hits
+            .iter()
+            .map(|h| {
+                (
+                    h.session.as_str(),
+                    agrep_core::query::meaning_score(h, 1793787066000),
+                )
+            })
+            .collect();
+        assert_eq!(
+            heads,
+            [
+                ("f005", 0.3806),
+                ("f003", 0.3448),
+                ("f002", 0.3281),
+                ("f000", 0.2972)
+            ]
+        );
+    }
 }

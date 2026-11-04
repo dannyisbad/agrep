@@ -613,6 +613,7 @@ pub fn pending(
     let mut status = "";
     let mut confidence = "medium";
     let mut evidence = String::new();
+    let todo_signal: String;
     let mut signals = vec![];
     let mut items = vec![];
     let mut caveats = vec![];
@@ -629,7 +630,7 @@ pub fn pending(
     }else if let Some((open,caveat))=block_section(&reply,&shape){status="open_next_steps";confidence=if caveat.is_some(){"medium"}else{"high"};evidence=open[0].clone();items=open;signals.push("final reply lists open next steps");if let Some(c)=caveat{caveats.push(c);}
     }else if reply.is_empty(){status=if last.ts>0{"agent_work_incomplete"}else{"unknown"};confidence=if last.ts>0{"medium"}else{"low"};evidence=last.text.clone();signals.push("no captured reply to the last turn");
     }else{
-        let (open,unknown)=todos(events);if !open.is_empty(){status="todo_open";evidence=open[0].clone();items=open;signals.push("last todo list has open items");}
+        let (open,unknown)=todos(events);if !open.is_empty(){status="todo_open";evidence=open[0].clone();todo_signal=format!("last todo list has {} open item{}",open.len(),if open.len()==1{""}else{"s"});signals.push(todo_signal.as_str());items=open;}
         else if later.iter().any(|e|e["meta"].as_str().unwrap_or("").split_whitespace().any(|m|m=="after_reply=1")){status="agent_work_incomplete";evidence=final_sentence.into();signals.push("reply ended before the turn's last tool call");}
         else if let Some(reason)=unknown{status="unknown";confidence="low";evidence=final_sentence.into();caveats.push(reason);}
         else if shape.end_cut{status="unknown";confidence="low";evidence=final_sentence.into();caveats.push("reply ending was capped; omitted items cannot be classified".into());}

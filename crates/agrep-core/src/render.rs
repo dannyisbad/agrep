@@ -24,8 +24,12 @@ pub struct Style {
     pub regex: bool,
     pub word: bool,
     pub checked: bool,
+    pub no_auto: bool,
     pub color: bool,
     pub full_argv: Vec<String>,
+    /// 0.4.9's bounded larger page and exhaustive rerun of this search, when it offered them.
+    pub larger_argv: Option<Vec<String>>,
+    pub exhaustive_argv: Option<Vec<String>>,
     pub data_root: Option<DataRoot>,
     pub requested: Option<usize>,
     pub diversify: bool,
@@ -96,9 +100,72 @@ pub fn age(ts: i64) -> String {
         format!("{}y", n / (86400 * 365))
     }
 }
-/// 0.4.9's freshness-story line for an absence read with `--no-auto`.
+/// 0.4.9's local timezone label: the zone's name and UTC offset, as `CET (UTC+01:00)`
+/// (py/summary.py:2023-2026).
+pub fn timezone_label() -> String {
+    let offset = chrono::Local::now().format("%z").to_string();
+    let (hours, minutes) = offset.split_at(offset.len().min(3));
+    format!(
+        "{} (UTC{hours}:{minutes})",
+        zone_name().unwrap_or_else(|| "local".into())
+    )
+}
+#[cfg(unix)]
+fn zone_name() -> Option<String> {
+    // SAFETY: `localtime_r` fills the zeroed `tm` it is given, and `tm_zone`, when set,
+    // points at a NUL-terminated name the C library keeps alive.
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&now, &mut tm).is_null() || tm.tm_zone.is_null() {
+            return None;
+        }
+        let name = std::ffi::CStr::from_ptr(tm.tm_zone)
+            .to_string_lossy()
+            .into_owned();
+        (!name.is_empty()).then_some(name)
+    }
+}
+#[cfg(windows)]
+fn zone_name() -> Option<String> {
+    use windows_sys::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
+    // GetTimeZoneInformation's documented TIME_ZONE_ID_DAYLIGHT.
+    const TIME_ZONE_ID_DAYLIGHT: u32 = 2;
+    // SAFETY: the zeroed structure is plain data that the call fills in.
+    let mut info: TIME_ZONE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a valid, writable TIME_ZONE_INFORMATION.
+    let id = unsafe { GetTimeZoneInformation(&mut info) };
+    let name = if id == TIME_ZONE_ID_DAYLIGHT {
+        &info.DaylightName[..]
+    } else {
+        &info.StandardName[..]
+    };
+    let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+    let name = String::from_utf16_lossy(&name[..end]);
+    (!name.is_empty()).then_some(name)
+}
+#[cfg(not(any(unix, windows)))]
+fn zone_name() -> Option<String> {
+    None
+}
+/// 0.4.9's freshness-story line for any read with `--no-auto` (py/search.py:7407-7416,
+/// py/indexd_runtime.py:3378-3380).
 pub const NO_AUTO_STALE: &str =
     "history may be stale: automatic freshness checks are disabled by --no-auto";
+pub fn note_no_auto(no_auto: bool) {
+    if no_auto {
+        eprintln!("{NO_AUTO_STALE}");
+    }
+}
+/// The machine freshness record; under `--no-auto` it is 0.4.9's: nothing checked the
+/// sources, so the index may be stale.
+pub fn machine_freshness(no_auto: bool, pending: usize) -> Value {
+    if no_auto {
+        json!({"state":"degraded","failing":true,"may_be_stale":true,"code":"search-index-stale","reason":"automatic freshness checks are disabled by --no-auto","checked":false})
+    } else {
+        freshness(checked(no_auto), pending)
+    }
+}
 pub fn checked(no_auto: bool) -> bool {
     !no_auto && !crate::data::read_only()
 }
@@ -113,14 +180,17 @@ pub fn freshness(checked: bool, pending: usize) -> Value {
     }
     v
 }
-pub fn hit_value(h: &Hit) -> Value {
+/// A search hit's JSON row. A meaning row is 0.4.9's (py/search.py:1010-1038, py/ask.py:
+/// 2613-2624): its cosine to six places, the keyword formula as `score`, no lane or match
+/// label, and the empty concept and summary and unknown model source its message lane
+/// reported.
+pub fn hit_value(h: &Hit, now: i64) -> Value {
+    if h.matched == "semantic" {
+        return json!({"session":h.session,"agent":h.agent,"project":h.project,"concept":"","model":h.model,"model_source":"unknown","turn":h.turn,"ts":h.ts,"who":h.who,"sem_score":crate::window::round6(h.score),"score_kind":"cosine","snippet":h.snippet,"summary":"","semantic_source":"message","score":crate::query::meaning_score(h, now),"handle":h.handle,"self":h.self_marker});
+    }
     let mut value = json!({"session":h.session,"agent":h.agent,"project":h.project,"model":h.model,"model_source":if h.who=="tool"{"tool"}else{&h.model_source},"turn":h.turn,"ts":h.ts,"who":h.who,"snippet":h.snippet,"score":h.score,"handle":h.handle,"self":h.self_marker});
     if h.matched != "phrase" {
         value["matched"] = json!(h.matched)
-    }
-    if h.matched == "semantic" {
-        value["lane"] = json!("semantic");
-        value["sem_score"] = json!(h.score)
     }
     value
 }
@@ -243,7 +313,7 @@ impl Marks {
 }
 pub fn compact_line(h: &Hit, marks: &Marks) -> String {
     let quality = if h.matched == "semantic" {
-        if h.score < 0.84 {
+        if h.sem_weak {
             "~semantic-weak (meaning match)"
         } else {
             "~semantic (meaning match)"
@@ -290,6 +360,7 @@ pub fn emit_semantic(
     coverage: Option<&crate::semantic::Coverage>,
 ) -> Result<()> {
     let truncated = ((!s.count && !s.tiers) && r.hits.len() < r.total) || r.total_basis != "exact";
+    let exhaustible = !s.semantic && !r.hits.iter().any(|h| h.matched == "semantic");
     let marks = Marks::new(q, s);
     let mut out = String::new();
     if s.count {
@@ -310,58 +381,14 @@ pub fn emit_semantic(
         .join(" ")
             + "\n";
     } else if s.json {
-        let mut meta = json!({"kind":"agrep-meta","query":q,"engine":"sqlite","freshness":freshness(s.checked,s.pending_sources),"filter_coverage":s.filter_coverage,"self_exclusion":s.self_exclusion,"completeness":{"shown":r.hits.len(),"total":r.total,"total_basis":r.total_basis,"unit":if s.chats || s.semantic{"chat"}else{"matching row"},"truncated":truncated,"tool_rows":r.tool_rows},"semantic_coverage":null});
-        if s.filter_coverage.is_null() {
-            meta["filter_coverage"] = json!({"checked":true,"empty_dimensions":[]})
-        }
-        if s.self_exclusion.is_null() {
-            meta["self_exclusion"] = json!({"active":false,"reason":"machine-surface"})
-        }
-        if let Some(coverage) = coverage {
-            meta["semantic_coverage"] = serde_json::to_value(coverage)?;
-            meta["semantic_partial"] = json!(coverage.partial());
-            meta["engine"] = json!(if s.semantic {
-                "semantic"
-            } else if r.hits.iter().any(|h| h.matched == "semantic") {
-                "sqlite+semantic"
-            } else {
-                "sqlite"
-            });
-        }
-        if truncated {
-            meta["completeness"]["more_argv"] = json!(s.full_argv);
-            meta["completeness"]["more_command"] = json!(surface::shell(&s.full_argv));
-            meta["completeness"]["more_kind"] = json!("broader-live-rerun");
-            meta["completeness"]["full_argv"] = json!(s.full_argv);
-            meta["completeness"]["full_command"] = json!(surface::shell(&s.full_argv));
-        }
-        if r.tools_excluded {
-            meta["completeness"]
-                .as_object_mut()
-                .unwrap()
-                .remove("tool_rows");
-            meta["completeness"]["tools_excluded"] = json!(true);
-        } else if r.total_basis != "exact" {
-            meta["completeness"]
-                .as_object_mut()
-                .unwrap()
-                .remove("tool_rows");
-            meta["completeness"]["tool_rows_basis"] = json!("unknown");
-        }
-        if r.hits.is_empty() {
-            meta["hits"] = json!([])
-        }
-        out += &format!("{}\n", crate::json_output::to_string(&meta)?);
-        for (i, h) in r.hits.iter().enumerate() {
-            let mut value = hit_value(h);
-            if s.caller_unknown {
-                value["self"] = Value::Null;
-            }
-            if let Some(n) = s.session_hits.get(i) {
-                value["session_hits"] = json!(n);
-            }
-            out += &format!("{}\n", crate::json_output::to_string(&value)?);
-        }
+        out = json_lines(
+            r,
+            q,
+            s,
+            coverage,
+            truncated,
+            chrono::Utc::now().timestamp_millis(),
+        )?;
     } else if s.chats && !s.compact {
         // 0.4.9's `_emit_chats`: one head line per matching chat (`grep -l`).
         for (i, h) in r.hits.iter().enumerate() {
@@ -460,19 +487,113 @@ pub fn emit_semantic(
     if let Some(legend) = speaker_legend(s, std::io::stderr().is_terminal()) {
         eprintln!("{legend}");
     }
-    if truncated && !s.json && !s.compact {
-        eprintln!(
-            "{}{} matches{}",
-            surface::number(r.total),
-            if r.total_basis == "exact" { "" } else { "+" },
-            if r.total_basis == "exact" {
-                ""
-            } else {
-                " (floor; -c exact)"
-            }
-        );
+    if truncated && !s.json && !s.compact && !s.count && !s.tiers {
+        eprintln!("{}", completeness_line(r, s, exhaustible));
     }
     Ok(())
+}
+/// The JSON surface: one `agrep-meta` line, then one line per hit.
+fn json_lines(
+    r: &Results,
+    q: &str,
+    s: &Style,
+    coverage: Option<&crate::semantic::Coverage>,
+    truncated: bool,
+    now: i64,
+) -> Result<String> {
+    let exhaustible = !s.semantic && !r.hits.iter().any(|h| h.matched == "semantic");
+    let mut meta = json!({"kind":"agrep-meta","query":q,"engine":"sqlite","freshness":machine_freshness(s.no_auto,s.pending_sources),"filter_coverage":s.filter_coverage,"self_exclusion":s.self_exclusion,"completeness":{"shown":r.hits.len(),"total":r.total,"total_basis":r.total_basis,"unit":if s.chats || s.semantic{"chat"}else{"matching row"},"truncated":truncated,"tool_rows":r.tool_rows},"semantic_coverage":null});
+    if s.filter_coverage.is_null() {
+        meta["filter_coverage"] = json!({"checked":true,"empty_dimensions":[]})
+    }
+    if s.self_exclusion.is_null() {
+        meta["self_exclusion"] = json!({"active":false,"reason":"machine-surface"})
+    }
+    if let Some(coverage) = coverage {
+        meta["semantic_coverage"] = serde_json::to_value(coverage)?;
+        meta["semantic_partial"] = json!(coverage.partial());
+    }
+    if s.semantic {
+        // 0.4.9 named its meaning lane's engine and led with the lane's status
+        // (py/search.py:4322, 8285-8287).
+        meta["engine"] = json!("semantic:hybrid");
+        meta["semantic"] = crate::semantic::status(coverage, !r.hits.is_empty());
+    }
+    if truncated {
+        if let Some(argv) = &s.larger_argv {
+            meta["completeness"]["more_command"] = json!(surface::shell(argv));
+            meta["completeness"]["more_command_kind"] = json!("broader-rerun");
+        }
+        if let Some(argv) = &s.exhaustive_argv {
+            meta["completeness"]["full_command"] = json!(surface::shell(argv));
+        }
+        if !exhaustible {
+            meta["completeness"]["no_exhaustive_form"] = json!(NO_EXHAUSTIVE_FORM);
+        }
+    }
+    if r.tools_excluded {
+        meta["completeness"]
+            .as_object_mut()
+            .unwrap()
+            .remove("tool_rows");
+        meta["completeness"]["tools_excluded"] = json!(true);
+    } else if r.total_basis != "exact" {
+        meta["completeness"]
+            .as_object_mut()
+            .unwrap()
+            .remove("tool_rows");
+        meta["completeness"]["tool_rows_basis"] = json!("unknown");
+    }
+    if r.hits.is_empty() {
+        meta["hits"] = json!([])
+    }
+    let mut out = format!("{}\n", crate::json_output::to_string(&meta)?);
+    for (i, h) in r.hits.iter().enumerate() {
+        let mut value = hit_value(h, now);
+        if s.caller_unknown {
+            value["self"] = Value::Null;
+        }
+        if let Some(n) = s.session_hits.get(i) {
+            value["session_hits"] = json!(n);
+        }
+        out += &format!("{}\n", crate::json_output::to_string(&value)?);
+    }
+    Ok(out)
+}
+const NO_EXHAUSTIVE_FORM: &str =
+    "the meaning lane ranks a bounded candidate set; no invocation returns every semantically related row";
+/// 0.4.9's `completeness_line` (py/surface_policy.py:2257-2281): a cut page's rows, their
+/// total and basis, and the larger page or why none exists.
+fn completeness_line(r: &Results, s: &Style, exhaustible: bool) -> String {
+    let exact = r.total_basis == "exact";
+    let unit = if s.chats || s.semantic {
+        "chat"
+    } else {
+        "matching row"
+    };
+    let tool = match r.tool_rows {
+        n if n == 0 || !exact || r.tools_excluded => String::new(),
+        n if unit.contains("row") => format!(" ({n} of them in tool output)"),
+        1 => " (1 matching row is tool output)".into(),
+        n => format!(" ({n} matching rows are tool output)"),
+    };
+    let basis = match (exact, exhaustible && !r.tools_excluded) {
+        (true, _) => "",
+        (false, true) => " (a floor, not the total; -c counts exactly)",
+        (false, false) => " (a floor, not the total)",
+    };
+    let tail = match (&s.larger_argv, exhaustible) {
+        (Some(argv), _) => format!(" · larger page: {}", surface::shell(argv)),
+        (None, false) => format!(" · {NO_EXHAUSTIVE_FORM}"),
+        (None, true) => String::new(),
+    };
+    format!(
+        "showing {} of {}{} {unit}{}{tool}{basis}{tail}",
+        r.hits.len(),
+        r.total,
+        if exact { "" } else { "+" },
+        if r.total == 1 { "" } else { "s" }
+    )
 }
 #[cfg(test)]
 mod tests {
@@ -485,6 +606,125 @@ mod tests {
             ..Hit::default()
         };
         assert!(compact_line(&hit, &Marks::new("", &Style::default())).contains("meaning match"));
+    }
+    // Expected lines are agrep 0.4.9's `-s "how do we rotate secret credentials" --json` on a
+    // six-chat fixture with 24 embedded rows, without the keys PORTING.md lists as not
+    // carried; `now` reproduces that run's scores.
+    #[test]
+    fn meaning_search_json_matches_0_4_9() {
+        let row = |tail: &str, project: &str, ts: i64, cosine: f64, topic: &str, digest: &str| {
+            let session = format!("01960000-0000-7000-8000-00000000{tail}");
+            Hit {
+                handle: format!("@{session}:0.{digest}"),
+                session,
+                agent: "pi".into(),
+                project: project.into(),
+                model: "pi/sonnet-5".into(),
+                model_source: "explicit".into(),
+                who: "agent".into(),
+                ts,
+                score: cosine,
+                matched: "semantic".into(),
+                snippet: format!(
+                    "Here is the procedure for {topic}: the operator checks the inventory, \
+                     updates the secret store, restarts the affected services and records \
+                     the change."
+                ),
+                ..Hit::default()
+            }
+        };
+        let mut r = Results::default();
+        r.hits = vec![
+            row(
+                "f000",
+                "/work/sec0",
+                1792058906000,
+                0.88186553,
+                "rotating the release signing keys",
+                "cb01",
+            ),
+            row(
+                "f002",
+                "/work/sec2",
+                1792231706000,
+                0.86953912,
+                "replacing the deploy credentials in the vault",
+                "f529",
+            ),
+            row(
+                "f005",
+                "/work/sec5",
+                1792490906000,
+                0.84503287,
+                "revoking leaked ssh keys",
+                "689b",
+            ),
+            row(
+                "f003",
+                "/work/sec3",
+                1792318106000,
+                0.83576804,
+                "resetting the database passwords",
+                "883d",
+            ),
+        ];
+        r.total = 4;
+        r.total_basis = "exact".into();
+        let s = Style {
+            json: true,
+            semantic: true,
+            session_hits: vec![1; 4],
+            ..Style::default()
+        };
+        let coverage = crate::semantic::Coverage {
+            embedded: 24,
+            total: 24,
+        };
+        let q = "how do we rotate secret credentials";
+        let lines: Vec<Value> = json_lines(&r, q, &s, Some(&coverage), false, 1793786928000)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let full = json!({"complete":true,"fraction":1.0,"indexed":24,"order":"newest-first","pending":0,"total":24});
+        assert_eq!(
+            lines[0],
+            json!({"completeness":{"shown":4,"tool_rows":0,"total":4,"total_basis":"exact","truncated":false,"unit":"chat"},"engine":"semantic:hybrid","filter_coverage":{"checked":true,"empty_dimensions":[]},"freshness":{"checked":true,"failing":false,"state":"no-known-failure"},"kind":"agrep-meta","query":q,"self_exclusion":{"active":false,"reason":"machine-surface"},"semantic":{"complete":true,"coverage":full,"eligible":true,"fallback_recommended":false,"min_score":0.82,"partial":false,"reason":null,"score_kind":"cosine","state":"ready"},"semantic_coverage":full,"semantic_partial":false})
+        );
+        assert_eq!(
+            lines[1],
+            json!({"agent":"pi","concept":"","handle":"@01960000-0000-7000-8000-00000000f000:0.cb01","model":"pi/sonnet-5","model_source":"unknown","project":"/work/sec0","score":0.2972,"score_kind":"cosine","self":false,"sem_score":0.881866,"semantic_source":"message","session":"01960000-0000-7000-8000-00000000f000","session_hits":1,"snippet":"Here is the procedure for rotating the release signing keys: the operator checks the inventory, updates the secret store, restarts the affected services and records the change.","summary":"","ts":1792058906000i64,"turn":0,"who":"agent"})
+        );
+        let scores: Vec<_> = lines[1..]
+            .iter()
+            .map(|v| (v["score"].clone(), v["sem_score"].clone()))
+            .collect();
+        assert_eq!(
+            scores,
+            [
+                (0.2972, 0.881866),
+                (0.3281, 0.869539),
+                (0.3807, 0.845033),
+                (0.3448, 0.835768)
+            ]
+            .map(|(score, sem)| (json!(score), json!(sem)))
+        );
+        // A meaning lane that cleared nothing: 0.4.9's zero-result status.
+        let none = json_lines(
+            &Results::default(),
+            "zebra quantum lighthouse marmalade",
+            &s,
+            Some(&coverage),
+            false,
+            0,
+        )
+        .unwrap();
+        let meta: Value = serde_json::from_str(none.trim()).unwrap();
+        assert_eq!(meta["hits"], json!([]));
+        assert_eq!(
+            meta["semantic"],
+            json!({"complete":true,"coverage":full,"eligible":true,"fallback_recommended":false,"min_score":0.82,"partial":false,"reason":null,"score_kind":"cosine","state":"no-confident-match"})
+        );
     }
     #[test]
     fn compact_meaning_rows_narrow_their_whole_text_around_a_keyword() {
@@ -523,5 +763,36 @@ mod tests {
         assert!(speaker_legend(&style, false).is_none());
         style.json = true;
         assert!(speaker_legend(&style, true).is_none());
+    }
+    // Expected strings follow py/surface_policy.py:2257-2281 for a total the scan stopped
+    // short of, with and without an exhaustive form.
+    #[test]
+    fn cut_page_line_states_a_floor_as_0_4_9() {
+        let mut r = Results::default();
+        r.hits = vec![Hit::default(); 40];
+        r.total = 118;
+        r.total_basis = "floor".into();
+        let s = Style {
+            larger_argv: Some(
+                ["agrep", "--classic", "-n", "80", "--", "deploy"]
+                    .map(String::from)
+                    .to_vec(),
+            ),
+            ..Style::default()
+        };
+        assert_eq!(
+            completeness_line(&r, &s, true),
+            "showing 40 of 118+ matching rows (a floor, not the total; -c counts exactly) · \
+             larger page: agrep --classic -n 80 -- deploy"
+        );
+        let s = Style {
+            semantic: true,
+            ..Style::default()
+        };
+        assert_eq!(
+            completeness_line(&r, &s, false),
+            "showing 40 of 118+ chats (a floor, not the total) · the meaning lane ranks a \
+             bounded candidate set; no invocation returns every semantically related row"
+        );
     }
 }

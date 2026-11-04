@@ -100,6 +100,191 @@ fn fixture_search_golden_modes() {
     assert_eq!(v["hits"].as_array().unwrap().len(), 1);
     assert_eq!(v["hits"][0]["window"].as_array().unwrap().len(), 5);
 }
+// Expected values are agrep 0.4.9's output on a home without tool rows
+// (py/surface_policy.py:843-848, 896-910).
+#[test]
+fn empty_filter_dimensions_are_named_as_0_4_9() {
+    let t = TempDir::new().unwrap();
+    let (h, d) = (t.path().join("h"), t.path().join("d"));
+    let dir = h.join(".pi/agent/sessions/-work-plain");
+    fs::create_dir_all(&dir).unwrap();
+    let id = "01970000-0000-7000-8000-000000000001";
+    let lines = [
+        serde_json::json!({"type":"session","id":id,"version":3,"cwd":"/work/plain","timestamp":"2026-01-02T03:04:05.000Z"}),
+        serde_json::json!({"type":"message","id":"u1","parentId":null,"timestamp":"2026-01-02T03:04:06.000Z","message":{"role":"user","content":[{"type":"text","text":"why did the retry backoff cap"}]}}),
+        serde_json::json!({"type":"message","id":"a1","parentId":"u1","timestamp":"2026-01-02T03:04:07.000Z","message":{"role":"assistant","content":[{"type":"text","text":"the retry cap is 30s"}]}}),
+    ];
+    fs::write(
+        dir.join(format!("2026-01-02T03-04-05-000Z_{id}.jsonl")),
+        lines.iter().map(|l| format!("{l}\n")).collect::<String>(),
+    )
+    .unwrap();
+    ok(cli(&h, &d, &["index"], &[]));
+    let json = cli(&h, &d, &["retry", "--who", "tool", "--json"], &[]);
+    assert_eq!(json.status.code(), Some(1));
+    assert_eq!(
+        values(&json)[0]["filter_coverage"]["empty_dimensions"],
+        serde_json::json!([{"flag":"--who","dimension":"who","value":"tool","indexed_values":2,
+            "known":["agent","user"],"known_complete":true}])
+    );
+    let stderr = |args: &[&str]| String::from_utf8(cli(&h, &d, args, &[]).stderr).unwrap();
+    assert_eq!(
+        stderr(&["retry", "--who", "tool"]),
+        "--who tool isn't in the index - indexed speakers: agent, user\n"
+    );
+    assert_eq!(
+        stderr(&["retry", "--project", "absent"]),
+        "--project absent isn't in the index - indexed projects: /work/plain\n"
+    );
+    assert_eq!(
+        stderr(&["recall", "retry", "--who", "tool"]),
+        "no hits across 1 indexed session.\n--who tool isn't in the index - indexed speakers: agent, user\n"
+    );
+}
+// Expected values are agrep 0.4.9's `summary --since 2025-01-01` output over the pi, claude
+// and codex fixtures (py/summary.py:2099-2404).
+#[test]
+fn summary_briefs_families_as_0_4_9() {
+    let t = TempDir::new().unwrap();
+    let (h, d) = (t.path().join("h"), t.path().join("d"));
+    for name in ["pi", "claude", "codex"] {
+        copy(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/{name}/home")),
+            &h,
+        );
+    }
+    ok(cli(&h, &d, &["index"], &[]));
+    let utc = [("TZ", "UTC")];
+    let rows = values(&ok(cli(
+        &h,
+        &d,
+        &["summary", "--since", "2025-01-01", "--json"],
+        &utc,
+    )));
+    let meta = &rows[0];
+    assert_eq!(meta["mode"], "briefing");
+    assert_eq!(
+        (meta["chats"].as_u64(), meta["side_chats"].as_u64()),
+        (Some(9), Some(3))
+    );
+    assert_eq!(meta["totals_exact"], true);
+    assert_eq!(meta["events_unavailable_chats"], 0);
+    assert_eq!(meta["window"]["until_ts"], Value::Null);
+    assert!(meta.get("total_estimated_active_ms").is_none());
+    // `NAME (UTC+HH:MM)`; under TZ=UTC 0.4.9 printed `UTC (UTC+00:00)`.
+    let zone = meta["timezone"].as_str().unwrap();
+    let offset = &zone[zone.rfind(" (UTC").unwrap() + 5..];
+    assert!(offset.len() == 7 && offset.ends_with(')') && offset.as_bytes()[3] == b':');
+    let beta = &rows[1];
+    assert_eq!(beta["project"], "beta");
+    assert_eq!(
+        beta["project_labels"],
+        serde_json::json!(["/work/beta", "beta"])
+    );
+    assert!(beta["last_age"].is_string());
+    let worked = &beta["worked_on"];
+    assert_eq!(
+        worked[0]["latest_handle"],
+        "@01940000-0000-7000-8000-000000000003:0.03a3"
+    );
+    assert_eq!(worked[0]["side_chats"], 1);
+    assert_eq!(worked[1]["parent"], "01990003-0001-7000-8000-000000000001");
+    assert_eq!(worked[1]["parent_indexed"], false);
+    assert_eq!(worked[2]["session_handle"], "@22222222");
+    assert_eq!(worked[2]["latest_handle"], "@22222222:1.10d4");
+    let open = &beta["open"][0];
+    assert_eq!(
+        open["signals"],
+        serde_json::json!(["side chat has no captured reply to its last turn"])
+    );
+    assert!(open.get("caveats").is_none());
+    let text = ok(cli(&h, &d, &["summary", "--since", "2025-01-01"], &utc));
+    let out = String::from_utf8(text.stdout).unwrap();
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(
+        lines[0].starts_with("beta  ·  estimated active time 3m  ·  3 chats  ·  5 turns  ·  last ")
+    );
+    assert_eq!(lines[1], "  worked on:");
+    assert!(lines[2].starts_with("    @01940000-0000-7000-8000-000000000003 pi "));
+    assert!(lines[2].ends_with(" 1t (+1 side)  fork question about the omp panel · agrep around @01940000-0000-7000-8000-000000000003:0.03a3"));
+    assert!(lines[3].contains(" 2t [side chat; parent not indexed]  [subagent task]"));
+    assert_eq!(lines[5], "  open:");
+    assert_eq!(lines[6], "    MEDIUM agent_work_incomplete @01940000-0000-7000-8000-000000000004:0.d74c  [side chat]  side chat has no captured reply to its last turn");
+    assert_eq!(
+        String::from_utf8(text.stderr).unwrap(),
+        "4 projects, 9 chats since 2025-01-01, most active first · estimated active time with a 20m idle cap, side chats folded into their family\n"
+    );
+    let time = ok(cli(
+        &h,
+        &d,
+        &["summary", "time", "--since", "2025-01-01"],
+        &utc,
+    ));
+    let footer = String::from_utf8(time.stderr).unwrap();
+    assert!(footer.starts_with(
+        "estimated active time for 9 chats since 2025-01-01, idle cap 20m, local time "
+    ));
+    assert!(footer.ends_with(" · not elapsed span, not billable\n"));
+    assert!(String::from_utf8(time.stdout)
+        .unwrap()
+        .starts_with("day         project      time  chats\n"));
+}
+// Expected values are agrep 0.4.9's `chats` output on this fixture (py/search.py:8862-8912,
+// 8970-8987).
+#[test]
+fn chats_json_names_chats_by_shortest_prefix_as_0_4_9() {
+    let (_t, h, d) = pi();
+    let rows = values(&ok(cli(&h, &d, &["chats", "-n", "2", "--json"], &[])));
+    assert_eq!(
+        rows[0]["completeness"],
+        serde_json::json!({"shown":2,"total":4,"total_basis":"exact","unit":"matching chat",
+            "truncated":true,"more_command":"agrep chats --json -n 80"})
+    );
+    assert_eq!(
+        rows[0]["filter_coverage"],
+        serde_json::json!({"checked":true,"empty_dimensions":[]})
+    );
+    assert!(rows[0].get("engine").is_none() && rows[0].get("filters").is_none());
+    assert_eq!(rows[1]["session_handle"], "@01950000");
+    assert_eq!(rows[1]["latest_handle"], "@01950000:1.2e22");
+    assert!(rows[1].get("self").is_none());
+    assert_eq!(
+        rows[2]["session_handle"],
+        "@01940000-0000-7000-8000-000000000003"
+    );
+    let text = ok(cli(&h, &d, &["chats", "-n", "2"], &[]));
+    assert!(String::from_utf8_lossy(&text.stderr).starts_with(
+        "showing 2 of 4 matching chats, newest first (side chats hidden; --side shows them) · larger page: agrep chats -n 80\n"
+    ));
+    let content = values(&ok(cli(&h, &d, &["chats", "retry", "--json"], &[])));
+    assert_eq!(content[1]["match_handle"], "@01930000:2.18ba");
+    assert!(content[1].get("matched").is_none());
+    let absent = cli(&h, &d, &["chats", "--project", "absent", "--json"], &[]);
+    assert_eq!(absent.status.code(), Some(1));
+    assert_eq!(
+        values(&absent)[0]["filter_coverage"]["empty_dimensions"][0]["known"],
+        serde_json::json!([
+            "/work/alpha",
+            "/work/beta",
+            "/work/legacy",
+            "/work/upstream"
+        ])
+    );
+    // Full ids still resolve wherever a prefix does.
+    let full = values(&ok(cli(
+        &h,
+        &d,
+        &["chats", "01950000-0000-7000-8000-000000000005", "--json"],
+        &[],
+    )));
+    assert_eq!(full[1]["session_handle"], "@01950000");
+    ok(cli(
+        &h,
+        &d,
+        &["around", "@01950000-0000-7000-8000-000000000005:1.2e22"],
+        &[],
+    ));
+}
 #[test]
 fn handle_rescue_clamp_and_tool_identity() {
     let (_t, h, d) = pi();
@@ -136,9 +321,11 @@ fn handle_rescue_clamp_and_tool_identity() {
     )
     .unwrap();
     let o = ok(cli(&h, &d, &["around", handle, "--no-auto"], &[]));
-    assert!(String::from_utf8(o.stderr)
-        .unwrap()
-        .contains("content moved: turn 0 → 3"));
+    assert_eq!(
+        String::from_utf8(o.stderr).unwrap(),
+        "handle digest matches turn 3, not turn 0 - either the session was renumbered since \
+         the handle was minted, or the digest is wrong; verify the content before citing it\n"
+    );
     let rows = values(&ok(cli(
         &h,
         &d,
@@ -408,6 +595,42 @@ fn chats_listing_and_no_auto_absence_match_0_4_9() {
         "recall: no confident match in 5 past conversations\n"
     );
     assert_eq!(String::from_utf8(o.stderr).unwrap(), format!("{stale}\n"));
+}
+// Expected output is agrep 0.4.9's on the pi fixture: --no-auto says the history may be
+// stale on every surface that answered, and JSON carries the same story.
+#[test]
+fn no_auto_reads_with_results_say_history_may_be_stale_as_0_4_9() {
+    let (_t, h, d) = pi();
+    let stale = "history may be stale: automatic freshness checks are disabled by --no-auto\n";
+    for args in [
+        &["retry", "--no-auto"][..],
+        &["retry", "--no-auto", "-c"],
+        &["recall", "retry", "--no-auto"],
+        &["recall", "retry", "--no-auto", "--probe"],
+        &["pack", "retry", "jitter", "--no-auto"],
+    ] {
+        let o = ok(cli(&h, &d, args, &[]));
+        assert_eq!(String::from_utf8(o.stderr).unwrap(), stale, "{args:?}");
+    }
+    let o = ok(cli(&h, &d, &["chats", "--no-auto"], &[]));
+    assert_eq!(
+        String::from_utf8(o.stderr).unwrap(),
+        format!(
+            "showing 4 of 4 matching chats, newest first (side chats hidden; --side shows them)\n\
+             {stale}"
+        )
+    );
+    let expected = serde_json::json!({"state":"degraded","failing":true,"may_be_stale":true,
+        "code":"search-index-stale",
+        "reason":"automatic freshness checks are disabled by --no-auto","checked":false});
+    for args in [
+        &["retry", "--no-auto", "--json"][..],
+        &["recall", "retry", "--no-auto", "--json"],
+        &["chats", "--no-auto", "--json"],
+    ] {
+        let o = ok(cli(&h, &d, args, &[]));
+        assert_eq!(values(&o)[0]["freshness"], expected, "{args:?}");
+    }
 }
 // Expected text is agrep 0.4.9's on this fixture: the empty-search line counts one
 // message per user-side row and names its matcher, chats lists short handles and
@@ -1002,7 +1225,20 @@ fn recall_direct_handle_preserves_its_role_and_overrides_filters() {
     ));
     let v: Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(v["hits"][0]["handle"], "@01930000:0.e5c8");
-    assert_eq!(v["filter_override"]["reason"], "direct-handle");
+    // Expected values are agrep 0.4.9's output for the same command.
+    let note = "explicit result handle wins: --chat not applied (--chat would have excluded it)";
+    assert_eq!(
+        v["filter_coverage"],
+        serde_json::json!({"empty_dimensions":[],"checked":false,"reason":note})
+    );
+    assert!(o.stderr.is_empty());
+    let o = ok(cli(
+        &h,
+        &d,
+        &["recall", "@01930000:0.e5c8", "--chat", "missing-chat"],
+        &[],
+    ));
+    assert_eq!(String::from_utf8(o.stderr).unwrap(), format!("{note}\n"));
     let rows = values(&ok(cli(
         &h,
         &d,
@@ -1014,6 +1250,106 @@ fn recall_direct_handle_preserves_its_role_and_overrides_filters() {
     let body = String::from_utf8(o.stdout).unwrap();
     assert!(body.contains(handle));
     assert!(body.contains("Duration::from_secs(30)"));
+}
+
+// Expected output is agrep 0.4.9's for the same commands on the pi fixture.
+#[test]
+fn recall_handle_hits_and_lane_disclosures_match_0_4_9() {
+    let (_t, h, d) = pi();
+    let moved = "handle digest matches turn 0, not turn 1 - either the session was renumbered \
+                 since the handle was minted, or the digest is wrong; verify the content before \
+                 citing it";
+    let o = ok(cli(&h, &d, &["recall", "@01930000:1.cd22", "--json"], &[]));
+    assert_eq!(String::from_utf8(o.stderr).unwrap(), format!("{moved}\n"));
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(
+        v["served"],
+        serde_json::json!({"served_as_requested":false,"divergences":[
+            {"kind":"content_moved","requested":1,"served":0,"note":moved}]})
+    );
+    assert_eq!(
+        (&v["hits"][0]["turn"], &v["hits"][0]["score"]),
+        (&0.into(), &1.0.into())
+    );
+    let o = ok(cli(&h, &d, &["recall", "@01930000:1.cd22"], &[]));
+    assert_eq!(String::from_utf8(o.stderr).unwrap(), format!("{moved}\n"));
+    let o = ok(cli(
+        &h,
+        &d,
+        &["recall", "@01930000:0.cd22", "--project", "/work/beta"],
+        &[],
+    ));
+    assert_eq!(
+        String::from_utf8(o.stderr).unwrap(),
+        "explicit result handle wins: --project not applied (--project would have excluded it)\n"
+    );
+    let pack = [
+        "pack",
+        "retry",
+        "jitter",
+        "backoff",
+        "--hits",
+        "1",
+        "--lexical",
+    ];
+    let o = ok(cli(&h, &d, &pack, &[]));
+    assert_eq!(
+        String::from_utf8(o.stderr).unwrap(),
+        "--hits 1 raised to 3: pack reserves one slot per query\n"
+    );
+    let o = ok(cli(&h, &d, &[&pack[..], &["--json"]].concat(), &[]));
+    assert!(o.stderr.is_empty());
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(
+        v["hits_floored"],
+        serde_json::json!({"requested":1,"raised_to":3})
+    );
+    let o = ok(cli(
+        &h,
+        &d,
+        &["recall", "retry backoff", "--who", "tool", "--json"],
+        &[],
+    ));
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(
+        v["semantic_status"],
+        serde_json::json!({"state":"not-run","reason":"tool-lane"})
+    );
+}
+
+// Expected output is agrep 0.4.9's for the same commands on the pi fixture.
+#[test]
+fn cut_search_pages_name_their_larger_page_as_0_4_9() {
+    let (_t, h, d) = pi();
+    let args = [
+        "backoff",
+        "-n",
+        "1",
+        "--project",
+        "/work/alpha",
+        "--sort",
+        "time",
+    ];
+    let o = ok(cli(&h, &d, &args, &[]));
+    assert_eq!(
+        String::from_utf8(o.stderr).unwrap(),
+        "showing 1 of 3 matching rows (1 of them in tool output) · larger page: agrep \
+         --project=/work/alpha --sort=time --classic -n 80 -- backoff\n"
+    );
+    let o = ok(cli(&h, &d, &[&args[..], &["--json"]].concat(), &[]));
+    let meta = &values(&o)[0]["completeness"];
+    assert_eq!(
+        (
+            &meta["more_command"],
+            &meta["more_command_kind"],
+            &meta["full_command"]
+        ),
+        (
+            &"agrep --project=/work/alpha --sort=time --json -n 80 -- backoff".into(),
+            &"broader-rerun".into(),
+            &"agrep --project=/work/alpha --sort=time --json -n 0 -- backoff".into()
+        )
+    );
 }
 
 #[test]
@@ -1060,4 +1396,93 @@ fn a_child_caller_does_not_hide_a_later_sibling() {
     .unwrap();
     assert!(caller.members.iter().any(|s| s == "later-sibling"));
     assert!(!caller.live_members.iter().any(|s| s == "later-sibling"));
+}
+/// Six pi chats, `days` old, asking how to handle one secret-rotation topic each.
+fn rotation_chats(home: &Path) {
+    let now = chrono::Utc::now().timestamp();
+    let topics = [
+        "rotating the release signing keys",
+        "renewing the TLS certificates for the gateway",
+        "replacing the deploy credentials in the vault",
+        "resetting the database passwords",
+        "expiring the old api tokens",
+        "revoking leaked ssh keys",
+    ];
+    for (i, topic) in topics.iter().enumerate() {
+        let t0 = now - (20 - i as i64) * 86_400;
+        let at = |s: i64| {
+            chrono::DateTime::from_timestamp(t0 + s, 0)
+                .unwrap()
+                .format("%Y-%m-%dT%H:%M:%S.000Z")
+                .to_string()
+        };
+        let dir = home.join(format!(".pi/agent/sessions/-work-sec{i}"));
+        fs::create_dir_all(&dir).unwrap();
+        let id = format!("01960000-0000-7000-8000-00000000f{i:03}");
+        let mut lines = vec![
+            serde_json::json!({"type":"session","id":id,"version":3,"cwd":format!("/work/sec{i}"),"timestamp":at(0)}),
+        ];
+        let turns = [
+            (format!("how do we handle {topic}?"), format!("Here is the procedure for {topic}: the operator checks the inventory, updates the secret store, restarts the affected services and records the change.")),
+            ("and the retry backoff for that job?".to_string(), "cap the retry backoff at 30s".to_string()),
+        ];
+        let mut parent = serde_json::Value::Null;
+        for (n, (user, reply)) in turns.iter().enumerate() {
+            let s = 2 * n as i64;
+            lines.push(serde_json::json!({"type":"message","id":format!("u{n}"),"parentId":parent,"timestamp":at(s + 1),"message":{"role":"user","content":[{"type":"text","text":user}],"timestamp":at(s + 1)}}));
+            lines.push(serde_json::json!({"type":"message","id":format!("a{n}"),"parentId":format!("u{n}"),"timestamp":at(s + 2),"message":{"role":"assistant","model":"pi/sonnet-5","provider":"anthropic","stopReason":"end_turn","timestamp":at(s + 2),"content":[{"type":"text","text":reply}]}}));
+            parent = serde_json::json!(format!("a{n}"));
+        }
+        let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        fs::write(
+            dir.join(format!("{}_{id}.jsonl", at(0).replace([':', '.'], "-"))),
+            body,
+        )
+        .unwrap();
+    }
+}
+// Expected rows are agrep 0.4.9's keyword-only `recall --json` on this fixture: content rows
+// come from the three rarest words, a row holding only "keys" never qualifies, and each
+// scores by its share of the query's IDF weight (py/corpusdb.py:4863-4911,
+// py/search.py:1852-1876). Scores allow one unit of drift for the seconds the run takes.
+#[test]
+fn recall_content_fallback_admits_and_scores_as_0_4_9() {
+    let t = TempDir::new().unwrap();
+    let (h, d) = (t.path().join("h"), t.path().join("d"));
+    rotation_chats(&h);
+    ok(cli(&h, &d, &["index"], &[]));
+    for (query, expected) in [
+        (
+            "rotating signing keys and TLS certificates",
+            vec![("f000", 0.2167), ("f001", 0.1627)],
+        ),
+        (
+            "how do we rotate secret credentials",
+            vec![
+                ("f002", 0.1752),
+                ("f005", 0.082),
+                ("f004", 0.0781),
+                ("f003", 0.0743),
+                ("f001", 0.0673),
+                ("f000", 0.064),
+            ],
+        ),
+    ] {
+        let out = ok(cli(&h, &d, &["recall", query, "--json"], &[]));
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let hits = v["hits"].as_array().unwrap();
+        let got: Vec<_> = hits
+            .iter()
+            .map(|h| {
+                let session = h["session"].as_str().unwrap();
+                (&session[session.len() - 4..], h["score"].as_f64().unwrap())
+            })
+            .collect();
+        assert_eq!(got.len(), expected.len(), "{query}: {got:?}");
+        for ((session, score), (want, want_score)) in got.iter().zip(&expected) {
+            assert_eq!(session, want, "{query}: {got:?}");
+            assert!((score - want_score).abs() <= 1.0001e-4, "{query}: {got:?}");
+        }
+        assert!(hits.iter().all(|h| h["matched"] == "content-terms"));
+    }
 }

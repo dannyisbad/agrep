@@ -557,7 +557,7 @@ fn run(cli: Cli) -> Result<i32> {
             root.validate(true)?;
             let _foreground = root.foreground()?;
             let result = store::reindex(&root)?;
-            agrep_core::surface::line(&agrep_core::surface::refresh_json(&result)?)?;
+            let after = std::time::Instant::now();
             if full {
                 semantic::reset(&root)?;
             }
@@ -567,7 +567,7 @@ fn run(cli: Cli) -> Result<i32> {
             }
             semantic::initialize(&root)?;
             cmd::work::after_index(&root, false)?;
-            Ok(0)
+            cmd::index::statistics(&result, after)
         }
         None | Some(Command::Status { .. }) => cmd::status::run(
             matches!(cli.command, Some(Command::Status { json: true })),

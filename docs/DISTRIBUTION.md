@@ -116,43 +116,12 @@ A 0.5 sample taken alone in a refresh case also appends the turn 0.4.9's sample
 would have appended. 0.4.9 catches up on appended turns, untimed, before it
 resumes and before the next case.
 
-### CI wall time
-
-Estimated from the committed matched runs (`docs/measurements/matched-*.json`,
-an M2 Max at load averages 13–228) by replaying this schedule over their
-recorded samples. Without early stops the dense comparison took 83 minutes;
-with them it needs about 41: 0.4.9 takes 5 samples per separated case instead
-of 20. The dense first index is 16 of those minutes. While 0.5 loses it, both
-versions build three times; once 0.5 wins it, 0.4.9 builds twice. A dense run
-of the new harness (`matched-dense-early-stop.json`: the first index,
-`old_dense` and `old_dense_phrase`) took 25 minutes for those three cases, where
-the replay predicts 32. Mixed samples fall from 10 to 4 minutes; semantic
-samples stay under a minute.
-
-In an earlier hosted run of this workflow the format, clippy and test step took
-3 minutes on macos-14, 7 on macos-15-intel and 13 on both Windows runners (no
-Linux log was kept). A cold release build of the jobs' targets took 5.5 minutes
-(`dense`) and 7 minutes (`test`) on the M2 Max. Hosted runners are unloaded but
-have 3–4 slower cores. The estimate assumes 0.7–1.5 times the M2 Max time for
-performance cases on Linux and macOS. On Windows, where the Rust tests'
-process-heavy suites ran 4–19 times slower, it doubles the release build, the
-first index and the mixed cases.
-
-| job | Linux, macOS | Windows |
-|---|---|---|
-| `test`: tests, release build, mixed, semantic, owner check | 25–40 min | 45–60 min |
-| `dense`: release build, dense comparison | 40–75 min | 70–90 min |
-
-A dense first index that 0.5 wins takes about 6 minutes less (12 on Windows).
-The first hosted run replaces these estimates: its evidence artifacts hold
-every sample with its time and load average.
-
-`docs/perf-budgets.json` keeps the SPEC §9 numbers as documented targets with
-their reasons. `examples/bench --check` (see CONTRIBUTING.md) and
-`bench/semantic_owner.py` verify results and print measured-vs-target lines;
-missing or wrong results fail them, a missed target does not. `semantic_eval
-cpu` remains the blocking recall@k quality gate. Current engine limitations are
-recorded in [ENGINE.md](ENGINE.md); gate failures remain failures.
+`docs/perf-budgets.json` keeps the performance targets with their reasons.
+`examples/bench --check` (see CONTRIBUTING.md) and `bench/semantic_owner.py`
+verify results and print measured-vs-target lines; missing or wrong results
+fail them, a missed target does not. `semantic_eval cpu` remains the blocking
+recall@k quality gate (see [SEMANTIC.md](SEMANTIC.md)). Engine limits are listed
+in [ENGINE.md](ENGINE.md); gate failures remain failures.
 
 ## Packages
 
@@ -205,9 +174,6 @@ with the local device name, and pass: `persistent_workspace_reuses_buffers_and_r
 `fused_geglu_preserves_candle_f16_values`, and `residual_norm_matches_metal`.
 A passing run without four GPU lines does not satisfy this release check.
 The same run must pass the portable device-selection and CPU-fallback tests.
-Local validation on 2026-11-02: Apple M2 Max; all four GPU tests printed that
-device name and passed, and the semantic-filtered run passed all 33 tests with
-zero failures or ignored tests.
 The selector requires Apple7-or-newer features (SIMD reductions and matrix
 multiply, nonuniform dispatch, 64-bit integer math), unified memory, sufficient
 threadgroup limits, and compatible compiled pipelines, including 32-lane attention.
@@ -236,5 +202,5 @@ require regenerating and reviewing the notice.
 
 After combining dependency changes, regenerate `THIRD_PARTY_LICENSES.txt` with
 `python bench/third_party_licenses.py --write`, review the diff, then run `--check`.
-History privacy must be cleared by the integrator before any public push; the
-working-tree fixes do not rewrite old commits.
+CI's `privacy-history` job scans every ref's history with
+`python bench/validate_repo_privacy.py --index --all-refs`.

@@ -1282,7 +1282,19 @@ pub(super) fn json(page: &Page, envelope: &mut Value) -> Result<String> {
             rows.push(json!({"kind":"events_omitted","session":w.session,"project":w.project,"n":cut,"expand":window_command(b, turns)}));
         }
         let h = &b.hit;
-        let frame = json!({"session":w.session,"turn":w.center,"ts":h.ts,"agent":w.agent,"project":w.project,"score":h.score,"sem_score":if h.matched=="semantic"{Some(h.score)}else{None},"score_kind":null,"matched":h.matched,"handle":h.handle,"self":h.self_marker,"window":[]});
+        // 0.4.9 labeled a meaning hit's lane and cosine, rounded to six places, and scored
+        // it with the keyword formula (py/recall.py:2373, 2394; py/ask.py:2491;
+        // py/search.py:1938-1942).
+        let meaning = h.matched == "semantic";
+        let score = if meaning {
+            agrep_core::query::meaning_score(h, chrono::Utc::now().timestamp_millis())
+        } else {
+            h.score
+        };
+        let mut frame = json!({"session":w.session,"turn":w.center,"ts":h.ts,"agent":w.agent,"project":w.project,"score":score,"sem_score":meaning.then(|| agrep_core::window::round6(h.score)),"score_kind":meaning.then_some("cosine"),"matched":h.matched,"handle":h.handle,"self":h.self_marker,"window":[]});
+        if meaning {
+            frame["lane"] = json!("semantic");
+        }
         let rows = rows
             .into_iter()
             .map(|value| {

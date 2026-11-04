@@ -87,6 +87,10 @@ pub struct Hit {
     pub self_marker: bool,
     #[serde(default, rename = "meta", skip_serializing_if = "is_false")]
     pub meta_marker: bool,
+    /// 0.4.9's `_semantic_row_weak` for a meaning row: a cosine below the strong band, less
+    /// than half the query's terms, or a query no word of which the scope holds.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sem_weak: bool,
     #[serde(skip)]
     pub rowid: i64,
     #[serde(skip)]
@@ -172,6 +176,15 @@ fn score(strength: f64, rec: f64, who: &str, factor: f64) -> f64 {
 pub fn recency(ts: i64, now: i64) -> f64 {
     let days = (now - ts).max(0) as f64 / 86_400_000.;
     0.5f64.powf(days / 14.)
+}
+/// The score 0.4.9 reported for a meaning row: its keyword formula with a full match
+/// (py/search.py:1817-1876, 1938-1942), while the cosine ranks the row.
+pub fn meaning_score(h: &Hit, now: i64) -> f64 {
+    let rec = recency(h.ts, now).max(if h.who == "user" { 0.35 } else { 0. });
+    let meta =
+        matches!(h.who.as_str(), "harness" | "synthetic") || (h.who == "subagent" && h.turn == 0);
+    let (w, s) = speaker(&h.who);
+    window::round4(rec * w * s * if meta { 0.45 } else { 1. })
 }
 /// The ranked (rounded) score a row can reach when its raw score is at most `ceiling`.
 /// The margin covers products formed in another order than the score's.
@@ -523,6 +536,9 @@ struct Matcher {
     coverage_term: Option<usize>,
     coverage_excluded: HashSet<usize>,
     minimum_coverage: f64,
+    /// The explicit `--coverage` lane, which scores partial rows by its own formula; the
+    /// content fallback scores them as 0.4.9 did.
+    coverage_lane: bool,
 }
 /// Literals every match of a regular expression begins or ends with, normalized: the
 /// single prefix literal and the single suffix literal, when the expression has them.
@@ -660,6 +676,7 @@ impl Matcher {
             coverage_term: None,
             coverage_excluded: HashSet::new(),
             minimum_coverage: 0.,
+            coverage_lane: false,
         })
     }
     fn order_for(&mut self, c: &Connection, table: &str, cache: &mut PlanCache) -> Result<()> {
@@ -933,6 +950,38 @@ impl Matcher {
                 snippet: snip.text,
             }));
         }
+        // The earliest occurrence of a found term anchors the snippet, as 0.4.9's content
+        // lanes place theirs; they find the literal term, so a spelling variant counts
+        // only for a term found through it alone.
+        let anchor = || {
+            found
+                .iter()
+                .filter_map(|&i| {
+                    let spellings = &self.terms[i];
+                    let at = |v: &String| low.find(v.as_str()).map(|at| (at, at + v.len()));
+                    at(&spellings[0]).or_else(|| spellings[1..].iter().filter_map(at).min())
+                })
+                .min_by_key(|&(at, _)| at)
+                .map(|(at, end)| row.start(at)..row.end(end))
+        };
+        if !self.coverage_lane {
+            // 0.4.9's content lane (py/corpusdb.py:4897-4908, py/search.py:1852-1876): the
+            // row's share of the query's weight, to four places, is its whole match strength,
+            // without a boundary factor.
+            let total = self.idf.iter().sum::<f64>();
+            let coverage = window::round4(found_weight / if total == 0. { 1. } else { total });
+            if cutoff.is_some_and(|c| c.excludes(2, coverage * rec * weight(who))) {
+                return Ok(Some(Scored::bare(2, "unscored")));
+            }
+            let anchor = anchor();
+            return Ok(Some(Scored {
+                tier: 2,
+                score: score(coverage, rec, who, 1.),
+                class: "",
+                snippet: Snip::new(text, anchor.as_slice()).text,
+                span: anchor,
+            }));
+        }
         let coverage = 0.5 * found_weight / self.idf.iter().sum::<f64>().max(1.);
         if cutoff.is_some_and(|c| c.excludes(2, coverage * rec * weight(who))) {
             return Ok(Some(Scored::bare(2, "unscored")));
@@ -951,18 +1000,7 @@ impl Matcher {
             .fold(1., f64::min);
         let tight =
             0.5 + 0.5 * (self.query_chars as f64 / (hi - lo).max(1) as f64).min(1.) * quality_scale;
-        // The earliest occurrence of a found term anchors the snippet, as 0.4.9's content
-        // lanes place theirs; they find the literal term, so a spelling variant counts
-        // only for a term found through it alone.
-        let anchor = found
-            .iter()
-            .filter_map(|&i| {
-                let spellings = &self.terms[i];
-                let at = |v: &String| low.find(v.as_str()).map(|at| (at, at + v.len()));
-                at(&spellings[0]).or_else(|| spellings[1..].iter().filter_map(at).min())
-            })
-            .min_by_key(|&(at, _)| at)
-            .map(|(at, end)| row.start(at)..row.end(end));
+        let anchor = anchor();
         let snip = Snip::new(text, anchor.as_slice());
         Ok(Some(Scored {
             tier: 2,
@@ -971,6 +1009,17 @@ impl Matcher {
             snippet: snip.text,
             span: anchor,
         }))
+    }
+    /// The largest coverage factor a partial row reaches when the terms it holds weigh at
+    /// most `weight`.
+    fn partial_share(&self, weight: f64) -> f64 {
+        let total = self.idf.iter().sum::<f64>();
+        if self.coverage_lane {
+            0.5 * weight / total.max(1.)
+        } else {
+            // Rounding is monotonic, so the rounded share bounds every rounded coverage.
+            window::round4(weight / if total == 0. { 1. } else { total })
+        }
     }
     /// 0.4.9's phrase strength in a snippet: its matches counted, the tightest measured in
     /// snippet characters.
@@ -1747,7 +1796,7 @@ fn block_bounds(
         out.push((
             id,
             if m.partial {
-                rw * (0.5 * possible_weight / m.idf.iter().sum::<f64>().max(1.))
+                rw * m.partial_share(possible_weight)
             } else {
                 phrase_tightness * repetition * rw
             },
@@ -1895,34 +1944,54 @@ fn search_unfiltered(c: &Connection, o: &Options, cache: &mut PlanCache) -> Resu
         search_pass(c, o, false, 0, None, cache, 0)?
     };
     if result.total == 0 && o.content && !o.regex && !o.word && automatic_content(&o.pattern) {
-        let count = content_terms(&o.pattern).len();
-        let mut fallback = None;
-        // Disjoint MaxScore partitions: rare terms first, then rows lacking every
-        // earlier term. The complement's IDF ceiling can rule out common terms.
-        for stage in 0..count {
-            fallback = Some(search_pass(c, o, true, 0, fallback, cache, stage)?);
+        let anchors = content_anchors(&content_terms(&o.pattern));
+        if anchors > 0 {
+            let mut fallback = None;
+            // Disjoint MaxScore partitions: the rarest anchor first, then rows lacking
+            // every earlier one.
+            for stage in 0..anchors {
+                fallback = Some(search_pass(c, o, true, 0, fallback, cache, stage)?);
+            }
+            let mut fallback = fallback.unwrap_or_default();
+            fallback.timings.add(&result.timings);
+            result = fallback;
         }
-        let mut fallback = fallback.unwrap_or_default();
-        fallback.timings.add(&result.timings);
-        result = fallback;
     }
     result.timings.total_ms = started.elapsed().as_secs_f64() * 1000.;
     Ok(result)
 }
-fn content_terms(pattern: &str) -> Vec<Vec<String>> {
+/// 0.4.9's `_content_terms`: the query's tokens without edge punctuation, at least two
+/// characters long and not connectives.
+fn content_words(pattern: &str) -> Vec<String> {
     const STOP:&str="a an and are as at be been but by can could did do does for from had has have how i if in is it its me my not of on or our should so that the their them they this these those to was we were what when where which who why will with would you your whats what's im i'm dont don't isnt isn't didnt didn't";
     boundary_rank::query_tokens(pattern)
         .into_iter()
-        .map(|t| {
-            t.trim_matches(|c: char| c.is_ascii_punctuation())
-                .to_owned()
-        })
+        .map(|t| t.trim_matches(|c: char| c.is_ascii_punctuation()))
         .filter(|t| {
             t.chars().count() >= 2 && !STOP.split_whitespace().any(|s| s == store::normalize(t))
         })
-        .map(|t| boundary_rank::term_variants(&t))
-        .filter(|v| !v.is_empty())
+        .map(boundary_rank::normalize_token)
+        .filter(|t| !t.is_empty())
         .collect()
+}
+/// The content fallback's terms as 0.4.9's content lane read them (py/corpusdb.py:4871):
+/// folded, deduplicated, each matching literally without spelling variants.
+fn content_terms(pattern: &str) -> Vec<Vec<String>> {
+    let mut seen = HashSet::new();
+    content_words(pattern)
+        .into_iter()
+        .filter(|t| seen.insert(t.clone()))
+        .map(|t| vec![t])
+        .collect()
+}
+/// 0.4.9 drew content candidates from the three rarest terms of three or more characters
+/// (py/corpusdb.py:4885-4886).
+fn content_anchors(terms: &[Vec<String>]) -> usize {
+    terms
+        .iter()
+        .filter(|v| v[0].chars().count() >= 3)
+        .count()
+        .min(3)
 }
 fn coverage_terms(pattern: &str) -> Vec<Vec<String>> {
     let mut seen = HashSet::new();
@@ -1936,13 +2005,53 @@ fn automatic_content(pattern: &str) -> bool {
     if !pattern.trim().contains(' ') {
         return false;
     }
-    let terms = content_terms(pattern);
-    !terms.is_empty()
-        && terms.iter().map(|v| v[0].clone()).collect::<Vec<_>>()
+    let words = content_words(pattern);
+    !words.is_empty()
+        && words
             != boundary_rank::query_tokens(pattern)
                 .iter()
                 .map(|s| store::normalize(s))
                 .collect::<Vec<_>>()
+}
+/// 0.4.9's content-lane term weights (py/corpusdb.py:4863-4884): `ln(1 + N / (df + 1))`,
+/// where `N` counts the lane's rows and `df` the rows holding the term; a term under three
+/// characters counts as in every row. Prose rows are counted exactly through the trigram
+/// index; tool rows, when in scope, by their word dictionary's frequency total.
+fn content_idf(
+    c: &Connection,
+    terms: &[Vec<String>],
+    prose_only: bool,
+    cache: &mut PlanCache,
+) -> Result<Vec<f64>> {
+    let count = store::counts(c)?;
+    let prose = count["prose"].as_f64().unwrap_or(0.);
+    let n = if prose_only {
+        prose
+    } else {
+        prose + count["tools"].as_f64().unwrap_or(0.)
+    };
+    let n = if n == 0. { 1. } else { n };
+    terms
+        .iter()
+        .map(|variants| {
+            let term = &variants[0];
+            let df = if term.chars().count() < 3 {
+                n
+            } else {
+                let rows: f64 = c.query_row(
+                    "SELECT count(*) FROM prose_fts WHERE prose_fts MATCH ?",
+                    [format!("\"{}\"", term.replace('"', "\"\""))],
+                    |r| r.get::<_, i64>(0),
+                )? as f64;
+                if prose_only {
+                    rows
+                } else {
+                    (rows + cache.tool_doc(c, term)?.map_or(n, |doc| doc as f64)).min(n)
+                }
+            };
+            Ok((1. + n / (df + 1.)).ln())
+        })
+        .collect()
 }
 /// Explicit IDF-weighted recovery. Presentation renders this separate evidence
 /// lane and keeps the primary search's exit status and machine framing.
@@ -2308,10 +2417,22 @@ fn search_pass(
         }
     }
     let now = chrono::Utc::now().timestamp_millis();
+    let only_tools = o.filters.who.as_deref() == Some("tool");
+    let include_tools = o.tools
+        && o.filters
+            .who
+            .as_deref()
+            .is_none_or(|who| who.split(',').any(|w| w == "tool"))
+        && !o
+            .filters
+            .no_who
+            .as_deref()
+            .is_some_and(|who| who.split(',').any(|w| w == "tool"));
     if partial {
+        m.coverage_lane = cache.coverage_all;
         if let Some(idf) = &cache.coverage_idf {
             m.idf = idf.clone();
-        } else {
+        } else if cache.coverage_all {
             let count = store::counts(c)?;
             let n = count["prose"].as_f64().unwrap_or(0.) + count["tools"].as_f64().unwrap_or(0.);
             m.idf = m
@@ -2347,10 +2468,18 @@ fn search_pass(
                 })
                 .collect();
             cache.coverage_idf = Some(m.idf.clone());
+        } else {
+            m.idf = content_idf(c, &m.terms, !only_tools && !include_tools, cache)?;
+            cache.coverage_idf = Some(m.idf.clone());
         }
         m.minimum_coverage = if cache.coverage_all { 0.55 } else { 0. };
-        let mut order: Vec<_> = (0..m.terms.len()).collect();
+        let mut order: Vec<_> = (0..m.terms.len())
+            .filter(|&i| cache.coverage_all || m.terms[i][0].chars().count() >= 3)
+            .collect();
         order.sort_by(|&a, &b| m.idf[b].total_cmp(&m.idf[a]).then(a.cmp(&b)));
+        if !cache.coverage_all {
+            order.truncate(content_anchors(&m.terms));
+        }
         m.coverage_term = order.get(coverage_stage).copied();
         m.coverage_excluded
             .extend(order.into_iter().take(coverage_stage));
@@ -2368,17 +2497,6 @@ fn search_pass(
 
     let (filter_scope, values) = sql_filters(&o.filters, "p", c)?;
     let scope = format!(" AND p.visible=1{filter_scope}");
-    let only_tools = o.filters.who.as_deref() == Some("tool");
-    let include_tools = o.tools
-        && o.filters
-            .who
-            .as_deref()
-            .is_none_or(|who| who.split(',').any(|w| w == "tool"))
-        && !o
-            .filters
-            .no_who
-            .as_deref()
-            .is_some_and(|who| who.split(',').any(|w| w == "tool"));
     result.tools_excluded = !only_tools && !include_tools;
     let tables = if only_tools {
         vec!["tools"]
@@ -2849,17 +2967,12 @@ fn search_pass(
                             recency(ts, now).max(if who == "user" { 0.35 } else { 0. })
                         };
                     if partial {
-                        if let Some(coverage) = &coverage {
-                            ceiling *= 0.5
-                                * coverage
-                                    .rows
-                                    .get(&r.get::<_, i64>(0)?)
-                                    .copied()
-                                    .unwrap_or_else(|| m.idf.iter().sum::<f64>())
-                                / m.idf.iter().sum::<f64>().max(1.);
-                        } else {
-                            ceiling *= 0.5;
-                        }
+                        let id: i64 = r.get(0)?;
+                        let total = m.idf.iter().sum::<f64>();
+                        let possible = coverage.as_ref().map_or(total, |coverage| {
+                            coverage.rows.get(&id).copied().unwrap_or(total)
+                        });
+                        ceiling *= m.partial_share(possible);
                     }
                     if bounded {
                         ceiling = ceiling.min(bound);
@@ -3018,6 +3131,7 @@ fn search_pass(
                     handle,
                     self_marker,
                     meta_marker: false,
+                    sem_weak: false,
                     rowid: r.get(0)?,
                     tier,
                     span,
@@ -3152,6 +3266,33 @@ mod snippet_tests {
             crate::surface::safe(&snippet, false),
             r"alpha \u001b[31mred\u0007 beta"
         );
+    }
+}
+#[cfg(test)]
+mod meaning_score_tests {
+    use super::{meaning_score, Hit};
+    // 0.4.9's `_score` with a full match: recency halving every 14 days, a user floor of
+    // 0.35, speaker weight times source scale, and 0.45 for stored meta rows
+    // (py/search.py:1218-1222, 1397, 1817-1876). 0.4.9's `recall --json` scored an agent
+    // meaning row 18.001 days old 0.3281.
+    #[test]
+    fn meaning_rows_score_by_the_keyword_formula_as_0_4_9() {
+        let day = 86_400_000;
+        let now = 1_800_000_000_000;
+        let row = |who: &str, turn: i64, age: f64| Hit {
+            who: who.into(),
+            turn,
+            ts: now - (age * day as f64) as i64,
+            score: 0.9,
+            matched: "semantic".into(),
+            ..Hit::default()
+        };
+        assert_eq!(meaning_score(&row("agent", 1, 14.), now), 0.4);
+        assert_eq!(meaning_score(&row("agent", 1, 18.001), now), 0.3281);
+        assert_eq!(meaning_score(&row("user", 1, 70.), now), 0.35);
+        assert_eq!(meaning_score(&row("tool", 1, 0.), now), 0.22);
+        assert_eq!(meaning_score(&row("subagent", 0, 0.), now), 0.3251);
+        assert_eq!(meaning_score(&row("harness", 3, 0.), now), 0.135);
     }
 }
 #[cfg(test)]

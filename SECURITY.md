@@ -33,4 +33,4 @@ returns the available keyword results.
 The npm launcher verifies the selected binary's SHA-256 checksum and fails closed
 when the checksum is missing or wrong. There is no unverified-binary override.
 Native resume refuses unsafe session identifiers and relative working directories.
-Archive restore destinations remain restricted and checked for path traversal.
+Archive restore destinations are restricted and checked for path traversal.

@@ -1,4 +1,4 @@
-//! Correctness of a complete benchmark report. Latencies are printed against the SPEC §9
+//! Correctness of a complete benchmark report. Latencies are printed against the design
 //! targets in docs/perf-budgets.json and never fail it: speed is gated by the matched
 //! comparison with agrep 0.4.9 (examples/matched.rs).
 use serde_json::Value;
