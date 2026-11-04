@@ -1,4 +1,5 @@
-//! F16 local/global attention with register tiles and no score/mask matrix.
+//! The arena's F16 local/global attention shader as a Candle op, for tests: register
+//! tiles and no score/mask matrix.
 use candle_core::{Device, Result, Tensor};
 use std::sync::Arc;
 

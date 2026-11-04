@@ -1,3 +1,9 @@
+#[cfg(unix)]
+#[path = "../examples/support/exit.rs"]
+mod exit;
+#[cfg(unix)]
+#[path = "support/job.rs"]
+mod job;
 mod support;
 use agrep_core::{data::DataRoot, store};
 use rusqlite::params;
@@ -237,6 +243,7 @@ fn audit_recounts_and_strict_gaps_fail() {
     let t = fixture();
     let audit = records(&ok(run(&t, &["audit", "--full", "--strict", "--json"])));
     assert_eq!(audit[0]["gaps"], json!(0));
+    assert_eq!(audit[0]["status"], "clean");
     let root = DataRoot(t.path().join("data"));
     let c = store::writer(&root).unwrap();
     c.execute(
@@ -245,17 +252,101 @@ fn audit_recounts_and_strict_gaps_fail() {
     )
     .unwrap();
     drop(c);
+    // py/audit.py:2515-2524: gaps are an evidence warning (exit 1, "warning"), and
+    // --strict makes them errors (exit 2, "error").
     let out = run(&t, &["audit", "--full", "--strict", "--json"]);
+    assert_eq!(out.status.code(), Some(2));
+    let strict = records(&out);
+    assert_eq!(
+        (&strict[0]["status"], &strict[0]["exit_code"]),
+        (&json!("error"), &json!(2))
+    );
+    assert!(!strict[0]["gap_details"].as_array().unwrap().is_empty());
+    let out = run(&t, &["audit", "--full", "--json"]);
     assert_eq!(out.status.code(), Some(1));
-    assert!(!records(&out)[0]["gap_details"]
-        .as_array()
-        .unwrap()
-        .is_empty());
-    ok(run(&t, &["audit", "--full", "--json"]));
+    let warning = records(&out);
+    assert_eq!(
+        (&warning[0]["status"], &warning[0]["exit_code"]),
+        (&json!("warning"), &json!(1))
+    );
     assert_eq!(
         run(&t, &["audit", "--agent", "unknown"]).status.code(),
         Some(2)
     );
+}
+#[test]
+fn audit_warns_about_a_source_written_since_the_refresh() {
+    // 0.4.9 (agrep audit on a pi chat appended after `agrep index`): exit 1 "warning", and
+    // 2 "error" under --strict.
+    let t = fixture();
+    assert_eq!(run(&t, &["audit"]).status.code(), Some(0));
+    let source = t
+        .path()
+        .join("home/.pi/agent/sessions/alpha/2026-01-02_root-alpha-0001.jsonl");
+    let mut text = fs::read_to_string(&source).unwrap();
+    text.push_str(&format!("{}\n", json!({"type":"message","id":"u9","parentId":"a1","timestamp":"2026-01-02T01:00:00Z","message":{"role":"user","content":[{"type":"text","text":"appended later"}],"timestamp":"2026-01-02T01:00:00Z"}})));
+    fs::write(&source, text).unwrap();
+    let out = run(&t, &["audit"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("source changed since refresh"));
+    let out = run(&t, &["audit", "--strict", "--json"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(records(&out)[0]["status"], "error");
+}
+#[test]
+fn audit_without_source_files_certifies_nothing() {
+    // 0.4.9's words and exit for an audit with nothing to count (py/audit.py:2383-2388,
+    // 2638-2643), from its output for an empty home and for `--agent codex` beside pi chats.
+    let t = TempDir::new().unwrap();
+    fs::create_dir_all(t.path().join("home")).unwrap();
+    for indexed in [false, true] {
+        if indexed {
+            ok(run(&t, &["index"]));
+        }
+        let out = run(&t, &["audit"]);
+        assert_eq!(out.status.code(), Some(2));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "audit unavailable: no supported source files were found; no completeness claim was made.\n"
+        );
+        assert_eq!(t.path().join("data").exists(), indexed);
+    }
+    let out = run(&t, &["audit", "--json"]);
+    assert_eq!(out.status.code(), Some(2));
+    let v = &records(&out)[0];
+    assert_eq!(
+        (&v["status"], &v["exit_code"]),
+        (&json!("error"), &json!(2))
+    );
+    assert_eq!(
+        v["problems"][0]["reason"],
+        "no source file census completed; audit cannot certify completeness"
+    );
+    let t = fixture();
+    let out = run(&t, &["audit", "--agent", "codex"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "audit unavailable: no codex source files were found; no completeness claim was made.\n"
+    );
+}
+#[test]
+fn audit_before_the_first_index_reports_every_source_as_a_gap() {
+    // 0.4.9 before any `agrep index`: "pi: never tallied: <path>" as a gap, exit 1.
+    let t = TempDir::new().unwrap();
+    let source = t.path().join("home/.pi/agent/sessions/alpha/a.jsonl");
+    let cwd = t.path().join("project");
+    write_chat(
+        &source,
+        "root-alpha-0001",
+        &cwd,
+        &[("2026-01-02T00:00:00Z", "design the cache", "Finished.")],
+    );
+    let out = run(&t, &["audit"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("source not indexed"));
+    assert_eq!(run(&t, &["audit", "--strict"]).status.code(), Some(2));
+    assert!(!t.path().join("data").exists());
 }
 #[test]
 fn doctor_reports_and_fixes_source_parse_errors() {
@@ -264,11 +355,21 @@ fn doctor_reports_and_fixes_source_parse_errors() {
     fs::create_dir_all(bad.parent().unwrap()).unwrap();
     fs::write(&bad, "not json\n").unwrap();
     ok(run(&t, &["index"]));
-    let out = run(&t, &["doctor", "--json"]);
-    assert_eq!(out.status.code(), Some(1));
+    // 0.4.9 exits 0 once the report is complete, whatever it found (py/doctor.py:15,
+    // 4194-4208); its audit counts the parse error as an accounting error (exit 2).
+    let out = ok(run(&t, &["doctor", "--json"]));
+    assert!(records(&out)[0]["status"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["path"] == bad.display().to_string() && s["last_error"].is_string()));
+    let out = ok(run(&t, &["doctor"]));
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("doctor: action needed\n"));
+    assert_eq!(run(&t, &["audit"]).status.code(), Some(2));
     assert_eq!(run(&t, &["audit", "--strict"]).status.code(), Some(2));
     fs::remove_file(bad).unwrap();
-    ok(run(&t, &["doctor", "--fix"]));
+    let out = ok(run(&t, &["doctor", "--fix"]));
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("doctor: checks passed\n"));
 }
 #[test]
 fn empty_diagnostics_do_not_create_data_root() {
@@ -528,22 +629,10 @@ fn run_relays_termination_and_drains_descendants() {
         .unwrap()
         .success());
     assert_eq!(process.wait().unwrap().code(), Some(143));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        let status = Command::new("/bin/ps")
-            .args(["-o", "stat=", "-p", &descendant.to_string()])
-            .output()
-            .unwrap();
-        let state = String::from_utf8_lossy(&status.stdout);
-        if state.trim().is_empty() || state.trim().starts_with('Z') {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "descendant is still live: {state}"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    assert!(
+        exit::wait(descendant, std::time::Duration::from_secs(2)).unwrap(),
+        "descendant {descendant} is still live"
+    );
     assert!(!t.path().join("data/runs").exists());
     // Normal leader exit must also terminate an owned descendant that ignores TERM.
     fake_agent(
@@ -553,23 +642,14 @@ fn run_relays_termination_and_drains_descendants() {
     );
     let normal = launch_cmd(&t).args(["run", "codex"]).output().unwrap();
     assert!(normal.status.success());
-    let pid = String::from_utf8_lossy(&normal.stdout).trim().to_owned();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        let out = Command::new("/bin/ps")
-            .args(["-o", "stat=", "-p", &pid])
-            .output()
-            .unwrap();
-        let state = String::from_utf8_lossy(&out.stdout);
-        if state.trim().is_empty() || state.trim().starts_with('Z') {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "normal-exit descendant is still live: {state}"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    let pid: u32 = String::from_utf8_lossy(&normal.stdout)
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        exit::wait(pid, std::time::Duration::from_secs(2)).unwrap(),
+        "normal-exit descendant {pid} is still live"
+    );
     // The wrapper propagates a stopped child to its caller, then resumes it.
     use std::os::unix::process::CommandExt;
     fake_agent(&t, "codex", "printf '%s\\n' \"$$\"; kill -STOP $$; exit 0");
@@ -588,24 +668,7 @@ fn run_relays_termination_and_drains_descendants() {
     BufReader::new(wrapper.stdout.take().unwrap())
         .read_line(&mut child_id)
         .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    let stopped = loop {
-        let mut status = 0;
-        let observed = unsafe {
-            libc::waitpid(
-                wrapper.id() as i32,
-                &mut status,
-                libc::WUNTRACED | libc::WNOHANG,
-            )
-        };
-        if observed > 0 {
-            break libc::WIFSTOPPED(status);
-        }
-        if std::time::Instant::now() >= deadline {
-            break false;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    };
+    let stopped = job::stops(wrapper.id(), std::time::Duration::from_secs(3));
     unsafe {
         libc::kill(wrapper.id() as i32, libc::SIGCONT);
         if !stopped {
@@ -616,6 +679,47 @@ fn run_relays_termination_and_drains_descendants() {
     let result = wrapper.wait().unwrap();
     assert!(stopped, "wrapper did not propagate child suspension");
     assert!(result.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn run_exits_with_its_agent_when_nothing_is_left_to_drain() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    let t = fixture();
+    // Each agent prints one line and exits; the second leaves a descendant that ends on TERM.
+    for script in [
+        "printf 'leaving\\n'; exit 0",
+        "/bin/sleep 60 & printf '%s\\n' \"$!\"; exit 0",
+    ] {
+        fake_agent(&t, "codex", script);
+        let mut process = launch_cmd(&t)
+            .args(["run", "codex"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(process.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        // Well under the 1.5 s grace that a member still running after TERM would get.
+        let exited = exit::wait(process.id(), std::time::Duration::from_secs(1)).unwrap();
+        if !exited {
+            process.kill().unwrap();
+        }
+        let status = process.wait().unwrap();
+        assert!(
+            exited,
+            "run outlived an agent that left nothing running: {script}"
+        );
+        assert!(status.success());
+        if let Ok(descendant) = line.trim().parse::<u32>() {
+            assert!(
+                exit::wait(descendant, std::time::Duration::from_secs(2)).unwrap(),
+                "descendant {descendant} is still live"
+            );
+        }
+    }
 }
 
 #[test]
@@ -711,8 +815,9 @@ fn integration_drift_and_corrupt_database_are_diagnosed() {
         ],
     ));
     fs::write(t.path().join("home/.pi/agent/AGENTS.md"), "user only").unwrap();
-    let out = run(&t, &["doctor", "--json"]);
-    assert_eq!(out.status.code(), Some(1));
+    // 0.4.9's doctor exits 0 for a completed report and 1 only when a repair --fix
+    // attempted failed (py/doctor.py:15).
+    let out = ok(run(&t, &["doctor", "--json"]));
     let status = records(&out);
     assert_eq!(status[0]["status"]["integrations"][0]["drifted"], true);
     fs::write(
@@ -723,14 +828,29 @@ fn integration_drift_and_corrupt_database_are_diagnosed() {
     ok(run(&t, &["doctor", "--json"]));
     fs::write(t.path().join("data/index.db"), b"not a sqlite database").unwrap();
     let out = run(&t, &["doctor", "--fix"]);
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(1));
     assert_eq!(
         fs::read(t.path().join("data/index.db")).unwrap(),
         b"not a sqlite database"
     );
     assert!(String::from_utf8_lossy(&out.stdout)
         .lines()
-        .any(|l| l == "repair: not_checked"));
+        .any(|l| l == "repair: failed - rebuilding a corrupt index requires confirmation on a terminal; run agrep doctor --fix"));
+}
+#[test]
+fn doctor_and_audit_help_keep_0_4_9_exit_lines() {
+    // Lines from 0.4.9's `agrep doctor --help` and `agrep audit --help`.
+    let t = TempDir::new().unwrap();
+    let doctor = String::from_utf8(ok(run(&t, &["doctor", "--help"])).stdout).unwrap();
+    assert!(doctor.lines().any(|l| l
+        == "exit: 0 diagnostic/action complete, 1 requested repair failed, 2 invalid options."));
+    let audit = String::from_utf8(ok(run(&t, &["audit", "--help"])).stdout).unwrap();
+    assert!(audit
+        .lines()
+        .any(|l| l == "exit: 0 clean, 1 evidence warning, 2 accounting error or invalid input."));
+    assert!(
+        audit.contains("promote coverage gaps and live/uncertified evidence to errors (exit 2)")
+    );
 }
 
 #[test]
@@ -960,7 +1080,8 @@ fn audit_does_not_collapse_identical_turns() {
     .unwrap();
     drop(c);
     let out = run(&t, &["audit", "--full", "--strict", "--json"]);
-    assert_eq!(out.status.code(), Some(1));
+    // --strict makes a gap an error (py/audit.py:2515-2517).
+    assert_eq!(out.status.code(), Some(2));
     assert!(records(&out)[0]["gap_details"]
         .as_array()
         .unwrap()
@@ -1059,7 +1180,7 @@ fn resume_noninteractive_picker_and_empty_list_exit_contracts() {
 
 #[cfg(unix)]
 #[test]
-fn run_hands_the_terminal_to_an_interactive_child() {
+fn run_lets_a_pipeline_agent_read_terminal_input() {
     use std::io::{BufRead, BufReader, Write};
     use std::os::fd::FromRawFd;
     use std::os::unix::process::CommandExt;
@@ -1124,6 +1245,138 @@ fn run_hands_the_terminal_to_an_interactive_child() {
         fs::read_to_string(t.path().join("argv.txt")).unwrap(),
         "terminal input"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_owns_a_pipeline_agent_and_ends_its_descendants() {
+    use std::io::{BufRead, BufReader};
+    use std::os::fd::FromRawFd;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    let t = fixture();
+    // The descendant also ignores the HUP this test's session leader sends its foreground
+    // group on exit, so only the agent's own group can end it.
+    fake_agent(
+        &t,
+        "codex",
+        "(trap '' TERM HUP; exec /bin/sleep 60) & printf '%s\\n' \"$!\"; \
+         if (: </dev/tty) 2>/dev/null; then echo terminal; else echo detached; fi",
+    );
+    let (mut master, mut slave) = (-1, -1);
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        },
+        0
+    );
+    for fd in [master, slave] {
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
+    }
+    let master = unsafe { fs::File::from_raw_fd(master) };
+    let slave = unsafe { fs::File::from_raw_fd(slave) };
+    // `agrep run codex | tee log` typed at a terminal.
+    let mut cmd = launch_cmd(&t);
+    cmd.args(["run", "codex"])
+        .stdin(Stdio::from(slave))
+        .stdout(Stdio::piped());
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().unwrap();
+    drop(cmd);
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let descendant: u32 = lines.next().unwrap().unwrap().parse().unwrap();
+    let terminal = lines.next().unwrap().unwrap();
+    let status = child.wait().unwrap();
+    let ended = exit::wait(descendant, std::time::Duration::from_secs(5)).unwrap();
+    if !ended {
+        unsafe { libc::kill(descendant as i32, libc::SIGKILL) };
+    }
+    drop(master);
+    assert!(status.success());
+    assert!(ended, "descendant {descendant} outlived agrep run");
+    // As in 0.4.9, a pipeline stage runs detached: the terminal stays with the whole job.
+    assert_eq!(terminal, "detached");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_spawned_worker_holds_no_pipe_of_the_caller() {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    use std::time::Duration;
+    let t = fixture();
+    let root = DataRoot(t.path().join("data"));
+    // A new source makes the search start a worker. With the writer lock held while a merge
+    // seems to run, the worker waits in its refresh until this test lets it go.
+    write_chat(
+        &t.path()
+            .join("home/.pi/agent/sessions/alpha/2026-01-04_root-alpha-0003.jsonl"),
+        "root-alpha-0003",
+        &t.path().join("project alpha"),
+        &[("2026-01-04T00:00:00Z", "add a new chat", "")],
+    );
+    let merging = root.merge_lock().unwrap().unwrap();
+    let writing = root.lock(true).unwrap().unwrap();
+    let (mut reader, writer) = std::io::pipe().unwrap();
+    let extra = writer.as_raw_fd();
+    let mut cmd = Command::new(support::binary());
+    cmd.env_clear()
+        .env("HOME", t.path().join("home"))
+        .env("AGREP_HOME", t.path().join("home"))
+        .env("AGREP_DATA_DIR", t.path().join("data"))
+        .env("AGREP_QUERY_TIMING", "1")
+        .args(["search", "cache"]);
+    // `out=$(agrep search cache 3>&1)`: the caller reads its pipe to the end.
+    unsafe {
+        cmd.pre_exec(move || {
+            let done = if extra == 3 {
+                libc::fcntl(3, libc::F_SETFD, 0)
+            } else {
+                libc::dup2(extra, 3)
+            };
+            if done < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let out = cmd.output().unwrap();
+    drop(writer);
+    let worker = String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .find_map(|l| serde_json::from_str::<Value>(l).ok()?["worker_started"]["pid"].as_u64())
+        .expect("the search started no worker") as u32;
+    let running = !exit::wait(worker, Duration::ZERO).unwrap();
+    let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    // The search has exited, so only the worker can still hold the pipe open.
+    let held =
+        matches!(reader.read(&mut [0; 1]), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock);
+    drop((writing, merging));
+    assert!(exit::wait(worker, Duration::from_secs(30)).unwrap());
+    assert!(running, "the worker exited before the pipe was checked");
+    assert!(!held, "the worker inherited the caller's pipe");
 }
 
 #[test]

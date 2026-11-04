@@ -207,9 +207,9 @@ class LauncherTests(unittest.TestCase):
         cls.root = Path(cls.temp.name)
         cls.exe = cls.root / ('probe.exe' if os.name == 'nt' else 'probe')
         source = cls.root / 'probe.rs'
-        source.write_text('''use std::{env,io::{self,Write},thread,time::Duration};
+        source.write_text('''use std::{env,io::{self,Read,Write}};
         fn main() { let a:Vec<String>=env::args().skip(1).collect();
-         if a.first().map(String::as_str)==Some("wait") {println!("ready");io::stdout().flush().unwrap();thread::sleep(Duration::from_secs(60));}
+         if a.first().map(String::as_str)==Some("wait") {println!("ready");io::stdout().flush().unwrap();io::stdin().read_to_end(&mut Vec::new()).unwrap();}
          if a.first().map(String::as_str)==Some("exit") {std::process::exit(a[1].parse().unwrap());}
          for s in a {println!("{}:{}",s.len(),s);} eprintln!("stderr intact");
         }''', encoding='utf-8')
@@ -237,7 +237,7 @@ class LauncherTests(unittest.TestCase):
         result = subprocess.run([*self.command, 'exit', '23'], env=self.env)
         self.assertEqual(result.returncode, 23)
         if os.name == 'posix':
-            with subprocess.Popen([*self.command, 'wait'], env=self.env, stdout=subprocess.PIPE) as child:
+            with subprocess.Popen([*self.command, 'wait'], env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE) as child:
                 self.assertEqual(child.stdout.readline(), b'ready\n')
                 child.send_signal(signal.SIGTERM)
                 self.assertEqual(child.wait(timeout=10), -signal.SIGTERM)
@@ -260,7 +260,7 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(result.stderr, b'stderr intact\n')
         self.assertEqual(subprocess.run([*command, 'exit', '23'], env=env).returncode, 23)
         if os.name == 'posix':
-            with subprocess.Popen([*command, 'wait'], env=env, stdout=subprocess.PIPE) as child:
+            with subprocess.Popen([*command, 'wait'], env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE) as child:
                 self.assertEqual(child.stdout.readline(), b'ready\n')
                 child.send_signal(signal.SIGTERM)
                 self.assertEqual(child.wait(timeout=10), -signal.SIGTERM)

@@ -125,6 +125,10 @@ pub struct Results {
     /// Counted rows per session id, kept when the scope names its sessions.
     #[serde(skip)]
     session_counts: HashMap<String, usize>,
+    /// On a page merged with meaning rows, whether either lane held rows it did not return
+    /// (0.4.9's `hybrid_more`); `None` for one lane's result.
+    #[serde(skip)]
+    pub hybrid_more: Option<bool>,
 }
 #[derive(Default, Clone, Serialize, Deserialize, Debug)]
 pub struct Timings {
@@ -336,7 +340,6 @@ struct PlanCache {
     candidates: HashMap<String, CandidateGroups>,
     rejected_candidates: HashSet<String>,
     coverage_idf: Option<Vec<f64>>,
-    coverage_all: bool,
     /// Per lane, a selective metadata scope's blocks; None when the scope is
     /// too broad to scan.
     scopes: HashMap<String, Option<ScopeBlocks>>,
@@ -417,7 +420,6 @@ impl PlanCache {
                 .get(&block)
                 .is_some_and(|ids| ids.binary_search(&id).is_ok())
         };
-        let total = m.idf.iter().sum::<f64>().max(1.);
         let mut candidates = HashMap::new();
         let mut rows = HashMap::new();
         let mut blocks = HashMap::new();
@@ -435,9 +437,6 @@ impl PlanCache {
                     .filter(|(_, g)| g.as_ref().is_none_or(|g| contains(g, block, id)))
                     .map(|(i, _)| m.idf[i])
                     .sum::<f64>();
-                if weight < m.minimum_coverage * total {
-                    continue;
-                }
                 candidates.entry(block).or_insert_with(Vec::new).push(id);
                 rows.insert(id, weight);
                 let upper = blocks.entry(block).or_insert(0.0_f64);
@@ -548,10 +547,6 @@ struct Matcher {
     tool_presence: Vec<Option<Vec<u64>>>,
     coverage_term: Option<usize>,
     coverage_excluded: HashSet<usize>,
-    minimum_coverage: f64,
-    /// The explicit `--coverage` lane, which scores partial rows by its own formula; the
-    /// content fallback scores them as 0.4.9 did.
-    coverage_lane: bool,
 }
 /// Literals every match of a regular expression begins or ends with, normalized: the
 /// single prefix literal and the single suffix literal, when the expression has them.
@@ -696,8 +691,6 @@ impl Matcher {
             tool_presence: Vec::new(),
             coverage_term: None,
             coverage_excluded: HashSet::new(),
-            minimum_coverage: 0.,
-            coverage_lane: false,
         })
     }
     fn order_for(&mut self, c: &Connection, table: &str, cache: &mut PlanCache) -> Result<()> {
@@ -842,8 +835,7 @@ impl Matcher {
         cutoff: Option<&Cutoff>,
     ) -> Result<Option<Scored>> {
         let rec = recency(ts, now).max(if who == "user" { 0.35 } else { 0. });
-        // The explicit `--coverage` lane scored its rows without it, as 0.4.9's did.
-        let meta = !self.coverage_lane && meta_role(who, turn);
+        let meta = meta_role(who, turn);
         if let Some(re) = &self.explicit {
             let Some(found) = re.find(text)? else {
                 return Ok(None);
@@ -903,9 +895,7 @@ impl Matcher {
             found_weight += self.idf.get(i).copied().unwrap_or(1.);
             found.push(i);
         }
-        if found.is_empty()
-            || (self.partial && found_weight < self.minimum_coverage * self.idf.iter().sum::<f64>())
-        {
+        if found.is_empty() {
             return Ok(None);
         }
         let first = if self.partial {
@@ -988,64 +978,29 @@ impl Matcher {
                 .min_by_key(|&(at, _)| at)
                 .map(|(at, end)| row.start(at)..row.end(end))
         };
-        if !self.coverage_lane {
-            // 0.4.9's content lane (py/corpusdb.py:4897-4908, py/search.py:1852-1876): the
-            // row's share of the query's weight, to four places, is its whole match strength,
-            // without a boundary factor.
-            let total = self.idf.iter().sum::<f64>();
-            let coverage = window::round4(found_weight / if total == 0. { 1. } else { total });
-            if cutoff
-                .is_some_and(|c| c.excludes(2, coverage * rec * weight(who) * meta_scale(meta)))
-            {
-                return Ok(Some(Scored::bare(2, "unscored")));
-            }
-            let anchor = anchor();
-            return Ok(Some(Scored {
-                tier: 2,
-                score: score(coverage, rec, who, 1., meta),
-                class: "",
-                snippet: Snip::new(text, anchor.as_slice()).text,
-                span: anchor,
-            }));
-        }
-        let coverage = 0.5 * found_weight / self.idf.iter().sum::<f64>().max(1.);
-        if cutoff.is_some_and(|c| c.excludes(2, coverage * rec * weight(who))) {
+        // 0.4.9's content lane (py/corpusdb.py:4897-4908, py/search.py:1852-1876): the
+        // row's share of the query's weight, to four places, is its whole match strength,
+        // without a boundary factor.
+        let total = self.idf.iter().sum::<f64>();
+        let coverage = window::round4(found_weight / if total == 0. { 1. } else { total });
+        if cutoff.is_some_and(|c| c.excludes(2, coverage * rec * weight(who) * meta_scale(meta))) {
             return Ok(Some(Scored::bare(2, "unscored")));
         }
-        let terms: Vec<&str> = found.iter().map(|&i| self.terms[i][0].as_str()).collect();
-        let b = boundary_rank::prepare_query(&terms.join(" "), &Stats::new())
-            .evaluate(text, None, true)?;
-        let spans: Vec<_> = b.spans.iter().flatten().collect();
-        let lo = spans.iter().map(|s| s[0]).min().unwrap_or(0);
-        let hi = spans.iter().map(|s| s[1]).max().unwrap_or(1);
-        let quality_scale = b
-            .qualities
-            .iter()
-            .copied()
-            .map(|q| (2. * q - 1.).max(0.))
-            .fold(1., f64::min);
-        let tight =
-            0.5 + 0.5 * (self.query_chars as f64 / (hi - lo).max(1) as f64).min(1.) * quality_scale;
         let anchor = anchor();
-        let snip = Snip::new(text, anchor.as_slice());
         Ok(Some(Scored {
             tier: 2,
-            score: window::round4(tight * rec * weight(who) * b.factor * coverage),
-            class: b.match_class,
-            snippet: snip.text,
+            score: score(coverage, rec, who, 1., meta),
+            class: "",
+            snippet: Snip::new(text, anchor.as_slice()).text,
             span: anchor,
         }))
     }
     /// The largest coverage factor a partial row reaches when the terms it holds weigh at
-    /// most `weight`.
+    /// most `weight`: rounding is monotonic, so the rounded share bounds every rounded
+    /// coverage.
     fn partial_share(&self, weight: f64) -> f64 {
         let total = self.idf.iter().sum::<f64>();
-        if self.coverage_lane {
-            0.5 * weight / total.max(1.)
-        } else {
-            // Rounding is monotonic, so the rounded share bounds every rounded coverage.
-            window::round4(weight / if total == 0. { 1. } else { total })
-        }
+        window::round4(weight / if total == 0. { 1. } else { total })
     }
     /// 0.4.9's phrase strength in a snippet: its matches counted, the tightest measured in
     /// snippet characters.
@@ -2019,14 +1974,6 @@ fn content_anchors(terms: &[Vec<String>]) -> usize {
         .count()
         .min(3)
 }
-fn coverage_terms(pattern: &str) -> Vec<Vec<String>> {
-    let mut seen = HashSet::new();
-    boundary_rank::query_tokens(pattern)
-        .into_iter()
-        .map(|t| boundary_rank::term_variants(t.trim_matches(|c: char| c.is_ascii_punctuation())))
-        .filter(|v| !v.is_empty() && seen.insert(v[0].clone()))
-        .collect()
-}
 fn automatic_content(pattern: &str) -> bool {
     if !pattern.trim().contains(' ') {
         return false;
@@ -2079,34 +2026,160 @@ fn content_idf(
         })
         .collect()
 }
-/// Explicit IDF-weighted recovery. Presentation renders this separate evidence
-/// lane and keeps the primary search's exit status and machine framing.
+/// 0.4.9's forced coverage lane (py/corpusdb.py:5154-5213, py/search.py:6353-6445): the
+/// 400 rows SQLite's bm25 ranks best for any of the query's words of three characters or
+/// more, without rows quoting the whole query, then one per chat and one per chat family,
+/// at most 20. Presentation prints them after the page; they never count toward its total
+/// or exit status.
 pub fn coverage(c: &Connection, o: &Options) -> Result<Results> {
     if o.regex || o.word || o.count_only || o.count_by_tier || o.sort != "score" {
         bail!("coverage requires a keyword score query without counts");
     }
     let started = Instant::now();
-    let count = coverage_terms(&o.pattern).len();
-    if count < 2 {
-        return Ok(Results {
-            total_basis: "exact".into(),
-            ..Default::default()
-        });
+    let raw: Vec<&str> = o
+        .pattern
+        .trim()
+        .split(|c: char| c.is_whitespace() || c == '-' || c == '_')
+        .filter(|w| !w.is_empty())
+        .collect();
+    let mut words: Vec<String> = vec![];
+    for word in raw.iter().map(|w| store::normalize(w)) {
+        if !word.is_empty() && !words.contains(&word) {
+            words.push(word);
+        }
     }
-    let mut cache = PlanCache {
-        coverage_all: true,
+    let long: Vec<&String> = words.iter().filter(|w| w.chars().count() >= 3).collect();
+    let mut result = Results {
+        total_basis: "exact".into(),
         ..Default::default()
     };
-    let mut result = None;
-    for stage in 0..count {
-        result = Some(search_pass(c, o, true, 0, result, &mut cache, stage)?);
+    if raw.len() < 2 || long.is_empty() {
+        return Ok(result);
     }
-    let result = result.unwrap_or_default();
-    let mut result = if o.filters.no_meta {
-        drop_meta(c, result, o)?
-    } else {
-        result
+    let quote = |w: &str| format!("\"{}\"", w.replace('"', "\"\""));
+    let who = |role: &str| {
+        o.filters
+            .who
+            .as_deref()
+            .is_none_or(|who| who.split(',').any(|w| (w == "tool") == (role == "tool")))
+            && !o
+                .filters
+                .no_who
+                .as_deref()
+                .is_some_and(|who| role == "tool" && who.split(',').any(|w| w == "tool"))
     };
+    let mut lanes = vec![];
+    if who("prose") {
+        lanes.push((
+            "prose",
+            long.iter()
+                .map(|w| quote(w))
+                .collect::<Vec<_>>()
+                .join(" OR "),
+        ));
+    }
+    // 0.4.9's lane read every row its speaker filters admit, tool output included whatever
+    // the tools setting said (py/corpusdb.py:4665-4674, py/search.py:6386-6391).
+    if who("tool") {
+        // Tool rows are indexed by word: a query word matches the words holding it.
+        let mut expanded = vec![];
+        for w in &long {
+            for word in crate::tool_index::expand(c, w)?.unwrap_or_default() {
+                expanded.push(quote(&word.term));
+            }
+        }
+        if !expanded.is_empty() {
+            lanes.push(("tools", expanded.join(" OR ")));
+        }
+    }
+    let mut ranked: Vec<(f64, &str, i64)> = vec![];
+    for (table, expression) in &lanes {
+        let (filters, mut values) = sql_filters(&o.filters, "r", c)?;
+        values.insert(0, Value::Text(expression.clone()));
+        let mut q = c.prepare(&format!(
+            "SELECT r.id,bm25({table}_fts) FROM {table}_fts JOIN {table} r ON r.id={table}_fts.rowid WHERE {table}_fts MATCH ? AND r.visible=1{filters} ORDER BY 2 LIMIT 400"
+        ))?;
+        let rows = q.query_map(rusqlite::params_from_iter(values), |r| {
+            Ok((r.get::<_, f64>(1)?, *table, r.get::<_, i64>(0)?))
+        })?;
+        for row in rows {
+            ranked.push(row?);
+        }
+    }
+    ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(b.1)).then(a.2.cmp(&b.2)));
+    ranked.truncate(400);
+    let echo = regex::Regex::new(
+        &raw.iter()
+            .map(|w| regex::escape(&store::normalize(w)))
+            .collect::<Vec<_>>()
+            .join(r"[\W_]*"),
+    )?;
+    let (mut chats, mut families) = (HashSet::new(), HashSet::new());
+    for (bm25, table, id) in ranked {
+        let mut h = c.query_row(
+            &format!("SELECT r.session,r.agent,r.project,r.position,r.who,r.model,r.model_source,r.ts,r.text,s.family,s.side FROM {table} r JOIN sessions s ON s.id=r.session AND s.agent=r.agent WHERE r.id=?"),
+            [id],
+            |r| {
+                Ok(Hit {
+                    rowid: id,
+                    session: r.get(0)?,
+                    agent: r.get(1)?,
+                    project: r.get(2)?,
+                    turn: r.get(3)?,
+                    who: r.get(4)?,
+                    model: r.get(5)?,
+                    model_source: r.get(6)?,
+                    ts: r.get(7)?,
+                    text: store::decode(table, r.get::<_, Vec<u8>>(8)?).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            8,
+                            rusqlite::types::Type::Blob,
+                            e.into_boxed_dyn_error(),
+                        )
+                    })?,
+                    family: r.get(9)?,
+                    side: r.get(10)?,
+                    score: -bm25,
+                    matched: "content-terms".into(),
+                    tier: 2,
+                    ..Default::default()
+                })
+            },
+        )?;
+        let (span, echoed) = {
+            let row = Folded::new(&h.text);
+            // Trigram candidates are a superset; the lead is the earliest word the row holds.
+            let Some((at, end)) = words
+                .iter()
+                .filter_map(|w| row.low.find(w.as_str()).map(|at| (at, at + w.len())))
+                .min()
+            else {
+                continue;
+            };
+            (row.start(at)..row.end(end), echo.is_match(&row.low))
+        };
+        let family = if h.family.is_empty() {
+            h.session.clone()
+        } else {
+            h.family.clone()
+        };
+        if echoed
+            || !chats.insert((h.agent.clone(), h.session.clone()))
+            || !families.insert((h.agent.clone(), family))
+        {
+            continue;
+        }
+        h.span = Some((
+            h.text[..span.start].chars().count(),
+            h.text[..span.end].chars().count(),
+        ));
+        h.snippet = Snip::new(&h.text, std::slice::from_ref(&span)).text;
+        result.hits.push(h);
+        if result.hits.len() == 20 {
+            break;
+        }
+    }
+    result.total = result.hits.len();
     result.timings.total_ms = started.elapsed().as_secs_f64() * 1000.;
     Ok(result)
 }
@@ -2430,11 +2503,7 @@ fn search_pass(
     // The tier this pass's rows take; a pass over both tiers is bounded as phrase rows.
     let pass_tier = if partial { 2 } else { u8::from(phase == 2) };
     if partial {
-        m.terms = if cache.coverage_all {
-            coverage_terms(&o.pattern)
-        } else {
-            content_terms(&o.pattern)
-        };
+        m.terms = content_terms(&o.pattern);
         if m.terms.is_empty() {
             return Ok(Results {
                 total_basis: "exact".into(),
@@ -2455,57 +2524,16 @@ fn search_pass(
             .as_deref()
             .is_some_and(|who| who.split(',').any(|w| w == "tool"));
     if partial {
-        m.coverage_lane = cache.coverage_all;
-        if let Some(idf) = &cache.coverage_idf {
-            m.idf = idf.clone();
-        } else if cache.coverage_all {
-            let count = store::counts(c)?;
-            let n = count["prose"].as_f64().unwrap_or(0.) + count["tools"].as_f64().unwrap_or(0.);
-            m.idf = m
-                .terms
-                .iter()
-                .map(|variants| {
-                    let df: usize = variants
-                        .iter()
-                        .map(|v| {
-                            let cs: Vec<_> = v.chars().collect();
-                            let prose = cs
-                                .windows(3)
-                                .map(|g| {
-                                    let gram: String = g.iter().collect();
-                                    c.query_row(
-                                        "SELECT doc FROM prose_terms WHERE term=?",
-                                        [&gram],
-                                        |r| r.get::<_, usize>(0),
-                                    )
-                                    .unwrap_or(0)
-                                })
-                                .min()
-                                .unwrap_or(n as usize);
-                            let tools = if o.tools || o.filters.who.as_deref() == Some("tool") {
-                                cache.tool_doc(c, v).ok().flatten().unwrap_or(n as usize)
-                            } else {
-                                0
-                            };
-                            prose.saturating_add(tools)
-                        })
-                        .sum();
-                    1. + ((n + 1.) / (df as f64 + 1.)).max(1.).ln()
-                })
-                .collect();
-            cache.coverage_idf = Some(m.idf.clone());
-        } else {
-            m.idf = content_idf(c, &m.terms, !only_tools && !include_tools, cache)?;
-            cache.coverage_idf = Some(m.idf.clone());
-        }
-        m.minimum_coverage = if cache.coverage_all { 0.55 } else { 0. };
+        m.idf = match &cache.coverage_idf {
+            Some(idf) => idf.clone(),
+            None => content_idf(c, &m.terms, !only_tools && !include_tools, cache)?,
+        };
+        cache.coverage_idf = Some(m.idf.clone());
         let mut order: Vec<_> = (0..m.terms.len())
-            .filter(|&i| cache.coverage_all || m.terms[i][0].chars().count() >= 3)
+            .filter(|&i| m.terms[i][0].chars().count() >= 3)
             .collect();
         order.sort_by(|&a, &b| m.idf[b].total_cmp(&m.idf[a]).then(a.cmp(&b)));
-        if !cache.coverage_all {
-            order.truncate(content_anchors(&m.terms));
-        }
+        order.truncate(content_anchors(&m.terms));
         m.coverage_term = order.get(coverage_stage).copied();
         m.coverage_excluded
             .extend(order.into_iter().take(coverage_stage));
@@ -2993,7 +3021,7 @@ fn search_pass(
                         } else {
                             recency(ts, now).max(if who == "user" { 0.35 } else { 0. })
                         }
-                        * meta_scale(!m.coverage_lane && meta_role(&who, turn));
+                        * meta_scale(meta_role(&who, turn));
                     if partial {
                         let id: i64 = r.get(0)?;
                         let total = m.idf.iter().sum::<f64>();
@@ -3134,7 +3162,7 @@ fn search_pass(
                     caller.agent == r.get::<_, String>(2).unwrap_or_default()
                         && caller.session == session
                 });
-                let meta_marker = !m.coverage_lane && meta_role(&who, turn);
+                let meta_marker = meta_role(&who, turn);
                 let h = Hit {
                     session,
                     agent: r.get(2)?,

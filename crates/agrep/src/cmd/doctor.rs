@@ -7,10 +7,22 @@ pub fn run(deep: bool, fix: bool, no_semantic: bool, json_output: bool) -> Resul
     let mut s = diagnostics::status(&root)?;
     let mut checks = vec![];
     let mut repaired = vec![];
+    // 0.4.9's contract (py/doctor.py:15): a completed report exits 0 whatever it found, and
+    // only a repair that --fix attempted and could not finish exits 1.
+    let mut repair_failed = false;
     if fix && s["index"]["state"] == "missing" && (s["format"] == "valid" || !root.0.exists()) {
-        root.validate(true)?;
-        store::refresh(&root, true, false)?;
-        repaired.push("created index");
+        match root
+            .validate(true)
+            .and_then(|()| store::refresh(&root, true, false))
+        {
+            Ok(_) => repaired.push("created index"),
+            Err(e) => {
+                repair_failed = true;
+                checks.push(
+                    json!({"check":"index_creation","state":"failed","detail":format!("{e:#}")}),
+                );
+            }
+        }
         s = diagnostics::status(&root)?;
     }
     if (deep || fix) && s["index"]["state"] == "ready" {
@@ -26,20 +38,34 @@ pub fn run(deep: bool, fix: bool, no_semantic: bool, json_output: bool) -> Resul
             .iter()
             .any(|c| c["check"] == "sqlite_integrity" && c["state"] == "failed")
     {
-        root.validate(false)?;
-        store::refresh(&root, true, false)?;
-        repaired.push("refreshed source files");
+        match root
+            .validate(false)
+            .and_then(|()| store::refresh(&root, true, false))
+        {
+            Ok(_) => repaired.push("refreshed source files"),
+            Err(e) => {
+                repair_failed = true;
+                checks.push(
+                    json!({"check":"source_refresh","state":"failed","detail":format!("{e:#}")}),
+                );
+            }
+        }
         s = diagnostics::status(&root)?;
     }
     let drifted = s["integrations"]
         .as_array()
         .is_some_and(|entries| entries.iter().any(|e| e["drifted"] == true));
     if fix && drifted {
-        let errors = agrep_core::integrations::repair(&root)?;
-        if errors.is_empty() {
-            repaired.push("repaired enrolled integrations");
-        } else {
-            checks.push(json!({"check":"integration_repair","state":"failed","detail":errors}));
+        match agrep_core::integrations::repair(&root) {
+            Ok(errors) if errors.is_empty() => repaired.push("repaired enrolled integrations"),
+            Ok(errors) => {
+                repair_failed = true;
+                checks.push(json!({"check":"integration_repair","state":"failed","detail":errors}));
+            }
+            Err(e) => {
+                repair_failed = true;
+                checks.push(json!({"check":"integration_repair","state":"failed","detail":format!("{e:#}")}));
+            }
         }
         s = diagnostics::status(&root)?;
     }
@@ -49,7 +75,8 @@ pub fn run(deep: bool, fix: bool, no_semantic: bool, json_output: bool) -> Resul
             .any(|c| c["check"] == "sqlite_integrity" && c["state"] == "failed");
     if fix && corrupt {
         if !std::io::stdin().is_terminal() {
-            checks.push(json!({"check":"repair","state":"not_checked","detail":"rebuilding a corrupt index requires confirmation on a terminal; run agrep doctor --fix"}));
+            repair_failed = true;
+            checks.push(json!({"check":"repair","state":"failed","detail":"rebuilding a corrupt index requires confirmation on a terminal; run agrep doctor --fix"}));
         } else {
             eprint!(
                 "Rebuild corrupt index at {} from source files? [y/N] ",
@@ -59,30 +86,42 @@ pub fn run(deep: bool, fix: bool, no_semantic: bool, json_output: bool) -> Resul
             let mut answer = String::new();
             std::io::stdin().read_line(&mut answer)?;
             if matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
-                rebuild(&root, |repair| {
+                match rebuild(&root, |repair| {
                     store::refresh(repair, true, true).map(|_| ())
-                })?;
-                repaired.push("rebuilt index; corrupt database retained");
-                s = diagnostics::status(&root)?;
-                checks.retain(|c| c["check"] != "sqlite_integrity");
+                }) {
+                    Ok(()) => {
+                        repaired.push("rebuilt index; corrupt database retained");
+                        s = diagnostics::status(&root)?;
+                        checks.retain(|c| c["check"] != "sqlite_integrity");
+                    }
+                    Err(e) => {
+                        repair_failed = true;
+                        checks.push(
+                            json!({"check":"repair","state":"failed","detail":format!("{e:#}")}),
+                        );
+                    }
+                }
             }
         }
     }
     if s["permissions"]["private"] == false {
         checks.push(json!({"check":"directory_permissions","state":"failed","detail":s["permissions"]["exposed"]}));
     }
-    let semantic = if s["semantic"]["integrity_error"].is_string() {
-        "failed"
-    } else if deep && !no_semantic {
-        if s["semantic"]["model_present"] == true {
-            "present"
+    if !no_semantic {
+        diagnostics::verify_model(&root, &mut s);
+        let semantic = if s["semantic"]["integrity_error"].is_string() {
+            "failed"
+        } else if deep {
+            if s["semantic"]["model_present"] == true {
+                "present"
+            } else {
+                "not installed"
+            }
         } else {
-            "not installed"
-        }
-    } else {
-        "not_checked"
-    };
-    checks.push(json!({"check":"semantic_model","state":semantic,"detail":s["semantic"]["integrity_error"]}));
+            "not_checked"
+        };
+        checks.push(json!({"check":"semantic_model","state":semantic,"detail":s["semantic"]["integrity_error"]}));
+    }
     let integration_errors = s["integrations"].as_array().is_some_and(|entries| {
         entries
             .iter()
@@ -91,23 +130,19 @@ pub fn run(deep: bool, fix: bool, no_semantic: bool, json_output: bool) -> Resul
     let errors = s["sources"]
         .as_array()
         .is_some_and(|a| a.iter().any(|v| !v["last_error"].is_null()));
-    let exit = if s["format"] != "valid"
-        || s["index"]["state"] != "ready"
-        || checks.iter().any(|c| c["state"] == "failed")
-    {
-        2
-    } else if errors || integration_errors {
-        1
-    } else {
-        0
-    };
+    let healthy = s["format"] == "valid"
+        && s["index"]["state"] == "ready"
+        && !checks.iter().any(|c| c["state"] == "failed")
+        && !errors
+        && !integration_errors;
+    let exit = i32::from(repair_failed);
     let v = json!({"version":1,"status":&s,"checks":&checks,"repairs":&repaired,"exit":exit});
     if json_output {
         println!("{}", agrep_core::json_output::to_string(&v)?)
     } else {
         println!(
             "doctor: {}",
-            if exit == 0 {
+            if healthy {
                 "checks passed"
             } else {
                 "action needed"

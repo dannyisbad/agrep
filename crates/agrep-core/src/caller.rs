@@ -560,6 +560,13 @@ pub fn search_with(
     decorate(c, &mut result, caller)?;
     Ok(result)
 }
+/// The forced coverage lane under options `caller::options` already scoped, its rows
+/// marked and given handles as search's are.
+pub fn coverage(c: &Connection, o: &Options, caller: &Caller) -> Result<Results> {
+    let mut result = query::coverage(c, o)?;
+    decorate(c, &mut result, caller)?;
+    Ok(result)
+}
 /// Session-list surfaces use the same native row predicate as retrieval.
 pub fn excludes(
     caller: &Caller,

@@ -40,6 +40,10 @@ pub fn merge(
     let Some(semantic) = semantic else {
         return keyword;
     };
+    // 0.4.9's `hybrid_more` (py/search.py:7962-7966): a lane held rows it did not return.
+    let lanes_more = [&keyword, &semantic]
+        .iter()
+        .any(|lane| lane.total_basis != "exact" || lane.total > lane.hits.len());
     let cap = limit;
     let mut lexical = std::mem::take(&mut keyword.hits);
     if cap == 0 {
@@ -176,6 +180,7 @@ pub fn merge(
     if hits.iter().any(|h| h.matched == "semantic") {
         keyword.total = keyword.total.max(hits.len());
         keyword.total_basis = "floor".into();
+        keyword.hybrid_more = Some(lanes_more);
     }
     keyword.hits = hits;
     keyword

@@ -12,7 +12,6 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     sync::Arc,
     time::Instant,
 };
@@ -342,8 +341,7 @@ pub fn pending(root: &DataRoot) -> Result<Pending> {
                 changed += 1;
             }
             next += 1;
-        } else if matches!(fs::symlink_metadata(path),Err(e) if registry::stat_proves_absent(Path::new(path),&e))
-        {
+        } else if store::gone(Path::new(path)) {
             changed += 1;
         }
     }
@@ -377,58 +375,161 @@ pub fn spawn_merge(root: &DataRoot, binary: &Path) -> Result<bool> {
     };
     detached(root, binary, &["__work", "merge"], guard)
 }
+/// The worker gets null stdin and stdout, the log as stderr, and no other descriptor or
+/// handle of this process: a worker holding a pipe this process got from its caller
+/// (`out=$(agrep search x 3>&1)`) would keep a caller that reads to the end waiting for it.
 fn detached(
     root: &DataRoot,
     binary: &Path,
     args: &[&str],
     guard: crate::data::WriterLock,
 ) -> Result<bool> {
-    let mut cmd = Command::new(binary);
-    cmd.args(args)
-        .env("AGREP_DATA_DIR", root.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(crate::logging::open(root)?);
-    // Its own process group keeps terminal signals from the worker. A pre_exec hook
-    // would force fork+exec and make the command wait until the child is scheduled
-    // and execs; without one std uses posix_spawn. __work lowers its own priority.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x00000008 | 0x00000200);
-        keep_std_handles()?;
-    }
+    let log = crate::logging::open(root)?;
     drop(guard);
-    let child = cmd.spawn()?;
-    crate::semantic_profile::event(serde_json::json!({"worker_started":{"pid":child.id()}}));
+    let pid = spawn_worker(binary, args, root.path(), log)?;
+    crate::semantic_profile::event(serde_json::json!({"worker_started":{"pid":pid}}));
     Ok(true)
 }
-/// std's CreateProcess passes every inheritable handle to the child, and this process's
-/// standard handles are inheritable when its caller passed pipes. A worker holding the
-/// caller's pipes keeps them open until it exits, so a caller that reads the command's
-/// output to its end (any shell capture, an agent's tool call) would wait for the
-/// worker. Children that inherit stdio still get their own inheritable duplicates.
-#[cfg(windows)]
-fn keep_std_handles() -> Result<()> {
-    use windows_sys::Win32::Foundation::{
-        SetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+#[cfg(unix)]
+fn spawn_worker(binary: &Path, args: &[&str], data: &Path, log: fs::File) -> Result<u32> {
+    use std::{
+        os::unix::process::CommandExt,
+        process::{Command, Stdio},
     };
-    use windows_sys::Win32::System::Console::{
-        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    let mut cmd = Command::new(binary);
+    cmd.args(args)
+        .env("AGREP_DATA_DIR", data)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(log)
+        .process_group(0);
+    // Its own process group keeps terminal signals from the worker. A pre_exec hook, such
+    // as closefrom in the child, would force fork+exec and make the command wait until the
+    // child is scheduled and execs; without one std uses posix_spawn. So the inheritable
+    // descriptors above stderr are close-on-exec only while it spawns. __work lowers its
+    // own priority.
+    let listing = if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else {
+        "/dev/fd"
     };
-    for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
-        let handle = unsafe { GetStdHandle(id) };
-        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+    let mut marked = vec![];
+    for entry in fs::read_dir(listing)? {
+        let Some(fd) = entry?.file_name().to_str().and_then(|n| n.parse().ok()) else {
             continue;
+        };
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if fd > 2
+            && flags >= 0
+            && flags & libc::FD_CLOEXEC == 0
+            && unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == 0
+        {
+            marked.push((fd, flags));
         }
-        if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+    }
+    let child = cmd.spawn();
+    for (fd, flags) in marked {
+        unsafe { libc::fcntl(fd, libc::F_SETFD, flags) };
+    }
+    Ok(child?.id())
+}
+/// CreateProcess passes a child every inheritable handle in this process unless a handle
+/// list names the only ones to inherit.
+#[cfg(windows)]
+fn spawn_worker(binary: &Path, args: &[&str], data: &Path, log: fs::File) -> Result<u32> {
+    use std::{ffi::OsStr, os::windows::ffi::OsStrExt, os::windows::io::AsRawHandle};
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT},
+        System::Threading::{
+            CreateProcessW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
+            UpdateProcThreadAttribute, CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT,
+            DETACHED_PROCESS, EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+        },
+    };
+    let null = fs::OpenOptions::new().read(true).write(true).open("NUL")?;
+    let handles = [
+        null.as_raw_handle() as HANDLE,
+        log.as_raw_handle() as HANDLE,
+    ];
+    for handle in handles {
+        if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
             return Err(std::io::Error::last_os_error().into());
         }
     }
-    Ok(())
+    let wide = |s: &OsStr| s.encode_wide().collect::<Vec<u16>>();
+    let application: Vec<u16> = wide(binary.as_os_str()).into_iter().chain([0]).collect();
+    let mut line = vec![u16::from(b'"')];
+    line.extend(wide(binary.as_os_str()));
+    line.push(u16::from(b'"'));
+    for arg in args {
+        line.push(u16::from(b' '));
+        line.extend(arg.encode_utf16());
+    }
+    line.push(0);
+    let mut variables: Vec<_> = std::env::vars_os()
+        .filter(|(key, _)| !key.eq_ignore_ascii_case("AGREP_DATA_DIR"))
+        .collect();
+    variables.push(("AGREP_DATA_DIR".into(), data.as_os_str().to_owned()));
+    // Windows keeps an environment block sorted by name, ignoring case.
+    variables.sort_by_key(|(key, _)| key.to_string_lossy().to_uppercase());
+    let mut environment = vec![];
+    for (key, value) in &variables {
+        environment.extend(wide(key));
+        environment.push(u16::from(b'='));
+        environment.extend(wide(value));
+        environment.push(0);
+    }
+    environment.push(0);
+    let mut size = 0;
+    unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size) };
+    let mut buffer = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
+    let list = buffer.as_mut_ptr().cast();
+    if unsafe { InitializeProcThreadAttributeList(list, 1, 0, &mut size) } == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut info: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+    info.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    info.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    info.StartupInfo.hStdInput = handles[0];
+    info.StartupInfo.hStdOutput = handles[0];
+    info.StartupInfo.hStdError = handles[1];
+    info.lpAttributeList = list;
+    let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    let created = unsafe {
+        UpdateProcThreadAttribute(
+            list,
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+            handles.as_ptr().cast(),
+            std::mem::size_of_val(&handles),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        ) != 0
+            && CreateProcessW(
+                application.as_ptr(),
+                line.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+                CREATE_NEW_PROCESS_GROUP
+                    | DETACHED_PROCESS
+                    | EXTENDED_STARTUPINFO_PRESENT
+                    | CREATE_UNICODE_ENVIRONMENT,
+                environment.as_ptr().cast(),
+                std::ptr::null(),
+                &info.StartupInfo,
+                &mut process,
+            ) != 0
+    };
+    let error = std::io::Error::last_os_error();
+    unsafe { DeleteProcThreadAttributeList(list) };
+    if !created {
+        return Err(error.into());
+    }
+    unsafe {
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+    }
+    Ok(process.dwProcessId)
 }

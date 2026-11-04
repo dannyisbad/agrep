@@ -19,8 +19,8 @@ fn stale_record(checked: bool, pending_sources: usize) -> Option<Value> {
 }
 pub(crate) fn run(mut a: Around, no_auto: bool, color: &str) -> Result<i32> {
     let result = (|| {
-        if let Some(who) = &a.who {
-            a.who = Some(agrep_core::coverage::speakers(who)?);
+        if a.who.as_deref() == Some("you") {
+            a.who = Some("user".into());
         }
         let exact = agrep_core::handles::is_handle(&a.session);
         let radius = match a.context.as_deref() {

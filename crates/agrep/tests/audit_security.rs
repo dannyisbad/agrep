@@ -32,14 +32,31 @@ fn ok(t: &TempDir, args: &[&str]) -> Output {
     );
     out
 }
+/// Runs `index` or `reindex` and returns the statistics it reports as an
+/// `AGREP_QUERY_TIMING` event.
+fn statistics(t: &TempDir, args: &[&str]) -> Value {
+    let out = command(t)
+        .env("AGREP_QUERY_TIMING", "1")
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|event| event.get("index").cloned())
+        .expect("index statistics event")
+}
 fn fixture() -> TempDir {
     let t = tempfile::tempdir().unwrap();
     let dir = t.path().join("home/.pi/agent/sessions/project");
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("session.jsonl"),format!("{}\n{}\n",json!({"type":"session","id":"secure-session","version":3,"cwd":t.path()}),json!({"type":"message","id":"m1","parentId":null,"timestamp":"2026-10-29T10:01:00Z","message":{"role":"user","content":[{"type":"text","text":"database migration failure"}]}}))).unwrap();
-    ok(&t, &["index"]);
-    let value: Value =
-        serde_json::from_slice(&fs::read(t.path().join("data/index-stats.json")).unwrap()).unwrap();
+    let value = statistics(&t, &["index"]);
     assert!(value.get("skipped_lock").is_none());
     t
 }
@@ -76,25 +93,21 @@ fn installed_corruption_is_disclosed_logged_and_reported_by_diagnostics() {
             .set_len(size)
             .unwrap();
     }
+    let run = |args: &[&str]| {
+        command(&t)
+            .env("AGREP_PROFILE", "compact")
+            .env("AGREP_DATA_READONLY", "1")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    // Automatic hybrid alone keeps the keyword answer, disclosed once.
     for args in [
         vec!["search", "database migration failure"],
         vec!["recall", "database migration failure"],
-        vec!["search", "-s", "database migration failure"],
-        vec!["recall", "-s", "database migration failure"],
         vec!["recall", "--json", "database migration failure"],
-        vec![
-            "pack",
-            "-s",
-            "database migration failure",
-            "migration failure",
-        ],
     ] {
-        let out = command(&t)
-            .env("AGREP_PROFILE", "compact")
-            .env("AGREP_DATA_READONLY", "1")
-            .args(&args)
-            .output()
-            .unwrap();
+        let out = run(&args);
         assert!(
             out.status.success(),
             "{args:?}: {}",
@@ -109,6 +122,122 @@ fn installed_corruption_is_disclosed_logged_and_reported_by_diagnostics() {
             assert_eq!(value["semantic_status"]["state"], "unavailable");
         }
     }
+    // An explicit `-s` never answers with keyword rows: agrep 0.4.9 printed one line, or
+    // under --json its `semantic-unavailable` record, and exited 2 (py/search.py:7686-7719,
+    // py/recall.py:2404-2412, 2717-2747).
+    for args in [
+        vec!["search", "-s", "database migration failure"],
+        vec!["recall", "-s", "database migration failure"],
+        vec![
+            "pack",
+            "-s",
+            "database migration failure",
+            "migration failure",
+        ],
+    ] {
+        let out = run(&args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(
+            text.starts_with("semantic search unavailable: model SHA-256 mismatch: "),
+            "{text}"
+        );
+    }
+    let keys =
+        |value: &Value| -> Vec<String> { value.as_object().unwrap().keys().cloned().collect() };
+    let out = run(&["search", "-s", "--json", "database migration failure"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stderr.is_empty());
+    let record: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        keys(&record),
+        [
+            "kind",
+            "query",
+            "engine",
+            "hits",
+            "error",
+            "semantic",
+            "self_exclusion",
+            "completeness",
+            "filter_coverage",
+            "freshness",
+            "semantic_coverage",
+            "semantic_partial"
+        ]
+    );
+    let reason = record["semantic"]["reason"].as_str().unwrap().to_owned();
+    assert!(reason.starts_with("model SHA-256 mismatch: "), "{reason}");
+    // 0.4.9's record less corpus_age_s and the status's filtered/truncated (PORTING.md).
+    assert_eq!(
+        record,
+        json!({"kind":"agrep-meta","query":"database migration failure",
+            "engine":"semantic:unavailable","hits":[],"error":{"code":"semantic-unavailable"},
+            "semantic":{"state":"unavailable","eligible":true,"reason":reason,"min_score":0.82,
+                "score_kind":"unavailable","coverage":null,"partial":true,"complete":false,
+                "fallback_recommended":true},
+            "self_exclusion":{"active":false,"reason":"machine-surface"},
+            "completeness":{"shown":0,"total":0,"total_basis":"floor","unit":"row",
+                "truncated":true,
+                "action_unavailable_reason":"the query did not produce a result set"},
+            "filter_coverage":{"empty_dimensions":[],"checked":false,
+                "reason":"the query returned before the index was filtered"},
+            "freshness":record["freshness"],"semantic_coverage":null,"semantic_partial":true})
+    );
+    for (args, mut expected) in [
+        (
+            vec!["recall", "-s", "--json", "database migration failure"],
+            vec![
+                "query",
+                "engine",
+                "hits",
+                "score_kind",
+                "partial",
+                "semantic_status",
+            ],
+        ),
+        (
+            vec![
+                "pack",
+                "-s",
+                "--json",
+                "database migration failure",
+                "migration failure",
+            ],
+            vec![
+                "query",
+                "engine",
+                "hits",
+                "score_kind",
+                "partial",
+                "semantic_status",
+                "semantic_queries",
+            ],
+        ),
+    ] {
+        let out = run(&args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(out.stderr.is_empty(), "{args:?}");
+        let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+        expected.extend([
+            "self_exclusion",
+            "filter_coverage",
+            "freshness",
+            "semantic_coverage",
+            "error",
+        ]);
+        assert_eq!(keys(&value), expected);
+        assert_eq!(value["engine"], "semantic:unavailable");
+        assert_eq!(value["hits"], json!([]));
+        assert_eq!(value["score_kind"], "unavailable");
+        assert_eq!(value["partial"], true);
+        assert_eq!(value["semantic_status"]["state"], "unavailable");
+        assert_eq!(value["semantic_status"]["reason"], json!(reason));
+        assert_eq!(value["semantic_coverage"], Value::Null);
+        assert_eq!(value["error"], json!({"code":"semantic-unavailable"}));
+    }
     assert!(fs::read_to_string(root.path().join("log/agrep.log"))
         .unwrap()
         .contains("SHA-256 mismatch"));
@@ -121,7 +250,14 @@ fn installed_corruption_is_disclosed_logged_and_reported_by_diagnostics() {
         .args(["doctor", "--deep", "--json"])
         .output()
         .unwrap();
-    assert_eq!(doctor.status.code(), Some(2));
+    // 0.4.9's doctor exits 0 for a completed report, whatever it found (py/doctor.py:15).
+    assert_eq!(doctor.status.code(), Some(0));
+    let doctor: Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert!(doctor["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["check"] == "semantic_model" && c["state"] == "failed"));
 }
 #[test]
 fn full_reindex_clears_vector_references_and_queues_every_visible_row() {
@@ -136,8 +272,7 @@ fn full_reindex_clears_vector_references_and_queues_every_visible_row() {
     let c = store::writer(&root).unwrap();
     c.execute_batch("INSERT INTO semantic_refs SELECT id,digest,digest FROM prose; INSERT INTO semantic_blocks VALUES('old',1); INSERT INTO semantic_chunks SELECT digest,0,'old',0 FROM prose LIMIT 1; DELETE FROM semantic_queue;").unwrap();
     drop(c);
-    ok(&t, &["reindex", "--full"]);
-    let value: Value = serde_json::from_slice(&fs::read(root.index_stats()).unwrap()).unwrap();
+    let value = statistics(&t, &["reindex", "--full"]);
     assert!(value.get("skipped_lock").is_none());
     let c = store::reader(&root).unwrap();
     assert_eq!(agrep_core::semantic::coverage(&c).unwrap().embedded, 0);
@@ -208,15 +343,17 @@ fn doctor_preserves_edited_extensions_and_hook_json_layout() {
         .join("home/.pi/agent/extensions/agrep-postcompact.ts");
     fs::write(&extension, b"user edits").unwrap();
     let out = command(&t).args(["doctor", "--fix"]).output().unwrap();
-    assert!(!out.status.success());
+    // 0.4.9: "1 requested repair failed" (py/doctor.py:15).
+    assert_eq!(out.status.code(), Some(1));
     let stdout = String::from_utf8_lossy(&out.stdout);
     // The failed repair names its cause, as 0.4.9's doctor rows did.
     let failed = stdout
         .lines()
         .find(|l| l.starts_with("integration_repair: failed - "))
         .unwrap_or_else(|| panic!("{stdout}"));
+    // Windows renders the joined test path with mixed separators, so compare its file name.
     assert!(
-        failed.contains(&extension.display().to_string()),
+        failed.contains("file has user edits: ") && failed.ends_with("agrep-postcompact.ts"),
         "{failed}"
     );
     assert_eq!(fs::read(&extension).unwrap(), b"user edits");
@@ -286,9 +423,14 @@ fn owned_directories_are_private_and_exposure_is_reported() {
     assert_eq!(mode(root.path()), 0o700);
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
     let out = command(&t).args(["doctor", "--json"]).output().unwrap();
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(0));
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["status"]["permissions"]["private"], false);
+    assert!(v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["check"] == "directory_permissions" && c["state"] == "failed"));
     root.validate(false).unwrap();
     assert_eq!(mode(root.path()), 0o700);
     ok(&t, &["archive"]);
@@ -320,4 +462,43 @@ fn evidence_headers_neutralize_transcript_control_and_bidi_text() {
     let packet = json!({"selection":{"caller_session":"secure-session","family_root":"secure-session","project":hostile,"agent":hostile,"boundary_turn":0},"coverage":{"shown_root_blocks":0,"eligible_root_blocks":0},"rows":[],"omissions":{"root_blocks":0}});
     let text = agrep_core::recovery::human(&packet);
     assert!(!text.contains(['\u{1b}', '\u{7}', '\u{202e}']));
+}
+// `doctor --deep --no-semantic` runs the deep checks "without the semantic model check"
+// (help.rs): an installed model is neither verified nor given a check row.
+#[test]
+fn doctor_no_semantic_neither_verifies_nor_reports_the_model() {
+    let t = fixture();
+    fs::create_dir(t.path().join("model")).unwrap();
+    for (name, size, _) in agrep_core::semantic_model::FILES {
+        fs::File::create(t.path().join("model").join(name))
+            .unwrap()
+            .set_len(size)
+            .unwrap();
+    }
+    let doctor = |args: &[&str]| -> Value {
+        let out = command(&t).args(args).output().unwrap();
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let model_rows = |report: &Value| -> Vec<Value> {
+        let checks = report["checks"].as_array().unwrap();
+        let rows = checks.iter().filter(|c| c["check"] == "semantic_model");
+        rows.cloned().collect()
+    };
+    let skipped = doctor(&["doctor", "--deep", "--no-semantic", "--json"]);
+    assert_eq!(model_rows(&skipped), Vec::<Value>::new());
+    assert!(skipped["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["check"] == "sqlite_integrity" && c["state"] == "passed"));
+    assert_eq!(skipped["status"]["semantic"]["model_installed"], true);
+    assert_eq!(
+        skipped["status"]["semantic"]["integrity_error"],
+        Value::Null
+    );
+    let checked = doctor(&["doctor", "--deep", "--json"]);
+    let rows = model_rows(&checked);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["state"], "failed");
+    assert!(rows[0]["detail"].as_str().unwrap().contains("SHA-256"));
 }

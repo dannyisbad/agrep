@@ -1,9 +1,9 @@
 //! Synthetic agent stores shared by the benchmark and the matched comparison.
-use anyhow::Result;
-use serde_json::json;
+use anyhow::{Context, Result};
+use serde_json::{json, Value};
 use std::{
     fs::{self, File},
-    io::{BufWriter, Write},
+    io::{BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -205,9 +205,7 @@ pub fn generate(home: &Path, rows: usize, dense: bool) -> Result<(PathBuf, u64)>
     let mut at = 0;
     let mut text_bytes = 0u64;
     for sid in 0..sessions {
-        // The measured history is overwhelmingly pi/OMP. A 20% prose-only
-        // Codex population distorted both the role mix and filter selectivity.
-        let codex = !dense && sid % 100 == 1;
+        let codex = is_codex(sid, dense);
         let file_base = if codex {
             home.join(".codex/sessions/bench")
         } else if !dense && sid % 10 != 0 {
@@ -245,8 +243,7 @@ pub fn generate(home: &Path, rows: usize, dense: bool) -> Result<(PathBuf, u64)>
             } else {
                 date.clone()
             };
-            let assistant = !dense && j % 80 == 1;
-            let tool = !dense && j % 9 != 0 && !assistant;
+            let (assistant, tool) = row_kind(j, dense);
             let id = format!("e{j}");
             let text = utterance(at, tool, dense, assistant);
             text_bytes += text.len() as u64;
@@ -293,4 +290,116 @@ pub fn generate(home: &Path, rows: usize, dense: bool) -> Result<(PathBuf, u64)>
         }
     }
     Ok((last, text_bytes))
+}
+
+/// The last complete line of a session file, read from its end.
+fn last_line(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let mut window = 4096u64;
+    loop {
+        let start = len.saturating_sub(window);
+        file.seek(SeekFrom::Start(start))?;
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer)?;
+        let body = buffer.strip_suffix(b"\n").unwrap_or(&buffer);
+        if let Some(at) = body.iter().rposition(|b| *b == b'\n') {
+            return Ok(String::from_utf8_lossy(&body[at + 1..]).into_owned());
+        }
+        if start == 0 {
+            return Ok(String::from_utf8_lossy(body).into_owned());
+        }
+        window *= 4;
+    }
+}
+
+/// Appends one user turn to a pi/omp session, parented on its last entry.
+pub fn append_turn(path: &Path, id: &str, text: &str) -> Result<()> {
+    let parent: Value = serde_json::from_str(&last_line(path)?).context("last session entry")?;
+    let mut file = fs::OpenOptions::new().append(true).open(path)?;
+    writeln!(
+        file,
+        "{}",
+        json!({"type":"message","id":id,"parentId":parent["id"],"timestamp":chrono::Utc::now().to_rfc3339(),"message":{"role":"user","content":text}})
+    )?;
+    Ok(())
+}
+
+fn is_codex(sid: usize, dense: bool) -> bool {
+    // The measured history is overwhelmingly pi/OMP. A 20% prose-only
+    // Codex population distorted both the role mix and filter selectivity.
+    !dense && sid % 100 == 1
+}
+
+/// What `generate` writes as row `j` of a session: (an agent reply, a tool call). Codex
+/// sessions write their tool-sized rows as user messages.
+fn row_kind(j: usize, dense: bool) -> (bool, bool) {
+    let assistant = !dense && j % 80 == 1;
+    (assistant, !dense && !j.is_multiple_of(9) && !assistant)
+}
+
+/// Every generated row in order: (session, row within the session, corpus ordinal).
+fn layout(rows: usize) -> impl Iterator<Item = (usize, usize, usize)> {
+    let sessions = (rows / 170).max(1);
+    let mut at = 0;
+    (0..sessions).flat_map(move |sid| {
+        let (start, n) = (at, (rows - at) / (sessions - sid));
+        at += n;
+        (0..n).map(move |j| (sid, j, start + j))
+    })
+}
+
+/// The messages and sessions both versions report for a generated corpus: one message per
+/// user turn, since an agent reply or a tool call belongs to the turn before it.
+pub fn expected_corpus(rows: usize, dense: bool) -> (u64, u64) {
+    let messages = layout(rows)
+        .filter(|&(sid, j, _)| {
+            let (assistant, tool) = row_kind(j, dense);
+            !assistant && (!tool || is_codex(sid, dense))
+        })
+        .count();
+    (messages as u64, (rows / 170).max(1) as u64)
+}
+
+/// The exact `TERM -c` count of a generated mixed corpus, ignoring case like the search:
+/// every prose row holding `term`, and every tool call whose command or first 800
+/// characters of output (the event cap both versions index) hold it. `codex_only` is
+/// `--agent codex`; every mixed row is dated at generation, inside any `--since` window.
+pub fn expected_count(rows: usize, term: &str, codex_only: bool) -> u64 {
+    let term = term.to_lowercase();
+    layout(rows)
+        .filter(|&(sid, j, i)| {
+            let codex = is_codex(sid, false);
+            if codex_only && !codex {
+                return false;
+            }
+            let (assistant, tool) = row_kind(j, false);
+            let text = utterance(i, tool, false, assistant).to_lowercase();
+            if tool && !codex {
+                let output: String = text.chars().take(800).collect();
+                format!("inspect source {i}").contains(&term) || output.contains(&term)
+            } else {
+                text.contains(&term)
+            }
+        })
+        .count() as u64
+}
+
+/// The handle of [`SEMANTIC_FIXTURE`] appended as the next user turn of the last pi
+/// session of a generated mixed corpus, the file `generate` returns.
+pub fn planted_handle(rows: usize) -> String {
+    let sessions = (rows / 170).max(1);
+    let last = (0..sessions)
+        .rev()
+        .find(|&sid| !is_codex(sid, false))
+        .expect("every corpus has a pi session");
+    let turn = layout(rows)
+        .filter(|&(sid, j, _)| sid == last && row_kind(j, false) == (false, false))
+        .count();
+    let names: Vec<String> = (0..sessions).map(|s| format!("bench-{s}")).collect();
+    agrep_core::handles::SessionIndex::from(names).mint(
+        &format!("bench-{last}"),
+        turn as i64,
+        SEMANTIC_FIXTURE,
+    )
 }

@@ -26,7 +26,7 @@ use clap::{Parser, ValueEnum};
 use serde_json::{json, Value};
 use std::{
     fs,
-    io::{Read, Seek, SeekFrom, Write},
+    io::Write,
     path::{Path, PathBuf},
     process::Stdio,
     time::{Duration, Instant},
@@ -122,6 +122,8 @@ struct Case {
     profile: &'static str,
     expected_exit: i32,
     kind: Kind,
+    /// The answer the corpus fixes; index cases take the corpus totals from the bench.
+    expect: results::Expect,
 }
 
 impl Case {
@@ -139,6 +141,7 @@ impl Case {
             profile,
             expected_exit,
             kind,
+            expect: results::Expect::default(),
         }
     }
     fn is_index(&self) -> bool {
@@ -222,6 +225,10 @@ struct Bench {
     trace: Option<PathBuf>,
     /// Extra environment of every command.
     env: Vec<(String, String)>,
+    /// Messages and sessions of the generated stores before any appended turn.
+    corpus: Option<(u64, u64)>,
+    /// User turns appended to the stores since.
+    appended: std::cell::Cell<u64>,
 }
 
 fn load_average() -> Option<[f64; 3]> {
@@ -238,39 +245,6 @@ fn load_average() -> Option<[f64; 3]> {
 
 fn millis(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.
-}
-
-/// The last complete line of a session file, read from its end.
-fn last_line(path: &Path) -> Result<String> {
-    let mut file = fs::File::open(path)?;
-    let len = file.metadata()?.len();
-    let mut window = 4096u64;
-    loop {
-        let start = len.saturating_sub(window);
-        file.seek(SeekFrom::Start(start))?;
-        let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer)?;
-        let body = buffer.strip_suffix(b"\n").unwrap_or(&buffer);
-        if let Some(at) = body.iter().rposition(|b| *b == b'\n') {
-            return Ok(String::from_utf8_lossy(&body[at + 1..]).into_owned());
-        }
-        if start == 0 {
-            return Ok(String::from_utf8_lossy(body).into_owned());
-        }
-        window *= 4;
-    }
-}
-
-/// Appends one user turn to a pi/omp session, parented on its last entry.
-fn append_turn(path: &Path, id: &str, text: &str) -> Result<()> {
-    let parent: Value = serde_json::from_str(&last_line(path)?).context("last session entry")?;
-    let mut file = fs::OpenOptions::new().append(true).open(path)?;
-    writeln!(
-        file,
-        "{}",
-        json!({"type":"message","id":id,"parentId":parent["id"],"timestamp":chrono::Utc::now().to_rfc3339(),"message":{"role":"user","content":text}})
-    )?;
-    Ok(())
 }
 
 fn bytes(path: &Path) -> u64 {
@@ -291,6 +265,31 @@ impl Bench {
         &self.lanes[1]
     }
 
+    /// Appends one user turn ending in a token no other text holds, and returns the token:
+    /// a refresh that committed the turn makes it searchable.
+    fn append(&self, session: &Path, id: &str, words: &str) -> Result<String> {
+        let token = absent_token();
+        corpus::append_turn(session, id, &format!("{words} {token}"))?;
+        self.appended.set(self.appended.get() + 1);
+        Ok(token)
+    }
+
+    /// The answer a sample of `case` must show now.
+    fn expect(&self, case: &Case) -> results::Expect {
+        results::Expect {
+            corpus: self
+                .corpus
+                .map(|(messages, sessions)| (messages + self.appended.get(), sessions)),
+            ..case.expect.clone()
+        }
+    }
+
+    /// Untimed: the rows of the lane's committed index that hold `token`, counted without
+    /// starting a refresh.
+    fn probe(&self, lane: &Lane, token: &str) -> Result<Option<u64>> {
+        let args = [token.to_string(), "-c".into(), "--no-auto".into()];
+        Ok(self.invoke(lane, &args, "classic")?.evidence["bench_count"].as_u64())
+    }
     fn invoke(&self, lane: &Lane, args: &[String], profile: &str) -> Result<Sample> {
         let mut command = process::command(
             &lane.bin,
@@ -307,6 +306,12 @@ impl Bench {
         if let Some(model) = &lane.model {
             command.env("AGREP_MODEL_DIR", model);
         }
+        let index = args.first().is_some_and(|a| a == "index");
+        if index {
+            // 0.5 reports an index run's phases and lock waits as timing events on stderr;
+            // both lanes get the variable, which 0.4.9 ignores.
+            command.env("AGREP_QUERY_TIMING", "1");
+        }
         command.envs(self.env.iter().map(|(k, v)| (k, v)));
         command
             .args(args)
@@ -314,7 +319,6 @@ impl Bench {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let load = load_average();
-        let begun = std::time::SystemTime::now();
         let start = Instant::now();
         let mut child = command
             .spawn()
@@ -345,24 +349,13 @@ impl Bench {
         };
         let closed_ms = millis(start);
         let exit = out.status.code().unwrap_or(-1);
-        let index = args.first().is_some_and(|a| a == "index");
         let settled = if index && lane.role == Role::Reference {
             reap::wait_absent(&lane.data.join(SEARCH_REQUEST), &lane.reap, SETTLE)?
         } else {
             true
         };
         let ms = if index { millis(start) } else { closed_ms };
-        let mut evidence = results::evidence(&out.stdout, &out.stderr);
-        if index && lane.role == Role::Candidate {
-            // Only this run's file counts: an index that failed early leaves the last one.
-            let stats = lane.data.join(results::INDEX_STATS);
-            if fs::metadata(&stats)
-                .and_then(|m| m.modified())
-                .is_ok_and(|t| t >= begun)
-            {
-                evidence = results::with_index_stats(evidence, &fs::read(&stats)?);
-            }
-        }
+        let evidence = results::evidence(&out.stdout, &out.stderr);
         Ok(Sample {
             ms,
             exit_ms,
@@ -429,7 +422,7 @@ impl Bench {
         case: &Case,
         runs: usize,
         session: Option<&Path>,
-        oracle: Option<&(Vec<String>, usize)>,
+        oracle: Option<&[String]>,
     ) -> Result<Value> {
         let mut ended = [0usize; 2];
         for (k, lane) in self.lanes.iter().enumerate() {
@@ -450,6 +443,8 @@ impl Bench {
         let mut drains = [vec![], vec![]];
         let mut unpaired = vec![];
         let mut appended = 0;
+        // The token of the turn the last changed-source sample appended.
+        let mut changed = String::new();
         // The reference's index misses turns appended while the candidate sampled alone.
         let mut reference_behind = false;
         loop {
@@ -468,6 +463,7 @@ impl Bench {
             if !paired {
                 unpaired.push(i);
             }
+            let mut token = None;
             match case.kind {
                 Kind::FirstIndex => {
                     ended[k] += lane.end()?;
@@ -479,22 +475,22 @@ impl Bench {
                     if !paired {
                         // Alone, the candidate still refreshes the turn the reference's
                         // sample would have appended.
-                        append_turn(
+                        self.append(
                             session,
                             &format!("refresh-reference-alone-{i}"),
                             &format!("one changed session incremental probe reference alone {i}"),
                         )?;
                         reference_behind = true;
                     }
-                    append_turn(
+                    token = Some(self.append(
                         session,
                         &format!("refresh-{}-{i}", lane.name()),
                         &format!("one changed session incremental probe {} {i}", lane.name()),
-                    )?;
+                    )?);
                 }
                 // One appended turn per pair, or per candidate sample taken alone.
                 Kind::Changed if k == 0 || !paired => {
-                    append_turn(
+                    changed = self.append(
                         session.context("changed-source case without a session")?,
                         &format!("changed-{appended}"),
                         &format!("active session update {appended}"),
@@ -504,7 +500,11 @@ impl Bench {
                 }
                 Kind::Warm | Kind::Changed => {}
             }
-            let s = self.invoke(lane, &case.args, case.profile)?;
+            let expect = self.expect(case);
+            let mut s = self.invoke(lane, &case.args, case.profile)?;
+            if let Some(token) = &token {
+                s.evidence["bench_probe_count"] = json!(self.probe(lane, token)?);
+            }
             let lane_oracle = if lane.role == Role::Candidate {
                 oracle
             } else {
@@ -512,14 +512,20 @@ impl Bench {
             };
             let mut verified = s.settled
                 && s.exit == case.expected_exit
-                && matched::sample_verified(&case.name, &case.args, &s.evidence, lane_oracle);
+                && matched::sample_verified(
+                    &case.name,
+                    &case.args,
+                    &s.evidence,
+                    lane_oracle,
+                    &expect,
+                );
             if !verified {
                 self.diagnose(lane, &format!("{} sample {i}", case.name), &s);
             }
             if case.kind == Kind::Changed {
                 // The next sample starts from a refreshed index; a failed refresh fails the sample.
                 let drain = self.invoke(lane, &["index".into()], "classic")?;
-                if drain.exit != 0 || !drain.settled {
+                if drain.exit != 0 || !drain.settled || self.probe(lane, &changed)? != Some(1) {
                     self.diagnose(lane, &format!("{} drain {i}", case.name), &drain);
                     verified = false;
                 }
@@ -538,7 +544,8 @@ impl Bench {
                         &case.name,
                         &case.args,
                         &s.evidence,
-                        Some(o)
+                        Some(o),
+                        &expect
                     ));
                 }
             }
@@ -651,6 +658,9 @@ fn summary(evidence: &Value) -> Value {
         "bench_semantic_rows",
         "bench_meaning_lines",
         "bench_stdout_bytes",
+        "bench_index_messages",
+        "bench_index_sessions",
+        "bench_probe_count",
     ] {
         value[key.trim_start_matches("bench_")] = evidence[key].clone();
     }
@@ -1014,7 +1024,7 @@ fn measure(
         let (last, generated) = corpus::generate(&home, rows, a.workload == Workload::Dense)?;
         text_bytes = generated;
         if semantic {
-            append_turn(&last, "semantic-fixture", corpus::SEMANTIC_FIXTURE)?;
+            corpus::append_turn(&last, "semantic-fixture", corpus::SEMANTIC_FIXTURE)?;
             text_bytes += corpus::SEMANTIC_FIXTURE.len() as u64;
         }
         session = Some(last);
@@ -1044,6 +1054,10 @@ fn measure(
     if let Some(path) = &trace {
         fs::write(path, [])?;
     }
+    let corpus_totals = (a.workload != Workload::Real).then(|| {
+        let (messages, sessions) = corpus::expected_corpus(rows, a.workload == Workload::Dense);
+        (messages + u64::from(semantic), sessions)
+    });
     let bench = Bench {
         lanes: lanes(
             "",
@@ -1059,6 +1073,8 @@ fn measure(
         private: a.workload == Workload::Real,
         trace: trace.clone(),
         env: a.env.clone(),
+        corpus: corpus_totals,
+        appended: Default::default(),
     };
     let versions = json!({
         "reference": version(&bench, bench.reference())?,
@@ -1076,7 +1092,7 @@ fn measure(
                    case: Case,
                    runs: usize,
                    session: Option<&Path>,
-                   oracle: Option<&(Vec<String>, usize)>,
+                   oracle: Option<&[String]>,
                    cases: &mut Vec<Value>|
      -> Result<()> {
         required.push(case.name.clone());
@@ -1088,7 +1104,8 @@ fn measure(
     if semantic {
         bench.build()?;
         preparation = bench.embed(a.model_dir.as_deref())?;
-        for case in hybrid_cases(corpus::SEMANTIC_QUERY) {
+        for mut case in hybrid_cases(corpus::SEMANTIC_QUERY) {
+            case.expect.top = Some(corpus::planted_handle(rows));
             let runs = if case.kind == Kind::Cold {
                 a.build_runs
             } else {
@@ -1122,12 +1139,15 @@ fn measure(
             run(&bench, changed, a.runs, source, None, &mut cases)?;
         }
         if a.workload == Workload::Dense {
-            for case in dense_cases() {
-                let oracle = corpus::dense_expected(
+            for mut case in dense_cases() {
+                let (handles, count) = corpus::dense_expected(
                     rows,
                     &case.args.iter().map(String::as_str).collect::<Vec<_>>(),
                 )?;
-                run(&bench, case, a.runs, None, Some(&oracle), &mut cases)?;
+                if case.args.iter().any(|a| a == "-c") {
+                    case.expect.count = Some(count as u64);
+                }
+                run(&bench, case, a.runs, None, Some(&handles), &mut cases)?;
             }
         } else {
             let real = a.workload == Workload::Real;
@@ -1146,6 +1166,12 @@ fn measure(
                             *shown = "<first session>".into();
                         }
                     }
+                } else if case.args.iter().any(|a| a == "-c") {
+                    case.expect.count = Some(corpus::expected_count(
+                        rows,
+                        &case.args[0],
+                        case.args.iter().any(|a| a == "codex"),
+                    ));
                 }
                 run(&bench, case, a.runs, None, None, &mut cases)?;
             }
@@ -1158,6 +1184,8 @@ fn measure(
                     private: true,
                     trace: trace.clone(),
                     env: a.env.clone(),
+                    corpus: None,
+                    appended: Default::default(),
                 };
                 preparation = hybrid.embed(a.model_dir.as_deref())?;
                 for case in hybrid_cases(NATURAL) {
@@ -1195,6 +1223,8 @@ fn measure(
                 private: true,
                 trace: trace.clone(),
                 env: a.env.clone(),
+                corpus: None,
+                appended: Default::default(),
             };
             active_bench.build()?;
             let refresh = Case::new("one_session_refresh", &["index"], "classic", Kind::Refresh);

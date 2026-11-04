@@ -204,6 +204,31 @@ pub fn normalize_agent(a: &str) -> &str {
         _ => a,
     }
 }
+/// 0.4.9's `capability_error` (py/hookless/registry.py:405-425): an unknown name lists the
+/// agents with `capability`, and a known agent without it gives its reason.
+pub fn capability_error(
+    capability: &str,
+    name: &str,
+    supported: &[&str],
+    reasons: &[(&str, &str)],
+) -> String {
+    match reasons.iter().find(|(agent, _)| *agent == name) {
+        Some((_, reason)) => format!("{name} has no {capability} support: {reason}"),
+        None => {
+            // Python's repr of the name, as 0.4.9 printed it.
+            let escaped = name.replace('\\', "\\\\");
+            let quoted = if name.contains('\'') && !name.contains('"') {
+                format!("\"{escaped}\"")
+            } else {
+                format!("'{}'", escaped.replace('\'', "\\'"))
+            };
+            format!(
+                "unknown agent {quoted}; supported for {capability}: {}",
+                supported.join(", ")
+            )
+        }
+    }
+}
 pub fn target(id: &str) -> String {
     format!("@{}", crate::handles::full_target(id))
 }

@@ -1,3 +1,5 @@
+#[path = "../examples/support/exit.rs"]
+mod exit;
 mod support;
 use agrep_core::{data::DataRoot, store};
 use rusqlite::{Connection, OpenFlags};
@@ -35,10 +37,24 @@ fn ok(out: Output) -> Output {
     );
     out
 }
-/// Runs `index` and returns the statistics it records in the data root.
+/// Runs `index` and returns the statistics it reports as an `AGREP_QUERY_TIMING` event.
 fn indexed(home: &Path, data: &Path) -> Value {
-    ok(cli(home, data, &["index"]));
-    serde_json::from_slice(&fs::read(data.join("index-stats.json")).unwrap()).unwrap()
+    let out = ok(Command::new(support::binary())
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", home)
+        .env("AGREP_HOME", home)
+        .env("AGREP_DATA_DIR", data)
+        .env("AGREP_PROFILE", "classic")
+        .env("AGREP_QUERY_TIMING", "1")
+        .arg("index")
+        .output()
+        .expect("built agrep executable is required"));
+    String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|event| event.get("index").cloned())
+        .expect("index statistics event")
 }
 // Rebuild invariants concern row counts. Status also reports physical disk use and
 // refresh timestamps, which are expected to change when the same rows are rebuilt.
@@ -558,6 +574,74 @@ fn two_token_adapters_do_not_delete_each_others_unchanged_rows() {
     assert_eq!(
         status_counts(cli(&h, &d, &["status", "--json", "--no-auto"])),
         before
+    );
+}
+// A source whose directory became a file is gone for the census, so the refresh that the
+// census asks for removes it, and the census then has nothing left to ask for.
+#[test]
+fn a_source_under_a_directory_turned_file_is_removed_by_the_refresh() {
+    let t = TempDir::new().unwrap();
+    let (h, d) = (t.path().join("h"), t.path().join("d"));
+    fixture("pi", &h);
+    ok(cli(&h, &d, &["index"]));
+    assert_eq!(pending_sources(&h, &d), 0);
+    let dir = h.join(".pi/agent/sessions/-work-legacy");
+    let source = dir.join("2025-11-01T00-00-00-000Z_01920000-0000-7000-8000-000000000002.jsonl");
+    fs::remove_dir_all(&dir).unwrap();
+    fs::write(&dir, b"not a directory").unwrap();
+    assert_eq!(pending_sources(&h, &d), 1);
+    ok(cli(&h, &d, &["index"]));
+    assert_eq!(pending_sources(&h, &d), 0);
+    let status: Value =
+        serde_json::from_slice(&ok(cli(&h, &d, &["status", "--json", "--no-auto"])).stdout)
+            .unwrap();
+    assert!(!status["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["path"] == source.display().to_string()));
+}
+// A directory the census cannot list is recorded with its error, and once it lists again
+// that record names no source: the census asks for a refresh, and the refresh drops it.
+#[test]
+fn a_directory_error_clears_once_the_directory_reads_again() {
+    let t = TempDir::new().unwrap();
+    let (h, d) = (t.path().join("h"), t.path().join("d"));
+    fixture("pi", &h);
+    ok(cli(&h, &d, &["index"]));
+    let dir = h.join(".pi/agent/sessions/-work-alpha");
+    // The record a refresh writes for a directory its census could not list (the shape a
+    // `chmod 000` on the sessions directory leaves for each session directory).
+    store::writer(&DataRoot(d.clone()))
+        .unwrap()
+        .execute(
+            "INSERT INTO sources VALUES(?1,'pi',0,0,'',?2)",
+            rusqlite::params![
+                dir.to_string_lossy(),
+                format!("source parse incomplete: {}", dir.display())
+            ],
+        )
+        .unwrap();
+    let errors = || -> Vec<Value> {
+        let status: Value =
+            serde_json::from_slice(&ok(cli(&h, &d, &["status", "--json", "--no-auto"])).stdout)
+                .unwrap();
+        status["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| !s["last_error"].is_null())
+            .cloned()
+            .collect()
+    };
+    assert_eq!(errors().len(), 1);
+    assert_eq!(pending_sources(&h, &d), 1);
+    ok(cli(&h, &d, &["index"]));
+    assert_eq!(pending_sources(&h, &d), 0);
+    assert!(errors().is_empty());
+    assert!(
+        String::from_utf8_lossy(&ok(cli(&h, &d, &["doctor"])).stdout)
+            .starts_with("doctor: checks passed\n")
     );
 }
 #[test]
@@ -2872,8 +2956,28 @@ fn explicit_coverage_is_separate_and_identifiers_keep_grep_semantics() {
     o.content = true;
     assert!(agrep_core::query::search(&c, &o).unwrap().hits.is_empty());
     let output = cli(&home, &data, &["--coverage", "specific useful missing"]);
-    assert_ne!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("coverage lane (forced)"));
+    // 0.4.9 printed the lane on stderr below the miss's explanation and kept the miss's
+    // exit status (py/search.py:6484-6531, 8139-8157, 8553-8560).
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert_eq!(lines.len(), 3, "{stderr}");
+    assert!(lines[0].starts_with("keyword: 0 matching rows"), "{stderr}");
+    assert_eq!(
+        lines[1],
+        "coverage lane (forced): top row matched 2/3 terms - dropped: missing"
+    );
+    assert!(lines[2].starts_with("@test-ses"), "{stderr}");
+    assert!(
+        lines[2].ends_with(" ~all specific useful context"),
+        "{stderr}"
+    );
+    let empty = cli(&home, &data, &["--coverage", "nothing matches here"]);
+    assert_eq!(empty.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&empty.stderr)
+        .lines()
+        .any(|l| l == "coverage lane: no candidate rows"));
     // 0.4.9 ranked the coverage lane by coverage whatever --sort said.
     for sort in ["time", "position"] {
         let sorted = cli(
@@ -2890,6 +2994,63 @@ fn explicit_coverage_is_separate_and_identifiers_keep_grep_semantics() {
             )
         );
     }
+}
+
+/// 0.4.9's forced lane (py/search.py:6412-6445, py/corpusdb.py:5165-5204): rows quoting
+/// the whole query are left out, each chat gives its best other row even when the page
+/// already shows that chat, and at most 20 chats are listed.
+#[test]
+fn coverage_lane_skips_echoes_and_lists_one_row_per_chat() {
+    let t = TempDir::new().unwrap();
+    let home = t.path().join("h");
+    let data = t.path().join("d");
+    let chat = |name: &str, texts: &[&str]| {
+        let p = home.join(format!(".pi/agent/sessions/{name}/chat.jsonl"));
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let mut lines = vec![serde_json::json!({"type":"session","id":format!("{name}-session"),"version":3,"cwd":format!("/work/{name}"),"timestamp":"2026-10-29T12:00:00Z"}).to_string()];
+        for (i, text) in texts.iter().enumerate() {
+            lines.push(serde_json::json!({"type":"message","id":format!("m{i}"),"parentId":if i==0{Value::Null}else{Value::String(format!("m{}",i-1))},"timestamp":"2026-10-29T12:00:01Z","message":{"role":"user","content":text}}).to_string());
+        }
+        fs::write(&p, lines.join("\n") + "\n").unwrap();
+    };
+    chat(
+        "echo",
+        &["rotate secret credentials", "rotate the vault credentials"],
+    );
+    for i in 0..24 {
+        chat(
+            &format!("many{i:02}"),
+            &[
+                &format!("rotate credentials number {i}"),
+                &format!("rotate keys number {i}"),
+            ],
+        );
+    }
+    ok(cli(&home, &data, &["index"]));
+    let output = cli(&home, &data, &["--coverage", "rotate secret credentials"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("rotate secret credentials"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let block: Vec<&str> = stderr
+        .lines()
+        .skip_while(|l| !l.starts_with("coverage lane (forced): "))
+        .collect();
+    assert_eq!(
+        block[0], "coverage lane (forced): top row matched 2/3 terms - dropped: secret",
+        "{stderr}"
+    );
+    let rows = &block[1..];
+    assert_eq!(rows.len(), 20, "{stderr}");
+    assert!(rows
+        .iter()
+        .all(|r| !r.contains("rotate secret credentials")));
+    assert!(rows
+        .iter()
+        .any(|r| r.ends_with("rotate the vault credentials")));
+    let chats: std::collections::HashSet<_> =
+        rows.iter().map(|r| r.split(':').next().unwrap()).collect();
+    assert_eq!(chats.len(), 20, "{stderr}");
+    assert!(rows.iter().all(|r| !r.contains("rotate keys")));
 }
 
 #[test]
@@ -3175,8 +3336,8 @@ fn index_output(h: &Path, d: &Path, limit: std::time::Duration) -> Output {
 
 /// std's CreateProcess on Windows passes every inheritable handle to the child, and a
 /// command's standard handles are inheritable when its caller passed pipes. The merger
-/// `index` starts waits here while an explicit command runs; had it inherited the
-/// pipes, the output would stay open until that command ended.
+/// `index` starts waits here while a writer is queued; had it inherited the pipes, the
+/// output would stay open until that writer was served.
 #[test]
 fn index_output_closes_while_the_merger_it_started_waits() {
     use serde_json::json;
@@ -3201,10 +3362,62 @@ fn index_output_closes_while_the_merger_it_started_waits() {
         Connection::open_with_flags(d.join("index.db"), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
     assert!(agrep_core::fts_segments::pending(&c).unwrap());
     drop(c);
-    let root = DataRoot::open(&d, false).unwrap();
-    let command = root.foreground().unwrap();
+    // What a blocking writer holds while it waits for `writer.lock`.
+    let queued = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(d.join("writer.queue"))
+        .unwrap();
+    queued.lock_shared().unwrap();
     ok(index_output(&h, &d, std::time::Duration::from_secs(300)));
-    drop(command);
+    queued.unlock().unwrap();
+}
+
+/// The automatic refresh end to end: a plain query that finds a changed source answers
+/// from the committed index and starts the detached `__work` that commits the change.
+#[test]
+fn a_query_that_finds_a_changed_source_starts_the_refresh_that_commits_it() {
+    use serde_json::json;
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let d = t.path().join("d");
+    let path = transcript(&h, &["prose turn marker"]);
+    ok(cli(&h, &d, &["index"]));
+    write_records(
+        &path,
+        &[
+            json!({"type":"message","id":"u0","parentId":"m0","timestamp":"2026-10-30T12:00:00Z","message":{"role":"user","content":"appended cobalt turn"}}),
+        ],
+        true,
+    );
+    let query = Command::new(support::binary())
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", &h)
+        .env("AGREP_HOME", &h)
+        .env("AGREP_DATA_DIR", &d)
+        .env("AGREP_PROFILE", "classic")
+        .env("AGREP_QUERY_TIMING", "1")
+        .args(["cobalt", "-c"])
+        .output()
+        .unwrap();
+    // The answer is the committed index's; the refresh runs after it.
+    assert_eq!(String::from_utf8_lossy(&query.stdout).trim(), "0");
+    let stderr = String::from_utf8_lossy(&query.stderr);
+    let pid = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|event| event["worker_started"]["pid"].as_u64())
+        .unwrap_or_else(|| panic!("no refresh worker started: {stderr}"));
+    assert!(
+        exit::wait(pid as u32, std::time::Duration::from_secs(300)).unwrap(),
+        "refresh worker {pid} did not exit"
+    );
+    let found = ok(cli(&h, &d, &["cobalt", "-c", "--no-auto"]));
+    assert_eq!(String::from_utf8_lossy(&found.stdout).trim(), "1");
+    assert_eq!(pending_sources(&h, &d), 0);
 }
 
 /// The first build leaves one segment per text index; later refreshes' smaller segments

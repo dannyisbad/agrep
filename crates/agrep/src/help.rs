@@ -250,14 +250,14 @@ pub(crate) const DOCTOR: &str = "examples:
   agrep doctor --fix    refresh sources, repair integrations, rebuild a corrupt index
   agrep doctor --json   machine-readable bounded report
 
-exit: 0 healthy, 1 source or integration problems, 2 failed checks, a missing or unreadable index, or invalid options.";
+exit: 0 diagnostic/action complete, 1 requested repair failed, 2 invalid options.";
 
 pub(crate) const AUDIT: &str = "examples:
   agrep audit                 bounded cached accounting check
   agrep audit --agent codex   check one source adapter
   agrep audit --full          recount every eligible source file
 
-exit: 0 clean, 1 coverage gaps under --strict, 2 unreadable evidence or invalid input.";
+exit: 0 clean, 1 evidence warning, 2 accounting error or invalid input.";
 
 pub(crate) const WHY: &str =
     "The reference resolves like `agrep resume`: session id or prefix, @handle,

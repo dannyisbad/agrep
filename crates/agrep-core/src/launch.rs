@@ -6,18 +6,38 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
+/// Agents without native resume and why, from 0.4.9's registry
+/// (py/hookless/agent_registry.json).
+const NO_RESUME: &[(&str, &str)] = &[
+    ("kimi", "no verified resume-by-session CLI contract"),
+    (
+        "cline",
+        "tasks are editor-owned and have no standalone resume command",
+    ),
+    ("gemini", "no verified resume-by-session CLI contract"),
+    ("crush", "no verified resume-by-session CLI contract"),
+    (
+        "cursor",
+        "sessions are editor-owned and have no safe CLI resume command",
+    ),
+];
 pub fn capability(agent: &str) -> Result<(&'static str, &'static str)> {
-    match history::normalize_agent(agent) {
+    let name = history::normalize_agent(agent);
+    match name {
         "claude" => Ok(("claude", "--resume")),
         "codex" => Ok(("codex", "resume")),
         "opencode" => Ok(("opencode", "--session")),
         "antigravity" => Ok(("agy", "--conversation")),
         "pi" => Ok(("pi", "-r")),
-        "cline" | "cursor" => {
-            bail!("{agent} sessions are editor-owned and have no standalone resume command")
-        }
-        "kimi" | "gemini" | "crush" => bail!("{agent} has no verified native resume/run command"),
-        _ => bail!("unknown agent: {agent}"),
+        _ => bail!(
+            "{}",
+            history::capability_error(
+                "native resume",
+                name,
+                &["claude", "codex", "opencode", "antigravity", "pi"],
+                NO_RESUME,
+            )
+        ),
     }
 }
 pub fn executable(name: &str) -> Option<PathBuf> {
@@ -81,10 +101,26 @@ pub fn run(exe: &Path, args: &[OsString], cwd: &Path) -> Result<i32> {
     let mut command = Command::new(exe);
     command.args(args).current_dir(cwd);
     #[cfg(unix)]
-    use std::os::unix::process::CommandExt;
+    let interactive = unsafe { libc::isatty(0) == 1 && libc::isatty(1) == 1 };
     #[cfg(unix)]
-    if unsafe { libc::isatty(0) == 0 || libc::isatty(1) == 1 } {
-        command.process_group(0);
+    {
+        use std::os::unix::process::CommandExt;
+        // As in 0.4.9, an interactive agent gets a group of its own in this session and is
+        // lent the terminal. In a pipeline (`agrep run x | less`) the terminal stays with the
+        // whole job, so the agent gets a session of its own and never stops a partner that
+        // reads /dev/tty.
+        if interactive {
+            command.process_group(0);
+        } else {
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
     }
     #[cfg(windows)]
     windows_job()?;
@@ -96,7 +132,7 @@ pub fn run(exe: &Path, args: &[OsString], cwd: &Path) -> Result<i32> {
         command.creation_flags(0x00000200);
     }
     #[cfg(unix)]
-    let mut signals = unix::Signals::install()?;
+    let mut signals = unix::Signals::install(interactive)?;
     let mut child = command
         .spawn()
         .with_context(|| format!("could not launch {}", exe.display()))?;
@@ -138,7 +174,10 @@ pub fn run(exe: &Path, args: &[OsString], cwd: &Path) -> Result<i32> {
 #[cfg(unix)]
 mod unix {
     use anyhow::Result;
-    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::{
+        sync::atomic::{AtomicI32, Ordering},
+        time::{Duration, Instant},
+    };
     static PID: AtomicI32 = AtomicI32::new(0);
     static SIGNAL: AtomicI32 = AtomicI32::new(0);
     extern "C" fn relay(sig: i32) {
@@ -146,9 +185,7 @@ mod unix {
         let pid = PID.load(Ordering::SeqCst);
         if pid > 0 {
             unsafe {
-                if libc::kill(-pid, sig) != 0 {
-                    libc::kill(pid, sig);
-                }
+                libc::kill(-pid, sig);
             }
         }
     }
@@ -159,15 +196,11 @@ mod unix {
         termios: Option<libc::termios>,
     }
     impl Signals {
-        pub fn install() -> Result<Self> {
+        pub fn install(interactive: bool) -> Result<Self> {
             let mut s = Self {
                 old: vec![],
                 pgrp: unsafe { libc::tcgetpgrp(0) },
-                tty: unsafe {
-                    libc::isatty(0) == 1
-                        && libc::isatty(1) == 1
-                        && libc::tcgetpgrp(0) == libc::getpgrp()
-                },
+                tty: interactive && unsafe { libc::tcgetpgrp(0) == libc::getpgrp() },
                 termios: {
                     let mut t = unsafe { std::mem::zeroed() };
                     if unsafe { libc::tcgetattr(0, &mut t) } == 0 {
@@ -267,7 +300,7 @@ mod unix {
             unsafe {
                 libc::kill(-(pid as i32), libc::SIGTERM);
             }
-            std::thread::sleep(std::time::Duration::from_millis(1500));
+            drain(pid as i32, Duration::from_millis(1500));
             unsafe {
                 libc::kill(-(pid as i32), libc::SIGKILL);
             }
@@ -300,6 +333,149 @@ mod unix {
             }
             PID.store(0, Ordering::SeqCst);
         }
+    }
+
+    /// Gives every member of group `leader` other than the exited, unreaped leader up to
+    /// `grace` to exit, returning as soon as none is left.
+    fn drain(leader: i32, grace: Duration) {
+        let deadline = Instant::now() + grace;
+        while member_exited(leader, deadline.saturating_duration_since(Instant::now())) {}
+    }
+
+    /// Waits up to `left` for a live member of group `leader` to exit. True means the group
+    /// is worth checking again; false means no member is left or none exited in time.
+    #[cfg(target_os = "macos")]
+    fn member_exited(leader: i32, left: Duration) -> bool {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let mut pids = vec![0 as libc::pid_t; 64];
+        let listed = loop {
+            let size = std::mem::size_of_val(pids.as_slice()) as libc::c_int;
+            let n = unsafe { libc::proc_listpgrppids(leader, pids.as_mut_ptr().cast(), size) };
+            if n < 0 {
+                return false;
+            }
+            if (n as usize) < pids.len() {
+                break n as usize;
+            }
+            pids.resize(pids.len() * 2, 0);
+        };
+        let changes: Vec<_> = pids[..listed]
+            .iter()
+            .filter(|&&pid| pid > 0 && pid != leader)
+            .map(|&pid| libc::kevent {
+                ident: pid as libc::uintptr_t,
+                filter: libc::EVFILT_PROC,
+                flags: libc::EV_ADD | libc::EV_ONESHOT | libc::EV_RECEIPT,
+                fflags: libc::NOTE_EXIT,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            })
+            .collect();
+        if changes.is_empty() {
+            return false;
+        }
+        let kq = unsafe { libc::kqueue() };
+        if kq < 0 {
+            return false;
+        }
+        let kq = unsafe { OwnedFd::from_raw_fd(kq) };
+        let mut receipts = changes.clone();
+        let now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let n = unsafe {
+            libc::kevent(
+                kq.as_raw_fd(),
+                changes.as_ptr(),
+                changes.len() as libc::c_int,
+                receipts.as_mut_ptr(),
+                receipts.len() as libc::c_int,
+                &now,
+            )
+        };
+        // A receipt's data is 0 for a watched member and ESRCH for one that already exited,
+        // which includes the zombies proc_listpgrppids lists.
+        if n <= 0 || !receipts[..n as usize].iter().any(|r| r.data == 0) {
+            return false;
+        }
+        let timeout = libc::timespec {
+            tv_sec: left.as_secs() as libc::time_t,
+            tv_nsec: left.subsec_nanos() as libc::c_long,
+        };
+        let mut event = changes[0];
+        woke(unsafe { libc::kevent(kq.as_raw_fd(), std::ptr::null(), 0, &mut event, 1, &timeout) })
+    }
+
+    /// Waits up to `left` for a live member of group `leader` to exit. True means the group
+    /// is worth checking again; false means no member is left or none exited in time.
+    #[cfg(target_os = "linux")]
+    fn member_exited(leader: i32, left: Duration) -> bool {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return false;
+        };
+        let mut members = vec![];
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<libc::pid_t>().ok())
+            else {
+                continue;
+            };
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            // State, parent and process group follow the parenthesized command name.
+            let mut fields = stat
+                .rsplit_once(')')
+                .map_or("", |(_, rest)| rest)
+                .split_whitespace();
+            let (state, group) = (fields.next(), fields.nth(1));
+            if pid == leader
+                || state == Some("Z")
+                || group.and_then(|g| g.parse::<libc::pid_t>().ok()) != Some(leader)
+            {
+                continue;
+            }
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+            if fd >= 0 {
+                members.push(unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) });
+            } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS) {
+                // Before Linux 5.3 no exit can be awaited, so the group gets its whole grace.
+                std::thread::sleep(left);
+                return false;
+            }
+        }
+        if members.is_empty() {
+            return false;
+        }
+        let mut polls: Vec<_> = members
+            .iter()
+            .map(|fd| libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        let millis = left.as_millis().min(i32::MAX as u128) as libc::c_int;
+        woke(unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, millis) })
+    }
+
+    /// Whether a kevent or poll result reports an event, or a signal that interrupted it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn woke(result: libc::c_int) -> bool {
+        let interrupted =
+            || std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted;
+        result > 0 || (result < 0 && interrupted())
+    }
+
+    /// Without an exit notification for other processes, the group gets its whole grace.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn member_exited(_: i32, left: Duration) -> bool {
+        std::thread::sleep(left);
+        false
     }
 }
 #[cfg(windows)]

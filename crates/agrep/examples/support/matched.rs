@@ -197,21 +197,20 @@ pub fn conformance(planned: usize, reference: &[f64], candidate: &[f64]) -> [Opt
     [beyond(reference.len(), r), beyond(candidate.len(), c)]
 }
 
-/// Whether one sample proves its case's answer: the benchmark's result predicates for
-/// every lane, and for the candidate on the dense corpus the exact full-corpus oracle.
+/// Whether one sample proves its case's answer: the benchmark's result predicates and the
+/// answer the corpus fixes for every lane, and for the candidate on the dense corpus the
+/// exact full-corpus ranking.
 pub fn sample_verified(
     name: &str,
     args: &[String],
     evidence: &Value,
-    oracle: Option<&(Vec<String>, usize)>,
+    oracle: Option<&[String]>,
+    expect: &super::results::Expect,
 ) -> bool {
-    match oracle {
-        Some((_, count)) if args.iter().any(|a| a == "-c") => {
-            evidence["bench_count"].as_u64() == Some(*count as u64)
-        }
-        Some((handles, _)) => evidence["bench_handles"] == json!(handles),
-        None => super::results::valid_result(name, evidence),
-    }
+    super::results::valid_result(name, evidence, expect)
+        && oracle.is_none_or(|handles| {
+            args.iter().any(|a| a == "-c") || evidence["bench_handles"] == json!(handles)
+        })
 }
 
 /// Why a lane's samples cannot stand as a measurement of the case, if they cannot.

@@ -21,6 +21,11 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   chats only, so the missing parent cannot make it ambiguous.
 - No automatic over-specification lane runs, so a compact page 0.4.9 would have retried
   keeps its exact count and notice: coverage recovery is the explicit `--coverage` lane.
+- The `--coverage` lane ranks prose and tool output each by bm25 in its own index and
+  merges the scores, where 0.4.9 ranked both in one trigram index: 0.5 indexes tool
+  output by word, so no one index holds both. A query word holding anything but ASCII
+  letters and digits matches no tool row there, and rows with equal scores keep their
+  index order where 0.4.9's order was SQLite's choice, so a rerun lists them the same.
 - Under `--no-meta`, recall and pack take each chat's best row from the ranking `--chats`
   uses, which folds tiers into one score, where 0.4.9 took it tier-first: one chat ranking
   serves both, and they differ only for a chat whose best phrase row scores below one of
@@ -32,8 +37,11 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
 - A tool event keeps only its trimmed search text, so `--tool-output` and JSON
   `input`/`output` lack the surrounding whitespace 0.4.9 stored separately, and
   `[+N indexed chars]` counts the trimmed output: the index stores one text per event.
-- Continuation pages live in a small SQLite store and survive changes to source content
-  until their TTL: the 0.5 frozen-page contract.
+- `--more` serves a page's frozen rows until its TTL, as 0.4.9 did, without 0.4.9's
+  `corpus changed since this page was frozen; newer results may exist - rerun the search
+  to refresh` line when the index changed meanwhile: a 0.5 page keeps its rows, query and
+  totals but not the state of the index it came from, which the background refresh
+  changes between almost any two pages while an agent works.
 - Recall's structured hit also carries its verified handle and `self` bit, and source reply
   truncation is known from retained reply metadata where 0.4.9 reported it as unknown: 0.5
   keeps that metadata.
@@ -43,6 +51,10 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   counting the rows below it, keeps one vector store whose coverage is `semantic_coverage`,
   and probes the scope for the query's words only when the keyword lane found nothing,
   since a keyword row already proves one occurs.
+- An explicit `-s` whose lane failed gives the failure's cause as its reason, and a pack
+  whose lanes failed for different causes says `semantic search unavailable: the meaning
+  lane did not answer` without 0.4.9's `; it retries automatically`: 0.5 has no daemon to
+  retry the lane.
 - A meaning row's `sem_score` can differ from 0.4.9's in the fourth decimal (0.882033
   where 0.4.9 said 0.881866): 0.5 embeds with the model's full-precision weights, where
   0.4.9 ran reduced-precision (int8 or fp16) copies.
@@ -67,6 +79,9 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
 - On a terminal a cut classic page ends with the same `showing N of M …` line a pipe
   gets, not 0.4.9's `N hits in C chats · keyword · 12ms` summary: counting the matching
   chats would cost the same full count.
+- When stdout and stderr share one pipe, a classic page's rows come before its stderr
+  lines, in the order a terminal shows them: 0.4.9 held piped rows in its output buffer
+  until it exited, so its notices landed above the rows.
 - Compact pages offer no `agrep --deeper` broader rerun: 0.5 drops the hidden `--deeper`
   replay; the larger `-n` rerun stays.
 - A bad `-E` pattern is reported with 0.5's regex engine's message (`bad regex: Parsing
@@ -121,24 +136,22 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   help`, `error: unexpected argument '--x' found`) instead of argparse's: 0.5 parses every
   command with one clap parser. Each page keeps 0.4.9's descriptions, option text, examples
   and exit lines wherever the command behaves the same; the refusals 0.4.9 worded itself
-  (option gates, time windows, `--more`) keep their wording; and every argument error still
-  exits 2, as 0.4.9's did.
+  (option gates, time windows, `--more`, unknown agents) keep their wording, without the
+  `; to search for the word "tail": agrep search tail …` hint argparse appended to a
+  subcommand's refusal; and every argument error still exits 2, as 0.4.9's did.
 - `status`, `resume`, `ui` and `serve` also accept `--no-auto`, which 0.4.9 refused with
   exit 2: in 0.5 each of them checks the agent stores for changes itself, as search does,
   where 0.4.9 left that to its daemon. `index --semantic` is new: it downloads the model if
   needed and embeds every row before exiting.
-- search's `--strict-semantic` and reindex's `--max-new` are gone (exit 2): the first was
-  a compatibility alias that changed nothing, since `-s` already exits 2 when meaning is
-  unavailable, and the second bounded the 0.4.9 daemon's background embedding passes,
-  which 0.5's background worker replaces with fixed batches.
+- search's `--strict-semantic` is gone (exit 2): it was a compatibility alias that changed
+  nothing, since `-s` already exits 2 when meaning is unavailable.
 
 ## Index and reindex
 
 - `index` prints 0.4.9's report without the lines about files 0.5 does not keep (the
   per-agent parse lines, the `-> messages.jsonl` target, and the `replies.jsonl` and
   event-stream lines with their counts), and its phases are 0.5's: census, parse, write,
-  bounds and stats, or only the census for an unchanged pass. The statistics object 0.5
-  printed before is written to `index-stats.json` in the data root: 0.5 keeps one SQLite
+  bounds and stats, or only the census for an unchanged pass: 0.5 keeps one SQLite
   database instead of those files.
 - `reindex` prints that report under 0.4.9's `=== ingest transcripts ===` stage, without
   its `(rust)` label or its `no new messages since last index` shortcut: 0.5's reindex
@@ -148,20 +161,34 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
 
 - Setup replaces every agrep-marked block, including an edited one: the marked block is
   agrep's to own. Unmarked skills and edited helper files stay protected.
-- Hook registration merges only the owned entry into existing hook arrays, and JSON
-  whitespace may be reformatted with the original LF/CRLF convention: other hooks and values
-  must survive the merge.
+- Hook registration adds agrep's entry beside a user's own hooks for the same event, where
+  0.4.9 registered nothing when a hook it had not installed was there: recovery works
+  without displacing the user's hook. It rewrites only the top-level `hooks` value, in the
+  file's indentation, separators, `\u` escaping and line endings as 0.4.9 detected them,
+  and leaves the rest of the file byte for byte where 0.4.9 re-serialized all of it in that
+  style: the user's other settings keep their exact text.
 - Consent and completion output omit the dependency, daemon, owner and sentinel stages: those
   stages no longer exist. Invalid settings print `agrep: tools must be on/off` without
   0.4.9's `agrep set:` prefix and its `to search for the word "set": …` hint: one error
   path renders every command's failures.
-- Archives use a version-1 SQLite catalog and immutable 1 MiB SHA-256 gzip chunks, never read
-  a 0.4.x manifest or blob, and report stored compressed bytes: 0.5 shares no data with
-  0.4.x.
-- An explicit capture snapshots SQLite through the backup API, and scheduled captures run at
-  most once per ten minutes inside `__work`: there is no daemon to settle captures.
-- A forced restore into an existing SQLite file uses the backup API under SQLite's write
-  lock and preserves contents rather than WAL file bytes: live readers stay coherent.
+- Archives use a version-1 SQLite catalog and immutable 1 MiB SHA-256 gzip chunks and never
+  read a 0.4.x manifest or xz blob: 0.5 shares no data with 0.4.x. The stored size counts the
+  compressed chunks alone, where 0.4.9 counted every file in its archive directory, so it and
+  the `x smaller than the originals` ratio differ for the same files: the catalog's fixed
+  database pages would outweigh a small archive's copies. An explicit capture lists its files
+  in path order, not 0.4.9's agent order: one sorted walk also drops a file two agents share.
+- Scheduled captures run inside `__work` at most once per ten minutes and snapshot a changed
+  SQLite store at once through the backup API, where 0.4.9's daemon checked every minute,
+  re-imaged a file rewritten in place at most every ten minutes and, explicit captures
+  included, deferred a SQLite store written in the last 15 minutes: there is no daemon tick,
+  and a backup-API snapshot is consistent while the store is in use. A file written while it
+  is copied, or a SQLite store a scheduled snapshot finds locked, fails for that pass where
+  0.4.9 listed it as deferred: the next pass retries it either way.
+- A forced restore into an existing SQLite file writes the archived contents into it through
+  the backup API under SQLite's write lock, where 0.4.9 replaced the file and deleted its
+  `-wal`, `-shm` and `-journal` files: open connections keep a coherent database instead of
+  one swapped beneath them. A restore refuses a destination holding such a file without its
+  database, which 0.4.9 deleted: it may hold the only copy of committed writes.
 
 ## Distribution, CI, release and documentation
 

@@ -160,7 +160,6 @@ fn upkeep_with(root: &DataRoot, cap: usize, step_pages: i64) -> Result<Upkeep> {
             break;
         };
         let c = {
-            root.wait_for_foreground()?;
             let _lock = root.lock_behind_writers()?;
             store::writer(root)?
         };
@@ -196,14 +195,14 @@ fn upkeep_with(root: &DataRoot, cap: usize, step_pages: i64) -> Result<Upkeep> {
     Ok(out)
 }
 
-/// SQLite virtual-machine instructions between checks for an explicit command during a
-/// step: FTS5 writes each output page through a statement, so about a millisecond.
+/// SQLite virtual-machine instructions between checks for a queued writer during a step:
+/// FTS5 writes each output page through a statement, so about a millisecond.
 const PROBE_OPS: i32 = 1000;
 
 /// Run FTS5 `merge` steps (a negative budget merges every segment into one) until a
-/// step leaves the structure record unchanged. A step starts only while no explicit
-/// command runs, and one that starts meanwhile interrupts it: the step rolls back, its
-/// writer lock is free at once, and the step runs again once the command has exited.
+/// step leaves the structure record unchanged. A step starts only while no writer is
+/// queued, and one that queues meanwhile interrupts it: the step rolls back, its writer
+/// lock is free at once, and the step runs again once no writer waits.
 fn steps(
     root: &DataRoot,
     c: &Connection,
@@ -213,14 +212,12 @@ fn steps(
 ) -> Result<usize> {
     let mut wal = root.db().into_os_string();
     wal.push("-wal");
-    let probe = std::sync::Arc::new(root.foreground_probe()?);
     let mut n = 0;
     loop {
-        root.wait_for_foreground()?;
         let lock = root.lock_behind_writers()?;
         let started = Instant::now();
         c.execute_batch("BEGIN IMMEDIATE")?;
-        let changed = step(c, table, pages, &probe, PROBE_OPS);
+        let changed = step(c, table, pages, root, PROBE_OPS);
         let changed = match changed {
             Ok(Some(changed)) => {
                 c.execute_batch("COMMIT")?;
@@ -257,12 +254,12 @@ fn steps(
 }
 
 /// One merge step inside the caller's transaction: whether it changed the structure,
-/// or `None` when an explicit command started during it and interrupted it.
+/// or `None` when a writer queued during it and interrupted it.
 fn step(
     c: &Connection,
     table: &str,
     pages: i64,
-    probe: &std::sync::Arc<crate::data::ForegroundProbe>,
+    root: &DataRoot,
     probe_ops: i32,
 ) -> Result<Option<bool>> {
     let record = || -> Result<Vec<u8>> {
@@ -273,8 +270,12 @@ fn step(
         )?)
     };
     let before = record()?;
-    let watch = std::sync::Arc::clone(probe);
-    c.progress_handler(probe_ops, Some(move || watch.active()));
+    let watch = root.clone();
+    // A probe that fails interrupts the step; retaking the queue then reports the error.
+    c.progress_handler(
+        probe_ops,
+        Some(move || watch.writer_queued().unwrap_or(true)),
+    );
     let merged = c.execute(
         &format!("INSERT INTO {table}({table},rank) VALUES('merge',?1)"),
         [pages],
@@ -412,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn a_step_rolls_back_as_soon_as_an_explicit_command_starts() {
+    fn a_step_rolls_back_as_soon_as_a_writer_queues() {
         let t = tempfile::tempdir().unwrap();
         let root = DataRoot::open(t.path(), true).unwrap();
         let c = store::writer(&root).unwrap();
@@ -426,17 +427,27 @@ mod tests {
         }
         let before = levels(&c, "prose_fts").unwrap();
         assert_eq!(segments(&before), 2);
-        let probe = std::sync::Arc::new(root.foreground_probe().unwrap());
-        let command = root.foreground().unwrap();
+        assert!(!root.writer_queued().unwrap());
+        // What a blocking writer holds while it waits for `writer.lock`.
+        let queued = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(t.path().join("writer.queue"))
+            .unwrap();
+        queued.lock_shared().unwrap();
+        assert!(root.writer_queued().unwrap());
         c.execute_batch("BEGIN IMMEDIATE").unwrap();
-        assert_eq!(step(&c, "prose_fts", 64, &probe, 1).unwrap(), None);
+        assert_eq!(step(&c, "prose_fts", 64, &root, 1).unwrap(), None);
         if !c.is_autocommit() {
             c.execute_batch("ROLLBACK").unwrap();
         }
         assert_eq!(levels(&c, "prose_fts").unwrap(), before);
-        drop(command);
+        queued.unlock().unwrap();
+        assert!(!root.writer_queued().unwrap());
         c.execute_batch("BEGIN IMMEDIATE").unwrap();
-        assert_eq!(step(&c, "prose_fts", 64, &probe, 1).unwrap(), Some(true));
+        assert_eq!(step(&c, "prose_fts", 64, &root, 1).unwrap(), Some(true));
         c.execute_batch("COMMIT").unwrap();
         assert_eq!(segments(&levels(&c, "prose_fts").unwrap()), 1);
     }

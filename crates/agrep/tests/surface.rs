@@ -8,7 +8,7 @@ use std::{
     process::{Command, Output},
 };
 use tempfile::TempDir;
-fn cli(home: &Path, data: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+fn command(home: &Path, data: &Path, args: &[&str], env: &[(&str, &str)]) -> Command {
     let mut cmd = Command::new(support::binary());
     cmd.env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
@@ -21,7 +21,10 @@ fn cli(home: &Path, data: &Path, args: &[&str], env: &[(&str, &str)]) -> Output 
     for (k, v) in env {
         cmd.env(k, v);
     }
-    cmd.output().unwrap()
+    cmd
+}
+fn cli(home: &Path, data: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+    command(home, data, args, env).output().unwrap()
 }
 fn ok(o: Output) -> Output {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
@@ -657,6 +660,60 @@ fn chats_listing_and_no_auto_absence_match_0_4_9() {
         "recall: no confident match in 5 past conversations\n"
     );
     assert_eq!(String::from_utf8(o.stderr).unwrap(), format!("{stale}\n"));
+}
+// Expected chats are agrep 0.4.9's `chats PATTERN` on this two-chat home: the identity
+// haystack holds the agent and the project's display name (py/search.py:8579-8583), so
+// "codex" finds a Codex chat whose words never say it, and the agent, display name and
+// stored project sit side by side ("pi alpha", "beta beta").
+#[test]
+fn chats_pattern_matches_agent_and_project_name_as_0_4_9() {
+    let t = TempDir::new().unwrap();
+    let (h, d) = (t.path().join("h"), t.path().join("d"));
+    let codex = h.join(
+        ".codex/sessions/2026/01/02/rollout-2026-01-02T10-00-00-22222222-2222-4222-8222-222222222222.jsonl",
+    );
+    fs::create_dir_all(codex.parent().unwrap()).unwrap();
+    fs::write(
+        &codex,
+        r#"{"type":"session_meta","payload":{"id":"22222222-2222-4222-8222-222222222222","cwd":"/work/beta","source":"cli"}}
+{"type":"turn_context","payload":{"model":"gpt-5.5"}}
+{"type":"response_item","timestamp":"2026-01-02T10:00:01.000Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"add a retry to the fetch helper"}]}}
+{"type":"event_msg","timestamp":"2026-01-02T10:00:01.000Z","payload":{"type":"user_message","message":"add a retry to the fetch helper"}}
+{"type":"response_item","timestamp":"2026-01-02T10:00:04.000Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Wrapped fetch in a 3-try loop with backoff."}]}}
+"#,
+    )
+    .unwrap();
+    let pi = h.join(".pi/agent/sessions/alpha/2026-01-03_root-alpha-0001.jsonl");
+    fs::create_dir_all(pi.parent().unwrap()).unwrap();
+    fs::write(
+        &pi,
+        r#"{"type":"session","id":"root-alpha-0001","version":3,"cwd":"/work/alpha","timestamp":"2026-01-03T00:00:00Z"}
+{"type":"message","id":"u0","parentId":null,"timestamp":"2026-01-03T00:00:00Z","message":{"role":"user","content":[{"type":"text","text":"design the cache"}],"timestamp":"2026-01-03T00:00:00Z"}}
+{"type":"message","id":"a0","parentId":"u0","timestamp":"2026-01-03T00:00:00Z","message":{"role":"assistant","model":"test","content":[{"type":"text","text":"Finished."}],"timestamp":"2026-01-03T00:00:00Z"}}
+"#,
+    )
+    .unwrap();
+    ok(cli(&h, &d, &["index"], &[]));
+    for (pattern, expected) in [
+        ("codex", &["22222222-2222-4222-8222-222222222222"][..]),
+        ("codex beta", &["22222222-2222-4222-8222-222222222222"]),
+        ("beta beta", &["22222222-2222-4222-8222-222222222222"]),
+        ("pi alpha", &["root-alpha-0001"]),
+        ("codex alpha", &[]),
+        ("beta /work", &[]),
+    ] {
+        let o = cli(&h, &d, &["chats", "--json", pattern], &[]);
+        assert_eq!(
+            o.status.code(),
+            Some(if expected.is_empty() { 1 } else { 0 }),
+            "{pattern}"
+        );
+        let sessions: Vec<_> = values(&o)[1..]
+            .iter()
+            .map(|r| r["session"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(sessions, expected, "{pattern}");
+    }
 }
 // Expected output is agrep 0.4.9's on the pi fixture: --no-auto says the history may be
 // stale on every surface that answered, and JSON carries the same story.
@@ -1959,6 +2016,219 @@ fn meta_rows_scale_sink_and_mark_as_0_4_9() {
     }
 }
 
+// 0.4.9 flushed a compact page's rows before its footer (py/search.py:8374-8377). Its real
+// output for `retry -n 1 --no-auto` on the pi fixture, compact and agent profiles alike, on a
+// terminal and in one pipe holding both streams, was the row, then `3 matches · broader rerun
+// (may repeat): agrep --deeper m.<TOKEN>`, then the --no-auto line. A classic terminal page
+// printed its rows, then its summary, then that line. The footers' own wording differs as
+// PORTING.md says (a floor, no --deeper, the classic summary).
+#[cfg(unix)]
+#[test]
+fn page_footers_follow_rows_on_a_terminal_and_in_a_pipe() {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    let (_t, h, d) = pi();
+    let age = regex::Regex::new(r"(?m) \d+[a-z]{1,2}( |$)").unwrap();
+    let transcript = |env: &[(&str, &str)], terminal: bool| -> String {
+        let mut cmd = command(&h, &d, &["retry", "-n", "1", "--no-auto"], env);
+        let mut bytes = Vec::new();
+        let mut child = if terminal {
+            let (mut master, mut slave) = (-1, -1);
+            assert_eq!(
+                unsafe {
+                    libc::openpty(
+                        &mut master,
+                        &mut slave,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                },
+                0
+            );
+            for fd in [master, slave] {
+                assert_eq!(
+                    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                    0
+                );
+            }
+            let mut master = unsafe { fs::File::from_raw_fd(master) };
+            let slave = unsafe { fs::File::from_raw_fd(slave) };
+            cmd.stdout(slave.try_clone().unwrap()).stderr(slave);
+            let child = cmd.spawn().unwrap();
+            drop(cmd);
+            let mut chunk = [0; 4096];
+            loop {
+                match master.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+                    // Linux reports a terminal whose last writer closed as EIO.
+                    Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
+                    Err(e) => panic!("terminal read: {e}"),
+                }
+            }
+            child
+        } else {
+            let (mut reader, writer) = std::io::pipe().unwrap();
+            cmd.stdout(writer.try_clone().unwrap()).stderr(writer);
+            let child = cmd.spawn().unwrap();
+            drop(cmd);
+            reader.read_to_end(&mut bytes).unwrap();
+            child
+        };
+        assert!(child.wait().unwrap().success());
+        let raw = String::from_utf8(bytes).unwrap().replace('\r', "");
+        let mut text = String::new();
+        let mut rest = raw.as_str();
+        while let Some(at) = rest.find('\x1b') {
+            text.push_str(&rest[..at]);
+            rest = &rest[at + rest[at..].find('m').unwrap() + 1..];
+        }
+        text.push_str(rest);
+        age.replace_all(&text, " <age>$1").into_owned()
+    };
+    let stale = "history may be stale: automatic freshness checks are disabled by --no-auto";
+    let compact = [
+        "@01930000:2.18ba pi/user alpha <age> now add jitter to the retry",
+        "2+ matches (floor; -c exact)",
+        stale,
+    ];
+    for env in [
+        &[("AGREP_PROFILE", "compact")][..],
+        &[
+            ("AGREP_PROFILE", ""),
+            ("CODEX_THREAD_ID", "sentinel-thread"),
+        ][..],
+    ] {
+        for terminal in [true, false] {
+            let out = transcript(env, terminal);
+            assert_eq!(
+                out.lines().collect::<Vec<_>>(),
+                compact,
+                "{env:?} {terminal}"
+            );
+        }
+    }
+    let classic = transcript(&[], true);
+    assert_eq!(
+        classic.lines().collect::<Vec<_>>(),
+        [
+            "pi · alpha  @01930000:2.18ba · 1 hit · <age>",
+            "     2 › now add jitter to the retry",
+            "key: › you · → agent · ⇒ subagent · ⚙ tool",
+            "showing 1 of 2+ matching rows (a floor, not the total; -c counts exactly) · larger page: agrep --no-auto --classic -n 80 -- retry",
+            stale,
+        ]
+    );
+    // 0.4.9 held these piped rows in its output buffer until it exited, so its stderr lines
+    // came first; PORTING.md keeps a terminal's order.
+    assert_eq!(
+        transcript(&[], false).lines().collect::<Vec<_>>(),
+        [
+            "01930000-0000-7000-8000-000000000001\tpi\talpha\t2\tuser\tnow add jitter to the retry",
+            "showing 1 of 2+ matching rows (a floor, not the total; -c counts exactly) · larger page: agrep --no-auto --classic -n 80 -- retry",
+            stale,
+        ]
+    );
+}
+
+// Expected lines and exit codes are agrep 0.4.9's real `archive` output on the pi fixture:
+// decimal sizes, an append's suffix as its new content, a stderr line per captured file, its
+// status sentences and notes (py/archive.py:212-222, 2282-2295, 2432-2468, 3182-3286). The
+// stored sizes are 0.5's compressed chunks, which PORTING.md says differ from 0.4.9's.
+#[test]
+fn archive_reports_as_0_4_9() {
+    let (_t, h, d) = pi();
+    let run = |args: &[&str]| cli(&h, &d, args, &[]);
+    let out = |o: &Output| String::from_utf8_lossy(&o.stdout).into_owned();
+    let never = "archive keeps the last 3 version(s) per source file: 0 files, 0 B stored, \
+                 never captured yet\narchive freshness-unknown: no capture pass has completed\n";
+    assert_eq!(
+        out(&ok(run(&["archive", "--on"]))),
+        "archive auto-capture enabled\n"
+    );
+    let empty = run(&["archive", "--status"]);
+    assert_eq!(
+        (empty.status.code(), out(&empty).as_str()),
+        (Some(1), never)
+    );
+    let time = regex::Regex::new(r" in \d+\.\ds\n$").unwrap();
+    let first = ok(run(&["archive"]));
+    assert_eq!(
+        time.replace(&out(&first), " in <T>s\n"),
+        "archive: 5 files - 0 unchanged, 0 appended, 5 full captures, 5.1 KB new content in <T>s\n"
+    );
+    let stderr = String::from_utf8_lossy(&first.stderr);
+    let mut captured: Vec<&str> = stderr.lines().collect();
+    captured.sort_unstable();
+    assert_eq!(
+        captured,
+        [
+            "archive: captured 2025-11-01T00-00-00-000Z_01920000-0000-7000-8000-000000000002.jsonl (494 bytes)",
+            "archive: captured 2026-01-02T03-04-05-000Z_01930000-0000-7000-8000-000000000001.jsonl (1925 bytes)",
+            "archive: captured 2026-02-03T04-05-06-000Z_01940000-0000-7000-8000-000000000003.jsonl (971 bytes)",
+            "archive: captured 2026-03-04T05-06-07-000Z_01950000-0000-7000-8000-000000000005.jsonl (1358 bytes)",
+            "archive: captured advisor.jsonl (344 bytes)",
+        ]
+    );
+    let status = out(&ok(run(&["archive", "--status"])));
+    assert!(
+        regex::Regex::new(
+            r"^archive keeps the last 3 version\(s\) per source file: 5 files, \d+\.\d KB stored, \d+\.\d+x smaller than the originals, last capture \d+s ago\n$"
+        )
+        .unwrap()
+        .is_match(&status),
+        "{status}"
+    );
+    let alpha = h.join(".pi/agent/sessions/-work-alpha/2026-01-02T03-04-05-000Z_01930000-0000-7000-8000-000000000001.jsonl");
+    let mut file = fs::OpenOptions::new().append(true).open(alpha).unwrap();
+    std::io::Write::write_all(&mut file, br#"{"type":"message","id":"zz","parentId":"a3","timestamp":"2026-01-02T03:05:00.000Z","message":{"role":"user","content":[{"type":"text","text":"one more line"}],"timestamp":"2026-01-02T03:05:00.000Z"}}
+"#).unwrap();
+    drop(file);
+    let second = ok(run(&["archive"]));
+    assert_eq!(
+        time.replace(&out(&second), " in <T>s\n"),
+        "archive: 5 files - 4 unchanged, 1 appended, 0 full captures, 200 B new content in <T>s\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&second.stderr),
+        "archive: appended 2026-01-02T03-04-05-000Z_01930000-0000-7000-8000-000000000001.jsonl (2125 bytes)\n"
+    );
+    assert_eq!(
+        out(&ok(run(&["archive", "--prune"]))),
+        "pruned 0 old version record(s), reclaimed 0 B\n"
+    );
+    let size = regex::Regex::new(r"\d+\.\d KB").unwrap();
+    let dir = d.join("archive").display().to_string();
+    let sized = |o: &Output| size.replace_all(&out(o), "<S>").replace(&dir, "<D>");
+    assert_eq!(
+        sized(&ok(run(&["archive", "--off"]))),
+        "archive auto-capture disabled\nthe copies already taken stay: <S> in <D>; `agrep archive --purge` deletes them\n"
+    );
+    assert_eq!(
+        sized(&ok(run(&["archive", "--status"]))),
+        "archive retention is off (`agrep archive --on` turns it on)\nearlier captures still stored: <S> in <D>; `agrep archive --purge` deletes them\n"
+    );
+    let refused = run(&["archive", "--purge"]);
+    assert_eq!(
+        (refused.status.code(), sized(&refused).as_str()),
+        (
+            Some(1),
+            "archive purge would delete <S> of archived copies in <D>; pass --yes to confirm\n"
+        )
+    );
+    ok(run(&["archive", "--on"]));
+    assert_eq!(
+        sized(&ok(run(&["archive", "--purge", "--yes"]))),
+        "archive purged: <S> of archived copies deleted from <D>\nretention is still on: the next capture pass re-archives the live stores (`agrep archive --off` stops that)\n"
+    );
+    let purged = run(&["archive", "--status"]);
+    assert_eq!(
+        (purged.status.code(), out(&purged).as_str()),
+        (Some(1), never)
+    );
+}
+
 // Expected exit codes and stderr lines are agrep 0.4.9's for the same commands on the pi
 // fixture: an option another makes inert, an impossible window and a bad bound are refused
 // by name, with a command that drops the refused option (py/surface_policy.py:943-1219,
@@ -2004,6 +2274,10 @@ fn usage_errors_exit_and_read_as_0_4_9() {
         (&["retry", "-E", "-w"], 2, "agrep: search matcher modes are mutually exclusive"),
         (&["retry", "-s", "-E"], 2, "agrep: search matcher modes are mutually exclusive"),
         (&["retry", "-s", "--lexical"], 2, "agrep: -s and --lexical are contradictory; pick one"),
+        (&["--no-auto", "search", "-s", "foo_bar"], 2, "agrep: unrecognized arguments: foo_bar"),
+        (&["search", "--no-auto", "foo", "-s", "bar"], 2, "agrep: unrecognized arguments: bar"),
+        (&["--no-auto", "foo", "-n", "5", "bar"], 2, "agrep: unrecognized arguments: bar"),
+        (&["--no-auto", "foo", "--json", "bar", "baz"], 2, "agrep: unrecognized arguments: bar baz"),
         (&["retry", "-c", "-s"], 2, "agrep: -c cannot be combined with --semantic; semantic totals are bounded"),
         (&["retry", "-c", "--no-meta"], 2, "agrep: --no-meta cannot narrow -c/--count-by-tier; machine counts keep grep parity"),
         (&["retry", "--agent", "nosuch"], 2, "unknown agent 'nosuch' - valid: claude, codex, opencode, antigravity, agy, kimi, cline, gemini, crush, cursor, pi, omp"),
@@ -2023,6 +2297,14 @@ fn usage_errors_exit_and_read_as_0_4_9() {
         (&["doctor", "--fix", "--json"], 2, "agrep doctor: --fix cannot be combined with --json, which prints one machine report; run: agrep doctor --json"),
         (&["doctor", "--deep", "--fix", "--json"], 2, "agrep doctor: --fix cannot be combined with --json, which prints one machine report; run: agrep doctor --deep --json"),
         (&["tail", "--events", "done", "--snapshot"], 2, "agrep tail: --events cannot be combined with --snapshot, which prints current session state once, not an event stream; run: agrep tail --snapshot"),
+        (&["tail", "--agent", "foo"], 2, "agrep tail: unknown agent 'foo'; supported for live observation: claude, codex, opencode, antigravity, cursor, pi"),
+        (&["tail", "--agent", "pi,KIMI"], 2, "agrep tail: kimi has no live observation support: no validated incremental journal tailer"),
+        (&["tail", "--agent", ","], 2, "agrep tail: --agent requires at least one supported agent name"),
+        (&["audit", "--agent", "pi,codex"], 2, "agrep audit: --agent must name one of: claude, codex, opencode, antigravity, kimi, cline, gemini, crush, cursor, pi"),
+        (&["audit", "--agent", "pi", "--agent", "codex"], 2, "agrep audit: --agent may be supplied only once"),
+        (&["audit", "--agent", " "], 2, "agrep audit: --agent needs a value (claude, codex, opencode, antigravity, kimi, cline, gemini, crush, cursor, pi) - an empty value would silently match every agent"),
+        (&["run", "Claude"], 2, "unknown agent 'Claude'; supported for native resume: claude, codex, opencode, antigravity, pi"),
+        (&["run", "cursor"], 2, "cursor has no native resume support: sessions are editor-owned and have no safe CLI resume command"),
         (&["around", "@01930000:2.18ba", "--max-chars", "100", "--full"], 2, "agrep around: --max-chars cannot be combined with --full, which uncaps indexed message text; run: agrep around @01930000:2.18ba --full"),
         (&["around", "@01930000:2.18ba", "--max-chars", "4000", "--full"], 2, "agrep around: --max-chars cannot be combined with --full, which uncaps indexed message text; run: agrep around @01930000:2.18ba --full"),
         (&["around", "@01930000:2.18ba", "--tool-output", "100", "--no-tools"], 2, "agrep around: --tool-output cannot be combined with --no-tools, which hides tool-call lines; run: agrep around @01930000:2.18ba --no-tools"),
@@ -2084,6 +2366,74 @@ fn usage_errors_exit_and_read_as_0_4_9() {
             1_767_243_600_000_i64
         );
     }
+}
+// Expected exit codes and stderr lines are agrep 0.4.9's: --who/--no-who skip blank list
+// items, refuse an empty list or an unknown speaker by name, and refuse each other
+// (py/surface_policy.py:632-664); a blank filter value names its vocabulary and what it
+// would silently select (py/surface_policy.py:747-825, py/session_context.py:1500-1522).
+#[test]
+fn speaker_and_blank_filter_refusals_read_as_0_4_9() {
+    let (_t, h, d) = pi();
+    let speakers = "user, subagent, agent, tool, control, synthetic, recap, harness";
+    let project =
+        "a chat's stored project label or its last path segment, exact; * and ? make it a glob";
+    let cases: Vec<(&[&str], String)> = vec![
+        (&["retry", "--who", "user", "--no-who", "tool"], "agrep: --who and --no-who are mutually exclusive".into()),
+        (&["retry", "-s", "--who", "tool,user", "--no-who", "agent"], "agrep: --who and --no-who are mutually exclusive".into()),
+        (&["retry", "--who", ","], format!("agrep: empty speaker list (choose from {speakers})")),
+        (&["retry", "--no-who", ", "], format!("agrep: empty speaker list (choose from {speakers})")),
+        (&["retry", "--who", "bogus"], format!("agrep: unknown speaker 'bogus' (choose from {speakers})")),
+        (&["retry", "--who", "it's"], format!("agrep: unknown speaker \"it's\" (choose from {speakers})")),
+        (&["retry", "--who="], format!("agrep: --who needs a value ({speakers}) - an empty value would silently include every speaker")),
+        (&["retry", "--who", "you,user,you", "--no-who="], format!("agrep: --no-who needs a value ({speakers}) - an empty value would silently exclude no speaker")),
+        (&["recall", "retry", "--who", "user", "--no-who", "tool"], "agrep recall: --who and --no-who are mutually exclusive".into()),
+        (&["recall", "retry", "--no-who", "user", "--who", "bogus"], format!("agrep recall: unknown speaker 'bogus' (choose from {speakers})")),
+        (&["recall", "retry", "--who="], format!("agrep recall: --who needs a value ({speakers}) - an empty value would silently include every speaker")),
+        (&["pack", "retry", "one", "--who", "user", "--no-who", "tool"], "agrep pack: --who and --no-who are mutually exclusive".into()),
+        (&["pack", "retry", "--who", ", "], format!("agrep pack: empty speaker list (choose from {speakers})")),
+        (&["retry", "--agent="], "--agent needs a value (claude, codex, opencode, antigravity, kimi, cline, gemini, crush, cursor, pi) - an empty value would silently match every agent".into()),
+        (&["chats", "--agent= "], "--agent needs a value (claude, codex, opencode, antigravity, kimi, cline, gemini, crush, cursor, pi) - an empty value would silently match every agent".into()),
+        (&["retry", "--project="], format!("agrep: --project needs a value ({project}) - an empty value would silently match every project")),
+        (&["retry", "--exclude-project="], format!("agrep: --exclude-project needs a value ({project}) - an empty value would silently exclude nothing")),
+        (&["retry", "--model="], "agrep: --model needs a value (an exact model name; --soft substring-matches) - an empty value would silently match every model".into()),
+        (&["retry", "--chat="], "agrep: --chat needs a value (an 8-char id prefix (as shown) or a full session uuid) - an empty value would silently match every chat".into()),
+    ];
+    for (args, stderr) in &cases {
+        let o = cli(&h, &d, args, &[]);
+        assert_eq!(
+            (
+                o.status.code(),
+                String::from_utf8_lossy(&o.stderr).trim_end()
+            ),
+            (Some(2), stderr.as_str()),
+            "{args:?}"
+        );
+        assert!(o.stdout.is_empty(), "{args:?}");
+    }
+    // A blank item is skipped, as is a repeat, so these read as `--who user`.
+    let plain = ok(cli(&h, &d, &["retry", "--who", "user", "--json"], &[])).stdout;
+    for who in ["user,", " user , ,you"] {
+        let o = ok(cli(&h, &d, &["retry", "--who", who, "--json"], &[]));
+        assert_eq!(o.stdout, plain, "{who}");
+    }
+    // around's --who names one speaker, as 0.4.9's choices did (py/around.py:826).
+    let o = cli(
+        &h,
+        &d,
+        &["around", "@01930000:2.18ba", "--who", "user,"],
+        &[],
+    );
+    assert_eq!(o.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&o.stderr).lines().next(),
+        Some("error: invalid value 'user,' for '--who <WHO>'")
+    );
+    ok(cli(
+        &h,
+        &d,
+        &["around", "@01930000:2.18ba", "--who", "you"],
+        &[],
+    ));
 }
 
 // Expected values are agrep 0.4.9's output on this fixture: a chat whose only user record
@@ -2223,9 +2573,9 @@ fn chats_latest_handle_claims_the_last_row_as_0_4_9() {
 // Expected lines are agrep 0.4.9's `index` and `reindex` reports on the pi fixture, times
 // masked, less the lines about files 0.5 does not write (crates/agrep-cli/src/main.rs:
 // 6245-6251, 7580-7615, reindex.py:72-85, 280-334). The statistics 0.5 printed instead
-// stay in the data root.
+// are AGREP_QUERY_TIMING events, absent without the variable.
 #[test]
-fn index_reports_as_0_4_9_and_keeps_its_statistics() {
+fn index_reports_as_0_4_9_and_its_statistics_as_timing_events() {
     let t = TempDir::new().unwrap();
     let (h, d) = (t.path().join("h"), t.path().join("d"));
     copy(
@@ -2242,8 +2592,13 @@ fn index_reports_as_0_4_9_and_keeps_its_statistics() {
             String::from_utf8(o.stderr).unwrap(),
         )
     };
-    let stats = || -> Value {
-        serde_json::from_slice(&fs::read(d.join("index-stats.json")).unwrap()).unwrap()
+    let stats = |data: &Path| -> Value {
+        let o = ok(cli(&h, data, &["index"], &[("AGREP_QUERY_TIMING", "1")]));
+        String::from_utf8_lossy(&o.stderr)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find_map(|event| event.get("index").cloned())
+            .expect("index statistics event")
     };
     let hint = "  next: `agrep setup` - teach your agents to search this history\n";
     let indexed = format!(
@@ -2256,14 +2611,17 @@ fn index_reports_as_0_4_9_and_keeps_its_statistics() {
             "building the search db (a first build can take a while on a large history) …\n".into()
         )
     );
+    let built = stats(&t.path().join("d2"));
     assert_eq!(
-        (stats()["sources"].clone(), stats()["parsed"].clone()),
+        (built["sources"].clone(), built["parsed"].clone()),
         (5.into(), 5.into())
     );
     let unchanged = "=== indexing transcripts ===\n  unchanged since last index (8 messages); skipped ingest + writes (T)\n  phases: census T\n";
     assert_eq!(run(&["index"]), (unchanged.into(), String::new()));
-    assert_eq!(stats()["parsed"], 0);
-    assert!(stats()["census_ms"].is_number() && stats()["after_refresh_ms"].is_number());
+    let again = stats(&d);
+    assert_eq!(again["parsed"], 0);
+    assert!(again["census_ms"].is_number() && again["after_refresh_ms"].is_number());
+    assert!(!d.join("index-stats.json").exists());
     assert_eq!(
         run(&["reindex"]),
         (

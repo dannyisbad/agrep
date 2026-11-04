@@ -621,23 +621,27 @@ fn semantic_meta(
         return meta;
     };
     let all = |key: &str| runs.iter().all(|(_, s, _)| s[key] == true);
-    let kinds: BTreeSet<_> = runs
-        .iter()
-        .map(|(_, s, _)| s["score_kind"].as_str())
-        .collect();
+    // A refused query's lane keeps its cosine kind; it never ran to be partial
+    // (py/recall.py:2283-2291).
+    let kind = |s: &Value| s["score_kind"].as_str().unwrap_or("cosine").to_owned();
+    let kinds: BTreeSet<_> = runs.iter().map(|(_, s, _)| kind(s)).collect();
     let coverage = runs.iter().rev().find_map(|(_, _, c)| c.as_ref());
     meta.insert(
         "score_kind".into(),
-        if kinds.len() == 1 {
-            first["score_kind"].clone()
+        json!(if kinds.len() == 1 {
+            kind(first)
         } else {
-            json!("mixed")
-        },
+            "mixed".into()
+        }),
     );
-    meta.insert("semantic_coverage".into(), json!(coverage));
+    // 0.4.9 left a lane's null coverage to the envelope's trailing field
+    // (py/recall.py:2725-2729).
+    if let Some(coverage) = coverage {
+        meta.insert("semantic_coverage".into(), json!(coverage));
+    }
     meta.insert(
         "partial".into(),
-        json!(coverage.is_none_or(|c| c.partial())),
+        json!(coverage.map_or(first["partial"] == true, |c| c.partial())),
     );
     let status = if runs.len() == 1 {
         first.clone()
@@ -739,7 +743,9 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
             return Err(e);
         }
     };
-    agrep_core::coverage::validate(&mut filters)?;
+    // 0.4.9's parser named the command in a filter refusal (py/recall.py:1704-1709).
+    agrep_core::coverage::validate(&mut filters)
+        .map_err(|e| super::usage::refusal(if pack { "agrep pack" } else { "agrep recall" }, e))?;
     if a.semantic && !semantic::installed(&agrep_core::data::DataRoot::discover()?) {
         eprintln!("semantic model not installed: run agrep setup");
         return Ok(2);
@@ -779,6 +785,9 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
     let c = store::reader(&root)?;
     let mut semantic_ran = false;
     let mut semantic_failed = false;
+    // An explicit `-s` lane that did not answer, and whether one failed rather than
+    // refused its query (py/recall.py:2273-2282).
+    let (mut semantic_unavailable, mut semantic_runtime) = (false, false);
     let mut hybrid_used = false;
     let mut lane_runs: Vec<(String, Value, Option<semantic::Coverage>)> = Vec::new();
     let include_self = a.scope.include_self || (a.scope.chat.is_some() && !a.scope.no_self);
@@ -969,14 +978,14 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
         } else {
             None
         };
-        let lane = if !semantic_failed
-            && (a.semantic
-                || (!a.lexical
-                    && !tools_only
-                    && (a.probe || meaning_room)
-                    && semantic::eligible(query)
-                    && semantic::installed(&root)
-                    && root.config()?.embeddings != "off"))
+        let lane = if a.semantic
+            || (!semantic_failed
+                && !a.lexical
+                && !tools_only
+                && (a.probe || meaning_room)
+                && semantic::eligible(query)
+                && semantic::installed(&root)
+                && root.config()?.embeddings != "off")
         {
             Some(semantic::begin(
                 &root,
@@ -996,7 +1005,7 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
         } else {
             options.limit
         };
-        let keyword = if a.semantic && !semantic_failed {
+        let keyword = if a.semantic {
             Default::default()
         } else if let Some((base, heads)) = meta.as_mut() {
             meta_dropped += heads.dropped;
@@ -1023,7 +1032,7 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
                     hybrid_used |= !a.semantic && !found.result.hits.is_empty();
                     lane_runs.push((
                         query.clone(),
-                        semantic::status(Some(&found.coverage), !found.result.hits.is_empty()),
+                        semantic::status(&found.coverage, !found.result.hits.is_empty()),
                         Some(found.coverage),
                     ));
                     caller::decorate_semantic(&c, &mut found.result, &caller)?;
@@ -1046,15 +1055,18 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
                         keyword
                     }
                 }
+                Err(error) if a.semantic => {
+                    let status = semantic::failed(&error);
+                    semantic_runtime |= status["state"] != "query-rejected";
+                    semantic_unavailable = true;
+                    lane_runs.push((query.clone(), status, None));
+                    Results::default()
+                }
                 Err(error) => {
                     agrep_core::logging::semantic_failure(&root, &error);
                     semantic_failed = true;
-                    lane_runs.push((query.clone(), semantic::status(None, false), None));
-                    if a.semantic {
-                        caller::search(&c, &options, &caller, include_self, a.scope.no_self)?
-                    } else {
-                        keyword
-                    }
+                    lane_runs.push((query.clone(), semantic::failed(&error), None));
+                    keyword
                 }
             }
         } else {
@@ -1103,6 +1115,20 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
         }
         deepen.push(deeper);
         buckets.push(hits);
+    }
+    // An explicit matcher failure cannot silently change matcher semantics: 0.4.9 dropped
+    // every row, and outside JSON and a probe stopped with its one line
+    // (py/recall.py:2404-2412).
+    if semantic_runtime {
+        if !a.json {
+            let meta = semantic_meta(&lane_runs, queries.len() > 1, false, false);
+            eprintln!("{}", semantic::unavailable_notice(&meta["semantic_status"]));
+            if !a.probe {
+                crate::finish_census(&root, census)?;
+                return Ok(2);
+            }
+        }
+        buckets.iter_mut().for_each(Vec::clear);
     }
     // 0.4.9's JSON note for a keyword lane that fell back to its any-order tiers
     // (py/recall.py:2379-2382, 2916-2917).
@@ -1223,8 +1249,13 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
     };
     let _render_span = agrep_core::semantic_profile::span("render");
     let checked = agrep_core::render::checked(no_auto);
+    // 0.4.9's `meaning_lane_down` (py/recall.py:2353-2357, 2766-2769): a meaning lane that
+    // failed or fell back leaves an empty answer unverified.
+    let meaning_down = lane_runs
+        .iter()
+        .any(|(_, status, _)| status["fallback_recommended"] == true);
     let exit = if blocks.is_empty() {
-        if checked {
+        if checked && !semantic_unavailable && !meaning_down {
             1
         } else {
             2
@@ -1291,7 +1322,7 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
         render::note_no_auto(no_auto);
         return Ok(if confident.is_some() {
             0
-        } else if checked {
+        } else if checked && !semantic_unavailable {
             1
         } else {
             2
@@ -1301,6 +1332,21 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
     let page = page::Page::new(&blocks, &queries, a.budget);
     if a.json {
         let mut value = json!({"query":if pack{json!(queries)}else{json!(queries[0])},"engine":if handle_only{"handle"}else{"sqlite"},"hits":[]});
+        let unanswered = semantic_unavailable && blocks.is_empty();
+        if unanswered {
+            let mut engines: Vec<&str> = Vec::new();
+            for (_, status, _) in &lane_runs {
+                let engine = match status["state"].as_str() {
+                    Some("query-rejected") => "semantic:policy",
+                    Some("unavailable") => "semantic:unavailable",
+                    _ => continue,
+                };
+                if !engines.contains(&engine) {
+                    engines.push(engine);
+                }
+            }
+            value["engine"] = json!(engines.join("+"));
+        }
         if !handle_notes.is_empty() {
             value["served"] = json!({"served_as_requested":false,"divergences":handle_notes});
         }
@@ -1338,10 +1384,18 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
         };
         value["freshness"] = render::machine_freshness(no_auto, pending_sources);
         value["semantic_coverage"] = lane_coverage;
+        if unanswered {
+            value["error"] = json!({"code":"semantic-unavailable"});
+        }
         if fell_back {
             value["note"] = json!("no exact phrase match; showing hits containing all terms");
         }
         surface::write(&page::json(&page, &mut value)?)?;
+    } else if blocks.is_empty() && semantic_unavailable {
+        // 0.4.9's line stands alone (py/recall.py:2745-2747).
+        let meta = semantic_meta(&lane_runs, queries.len() > 1, false, false);
+        eprintln!("{}", semantic::unavailable_notice(&meta["semantic_status"]));
+        return Ok(exit);
     } else if blocks.is_empty() {
         let n: i64 = c.query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))?;
         eprintln!(
@@ -1428,11 +1482,11 @@ mod tests {
     fn semantic_envelope_matches_0_4_9() {
         let full = json!({"indexed":24,"total":24,"pending":0,"fraction":1.0,"complete":true,"order":"newest-first"});
         let ready = json!({"state":"ready","eligible":true,"reason":null,"min_score":0.82,"score_kind":"cosine","coverage":full,"partial":false,"complete":true,"fallback_recommended":false});
-        assert_eq!(semantic::status(Some(&coverage()), true), ready);
+        assert_eq!(semantic::status(&coverage(), true), ready);
         let none = json!({"state":"no-confident-match","eligible":true,"reason":null,"min_score":0.82,"score_kind":"cosine","coverage":full,"partial":false,"complete":true,"fallback_recommended":false});
         let runs = vec![(
             "zebra quantum lighthouse marmalade".to_owned(),
-            semantic::status(Some(&coverage()), false),
+            semantic::status(&coverage(), false),
             Some(coverage()),
         )];
         assert_eq!(
@@ -1461,23 +1515,26 @@ mod tests {
             Value::Object(semantic_meta(&runs[..1], false, false, true)),
             json!({"semantic_status":ready})
         );
-        // py/search.py:581-599: a lane that failed reports unavailable and partial.
-        let failed = vec![("q".to_owned(), semantic::status(None, false), None)];
-        let meta = semantic_meta(&failed, false, false, false);
+        // py/search.py:581-610: a failed lane reports unavailable, partial and its cause.
+        let error = anyhow::anyhow!("model SHA-256 mismatch: model.safetensors");
+        let failed = vec![("q".to_owned(), semantic::failed(&error), None)];
         assert_eq!(
-            (
-                &meta["score_kind"],
-                &meta["partial"],
-                &meta["semantic_coverage"]
-            ),
-            (&json!("unavailable"), &json!(true), &Value::Null)
+            Value::Object(semantic_meta(&failed, false, false, false)),
+            json!({"score_kind":"unavailable","partial":true,"semantic_status":{
+                "state":"unavailable","eligible":true,
+                "reason":"model SHA-256 mismatch: model.safetensors","min_score":0.82,
+                "score_kind":"unavailable","coverage":null,"partial":true,"complete":false,
+                "fallback_recommended":true}})
         );
+        // agrep 0.4.9's `recall -s --json foo_bar`: a refused query keeps the cosine kind
+        // and is not partial.
+        let error = anyhow::Error::new(semantic::Rejected("identifier-query"));
+        let refused = vec![("foo_bar".to_owned(), semantic::failed(&error), None)];
         assert_eq!(
-            (
-                &meta["semantic_status"]["state"],
-                &meta["semantic_status"]["fallback_recommended"]
-            ),
-            (&json!("unavailable"), &json!(true))
+            Value::Object(semantic_meta(&refused, false, false, false)),
+            json!({"score_kind":"cosine","partial":false,"semantic_status":{
+                "state":"query-rejected","complete":false,"fallback_recommended":true,
+                "eligible":false,"reason":"identifier-query","min_score":0.82,"coverage":null}})
         );
     }
     fn row(session: &str, turn: i64, who: &str, text: &str) -> Row {

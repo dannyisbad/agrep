@@ -29,6 +29,13 @@
       "reason": "Uses POSIX PTYs, termios, signals or executable shell fixtures; Windows console behavior is covered separately."
     },
     {
+      "test": "crates/agrep/tests/browse.rs::run_exits_with_its_agent_when_nothing_is_left_to_drain",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Uses POSIX PTYs, termios, signals or executable shell fixtures; Windows console behavior is covered separately."
+    },
+    {
       "test": "crates/agrep/tests/browse.rs::windows_run_and_resume_preserve_native_argv_without_records",
       "gates": [
         "cfg(windows)"
@@ -43,11 +50,32 @@
       "reason": "Requires a POSIX controlling PTY to exercise interactive consent. Portable rebuild publication is tested on Windows; Windows interactive consent is not covered by this fixture."
     },
     {
-      "test": "crates/agrep/tests/browse.rs::run_hands_the_terminal_to_an_interactive_child",
+      "test": "crates/agrep/tests/surface.rs::page_footers_follow_rows_on_a_terminal_and_in_a_pipe",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Needs a POSIX PTY to share stdout and stderr on one terminal; the footer's place after the rows is platform-independent render order."
+    },
+    {
+      "test": "crates/agrep/tests/browse.rs::run_lets_a_pipeline_agent_read_terminal_input",
       "gates": [
         "cfg(unix)"
       ],
       "reason": "Uses POSIX PTYs, termios, signals or executable shell fixtures; Windows console behavior is covered separately."
+    },
+    {
+      "test": "crates/agrep/tests/browse.rs::run_owns_a_pipeline_agent_and_ends_its_descendants",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Uses POSIX PTYs, termios, signals or executable shell fixtures; Windows console behavior is covered separately."
+    },
+    {
+      "test": "crates/agrep/tests/browse.rs::a_spawned_worker_holds_no_pipe_of_the_caller",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Hands the search one extra descriptor through a POSIX pre-exec dup2; std on Windows cannot give one inheritable handle to a single child without children that other tests spawn meanwhile inheriting it too."
     },
     {
       "test": "crates/agrep/tests/browse.rs::resume_chooses_omp_for_windows_origin_paths",
@@ -108,7 +136,7 @@
     {
       "test": "crates/agrep-core/src/semantic_attention_metal.rs::tests::simdgroup_attention_matches_masked_f16_attention_with_strided_values",
       "gates": [
-        "cfg(all(test,target_os=LITERAL))",
+        "cfg(all(test,target_os=\"macos\"))",
         "capability(semantic_device::metal_device)"
       ],
       "reason": "Requires an Apple7-or-newer integrated Metal GPU with the complete semantic kernel capability set. Hosted macOS runners have no capable GPU (Apple-silicon VM: no device; Intel VM: unsupported family/features). The product capability check gates this test; portable CPU fallback tests always run, and all four GPU tests are required locally before release."
@@ -116,14 +144,14 @@
     {
       "test": "crates/agrep-core/src/semantic_bert.rs::tests::vector_exponential_geglu_preserves_erf_values",
       "gates": [
-        "cfg(target_os=LITERAL)"
+        "cfg(target_os=\"macos\")"
       ],
       "reason": "Exercises the macOS Accelerate vector exponential implementation; the portable GeGLU path is tested separately."
     },
     {
       "test": "crates/agrep-core/src/semantic_metal.rs::tests::fused_geglu_preserves_candle_f16_values",
       "gates": [
-        "cfg(all(test,target_os=LITERAL))",
+        "cfg(all(test,target_os=\"macos\"))",
         "capability(semantic_device::metal_device)"
       ],
       "reason": "Requires an Apple7-or-newer integrated Metal GPU with the complete semantic kernel capability set. Hosted macOS runners have no capable GPU (Apple-silicon VM: no device; Intel VM: unsupported family/features). The product capability check gates this test; portable CPU fallback tests always run, and all four GPU tests are required locally before release."
@@ -131,7 +159,7 @@
     {
       "test": "crates/agrep-core/src/semantic_norm.rs::tests::residual_norm_matches_metal",
       "gates": [
-        "cfg(target_os=LITERAL)",
+        "cfg(target_os=\"macos\")",
         "capability(semantic_device::metal_device)"
       ],
       "reason": "Requires an Apple7-or-newer integrated Metal GPU with the complete semantic kernel capability set. Hosted macOS runners have no capable GPU (Apple-silicon VM: no device; Intel VM: unsupported family/features). The product capability check gates this test; portable CPU fallback tests always run, and all four GPU tests are required locally before release."
@@ -139,8 +167,8 @@
     {
       "test": "crates/agrep-core/src/semantic_arena.rs::tests::persistent_workspace_reuses_buffers_and_reads_new_inputs",
       "gates": [
-        "cfg(target_os=LITERAL)",
-        "cfg(all(test,target_os=LITERAL))",
+        "cfg(target_os=\"macos\")",
+        "cfg(all(test,target_os=\"macos\"))",
         "capability(semantic_device::metal_device)"
       ],
       "reason": "Requires an Apple7-or-newer integrated Metal GPU with the complete semantic kernel capability set. Hosted macOS runners have no capable GPU (Apple-silicon VM: no device; Intel VM: unsupported family/features). The product capability check gates this test; portable CPU fallback tests always run, and all four GPU tests are required locally before release."
@@ -177,7 +205,14 @@
       "reason": "Returns an IO error inside the child pre-exec closure; the test itself never returns early."
     },
     {
-      "test": "crates/agrep/tests/browse.rs::run_hands_the_terminal_to_an_interactive_child",
+      "test": "crates/agrep/tests/browse.rs::run_lets_a_pipeline_agent_read_terminal_input",
+      "gates": [
+        "return"
+      ],
+      "reason": "Returns an IO error inside the child pre-exec closure; the test itself never returns early."
+    },
+    {
+      "test": "crates/agrep/tests/browse.rs::run_owns_a_pipeline_agent_and_ends_its_descendants",
       "gates": [
         "return"
       ],
@@ -194,9 +229,10 @@
     {
       "test": "crates/agrep/tests/live.rs::pty::ui_serves_while_browser_opener_is_running",
       "gates": [
-        "cfg!(target_os=LITERAL)"
+        "cfg!(target_os=\"macos\")",
+        "return"
       ],
-      "reason": "Chooses the platform opener executable name; assertions are shared."
+      "reason": "Chooses the platform opener executable name and returns an IO error inside the child pre-exec closure; assertions are shared and the test itself never returns early."
     },
     {
       "test": "crates/agrep-core/src/caller.rs::tests::process_publication_rejects_recycled_identity",
@@ -223,8 +259,8 @@
     {
       "test": "crates/agrep-core/src/semantic_bert.rs::tests::fused_cpu_geglu_matches_candle_in_serial_and_parallel_batches",
       "gates": [
-        "cfg(not(target_os=LITERAL))",
-        "cfg(target_os=LITERAL)"
+        "cfg(not(target_os=\"macos\"))",
+        "cfg(target_os=\"macos\")"
       ],
       "reason": "The portable CPU GeGLU assertions run everywhere; the expected-error bound accounts for the macOS system erf implementation."
     },

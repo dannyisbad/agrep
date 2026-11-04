@@ -62,7 +62,9 @@ report that as a verified zero match.
 
 Only vectors belonging to the exact current text can supply a meaning hit.
 Coverage is a number, such as `semantic 164499/173524 rows`. A completed
-semantic-only miss with partial coverage exits 1 and states the coverage.
+semantic-only search miss with partial coverage exits 1 and states the coverage.
+An empty `recall` or `pack` exits 2, as 0.4.9's did, when a meaning lane failed or
+missed while more than 1% of the rows were unembedded: that answer is unverified.
 
 ## Handles and around
 
@@ -139,11 +141,14 @@ content and requires explicit `--force` to replace an existing file.
 `reindex --full` rebuilds derived rows, invalidates every vector reference and
 queues visible rows for embedding. `index` and `reindex` print 0.4.9's human report
 (message and session counts, the refresh's time and phases, and the setup pointer
-while no agent is enrolled) and write the refresh's public statistics, with the
-time each lock file blocked the command, to `index-stats.json` in the data root.
+while no agent is enrolled). With `AGREP_QUERY_TIMING` set they also print the
+refresh's statistics as a JSON `{"index": …}` line on stderr.
 
-Only a missing model quietly disables automatic meaning retrieval. Any failure
-from an installed model is disclosed once on stderr and written to the diagnostic
-log; keyword results are returned even for an explicit `-s` request. Recall/pack
-JSON marks that semantic attempt as failed. `status` and `doctor` verify installed
-model files against their pinned hashes and unchanged verification stamps.
+Only a missing model quietly disables automatic meaning retrieval. In automatic hybrid
+retrieval, any failure from an installed model is disclosed once on stderr and written to
+the diagnostic log, and the keyword results stand; recall/pack JSON marks that semantic
+attempt as failed. An explicit `-s` (search, recall, pack) never answers with keyword rows:
+when its lane fails or the meaning policy refuses its query, it prints `semantic search
+unavailable: <reason>`, or under `--json` 0.4.9's record with `error.code`
+`semantic-unavailable`, and exits 2. `status` and `doctor` verify installed model files
+against their pinned hashes and unchanged verification stamps.

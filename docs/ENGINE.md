@@ -30,11 +30,10 @@ and fail instead of taking a lock or writing.
 | `vectors/<sha256>.q8f16` | immutable embedding blocks referenced from `index.db` |
 | `model/granite-embedding-small-english-r2/` | the pinned embedding model (`AGREP_MODEL_DIR` overrides) |
 | `config.json` | `tools`, `embeddings`, `post_index`, archive policy, board view, integration enrollment |
-| `index-stats.json` | the last `index` or `reindex` run's refresh phases, counts and lock waits, one JSON object |
 | `harness_prefixes.txt` | optional user-written harness prompt prefixes |
 | `archive/` | opt-in source archive: `catalog.db`, `blobs/<sha256>.gz`, `archive.lock` |
 | `log/agrep.log` | worker stderr and semantic failures; rotated to `agrep.log.1` at 1 MiB |
-| `writer.lock`, `writer.queue`, `foreground.lock`, `work.lock`, `merge.lock` | advisory locks, below |
+| `writer.lock`, `writer.queue`, `work.lock`, `merge.lock` | advisory locks, below |
 | `repair-<pid>/`, `index.corrupt-<ms>` | `doctor --fix`: the rebuild directory and the retained corrupt database |
 
 ## Locks and snapshots
@@ -47,19 +46,16 @@ never deleted. Readers take no lock.
   change pending if another writer holds it, except that it waits out a merge step.
   `index`, `reindex`, the first build, `postcompact`'s session refresh, `set` and
   embedding publication wait for it.
-- `writer.queue`: a waiting writer holds it shared until it has `writer.lock`. A merge
-  step takes it exclusively before `writer.lock` and drops it once it has the writer
-  lock, so a step starts only when no writer is waiting. Neither `flock` nor
-  `LockFileEx` hands a released lock to a waiter, so without the queue a merger
-  re-taking `writer.lock` in a loop could starve one.
-- `foreground.lock`: `index` and `reindex` hold it shared for their whole run. A merge
-  step starts only while no process holds it, and checks it about every thousand SQLite
-  instructions while it runs (FTS5 writes each output page through a statement): when
-  an explicit command starts, the step is interrupted and rolled back, its writer lock
-  is free at once, and it runs again after the command exits. A command therefore never
-  waits for merge work, however long the step a common trigram's doclist forces. The
-  merger only probes the lock or takes it for an instant, so a command's shared lock
-  never waits behind it.
+- `writer.queue`: a waiting writer holds it shared until it has `writer.lock`, and so
+  does a command waiting for `work.lock`. A merge step takes it exclusively before
+  `writer.lock` and drops it once it has the writer lock, so a step starts only when no
+  writer is waiting. Neither `flock` nor `LockFileEx` hands a released lock to a waiter,
+  so without the queue a merger re-taking `writer.lock` in a loop could starve one.
+  While a step runs, it try-locks the queue exclusively about every thousand SQLite
+  instructions (FTS5 writes each output page through a statement), which fails exactly
+  while a writer waits: the step is interrupted and rolled back, its writer lock is free
+  at once, and it runs again once no writer waits. A writer therefore never waits for
+  merge work, however long the step a common trigram's doclist forces.
 - `work.lock`: one background worker for refresh and the queue tasks. A command spawns a
   worker only while the lock is free; the worker takes it itself and exits if another
   process got there first.
@@ -87,16 +83,17 @@ can leave only an unreferenced file, which reclamation deletes.
 - A fingerprint is size, modification time in nanoseconds and a change token (on Unix,
   the inode change time). SQLite stores (`.db`, `.sqlite`, `.sqlite3`, `.vscdb`) include
   their `-wal` file's size, time and token.
-- A source has changed when it is new, its fingerprint differs, or stat proves it
-  absent. Symbolic links are not followed. An unreadable directory yields an error
-  record rather than the deletion of its unseen subtree.
+- A source has changed when it is new, its fingerprint differs, stat proves it absent,
+  or a directory now stands at its path; the refresh removes a source on the same test.
+  Symbolic links are not followed. An unreadable directory yields an error record rather
+  than the deletion of its unseen subtree, and the record goes once the directory lists.
 - The census also reports whether FTS segments need merging. It writes nothing; the
   refresh saves the listings it used.
 
 How commands use it (`ready` and `finish_census` in `crates/agrep/src/main.rs`):
 
-- Without `index.db` the command builds the index inline, printing
-  `agrep: indexing N source files…` on stderr, then answers.
+- Without `index.db` the command builds the index inline, printing `building the search
+  db (a first build can take a while on a large history) …` on stderr, then answers.
 - Otherwise the census runs on its own thread while the command queries its snapshot.
   Afterwards, if sources changed, the command spawns `agrep __work`. If none changed, it
   spawns `agrep __work merge` when segments need merging, and `semantic::schedule`
@@ -221,9 +218,9 @@ stay in memory up to `hashsize` 8 MiB.
   few percent to lookups, which seek every segment for every term; each step up in the
   cap halves how often the large segment is rewritten.
 - Each step asks for 64 output pages and is its own transaction under `writer.lock`,
-  taken behind `writer.queue` and only while no explicit command holds
-  `foreground.lock`. FTS5 ends a step only between terms, so a common trigram's doclist
-  is one long step whatever the budget; a command that starts during it interrupts it.
+  taken behind `writer.queue`. FTS5 ends a step only between terms, so a common
+  trigram's doclist is one long step whatever the budget; a writer that queues during
+  it interrupts it.
 - The merger disables auto-checkpoints and runs a passive checkpoint after each run of
   steps and whenever the WAL reaches 4 MiB, so foreground commits do not inherit its
   frames.
@@ -244,7 +241,8 @@ fill a row page the lower tiers are not run; otherwise an all-terms pass continu
 the phrase rows. When nothing matches, interactive and compact output run the
 content-terms tier for a multi-word query that contains stop words, one-character terms
 or punctuation: one pass per remaining term, highest IDF first, each over the rows
-lacking the earlier terms. `--coverage` runs that tier explicitly.
+lacking the earlier terms. `--coverage` is a separate bm25 lane; see
+[SEARCH_RANKING.md](SEARCH_RANKING.md).
 
 `-w` and `-E` compile a case-insensitive fancy-regex with a backtrack limit of 100,000.
 The literal every match begins or ends with, if there is one, drives the index.
@@ -283,8 +281,10 @@ uncounted, a block ceiling ended a pass, or the tool lane was skipped because a 
 (scoring at most 0.22) cannot outscore the page's last phrase row. A `--no-meta` page
 whose matches did not fit the fetched rows, partial semantic coverage, a meaning scan
 stopped at its bound and a hybrid merge that added meaning rows also give floors.
-Classic output prints a floor on stderr as `N+ matches (floor; -c exact)`; JSON then
-omits `tool_rows` and sets `tool_rows_basis` to `unknown`.
+Classic output prints a floor on stderr as `showing N of M+ … (a floor, not the total;
+-c counts exactly)`. A compact page prints `N+ matches (floor; -c exact)`, or `N+ matches
+(floor)` on a meaning page, and a merged page whose lanes returned every row prints none;
+JSON then omits `tool_rows` and sets `tool_rows_basis` to `unknown`.
 
 ## Caller exclusion
 
@@ -330,7 +330,9 @@ exclusion (`self_exclusion.reason` is `chat-filter`) unless `--no-self` is given
 - `refresh`, under `work.lock`;
 - `merge`, under `merge.lock` alone;
 - under `work.lock` again: `semantic` embeds queued rows newest-first in batches of 128,
-  publishing each batch in its own transaction; `reclaim` deletes unreferenced vector
+  publishing each batch in its own transaction, and stops between batches while a writer
+  or an explicit command waits in `writer.queue` (the rest is then left to that command
+  or the next worker); `reclaim` deletes unreferenced vector
   metadata, and block files that are unreferenced and older than ten minutes; `archive`
   captures sources when the archive is on and ten minutes have passed since the last
   capture; `post_index` runs the configured `post_index` command through the shell after
@@ -338,14 +340,19 @@ exclusion (`self_exclusion.reason` is `chat-filter`) unless `--no-self` is given
 
 The worker lowers its priority (nice 10 on Unix, below-normal on Windows), uses at most
 half the logical CPUs and keeps BLAS single-threaded. A spawned worker runs in its own
-process group, with stdin and stdout null and stderr appended to `log/agrep.log`. On
-Windows the spawning command first makes its own standard handles non-inheritable:
-`CreateProcess` passes every inheritable handle, and a worker holding the caller's pipes
-would keep a caller that reads the output to its end waiting until the worker exits.
+process group, with stdin and stdout null and stderr appended to `log/agrep.log`, and
+inherits no other descriptor or handle of the spawning command: a worker holding a pipe
+the command got from its caller (`out=$(agrep search x 3>&1)`) would keep the caller
+reading to the end waiting until the worker exits. On Unix the command marks its other
+descriptors close-on-exec while it spawns, so std still uses `posix_spawn`; on Windows a
+`PROC_THREAD_ATTRIBUTE_HANDLE_LIST` names the worker's only inherited handles.
 
-`index` and `reindex` refresh inline, start a detached merger when segments need
-merging, and run the remaining tasks inline, waiting for `work.lock`. `index --semantic`
-also provisions the model and embeds even when `embeddings` is off.
+`index` and `reindex` refresh inline and start a detached merger when segments need
+merging. `reindex` and `index --semantic` then embed the queue inline, waiting for
+`work.lock` in `writer.queue`, and run the remaining tasks; `index --semantic` also
+provisions the model and embeds even when `embeddings` is off. A plain `index` never
+embeds and never waits for `work.lock`: it runs `reclaim`, `archive` and `post_index`
+only while the lock is free, and leaves the queue to a background worker.
 
 ## Known limits
 

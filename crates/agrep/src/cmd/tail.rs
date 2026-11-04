@@ -32,16 +32,19 @@ fn follow(
     events: Option<String>,
     snapshot: bool,
 ) -> Result<i32> {
+    // 0.4.9's parser refusals (py/tail.py:95-103), each as `agrep tail: …`.
+    let refuse = |message: String| super::usage::refusal("agrep tail", message);
     let mut agents = vec![];
     for a in &agent {
         for a in a.split(',').filter(|s| !s.trim().is_empty()) {
-            agents.push(live::normalize_agent(a)?);
+            agents.push(live::normalize_agent(a).map_err(|e| refuse(e.to_string()))?);
         }
     }
-    ensure!(
-        agent.is_empty() || !agents.is_empty(),
-        "--agent requires at least one supported agent name"
-    );
+    if !agent.is_empty() && agents.is_empty() {
+        return Err(refuse(
+            "--agent requires at least one supported agent name".into(),
+        ));
+    }
     agents.sort();
     agents.dedup();
     let session = session
@@ -105,6 +108,7 @@ fn follow(
             }
             Ok(())
         })?;
+        // No watch covers agent stores: poll every 700 ms, checking the signal flag every 50 ms.
         for _ in 0..14 {
             if signals.pending() != 0 {
                 break;

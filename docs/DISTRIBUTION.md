@@ -60,10 +60,15 @@ process measured to exit, kept and recorded with the load average. A case plans
 so its index samples end when the build request it queued has been served; the
 process exit is recorded too.
 
-Every sample of both versions is verified: exit codes, non-empty answers where
-matches exist, meaning rows for hybrid and `-s` cases, and on the dense corpus
-0.5's exact top-40 handles and counts against an independent full-corpus
-oracle. A case is a win only when 0.5's median and its p95 over the samples
+Every sample of both versions is verified against the work its case asks for:
+exit codes; non-empty answers where matches exist; the message and session totals
+of the generated corpus in every index report; after each measured refresh and
+each changed-source drain, the unique text appended before it found exactly once
+by an untimed `--no-auto` count; exact `-c` counts from a full-corpus oracle;
+meaning rows for hybrid and `-s` cases, with the planted answer first on the
+semantic corpus; and on the dense corpus 0.5's exact top-40 handles. A command
+that returns without doing that work fails its case. A case is a win only when
+0.5's median and its p95 over the samples
 taken are both strictly below 0.4.9's. When 0.4.9 crashes, exits with the wrong
 code or leaves broken evidence, the case is a reference failure and never a
 win. When 0.4.9 reaches its expected exit on every sample but cannot prove a

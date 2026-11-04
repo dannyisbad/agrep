@@ -85,7 +85,8 @@ pub fn run(
             return Ok(1);
         }
     };
-    launch::capability(&chosen.agent)?;
+    // 0.4.9 printed the refusal as a bare line (py/hookless/native.py:999-1002).
+    launch::capability(&chosen.agent).map_err(|e| super::usage::refusal("", e))?;
     let source:String=c.query_row("SELECT src.path FROM sources src JOIN prose p ON p.source=src.rowid WHERE p.session=?1 AND p.agent=?2 AND p.visible=1 LIMIT 1",[&chosen.id,&chosen.agent],|r|r.get(0)).unwrap_or_default();
     let preferred = if source.replace('\\', "/").contains("/.omp/") {
         Some("omp")

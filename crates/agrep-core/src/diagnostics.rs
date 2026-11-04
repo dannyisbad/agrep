@@ -138,20 +138,24 @@ pub fn status(root: &DataRoot) -> Result<Value> {
         .collect::<Vec<_>>());
     out["sources"] = json!(sources);
     let coverage = crate::semantic::coverage(&c)?;
-    let model = crate::semantic_model::directory(root);
-    let present = crate::semantic::installed(root);
-    let integrity = if present {
-        crate::semantic_model::verify_installed(root)
-            .err()
-            .map(|e| format!("{e:#}"))
-    } else {
-        None
-    };
-    out["semantic"] = json!({"model_present":present&&integrity.is_none(),"model_installed":present,"integrity_error":integrity,"model_path":model,"indexed_rows":coverage.embedded,"total_rows":coverage.total,"backlog":coverage.total.saturating_sub(coverage.embedded)});
+    let installed = crate::semantic::installed(root);
+    out["semantic"] = json!({"model_present":false,"model_installed":installed,"integrity_error":null,"model_path":crate::semantic_model::directory(root),"indexed_rows":coverage.embedded,"total_rows":coverage.total,"backlog":coverage.total.saturating_sub(coverage.embedded)});
     let (bytes, files) = disk_usage(&root.0)?;
     out["disk_bytes"] = json!(bytes);
     out["disk_files"] = json!(files);
     Ok(out)
+}
+/// Verifies the model [`status`] found installed, hashing only files whose verified
+/// stamps changed, and records the outcome in it. `doctor --no-semantic` skips this.
+pub fn verify_model(root: &DataRoot, status: &mut Value) {
+    if status["semantic"]["model_installed"] != true {
+        return;
+    }
+    let error = crate::semantic_model::verify_installed(root)
+        .err()
+        .map(|e| format!("{e:#}"));
+    status["semantic"]["model_present"] = json!(error.is_none());
+    status["semantic"]["integrity_error"] = json!(error);
 }
 pub fn integrations(config: &crate::data::Config) -> Result<Vec<Value>> {
     Ok(config.enrollment.iter().map(|item| {

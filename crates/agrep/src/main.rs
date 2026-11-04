@@ -272,6 +272,8 @@ struct Around {
     #[arg(
         long,
         value_name = "WHO",
+        value_parser = ["you", "user", "subagent", "agent", "tool", "control", "synthetic", "recap", "harness"],
+        hide_possible_values = true,
         help = "only this speaker: you, user, subagent, agent, tool, control, synthetic, recap or harness (`you` is an alias for `user`)"
     )]
     who: Option<String>,
@@ -655,6 +657,13 @@ enum Command {
             help = "also rebuild every semantic embedding (reindex always reparses every source)"
         )]
         full: bool,
+        #[arg(
+            long,
+            value_name = "MAX_NEW",
+            allow_negative_numbers = true,
+            help = "cap messages embedded this run (background/bounded refresh)"
+        )]
+        max_new: Option<i64>,
     },
     #[command(
         about = "bounded diagnostic; --deep runs full integrity checks and --fix repairs safe faults",
@@ -693,7 +702,10 @@ enum Command {
         agent: Vec<String>,
         #[arg(long, help = "machine output")]
         json: bool,
-        #[arg(long, help = "promote proven coverage gaps to a failure (exit 1)")]
+        #[arg(
+            long,
+            help = "promote coverage gaps and live/uncertified evidence to errors (exit 2)"
+        )]
         strict: bool,
         #[arg(
             long,
@@ -924,26 +936,26 @@ fn ready(no_auto: bool) -> Result<(DataRoot, Option<CensusTask>)> {
     let no_auto = no_auto || agrep_core::data::read_only();
     let root = DataRoot::discover()?;
     root.validate(!no_auto)?;
-    let census = if no_auto {
-        None
-    } else if !root.db().exists() {
+    // A first build runs inline; its census then finds the sources it just read.
+    if !no_auto && !root.db().exists() {
         store::refresh(&root, true, false)?;
         semantic::initialize(&root)?;
-        None
-    } else {
+    }
+    let census = (!no_auto).then(|| {
         let copy = root.clone();
-        Some(std::thread::spawn(move || {
+        std::thread::spawn(move || {
             let _span = agrep_core::semantic_profile::span("freshness");
             let pending = agrep_core::freshness::pending(&copy)?;
             agrep_core::semantic_profile::event(serde_json::json!({"freshness":pending}));
             Ok(pending)
-        }))
-    };
+        })
+    });
     Ok((root, census))
 }
+/// Joins the census and starts the background work it found. A command without one
+/// (`--no-auto`, or a read-only data root) starts none.
 fn finish_census(root: &DataRoot, census: Option<CensusTask>) -> Result<usize> {
     let Some(task) = census else {
-        semantic::schedule(root)?;
         return Ok(0);
     };
     let census = task
@@ -1037,7 +1049,7 @@ fn run(cli: Cli, invocation: &cmd::usage::Invocation) -> Result<i32> {
         }) => cmd::audit::run(agent, json, strict, full),
         Some(Command::Why { reference, json }) => cmd::why::run(reference, json),
         Some(Command::Index { full, semantic }) => cmd::index::run(full, semantic),
-        Some(Command::Reindex { full }) => cmd::index::reindex(full),
+        Some(Command::Reindex { full, max_new }) => cmd::index::reindex(full, max_new),
         None => cmd::status::run(false, false),
         Some(Command::Status { json, no_auto }) => cmd::status::run(json, no_auto),
         Some(Command::Set { values }) => cmd::set::run(values),
@@ -1203,8 +1215,8 @@ fn main() {
 mod tests {
     use super::*;
     // Each command's options as 0.4.9's `--help` listed them, less search's
-    // `--strict-semantic` and reindex's `--max-new`, plus `index --semantic` and `--no-auto`
-    // on status, resume, ui and serve (docs/PORTING.md).
+    // `--strict-semantic`, plus `index --semantic` and `--no-auto` on status, resume, ui and
+    // serve (docs/PORTING.md).
     #[test]
     fn every_command_offers_its_own_options_each_described() {
         let scope = [
@@ -1330,7 +1342,7 @@ mod tests {
                 ],
             ),
             ("index", &["full", "semantic"]),
-            ("reindex", &["full"]),
+            ("reindex", &["full", "max-new"]),
             ("doctor", &["deep", "fix", "no-semantic", "json"]),
             ("audit", &["agent", "json", "strict", "full"]),
             (

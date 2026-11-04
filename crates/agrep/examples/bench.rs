@@ -17,9 +17,14 @@ mod perf;
 mod process;
 #[path = "support/results.rs"]
 mod results;
-use corpus::{dense_expected, generate, utterance};
+use corpus::{
+    append_turn, dense_expected, expected_corpus, expected_count, generate, planted_handle,
+    utterance,
+};
 
-static DENSE_ROWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The corpus the cases read: rows, dense, with the semantic fixture, and whether it was
+/// generated (real history fixes no answer).
+static CORPUS: std::sync::OnceLock<(usize, bool, bool, bool)> = std::sync::OnceLock::new();
 static TRACE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 fn trace(value: &Value) -> Result<()> {
     if let Some(path) = TRACE.get() {
@@ -92,31 +97,53 @@ fn invoke(
         });
     #[cfg(not(unix))]
     let load: Option<Vec<f64>> = None;
-    let begun = std::time::SystemTime::now();
-    let t = Instant::now();
-    let out = process::command(
+    let mut command = process::command(
         bin,
         home,
         data,
         profile,
         std::env::var_os("PATH").unwrap_or_default(),
         std::env::var_os("SystemRoot"),
-    )
-    .args(args)
-    .output()?;
+    );
+    if args.first() == Some(&"index") {
+        // An index run reports its phases and lock waits as timing events on stderr.
+        command.env("AGREP_QUERY_TIMING", "1");
+    }
+    let t = Instant::now();
+    let out = command.args(args).output()?;
     let ms = t.elapsed().as_secs_f64() * 1000.;
     let rc = out.status.code().unwrap_or(2);
     let mut parsed = results::evidence(&out.stdout, &out.stderr);
-    let stats = data.join(results::INDEX_STATS);
-    if args.first() == Some(&"index")
-        && std::fs::metadata(&stats)
-            .and_then(|m| m.modified())
-            .is_ok_and(|t| t >= begun)
-    {
-        parsed = results::with_index_stats(parsed, &std::fs::read(&stats)?);
-    }
     parsed["bench_load_averages"] = json!(load);
     Ok((ms, rc, parsed))
+}
+/// The answer the generated corpus fixes for a case, and for a dense case the ranked
+/// handles of the full-corpus oracle.
+fn expectation(name: &str, args: &[&str]) -> Result<(results::Expect, Option<Vec<String>>)> {
+    let (rows, dense, semantic, generated) = *CORPUS.get().expect("corpus recorded");
+    let mut expect = results::Expect::default();
+    if !generated {
+        return Ok((expect, None));
+    }
+    let (messages, sessions) = expected_corpus(rows, dense);
+    expect.corpus = Some((messages + u64::from(semantic), sessions));
+    let counted = args.contains(&"-c");
+    if name.starts_with("old_dense") {
+        let (handles, count) = dense_expected(rows, args)?;
+        expect.count = counted.then_some(count as u64);
+        return Ok((expect, Some(handles)));
+    }
+    if counted {
+        expect.count = Some(expected_count(rows, args[0], args.contains(&"codex")));
+    }
+    if semantic && name.contains("hybrid") {
+        expect.top = Some(planted_handle(rows));
+    }
+    Ok((expect, None))
+}
+/// Untimed: the rows of the committed index that hold `token`, counted without a refresh.
+fn probe(bin: &Path, home: &Path, data: &Path, token: &str) -> Result<Value> {
+    Ok(invoke(bin, home, data, &[token, "-c", "--no-auto"], "classic")?.2["bench_count"].clone())
 }
 fn case(
     bin: &Path,
@@ -131,12 +158,7 @@ fn case(
     let mut loads = vec![];
     let mut evidence = Value::Null;
     let mut verified = vec![];
-    let expected = if name.starts_with("old_dense") {
-        let rows = DENSE_ROWS.load(std::sync::atomic::Ordering::Relaxed);
-        Some(dense_expected(rows, args)?)
-    } else {
-        None
-    };
+    let (expect, oracle) = expectation(name, args)?;
     for i in 0..runs {
         if name == "first_index" && i > 0 {
             fs::remove_dir_all(data)?;
@@ -152,15 +174,12 @@ fn case(
                 "classic"
             },
         )?;
-        verified.push(if let Some((handles, count)) = &expected {
-            if args.contains(&"-c") {
-                p["bench_count"].as_u64() == Some(*count as u64)
-            } else {
-                p["bench_handles"] == json!(handles)
-            }
-        } else {
-            results::valid_result(name, &p)
-        });
+        verified.push(
+            results::valid_result(name, &p, &expect)
+                && oracle.as_ref().is_none_or(|handles| {
+                    args.contains(&"-c") || p["bench_handles"] == json!(handles)
+                }),
+        );
         times.push(ms);
         codes.push(rc);
         loads.push(p["bench_load_averages"].clone());
@@ -170,7 +189,7 @@ fn case(
     sorted.sort_by(f64::total_cmp);
     let median = sorted[sorted.len() / 2];
     eprintln!("{name:24} {median:10.2} ms  rc={:?}", codes);
-    let value = json!({"name":name,"args":args,"median_ms":median,"p95_ms":sorted[(runs*95).div_ceil(100)-1],"samples_ms":times,"exit_codes":codes,"verified_results":verified,"load_averages":loads,"oracle_expected_handles":expected.as_ref().map(|e|&e.0),"oracle_expected_count":expected.as_ref().map(|e|e.1),"evidence":evidence});
+    let value = json!({"name":name,"args":args,"median_ms":median,"p95_ms":sorted[(runs*95).div_ceil(100)-1],"samples_ms":times,"exit_codes":codes,"verified_results":verified,"load_averages":loads,"oracle_expected_handles":oracle,"oracle_expected_count":expect.count,"evidence":evidence});
     trace(&value)?;
     Ok(value)
 }
@@ -254,7 +273,9 @@ fn layout(t: &Path) -> Result<Value> {
 }
 fn main() -> Result<()> {
     let a = Args::parse();
-    DENSE_ROWS.store(a.rows, std::sync::atomic::Ordering::Relaxed);
+    CORPUS
+        .set((a.rows, a.dense, a.semantic, !a.real))
+        .expect("corpus recorded once");
     if a.runs == 0 || a.build_runs == Some(0) {
         bail!("--runs must be positive")
     }
@@ -302,14 +323,8 @@ fn main() -> Result<()> {
     };
     if a.semantic {
         let path = last.as_ref().expect("synthetic semantic source");
-        let mut source = fs::OpenOptions::new().append(true).open(path)?;
-        let fixture = corpus::SEMANTIC_FIXTURE;
-        text_bytes += fixture.len() as u64;
-        writeln!(
-            source,
-            "{}",
-            json!({"type":"message","id":"semantic-fixture","timestamp":chrono::Utc::now().to_rfc3339(),"message":{"role":"user","content":fixture}})
-        )?;
+        append_turn(path, "semantic-fixture", corpus::SEMANTIC_FIXTURE)?;
+        text_bytes += corpus::SEMANTIC_FIXTURE.len() as u64;
     }
     let source_bytes = if a.real { 0 } else { bytes(&home) };
     let mut cases = vec![];
@@ -334,58 +349,73 @@ fn main() -> Result<()> {
         &["__census"],
         a.runs,
     )?);
+    let mut appended = 0;
     if let Some(path) = &last {
+        let (expect, _) = expectation("one_session_refresh", &["index"])?;
         let mut trials = vec![];
+        let mut verified = vec![];
         for i in 0..a.runs {
-            let body = fs::read_to_string(path)?;
-            let parent: Value = serde_json::from_str(body.lines().last().unwrap())?;
-            {
-                let mut f = fs::OpenOptions::new().append(true).open(path)?;
-                writeln!(
-                    f,
-                    "{}",
-                    json!({"type":"message","id":format!("incremental-{i}"),"parentId":parent["id"],"timestamp":chrono::Utc::now().to_rfc3339(),"message":{"role":"user","content":format!("one changed session incremental probe {i}")}})
-                )?;
-            }
-            trials.push(invoke(&bin, &home, &data, &["index"], "classic")?);
+            let token = format!("zzincremental{i}x");
+            append_turn(
+                path,
+                &format!("incremental-{i}"),
+                &format!("one changed session incremental probe {i} {token}"),
+            )?;
+            appended += 1;
+            let mut trial = invoke(&bin, &home, &data, &["index"], "classic")?;
+            trial.2["bench_probe_count"] = probe(&bin, &home, &data, &token)?;
+            let expect = results::Expect {
+                corpus: expect.corpus.map(|(m, s)| (m + appended, s)),
+                ..expect.clone()
+            };
+            verified.push(results::valid_result(
+                "one_session_refresh",
+                &trial.2,
+                &expect,
+            ));
+            trials.push(trial);
         }
         let times: Vec<_> = trials.iter().map(|t| t.0).collect();
         let mut sorted = times.clone();
         sorted.sort_by(f64::total_cmp);
         let median = sorted[sorted.len() / 2];
         eprintln!("one_session_refresh {median:.2} ms");
-        let value = json!({"name":"one_session_refresh","args":["index"],"median_ms":median,"p95_ms":sorted[(sorted.len()*95).div_ceil(100)-1],"samples_ms":times,"load_averages":trials.iter().map(|t|t.2["bench_load_averages"].clone()).collect::<Vec<_>>(),"exit_codes":trials.iter().map(|t|t.1).collect::<Vec<_>>(),"evidence":trials.last().unwrap().2});
+        let value = json!({"name":"one_session_refresh","args":["index"],"median_ms":median,"p95_ms":sorted[(sorted.len()*95).div_ceil(100)-1],"samples_ms":times,"load_averages":trials.iter().map(|t|t.2["bench_load_averages"].clone()).collect::<Vec<_>>(),"exit_codes":trials.iter().map(|t|t.1).collect::<Vec<_>>(),"verified_results":verified,"evidence":trials.last().unwrap().2});
         trace(&value)?;
         cases.push(value);
     }
     if !a.real {
         let path = last.as_ref().expect("synthetic pi source");
         let mut trials = vec![];
+        let mut verified = vec![];
         let query = if a.dense {
             "deepold"
         } else {
             "release workflow"
         };
         for i in 0..a.runs {
-            let source = fs::read_to_string(path)?;
-            let parent: Value = serde_json::from_str(source.lines().last().unwrap())?;
-            let mut f = fs::OpenOptions::new().append(true).open(path)?;
-            writeln!(
-                f,
-                "{}",
-                json!({"type":"message","id":format!("pending-{i}"),"parentId":parent["id"],"timestamp":chrono::Utc::now().to_rfc3339(),"message":{"role":"user","content":format!("active session update {i}")}})
+            let token = format!("zzpending{i}x");
+            append_turn(
+                path,
+                &format!("pending-{i}"),
+                &format!("active session update {i} {token}"),
             )?;
-            drop(f);
-            trials.push(invoke(&bin, &home, &data, &[query, "--json"], "classic")?);
+            let trial = invoke(&bin, &home, &data, &[query, "--json"], "classic")?;
             let (_, rc, _) = invoke(&bin, &home, &data, &["index"], "classic")?;
             if rc != 0 {
                 bail!("changed-source drain failed");
             }
+            // The drain must have committed the turn the sample found pending.
+            verified.push(
+                results::valid_result("json", &trial.2, &results::Expect::default())
+                    && probe(&bin, &home, &data, &token)? == 1,
+            );
+            trials.push(trial);
         }
         let mut times: Vec<_> = trials.iter().map(|t| t.0).collect();
         let samples = times.clone();
         times.sort_by(f64::total_cmp);
-        let value = json!({"name":"search_changed_source","median_ms":times[times.len()/2],"p95_ms":times[(times.len()*95).div_ceil(100)-1],"samples_ms":samples,"load_averages":trials.iter().map(|t|t.2["bench_load_averages"].clone()).collect::<Vec<_>>(),"exit_codes":trials.iter().map(|t|t.1).collect::<Vec<_>>(),"verified_results":trials.iter().map(|t|results::valid_result("json", &t.2)).collect::<Vec<_>>()});
+        let value = json!({"name":"search_changed_source","median_ms":times[times.len()/2],"p95_ms":times[(times.len()*95).div_ceil(100)-1],"samples_ms":samples,"load_averages":trials.iter().map(|t|t.2["bench_load_averages"].clone()).collect::<Vec<_>>(),"exit_codes":trials.iter().map(|t|t.1).collect::<Vec<_>>(),"verified_results":verified});
         trace(&value)?;
         cases.push(value);
     }
@@ -400,16 +430,25 @@ fn main() -> Result<()> {
                 fs::copy(source.join(name), destination.join(name))?;
             }
         }
+        // `index --semantic` waits for the worker setup starts and embeds what it left, so
+        // the timed cases search a fully embedded corpus.
         for args in [
             vec!["setup", "--yes", "--no-teach", "--no-hook", "--no-archive"],
-            vec!["__work"],
+            vec!["index", "--semantic"],
         ] {
             let (_, rc, evidence) = invoke(&bin, &home, &data, &args, "classic")?;
             if rc != 0 {
                 bail!("semantic preparation failed: {args:?}: {evidence}");
             }
         }
-        let args = [corpus::SEMANTIC_QUERY, "--json"];
+        let status = ["status", "--json", "--no-auto"];
+        let semantic = invoke(&bin, &home, &data, &status, "classic")?.2["semantic"].clone();
+        if semantic["backlog"] != 0 || semantic["indexed_rows"] == 0 {
+            bail!("semantic preparation left the corpus partly embedded: {semantic}");
+        }
+        // The rendered agent page, as matched.rs measures it: `--json` turns automatic
+        // hybrid off.
+        let args = [corpus::SEMANTIC_QUERY];
         cases.push(case(&bin, &home, &data, "compact_first_hybrid", &args, 1)?);
         cases.push(case(
             &bin,

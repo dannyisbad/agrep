@@ -117,10 +117,7 @@ pub fn check(
         if exits.is_none_or(|v| v.is_empty() || v.iter().any(|rc| rc.as_i64() != Some(expected))) {
             failures.push(format!("{name}: failed CLI exit (expected {expected})"));
         }
-        if !matches!(
-            name,
-            "first_index" | "no_change_census" | "one_session_refresh"
-        ) && case["verified_results"]
+        if case["verified_results"]
             .as_array()
             .is_none_or(|v| Some(v.len()) != samples.map(Vec::len) || v.iter().any(|b| b != true))
         {

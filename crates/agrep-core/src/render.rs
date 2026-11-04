@@ -349,20 +349,70 @@ pub fn compact_line(h: &Hit, marks: &Marks) -> String {
     .collect::<Vec<_>>()
     .join(" ")
 }
-pub fn emit(r: &Results, q: &str, f: &Filters, s: &Style) -> Result<()> {
-    emit_semantic(r, q, f, s, None)
+/// 0.4.9's forced coverage lane on stderr (py/search.py:6468-6532): what the top row
+/// matched of the query's words, then one compact line per row.
+pub fn coverage_block(hits: &[Hit], q: &str, s: &Style) -> Vec<String> {
+    let Some(top) = hits.first() else {
+        return vec!["coverage lane: no candidate rows".into()];
+    };
+    // The words as 0.4.9 split them (py/corpusdb.py:5165-5166, 5193-5202): at whitespace,
+    // hyphens and underscores, lowercased, each found anywhere in the lowercased row.
+    let mut words: Vec<String> = vec![];
+    for word in q
+        .trim()
+        .split(|c: char| c.is_whitespace() || c == '-' || c == '_')
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+    {
+        if !words.contains(&word) {
+            words.push(word);
+        }
+    }
+    let text = top.text.to_lowercase();
+    let (matched, missing): (Vec<&String>, Vec<&String>) =
+        words.iter().partition(|w| text.contains(w.as_str()));
+    let detail = if missing.is_empty() {
+        format!("top row matched all {} terms", words.len())
+    } else {
+        let mut dropped = missing
+            .iter()
+            .take(6)
+            .map(|w| w.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if missing.len() > 6 {
+            dropped.push_str(", …");
+        }
+        format!(
+            "top row matched {}/{} terms - dropped: {}",
+            matched.len(),
+            words.len(),
+            safe(&dropped)
+        )
+    };
+    let marks = Marks::new(q, s);
+    std::iter::once(format!("coverage lane (forced): {detail}"))
+        .chain(hits.iter().map(|h| compact_line(h, &marks)))
+        .collect()
 }
+pub fn emit(r: &Results, q: &str, f: &Filters, s: &Style) -> Result<()> {
+    emit_semantic(r, q, f, s, None, &[])
+}
+/// `after` goes to stderr below the rows and a compact page's footer, above the line
+/// saying a classic page was cut.
 pub fn emit_semantic(
     r: &Results,
     q: &str,
     _f: &Filters,
     s: &Style,
     coverage: Option<&crate::semantic::Coverage>,
+    after: &[String],
 ) -> Result<()> {
     let truncated = ((!s.count && !s.tiers) && r.hits.len() < r.total) || r.total_basis != "exact";
     let exhaustible = !s.semantic && !r.hits.iter().any(|h| h.matched == "semantic");
     let marks = Marks::new(q, s);
     let mut out = String::new();
+    let mut footer = None;
     if s.count {
         out = format!(
             "{}{}\n",
@@ -408,43 +458,7 @@ pub fn emit_semantic(
             );
         }
     } else if s.compact {
-        let ordered = diversify(demote_meta(r.hits.clone()));
-        let frozen = pages::Frozen {
-            records: ordered
-                .iter()
-                .map(|h| pages::Record {
-                    line: compact_line(h, &marks),
-                    family: format!("{}:{}", h.agent, h.family),
-                    score: h.score,
-                    lane: h.matched.clone(),
-                    tool: h.who == "tool",
-                    identity: if h.who == "tool" {
-                        h.handle.clone()
-                    } else {
-                        format!("{}:{}:{}", h.agent, h.session, h.turn)
-                    },
-                })
-                .collect(),
-            query: q.into(),
-            total: r.total,
-            exact: r.total_basis == "exact",
-            shown: 0,
-            requested: s.requested,
-            chat_scoped: _f.chat.is_some() || !s.diversify,
-            full_argv: s.full_argv.clone(),
-            // 0.4.9: a --no-meta page that dropped rows bounds only what it fetched.
-            exhaustible: r.meta_dropped + r.meta_retained == 0,
-        };
-        let page = pages::select(frozen);
-        out = page.text;
-        let more = if let Some(root) = &s.data_root {
-            pages::save(root, &page.remainder)?
-        } else {
-            None
-        };
-        if more.is_some() || truncated || !page.remainder.records.is_empty() {
-            eprintln!("{}", pages::footer(&page.remainder, more.as_deref()));
-        }
+        (out, footer) = compact_page(r, q, _f, s, &marks, truncated, exhaustible)?;
     } else {
         let mut sessions = Vec::<(&str, Vec<&Hit>)>::new();
         for hit in demote_meta(r.hits.iter().collect()) {
@@ -477,6 +491,12 @@ pub fn emit_semantic(
         }
     }
     surface::write(&out)?;
+    if let Some(line) = footer {
+        eprintln!("{line}");
+    }
+    for line in after {
+        eprintln!("{line}");
+    }
     if let Some(legend) = speaker_legend(s, std::io::stderr().is_terminal()) {
         eprintln!("{legend}");
     }
@@ -484,6 +504,57 @@ pub fn emit_semantic(
         eprintln!("{}", completeness_line(r, s, exhaustible));
     }
     Ok(())
+}
+/// A compact page's rows, frozen behind their continuation, and the footer printed below
+/// them.
+fn compact_page(
+    r: &Results,
+    q: &str,
+    f: &Filters,
+    s: &Style,
+    marks: &Marks,
+    truncated: bool,
+    exhaustible: bool,
+) -> Result<(String, Option<String>)> {
+    let ordered = diversify(demote_meta(r.hits.clone()));
+    let frozen = pages::Frozen {
+        records: ordered
+            .iter()
+            .map(|h| pages::Record {
+                line: compact_line(h, marks),
+                family: format!("{}:{}", h.agent, h.family),
+                score: h.score,
+                lane: h.matched.clone(),
+                tool: h.who == "tool",
+                identity: if h.who == "tool" {
+                    h.handle.clone()
+                } else {
+                    format!("{}:{}:{}", h.agent, h.session, h.turn)
+                },
+            })
+            .collect(),
+        query: q.into(),
+        total: r.total,
+        exact: r.total_basis == "exact",
+        shown: 0,
+        requested: s.requested,
+        chat_scoped: f.chat.is_some() || !s.diversify,
+        full_argv: s.full_argv.clone(),
+        // 0.4.9 offered `-c` on neither a meaning page nor a --no-meta page that dropped
+        // rows, which bounds only what it fetched (py/search.py:6108-6110).
+        exhaustible: exhaustible && r.meta_dropped + r.meta_retained == 0,
+    };
+    let page = pages::select(frozen);
+    let more = match &s.data_root {
+        Some(root) => pages::save(root, &page.remainder)?,
+        None => None,
+    };
+    // A page merged with meaning rows is cut only when a lane held more, whatever its floor
+    // total says (py/search.py:8321-8325).
+    let cut = r.hybrid_more.unwrap_or(truncated);
+    let footer = (more.is_some() || cut || !page.remainder.records.is_empty())
+        .then(|| pages::footer(&page.remainder, more.as_deref()));
+    Ok((page.text, footer))
 }
 /// 0.4.9's `_demote_meta`: ~meta rows sink below lived rows, each side keeping its order.
 fn demote_meta<T: std::borrow::Borrow<Hit>>(hits: Vec<T>) -> Vec<T> {
@@ -545,7 +616,7 @@ fn json_lines(
         meta["semantic_coverage"] = serde_json::to_value(coverage)?;
         meta["semantic_partial"] = json!(coverage.partial());
     }
-    if s.semantic {
+    if let Some(coverage) = coverage.filter(|_| s.semantic) {
         // 0.4.9 named its meaning lane's engine and led with the lane's status
         // (py/search.py:4322, 8285-8287).
         meta["engine"] = json!("semantic:hybrid");
@@ -756,6 +827,111 @@ mod tests {
         assert_eq!(
             meta["semantic"],
             json!({"complete":true,"coverage":full,"eligible":true,"fallback_recommended":false,"min_score":0.82,"partial":false,"reason":null,"score_kind":"cosine","state":"no-confident-match"})
+        );
+    }
+    // 0.4.9's real compact page for "how do we rotate secret credentials" on the six-chat
+    // fixture with its models installed: the strong meaning row, then the other chats'
+    // bag-of-words rows, and no footer, since neither lane held more. Under `-n 3` it showed
+    // two rows and `7+ matches (floor) · broader rerun (may repeat): agrep --deeper m.<TOKEN>`,
+    // whose rerun PORTING.md drops. The lanes are that fixture's: seven content rows (each
+    // reply naming the secret store, and the vault chat's question) and the meaning rows,
+    // only the vault chat's reply strong.
+    #[test]
+    fn hybrid_compact_page_and_footer_match_0_4_9() {
+        let row = |chat: u8, who: &str, digest: &str, score: f64, matched: &str, weak: bool| {
+            let session = format!("01960000-0000-7000-8000-00000000f00{chat}");
+            Hit {
+                handle: format!("@{session}:0.{digest}"),
+                family: session.clone(),
+                session,
+                agent: "pi".into(),
+                project: format!("/work/sec{chat}"),
+                who: who.into(),
+                score,
+                matched: matched.into(),
+                sem_weak: weak,
+                ..Hit::default()
+            }
+        };
+        let lanes = |rows: usize| {
+            let mut keyword = Results::default();
+            keyword.hits = [
+                (2, "agent", "f529", 0.1752),
+                (2, "user", "question", 0.1),
+                (5, "agent", "689b", 0.082),
+                (4, "agent", "d404", 0.0781),
+                (3, "agent", "883d", 0.0743),
+                (1, "agent", "7c63", 0.0673),
+                (0, "agent", "cb01", 0.064),
+            ]
+            .into_iter()
+            .take(rows)
+            .map(|(chat, who, digest, score)| row(chat, who, digest, score, "content-terms", false))
+            .collect();
+            keyword.total = 7;
+            keyword.total_basis = "exact".into();
+            let mut meaning = Results::default();
+            meaning.hits = vec![
+                row(0, "agent", "cb01", 0.882, "semantic", true),
+                row(2, "agent", "f529", 0.870, "semantic", false),
+                row(5, "agent", "689b", 0.845, "semantic", true),
+                row(3, "agent", "883d", 0.836, "semantic", true),
+            ];
+            meaning.total = 4;
+            meaning.total_basis = "exact".into();
+            crate::hybrid::merge(keyword, Some(meaning), rows, true)
+        };
+        let q = "how do we rotate secret credentials";
+        let page = |rows: usize, requested: Option<usize>| {
+            let r = lanes(rows);
+            let s = Style {
+                compact: true,
+                diversify: true,
+                requested,
+                ..Style::default()
+            };
+            let truncated = r.hits.len() < r.total || r.total_basis != "exact";
+            let (text, footer) = compact_page(
+                &r,
+                q,
+                &Filters::default(),
+                &s,
+                &Marks::new(q, &s),
+                truncated,
+                false,
+            )
+            .unwrap();
+            let handles: Vec<String> = text
+                .lines()
+                .map(|l| {
+                    l.split(' ').next().unwrap()["@01960000-0000-7000-8000-00000000".len()..]
+                        .to_owned()
+                })
+                .collect();
+            (handles, footer)
+        };
+        assert_eq!(
+            page(40, None),
+            (
+                [
+                    "f002:0.f529",
+                    "f005:0.689b",
+                    "f004:0.d404",
+                    "f003:0.883d",
+                    "f001:0.7c63",
+                    "f000:0.cb01"
+                ]
+                .map(String::from)
+                .to_vec(),
+                None
+            )
+        );
+        assert_eq!(
+            page(3, Some(3)),
+            (
+                ["f002:0.f529", "f005:0.689b"].map(String::from).to_vec(),
+                Some("7+ matches (floor)".to_owned())
+            )
         );
     }
     #[test]

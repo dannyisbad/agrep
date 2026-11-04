@@ -32,8 +32,7 @@ const KNOWN_AGENTS: [&str; 12] = [
     "omp",
 ];
 /// 0.4.9's `agent_filter_error` (py/session_context.py:1500-1522): the refusal of the first
-/// `--agent` value before `--` that names no agent. A blank value is the filter's own
-/// refusal.
+/// `--agent` value before `--` that is blank or names no agent.
 pub(crate) fn unknown_agent(args: &[OsString]) -> Option<String> {
     let words: Vec<_> = args.iter().map(|a| a.to_string_lossy()).collect();
     for (i, word) in words.iter().enumerate() {
@@ -48,7 +47,10 @@ pub(crate) fn unknown_agent(args: &[OsString]) -> Option<String> {
             },
             None => continue,
         };
-        if !value.trim().is_empty() && !KNOWN_AGENTS.contains(&value) {
+        if value.trim().is_empty() {
+            return Some(agrep_core::coverage::blank_notice("--agent"));
+        }
+        if !KNOWN_AGENTS.contains(&value) {
             return Some(format!(
                 "unknown agent '{value}' - valid: {}",
                 KNOWN_AGENTS.join(", ")
@@ -333,6 +335,56 @@ fn without(argv: &[String], id: &str, specs: &HashMap<String, (String, bool)>) -
     }
     kept
 }
+/// The words argparse's `nargs="*"` positional left over in 0.4.9: it took the first run
+/// of words, so a word typed after an option that follows that run was unrecognized.
+fn stray_words(argv: &[String], specs: &HashMap<String, (String, bool)>) -> Vec<String> {
+    // None before the first word, Some(false) inside the run, Some(true) after it.
+    let mut run = None;
+    let mut stray = Vec::new();
+    let mut index = 0;
+    while index < argv.len() {
+        let token = &argv[index];
+        index += 1;
+        if token == "--" {
+            if run == Some(true) {
+                stray.extend_from_slice(&argv[index..]);
+            }
+            break;
+        }
+        if token == "-" || !token.starts_with('-') {
+            if run == Some(true) {
+                stray.push(token.clone());
+            } else {
+                run = Some(false);
+            }
+            continue;
+        }
+        if run == Some(false) {
+            run = Some(true);
+        }
+        let (flag, attached) = match token.split_once('=') {
+            Some((flag, _)) => (flag, true),
+            None => (token.as_str(), false),
+        };
+        if let Some((_, takes_value)) = specs.get(flag) {
+            index += usize::from(*takes_value && !attached);
+            continue;
+        }
+        if token.starts_with("--") {
+            continue;
+        }
+        for (offset, letter) in token.char_indices().skip(1) {
+            let Some((_, takes_value)) = specs.get(&format!("-{letter}")) else {
+                break;
+            };
+            if *takes_value {
+                index += usize::from(token[offset + letter.len_utf8()..].is_empty());
+                break;
+            }
+        }
+    }
+    stray
+}
 /// The command line as parsed: which options were typed and the command's own words.
 pub(crate) struct Invocation {
     command: Option<(String, ArgMatches)>,
@@ -351,6 +403,30 @@ impl Invocation {
     /// Whether the command's last `n` words followed a `--`, so none of them is an option.
     pub(crate) fn escaped(&self, n: usize) -> bool {
         n > 0 && self.argv.len() > n && self.argv[self.argv.len() - n - 1] == "--"
+    }
+    /// 0.4.9's argparse refusal of the words left over after the command's run of words.
+    fn one_run(&self, prog: &str) -> Result<()> {
+        let Some((command, _)) = &self.command else {
+            return Ok(());
+        };
+        let argv: Vec<String> = self
+            .argv
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let option = |t: &&String| t.starts_with('-') && *t != "-";
+        // Only an option after the first word can end the run.
+        if !argv.iter().skip_while(option).any(|t| option(&t)) {
+            return Ok(());
+        }
+        let stray = stray_words(&argv, &specs(command));
+        if stray.is_empty() {
+            return Ok(());
+        }
+        Err(refusal(
+            prog,
+            format!("unrecognized arguments: {}", stray.join(" ")),
+        ))
     }
     /// 0.4.9's `option_gate_error` (py/surface_policy.py:1198-1219): the first refused
     /// option, and a copyable command that clears every gate.
@@ -436,6 +512,7 @@ fn specs(command: &str) -> HashMap<String, (String, bool)> {
 }
 /// py/search.py:7253-7373, in 0.4.9's order.
 pub(crate) fn search(s: &Search, invocation: &Invocation) -> Result<()> {
+    invocation.one_run("agrep")?;
     let fail = |message: &str| Err(refusal("agrep", message));
     if s.more.is_some() && (s.count || s.count_by_tier) {
         return fail("-c/--count-by-tier cannot be combined with --more");

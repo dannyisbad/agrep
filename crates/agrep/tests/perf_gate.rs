@@ -122,10 +122,16 @@ fn check_rejects_empty_answers_and_unexpected_no_match() {
     let errors = failures(&cases, true, false, 2_000_000, 886_000_000);
     assert!(errors.contains("failed CLI exit"));
     assert!(errors.contains("empty result evidence"));
-    assert!(!results::valid_result("count", &json!({"bench_count":0})));
+    let any = results::Expect::default();
+    assert!(!results::valid_result(
+        "count",
+        &json!({"bench_count":0}),
+        &any
+    ));
     assert!(!results::valid_result(
         "json",
-        &json!({"bench_stdout_bytes":200,"bench_result_rows":0})
+        &json!({"bench_stdout_bytes":200,"bench_result_rows":0}),
+        &any
     ));
 }
 #[test]
@@ -232,24 +238,42 @@ fn evidence_counts_rows_hits_counts_and_meaning_matches() {
     );
     assert_eq!(rendered["bench_meaning_lines"], 1);
     assert_eq!(rendered["bench_text_hits"], 2);
-    assert!(results::valid_result("warm_hybrid", &rendered));
+    let any = results::Expect::default();
+    assert!(results::valid_result("warm_hybrid", &rendered, &any));
+    assert_eq!(rendered["bench_top_handle"], "@s:1.ab");
     let keyword_only = results::evidence(b"@t:2.cd pi/user demo 0m ~all text\n", b"");
-    assert!(!results::valid_result("warm_hybrid", &keyword_only));
+    assert!(!results::valid_result("warm_hybrid", &keyword_only, &any));
     let count = results::evidence(b"2555\n", b"");
     assert_eq!(count["bench_count"], 2555);
-    assert!(results::valid_result("count", &count));
+    assert!(results::valid_result("count", &count, &any));
     let empty = results::evidence(b"", b"keyword: 0 matching rows\n");
-    assert!(!results::valid_result("release", &empty));
-    assert!(!results::valid_result("status", &empty));
-    let index = results::with_index_stats(
-        results::evidence(b"=== indexing transcripts ===\n", b""),
-        br#"{"parsed":3,"census_ms":1.5}"#,
+    assert!(!results::valid_result("release", &empty, &any));
+    assert!(!results::valid_result("status", &empty, &any));
+    assert_eq!(rows["bench_top_handle"], "@s:1.ab");
+    let report = results::evidence(
+        "=== indexing transcripts ===\n  indexed 8 messages across 5 sessions (40ms)\n".as_bytes(),
+        b"",
     );
     assert_eq!(
-        (index["parsed"].clone(), index["census_ms"].clone()),
-        (json!(3), json!(1.5))
+        (
+            &report["bench_index_messages"],
+            &report["bench_index_sessions"]
+        ),
+        (&json!(8), &json!(5))
     );
-    assert_eq!(results::INDEX_STATS, "index-stats.json");
+    let index = results::evidence(
+        b"=== indexing transcripts ===\n",
+        b"{\"phase\":\"freshness\",\"wall_ms\":0.5}\n{\"lock_wait\":{\"lock\":\"writer_queue\",\"ms\":0.25}}\n{\"lock_wait\":{\"lock\":\"writer_queue\",\"ms\":0.5}}\n{\"index\":{\"parsed\":3,\"census_ms\":1.5}}\nnot json\n",
+    );
+    assert_eq!(
+        (
+            &index["parsed"],
+            &index["census_ms"],
+            &index["wait_writer_queue_ms"]
+        ),
+        (&json!(3), &json!(1.5), &json!(0.75))
+    );
+    assert!(index.get("phase").is_none());
 }
 
 #[test]

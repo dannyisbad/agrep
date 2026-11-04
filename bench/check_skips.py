@@ -16,11 +16,14 @@ METAL_GUARD = re.findall(r'[A-Za-z_][A-Za-z_0-9]*|[^\s]',
 
 
 def scan_rust(text, inherited=()):
-    tokens = []
+    # Literals are opaque tokens to the item scan; gates keep their source text, so a
+    # registration names the platform value it was granted for.
+    tokens, source = [], []
     for match in TOKEN.finditer(text):
         token = match.group()
         if token.startswith(('//', '/*')):
             continue
+        source.append(token)
         if token.startswith(('"', 'b"', "'", "b'")) or re.match(r'(br|r)#*"', token):
             token = 'LITERAL'
         tokens.append(token)
@@ -40,7 +43,7 @@ def scan_rust(text, inherited=()):
         bracket = i + (2 if inner else 1)
         if bracket >= end or tokens[bracket] != '[': return None
         stop = closing(bracket, end)
-        return inner, ''.join(tokens[bracket + 1:stop]), stop + 1
+        return inner, ''.join(source[bracket + 1:stop]), stop + 1
 
     def gate(value):
         return value.startswith(('cfg(', 'cfg_attr(')) and value != 'cfg(test)'
@@ -85,7 +88,7 @@ def scan_rust(text, inherited=()):
                                 k = a[2]; continue
                             if tokens[k:k + 3] == ['cfg', '!', '(']:
                                 last = closing(k + 2, stop)
-                                body_gates.append(''.join(tokens[k:last + 1])); k = last + 1; continue
+                                body_gates.append(''.join(source[k:last + 1])); k = last + 1; continue
                             if tokens[k] == 'return': body_gates.append('return')
                             k += 1
                         if body_gates: partial[key] = list(dict.fromkeys(body_gates))

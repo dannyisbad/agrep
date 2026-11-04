@@ -1,13 +1,6 @@
 //! Tiled inference-only attention. Scores live in a small stack tile, never S².
 use candle_core::{CpuStorage, CustomOp3, Layout, Result, Shape, Tensor};
 
-pub(crate) fn kind() -> u8 {
-    std::env::var("AGREP_SEM_FUSED_ATTN")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(if cfg!(target_os = "macos") { 3 } else { 0 })
-}
-
 struct Attention<'a> {
     lengths: &'a [usize],
     radius: Option<usize>,
@@ -381,6 +374,8 @@ impl CustomOp3 for Attention<'_> {
     }
 }
 
+/// Only macOS runs tiled CPU attention (`ModernBert::load`), through Accelerate's tiles;
+/// the scalar variants remain as the tests' references.
 pub(crate) fn cpu(
     q: &Tensor,
     k: &Tensor,
@@ -396,8 +391,8 @@ pub(crate) fn cpu(
             lengths,
             radius,
             scale,
-            vector_exp: matches!(kind(), 2 | 3),
-            blas_tiles: kind() == 3,
+            vector_exp: true,
+            blas_tiles: true,
         },
     )
 }

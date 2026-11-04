@@ -70,10 +70,25 @@ fn bounded_line(reader: &mut impl BufRead, discarding: bool) -> std::io::Result<
 pub fn now() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
+/// Agents without live observation and why, from 0.4.9's registry
+/// (py/hookless/agent_registry.json).
+const NO_LIVE: &[(&str, &str)] = &[
+    ("kimi", "no validated incremental journal tailer"),
+    ("cline", "no validated low-cost task-store watcher"),
+    (
+        "gemini",
+        "rewritten session files have no validated mutation poller",
+    ),
+    ("crush", "no validated live database watermark contract"),
+];
 pub fn normalize_agent(s: &str) -> Result<String> {
-    let lower = s.trim().to_ascii_lowercase();
+    let lower = s.trim().to_lowercase();
     let name = crate::history::normalize_agent(&lower);
-    anyhow::ensure!(AGENTS.contains(&name), "unsupported live agent: {s}");
+    anyhow::ensure!(
+        AGENTS.contains(&name),
+        "{}",
+        crate::history::capability_error("live observation", name, AGENTS, NO_LIVE)
+    );
     Ok(name.into())
 }
 pub fn normalize_session(s: &str) -> Result<String> {
@@ -741,6 +756,7 @@ impl Service {
                 shared.1 = watcher.snapshot();
                 drop(shared);
                 cv.notify_all();
+                // No watch covers agent stores, so they are polled every 700 ms.
                 let guard = lock.lock().unwrap();
                 let _ = cv.wait_timeout(guard, Duration::from_millis(700)).unwrap();
             }

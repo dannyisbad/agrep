@@ -67,17 +67,21 @@ none of `--json`, `--flat`, `-l`, `--lexical`, `-w`, `-E`, `-c`, `--count-by-tie
   [SEARCH_RANKING.md](SEARCH_RANKING.md).
 
 Without the model, automatic hybrid quietly stays keyword-only and `status` says so;
-`-s` prints `semantic model not installed: run agrep setup` and exits 2. A failure of an
-installed model prints one stderr line, logs the cause to `log/agrep.log` and returns
-keyword results, for `-s` too. A semantic-only search that finds nothing exits 1, also
-when coverage is partial.
+`-s` prints `semantic model not installed: run agrep setup` and exits 2. In automatic
+hybrid, a failure of an installed model prints one stderr line, logs the cause to
+`log/agrep.log` and keeps the keyword results. An explicit `-s` never answers with keyword
+rows: a failed lane, or a query the meaning policy refuses, prints `semantic search
+unavailable: <reason>` (under `--json`, a record with `error.code` `semantic-unavailable`)
+and exits 2. A semantic-only search that finds nothing exits 1, also when coverage is
+partial.
 
 ## Vector storage and scan
 
 - Prose triggers keep `semantic_queue` current in the same transaction as the rows: a
   visible row is queued on insert and re-queued when its text, digest, visibility,
   speaker or agent changes; a deleted row leaves the queue and its references.
-- The worker embeds the queue newest-first in batches of 128 rows. Identical content
+- The worker embeds the queue newest-first in batches of 128 rows, and stops between
+  batches while a writer or an explicit command waits. Identical content
   reuses its existing chunks: `semantic_chunks` is keyed by a content key (the row
   digest plus its preparation variant), and `semantic_refs` maps each row to it.
 - A batch's vectors go into one immutable block file `vectors/<sha256>.q8f16`, named by

@@ -3,30 +3,73 @@ use crate::query::Filters;
 use anyhow::{bail, Result};
 use rusqlite::Connection;
 use serde_json::{json, Value};
+/// 0.4.9's speaker vocabulary, in its order (py/surface_policy.py:593-605).
+pub const SPEAKERS: [&str; 8] = [
+    "user",
+    "subagent",
+    "agent",
+    "tool",
+    "control",
+    "synthetic",
+    "recap",
+    "harness",
+];
+/// 0.4.9's `parse_speaker_list` (py/surface_policy.py:632-649): blank items are skipped,
+/// `you` is `user`, and a repeat counts once.
 pub fn speakers(value: &str) -> Result<String> {
     let mut out = Vec::new();
-    for word in value.split(',') {
-        let word = word.trim();
-        let word = if word == "you" { "user" } else { word };
-        if ![
-            "user",
-            "agent",
-            "subagent",
-            "tool",
-            "control",
-            "synthetic",
-            "recap",
-            "harness",
-        ]
-        .contains(&word)
-        {
-            bail!("unknown speaker '{word}' - valid: user, subagent, agent, tool, control, synthetic, recap, harness")
+    for token in value.split(',') {
+        let token = match token.trim_matches(crate::unicode_v16::is_space) {
+            "you" => "user",
+            token => token,
+        };
+        if token.is_empty() {
+            continue;
         }
-        if !out.contains(&word) {
-            out.push(word)
+        if !SPEAKERS.contains(&token) {
+            bail!(
+                "unknown speaker {} (choose from {})",
+                crate::briefing::repr(token),
+                SPEAKERS.join(", ")
+            )
+        }
+        if !out.contains(&token) {
+            out.push(token)
         }
     }
+    if out.is_empty() {
+        bail!("empty speaker list (choose from {})", SPEAKERS.join(", "))
+    }
     Ok(out.join(","))
+}
+/// 0.4.9's refusal of a filter flag given a blank value: what a value may be, and what the
+/// blank would silently select (py/surface_policy.py:747-773).
+pub fn blank_notice(flag: &str) -> String {
+    const PROJECT: &str =
+        "a chat's stored project label or its last path segment, exact; * and ? make it a glob";
+    let agents = crate::ingest::registry::ADAPTERS
+        .iter()
+        .map(|a| a.name())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let speakers = SPEAKERS.join(", ");
+    let (vocabulary, effect) = match flag {
+        "--agent" => (agents.as_str(), "match every agent"),
+        "--project" => (PROJECT, "match every project"),
+        "--exclude-project" => (PROJECT, "exclude nothing"),
+        "--model" => (
+            "an exact model name; --soft substring-matches",
+            "match every model",
+        ),
+        "--who" => (speakers.as_str(), "include every speaker"),
+        "--no-who" => (speakers.as_str(), "exclude no speaker"),
+        "--chat" => (
+            "an 8-char id prefix (as shown) or a full session uuid",
+            "match every chat",
+        ),
+        other => unreachable!("{other} is not a filter flag"),
+    };
+    format!("{flag} needs a value ({vocabulary}) - an empty value would silently {effect}")
 }
 pub fn validate(f: &mut Filters) -> Result<()> {
     for (name, value) in [
@@ -34,12 +77,12 @@ pub fn validate(f: &mut Filters) -> Result<()> {
         ("--project", &f.project),
         ("--exclude-project", &f.exclude_project),
         ("--model", &f.model),
-        ("--chat", &f.chat),
         ("--who", &f.who),
         ("--no-who", &f.no_who),
+        ("--chat", &f.chat),
     ] {
         if value.as_ref().is_some_and(|v| v.trim().is_empty()) {
-            bail!("{name} cannot be empty")
+            bail!("{}", blank_notice(name))
         }
     }
     if let Some(v) = &f.who {
@@ -47,6 +90,9 @@ pub fn validate(f: &mut Filters) -> Result<()> {
     }
     if let Some(v) = &f.no_who {
         f.no_who = Some(speakers(v)?)
+    }
+    if f.who.is_some() && f.no_who.is_some() {
+        bail!("--who and --no-who are mutually exclusive")
     }
     if let Some(agents) = &f.agent {
         f.agent = Some(
@@ -269,10 +315,14 @@ pub fn initialize(root: &crate::data::DataRoot) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 0.4.9's parse_speaker_list (py/test_who_filters.py:39-75).
     #[test]
     fn speaker_alias_is_canonical() {
         assert_eq!(speakers("you,agent").unwrap(), "user,agent");
-        assert!(speakers("user,").is_err());
+        assert_eq!(speakers("user, agent,user").unwrap(), "user,agent");
+        assert_eq!(speakers("user,").unwrap(), "user");
+        assert!(speakers(" , ").is_err());
+        assert!(speakers("operator").is_err());
     }
     // Expected values are 0.4.9's own `_nearest_values` and difflib under Python 3.14.
     #[test]

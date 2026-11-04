@@ -55,9 +55,11 @@ pub mod semantic;
 #[cfg(target_os = "macos")]
 mod semantic_arena;
 mod semantic_attention;
+#[cfg(all(test, target_os = "macos"))]
 mod semantic_attention_metal;
 mod semantic_bert;
 pub mod semantic_device;
+#[cfg(all(test, target_os = "macos"))]
 mod semantic_metal;
 pub mod semantic_model;
 mod semantic_norm;

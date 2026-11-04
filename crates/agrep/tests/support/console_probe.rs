@@ -62,6 +62,7 @@ fn main() {
     let mut child = cmd.spawn().unwrap();
     let ready = if command == "board" {
         let deadline = Instant::now() + Duration::from_secs(10);
+        // Console modes change without notification; poll them, waking early if the command exits.
         loop {
             let mut mode = 0;
             assert_ne!(

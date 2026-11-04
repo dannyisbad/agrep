@@ -208,7 +208,6 @@ mod tests {
                 None,
             )
             .unwrap();
-            assert!(!model.uses_arena());
             let ids = Tensor::new(&[[1u32, 2, 3, 4], [1, 5, 0, 0]], &device).unwrap();
             let mask = Tensor::new(&[[1f32, 1., 1., 1.], [1., 1., 0., 0.]], &device).unwrap();
             let cls = model

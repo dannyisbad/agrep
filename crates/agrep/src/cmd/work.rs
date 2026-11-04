@@ -16,24 +16,38 @@ pub(crate) fn run(tasks: &[String]) -> Result<i32> {
         return Ok(0);
     }
     root.validate(false)?;
-    execute(&root, tasks, false, false)
+    let drain = semantic::Drain {
+        background: true,
+        ..Default::default()
+    };
+    execute(&root, tasks, false, drain)
 }
 
-/// An explicit index or reindex finishes the background tasks inline except merging,
-/// which it leaves to a detached worker so that it waits for no merge step.
-pub(crate) fn after_index(root: &DataRoot, force_semantic: bool) -> Result<i32> {
+/// What an explicit index or reindex finishes before it exits. Merging is left to a
+/// detached worker so that the command waits for no merge step. With `embed` the command
+/// drains the embedding queue itself, waiting for work.lock; without it the queue is left
+/// to a background worker, and the remaining tasks run only while work.lock is free.
+pub(crate) fn after_index(root: &DataRoot, embed: Option<semantic::Drain>) -> Result<i32> {
     if root.db().exists() && agrep_core::fts_segments::pending(&store::reader(root)?)? {
         agrep_core::freshness::spawn_merge(root, &std::env::current_exe()?)?;
     }
-    let tasks = TASKS[2..].iter().map(|s| s.to_string()).collect::<Vec<_>>();
-    execute(root, &tasks, true, force_semantic)
+    let first = if embed.is_some() { 2 } else { 3 };
+    let tasks = TASKS[first..]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    let status = execute(root, &tasks, embed.is_some(), embed.unwrap_or_default())?;
+    if embed.is_none() {
+        semantic::schedule(root)?;
+    }
+    Ok(status)
 }
 
 fn execute(
     root: &DataRoot,
     requested: &[String],
     blocking: bool,
-    force_semantic: bool,
+    drain: semantic::Drain,
 ) -> Result<i32> {
     for task in requested {
         if !TASKS.contains(&task.as_str()) {
@@ -62,8 +76,9 @@ fn execute(
     let Some(_lock) = root.work_lock(blocking)? else {
         return Ok(0);
     };
-    if selected("semantic") {
-        semantic::drain(root, force_semantic)?;
+    if selected("semantic") && semantic::drain(root, drain)? {
+        // A writer or explicit command waits: it, or the next worker, does the rest.
+        return Ok(0);
     }
     if selected("reclaim") && root.db().exists() {
         semantic::reclaim(root)?;

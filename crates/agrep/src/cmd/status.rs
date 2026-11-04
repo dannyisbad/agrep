@@ -13,6 +13,7 @@ pub fn run(json: bool, no_auto: bool) -> Result<i32> {
         None
     };
     let mut s = diagnostics::status(&root)?;
+    diagnostics::verify_model(&root, &mut s);
     if root.db().exists() {
         let pending = crate::finish_census(&root, census)?;
         s["freshness"] = render::freshness(render::checked(no_auto), pending);

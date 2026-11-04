@@ -1,10 +1,14 @@
 //! The matched comparison's gate: a case is won only by a verified candidate whose median
 //! and p95 are both below a verified reference's, over samples taken as the schedule asks.
+#[path = "../examples/support/corpus.rs"]
+mod corpus;
 #[path = "../examples/support/matched.rs"]
 mod matched;
 #[path = "../examples/support/results.rs"]
 mod results;
+mod support;
 use matched::{Lane, Next, Stop};
+use results::Expect;
 use serde_json::{json, Value};
 
 /// Samples a case the way the harness does: `reference(i)` and `candidate(i)` are each
@@ -399,11 +403,15 @@ fn both_lanes_results_are_verified_by_the_same_predicates() {
     let hits = results::evidence(b"session\tpi\tdemo\t2\tuser\trelease workflow\n", b"");
     let empty = results::evidence(b"", b"keyword: 0 matching rows\n");
     let none: &[String] = &[];
-    assert!(matched::sample_verified("release", none, &hits, None));
-    assert!(!matched::sample_verified("release", none, &empty, None));
+    let any = Expect::default();
+    assert!(matched::sample_verified("release", none, &hits, None, &any));
+    assert!(!matched::sample_verified(
+        "release", none, &empty, None, &any
+    ));
     let checked = |lane: &mut Lane, evidence: &Value| {
-        lane.verified
-            .fill(matched::sample_verified("release", none, evidence, None));
+        lane.verified.fill(matched::sample_verified(
+            "release", none, evidence, None, &any,
+        ));
     };
     let (mut slow_hits, mut fast_empty, _) = drive(20, counting(500.), counting(10.));
     checked(&mut slow_hits, &hits);
@@ -425,19 +433,21 @@ fn both_lanes_results_are_verified_by_the_same_predicates() {
         "warm_hybrid",
         none,
         &meaning,
-        None
+        None,
+        &any
     ));
     assert!(!matched::sample_verified(
         "first_hybrid",
         none,
         &keyword,
-        None
+        None,
+        &any
     ));
 }
 
 #[test]
 fn the_dense_oracle_binds_the_candidate_to_exact_answers() {
-    let oracle = (vec!["@a:1.aa".to_string(), "@b:2.bb".to_string()], 7usize);
+    let oracle = vec!["@a:1.aa".to_string(), "@b:2.bb".to_string()];
     let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     let rows = results::evidence(
         b"{\"kind\":\"agrep-meta\"}\n{\"session\":\"a\",\"handle\":\"@a:1.aa\"}\n{\"session\":\"b\",\"handle\":\"@b:2.bb\"}\n",
@@ -448,45 +458,181 @@ fn the_dense_oracle_binds_the_candidate_to_exact_answers() {
         b"",
     );
     let json = args(&["deepold", "--json"]);
+    let any = Expect::default();
     assert!(matched::sample_verified(
         "old_dense",
         &json,
         &rows,
-        Some(&oracle)
+        Some(&oracle),
+        &any
     ));
     assert!(!matched::sample_verified(
         "old_dense",
         &json,
         &reordered,
-        Some(&oracle)
+        Some(&oracle),
+        &any
     ));
     assert!(matched::sample_verified(
         "old_dense",
         &json,
         &reordered,
-        None
+        None,
+        &any
     ));
+    // The exact count binds both lanes.
     let count = args(&["deepold", "-c"]);
-    let seven = results::evidence(b"7\n", b"");
-    let eight = results::evidence(b"8\n", b"");
-    assert!(matched::sample_verified(
-        "old_dense_count",
-        &count,
-        &seven,
-        Some(&oracle)
-    ));
+    let seven = Expect {
+        count: Some(7),
+        ..Expect::default()
+    };
+    for oracle in [Some(&oracle[..]), None] {
+        let verified = |stdout: &[u8]| {
+            let evidence = results::evidence(stdout, b"");
+            matched::sample_verified("old_dense_count", &count, &evidence, oracle, &seven)
+        };
+        assert!(verified(b"7\n"));
+        assert!(!verified(b"8\n"));
+    }
+}
+
+#[test]
+fn a_no_op_candidate_fails_every_case_that_proves_work() {
+    // 0.4.9's answers on a 2000-row corpus (real output), and what a candidate that does
+    // nothing shows: no output, or a report of work it never committed.
+    let none: &[String] = &[];
+    let built = Expect {
+        corpus: Some((378, 11)),
+        ..Expect::default()
+    };
+    let refreshed = Expect {
+        corpus: Some((379, 11)),
+        ..Expect::default()
+    };
+    let report = |stdout: &str| results::evidence(stdout.as_bytes(), b"");
+    let first = report("=== indexing transcripts ===\n  [pi] 10 parsed files: 3420 seen -> 200 rows\n  indexed 378 messages across 11 sessions -> /d/messages.jsonl (70ms)\n");
+    let unchanged = report("=== indexing transcripts ===\n  unchanged since last index (378 messages); skipped ingest + writes (36ms)\n  phases: source-check 10ms\n");
+    let mut refresh = report("=== indexing transcripts ===\n  indexed 379 messages across 11 sessions -> /d/messages.jsonl (9ms)\n");
+    let no_op = report("");
+    let mut committed_nothing = unchanged.clone();
+    committed_nothing["bench_probe_count"] = json!(0);
+    refresh["bench_probe_count"] = json!(1);
+    let mut stale = refresh.clone();
+    stale["bench_probe_count"] = json!(0);
+    let census = report(r#"{"changed_sources":0,"census_ms":1.3,"stat_files":11}"#);
+    let missed = report(r#"{"changed_sources":0,"census_ms":0.1,"stat_files":0}"#);
+    let count = Expect {
+        count: Some(1260),
+        ..Expect::default()
+    };
+    let planted = Expect {
+        top: Some("@bench-10:21.6b71".into()),
+        ..Expect::default()
+    };
+    let answer = report("@bench-10:21.6b71 pi/user project-0 0m ~semantic (meaning match) The cobalt lantern project's migration checklist\n@bench-3:9.c0de pi/user project-3 0m ~all …release…\n");
+    let buried = report("@bench-3:9.c0de pi/user project-3 0m ~semantic (meaning match) …release…\n@bench-10:21.6b71 pi/user project-0 0m ~semantic (meaning match) The cobalt lantern\n");
+    for (name, reference, failures, expect) in [
+        ("first_index", &first, vec![&no_op, &unchanged], &built),
+        ("no_change_index", &unchanged, vec![&no_op], &built),
+        (
+            "one_session_refresh",
+            &refresh,
+            vec![&no_op, &stale, &committed_nothing],
+            &refreshed,
+        ),
+        ("no_change_census", &census, vec![&no_op, &missed], &built),
+        (
+            "count",
+            &report("1260\n"),
+            vec![&no_op, &report("1259\n")],
+            &count,
+        ),
+        ("warm_hybrid", &answer, vec![&no_op, &buried], &planted),
+    ] {
+        assert!(
+            matched::sample_verified(name, none, reference, None, expect),
+            "{name}"
+        );
+        for failure in failures {
+            assert!(
+                !matched::sample_verified(name, none, failure, None, expect),
+                "{name}: {failure}"
+            );
+            let (reference_lane, mut fast, _) = drive(20, counting(500.), counting(1.));
+            fast.verified.fill(false);
+            let value = case(name, &reference_lane, &fast);
+            assert_eq!(value["verdict"], "candidate_failure", "{name}");
+            assert!(!matched::gate(&[value], &[name]).is_empty(), "{name}");
+        }
+    }
+    // A full build that reports an earlier corpus did not index the appended turn.
     assert!(!matched::sample_verified(
-        "old_dense_count",
-        &count,
-        &eight,
-        Some(&oracle)
+        "first_index",
+        none,
+        &first,
+        None,
+        &refreshed
     ));
-    assert!(matched::sample_verified(
-        "old_dense_count",
-        &count,
-        &eight,
-        None
-    ));
+}
+
+#[test]
+fn the_corpus_oracles_hold_the_answers_of_0_4_9() {
+    // 0.4.9 on the generated 2000-row corpus: "indexed 378 messages across 11 sessions",
+    // `error -c` 1260 and `error -c --agent codex --since 14d` 122.
+    assert_eq!(corpus::expected_corpus(2000, false), (378, 11));
+    assert_eq!(corpus::expected_count(2000, "error", false), 1260);
+    assert_eq!(corpus::expected_count(2000, "error", true), 122);
+    let temp = tempfile::TempDir::new().unwrap();
+    let run = |home: &std::path::Path, args: &[&str]| {
+        let out = std::process::Command::new(support::binary())
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("AGREP_HOME", home)
+            .env("AGREP_DATA_DIR", home.join("data"))
+            .env("AGREP_PROFILE", "classic")
+            .args(args)
+            .output()
+            .unwrap();
+        results::evidence(&out.stdout, &out.stderr)
+    };
+    let mixed = temp.path().join("mixed");
+    let (last, _) = corpus::generate(&mixed, 2000, false).unwrap();
+    corpus::append_turn(&last, "semantic-fixture", corpus::SEMANTIC_FIXTURE).unwrap();
+    let fixture = Expect {
+        corpus: Some((379, 11)),
+        top: Some(corpus::planted_handle(2000)),
+        ..Expect::default()
+    };
+    let built = run(&mixed, &["index"]);
+    assert!(
+        results::valid_result("first_index", &built, &fixture),
+        "{} messages, {} sessions",
+        built["bench_index_messages"],
+        built["bench_index_sessions"]
+    );
+    assert_eq!(run(&mixed, &["error", "-c"])["bench_count"], 1260);
+    // Without a model a search is keyword-only: the planted turn alone holds the query's
+    // content words, and it is the first result.
+    let words: Vec<&str> = corpus::SEMANTIC_QUERY
+        .split(' ')
+        .filter(|w| w.len() > 3 && corpus::SEMANTIC_FIXTURE.contains(w))
+        .collect();
+    assert_eq!(words, ["cobalt", "lantern", "deployment", "checklist"]);
+    let found = run(&mixed, &[&words.join(" "), "--json"]);
+    assert_eq!(found["bench_result_rows"], 1);
+    assert_eq!(found["bench_top_handle"], json!(fixture.top));
+    let dense = temp.path().join("dense");
+    corpus::generate(&dense, 1700, true).unwrap();
+    assert_eq!(corpus::expected_corpus(1700, true), (1700, 10));
+    run(&dense, &["index"]);
+    let (handles, count) = corpus::dense_expected(1700, &["deepold", "-c"]).unwrap();
+    assert_eq!(run(&dense, &["deepold", "-c"])["bench_count"], count);
+    assert_eq!(
+        run(&dense, &["deepold", "--json", "-n", "40"])["bench_handles"],
+        json!(handles)
+    );
 }
 
 #[test]
@@ -509,27 +655,41 @@ fn statistics_are_the_upper_median_and_nearest_rank_p95() {
 }
 
 #[test]
-fn an_index_run_keeps_its_phases_from_its_statistics_file() {
-    let stdout = "=== indexing transcripts ===\n  indexed 8 messages across 5 sessions (40ms)\n  phases: census 1ms · parse 2ms\n";
-    let report = results::evidence(stdout.as_bytes(), b"");
-    assert!(report.get("census_ms").is_none());
-    let merged = results::with_index_stats(
-        report,
-        br#"{"sources":5,"parsed":5,"changed_rows":20,"census_ms":1.5,"parse_ms":2.25}"#,
-    );
+fn an_index_run_reports_its_phases_as_timing_events() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    corpus::generate(&home, 400, false).unwrap();
+    let index = |timing: bool| {
+        let mut command = std::process::Command::new(support::binary());
+        command
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("AGREP_HOME", &home)
+            .env("AGREP_DATA_DIR", temp.path().join("data"))
+            .arg("index");
+        if timing {
+            command.env("AGREP_QUERY_TIMING", "1");
+        }
+        let out = command.output().unwrap();
+        assert!(out.status.success());
+        results::evidence(&out.stdout, &out.stderr)
+    };
+    let built = index(true);
     assert_eq!(
-        [
-            &merged["sources"],
-            &merged["changed_rows"],
-            &merged["census_ms"],
-            &merged["parse_ms"]
-        ],
-        [&json!(5), &json!(20), &json!(1.5), &json!(2.25)]
+        [&built["sources"], &built["parsed"]],
+        [&json!(2), &json!(2)]
     );
-    assert_eq!(merged["bench_stdout_bytes"], stdout.len());
-    assert_eq!(results::INDEX_STATS, "index-stats.json");
-    assert_eq!(
-        results::with_index_stats(json!({"stdout_bytes":1}), b"=== not json"),
-        json!({"stdout_bytes":1})
-    );
+    assert!(built["changed_rows"].as_u64().is_some_and(|n| n > 0));
+    for key in ["census_ms", "parse_ms", "write_ms", "after_refresh_ms"] {
+        assert!(built[key].is_number(), "{key}");
+    }
+    assert!(built["wait_writer_lock_ms"].is_number());
+    assert!(built.get("skipped_lock").is_none());
+    // Without the variable an index run prints no statistics and writes none.
+    let quiet = index(false);
+    assert!(quiet.get("census_ms").is_none());
+    assert_eq!(quiet["bench_index_messages"], built["bench_index_messages"]);
+    assert!(!temp.path().join("data/index-stats.json").exists());
 }

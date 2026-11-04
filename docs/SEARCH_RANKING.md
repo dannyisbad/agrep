@@ -212,21 +212,24 @@ lane. `--who tool` forces the tool lane directly.
 
 ## Coverage lane
 
-`--coverage` adds an explicit IDF-weighted coverage lane after a default keyword
-page; there is no automatic retry. The query's distinct terms (punctuation
-trimmed; at least two are needed) are each weighted by
-`1 + ln((N + 1) / (df + 1))`, where `N` counts indexed prose and tool rows and
-`df` is the term's estimated document frequency. A row qualifies when the terms
-it contains carry at least 55% of the total weight, and it scores by its covered
-share, proximity, recency, speaker and boundary factor. Rows already on the page
-are left out.
+`--coverage` adds an explicit coverage lane after a default keyword page; there
+is no automatic retry. The query splits into words at whitespace, hyphens and
+underscores (at least two are needed), and its words of three characters or
+more are OR-ed and ranked by SQLite's bm25: prose through its trigram index,
+tool output through the indexed words holding each query word, both lanes
+merged by score. Of the 400 best rows, a row quoting the whole query is left
+out, each chat gives its best remaining row, each chat family its best chat,
+and at most 20 rows remain, whatever `--sort` says. Rows the page already
+shows can return.
 
-The rows print after the page under `coverage recovery (partial term matches):`
-(or `no additional evidence`), and stderr reports how many were added. They
-honour every scope filter of the query, including `--exclude-project`,
-`--no-side` and the caller's self-exclusion, and never enter `--json`, counts or
-the exit status. `--coverage` is refused with machine output, counts, chat
-lists, `-s`, `--lexical`, `-w`, `-E` and non-score sorts.
+The rows print on stderr after the page (after a compact page's summary line,
+before a classic page's `showing N of M` line), led by
+`coverage lane (forced): top row matched M/T terms - dropped: …` (or
+`coverage lane: no candidate rows`). They honour every scope filter of the
+query except `--no-meta`, including `--exclude-project`, `--no-side` and the
+caller's self-exclusion, and never enter counts or the exit status.
+`--coverage` is refused with machine output, counts, chat lists, `-s`,
+`--lexical`, `-w` and `-E`.
 
 ## Caller window
 
@@ -287,10 +290,12 @@ before display caps, across phrase boundary classes and the all-terms lane.
 `--count-by-tier` reports
 `phrase_aligned`, `phrase_partial`, `phrase_interior`, `all_terms`, and `total`.
 
-An exhausted compact page with a known exact total stays silent. An incomplete
-page emits exactly one completeness line: `N matches` for an exact total, or
-`N+ matches (floor)` (`N+ matches (floor; -c exact)` when an exhaustive count is
-available) for a measured lower bound. ` · more: agrep --more HANDLE` is appended
+An exhausted compact page with a known exact total stays silent, as does a page
+merged with meaning rows when neither lane held rows it did not return. An
+incomplete page emits exactly one completeness line: `N matches` for an exact
+total, or `N+ matches (floor)` (`N+ matches (floor; -c exact)` when an exhaustive
+count is available; never on a meaning page, since `-c` counts keyword rows only)
+for a measured lower bound. ` · more: agrep --more HANDLE` is appended
 when a continuation exists, or ` · full results (live rerun): COMMAND` when only
 a rerun can show the rest; compact output never presents the number of rendered
 rows as a corpus floor. Machine and classic surfaces retain their separate output

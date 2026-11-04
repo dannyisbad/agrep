@@ -16,13 +16,6 @@ use serde::Deserialize;
 use core::f32;
 use std::collections::HashMap;
 use std::sync::Arc;
-fn option(name: &str, default: bool) -> bool {
-    match std::env::var(name).as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
-        _ => default,
-    }
-}
 
 /// The checkpoint stores the backbone's tensors without the `model.` prefix.
 pub(crate) fn checkpoint_name(name: &str) -> &str {
@@ -429,7 +422,6 @@ struct ModernBertAttention {
     num_attention_heads: usize,
     attention_head_size: usize,
     rotary_emb: Arc<RotaryEmbedding>,
-    metal_attention: Option<Arc<crate::semantic_attention_metal::Attention>>,
 }
 
 impl ModernBertAttention {
@@ -437,7 +429,6 @@ impl ModernBertAttention {
         vb: VarBuilder,
         config: &Config,
         rotary_emb: Arc<RotaryEmbedding>,
-        metal_attention: Option<Arc<crate::semantic_attention_metal::Attention>>,
         mapped: Option<&MappedWeights>,
     ) -> Result<Self> {
         let num_attention_heads = config.num_attention_heads;
@@ -457,7 +448,6 @@ impl ModernBertAttention {
             num_attention_heads,
             attention_head_size,
             rotary_emb,
-            metal_attention,
         })
     }
 
@@ -468,7 +458,6 @@ impl ModernBertAttention {
         lengths: &[usize],
         radius: Option<usize>,
         tiled: bool,
-        metal_lengths: Option<&crate::semantic_attention_metal::Lengths>,
     ) -> Result<Tensor> {
         let xs = hidden_states.clone();
         let (b, seq_len, d) = xs.dims3()?;
@@ -499,24 +488,6 @@ impl ModernBertAttention {
             if q.device().is_cpu() && tiled {
                 return crate::semantic_attention::cpu(&q, &k, &v, lengths, radius, scale as f32);
             }
-            if q.device().is_metal() && tiled {
-                return self
-                    .metal_attention
-                    .as_ref()
-                    .ok_or_else(|| {
-                        candle_core::Error::Msg("missing Metal attention pipeline".into())
-                    })?
-                    .forward(
-                        &q,
-                        &k,
-                        &v,
-                        metal_lengths.ok_or_else(|| {
-                            candle_core::Error::Msg("missing Metal lengths".into())
-                        })?,
-                        radius,
-                        scale as f32,
-                    );
-            }
             let attention_mask = attention_mask
                 .ok_or_else(|| candle_core::Error::Msg("missing attention mask".into()))?;
             if q.device().is_metal() && seq_len > 8 {
@@ -542,7 +513,7 @@ impl ModernBertAttention {
             }
         })?;
 
-        let xs = if (xs.device().is_cpu() || xs.device().is_metal()) && tiled {
+        let xs = if xs.device().is_cpu() && tiled {
             xs
         } else {
             xs.transpose(1, 2)?.reshape((b, seq_len, d))?
@@ -715,17 +686,10 @@ impl candle_core::CustomOp1 for CpuGeglu {
 pub struct ModernBertMLP {
     wi: Projection,
     wo: Projection,
-    metal_geglu: Option<Arc<crate::semantic_metal::Geglu>>,
-    vector_erf: bool,
 }
 
 impl ModernBertMLP {
-    fn load(
-        vb: VarBuilder,
-        config: &Config,
-        metal_geglu: Option<Arc<crate::semantic_metal::Geglu>>,
-        mapped: Option<&MappedWeights>,
-    ) -> Result<Self> {
+    fn load(vb: VarBuilder, config: &Config, mapped: Option<&MappedWeights>) -> Result<Self> {
         let wi = Projection::load(
             config.hidden_size,
             config.intermediate_size * 2,
@@ -738,12 +702,7 @@ impl ModernBertMLP {
             vb.pp("Wo"),
             mapped,
         )?;
-        Ok(Self {
-            wi,
-            wo,
-            metal_geglu,
-            vector_erf: cfg!(target_os = "macos") && option("AGREP_SEM_VECTOR_ERF", true),
-        })
+        Ok(Self { wi, wo })
     }
 }
 
@@ -753,10 +712,8 @@ impl Module for ModernBertMLP {
         let xs = stage(xs.device(), "geglu", || {
             if xs.device().is_cpu() && xs.dtype() == DType::F32 {
                 xs.contiguous()?.apply_op1_no_bwd(&CpuGeglu {
-                    vector: self.vector_erf,
+                    vector: cfg!(target_os = "macos"),
                 })
-            } else if let Some(op) = &self.metal_geglu {
-                xs.contiguous()?.apply_op1_no_bwd(op.as_ref())
             } else {
                 let halves = xs.chunk(2, D::Minus1)?;
                 &halves[0].gelu_erf()? * &halves[1]
@@ -782,13 +739,10 @@ impl ModernBertLayer {
         config: &Config,
         rotary_emb: Arc<RotaryEmbedding>,
         uses_local_attention: bool,
-        metal_geglu: Option<Arc<crate::semantic_metal::Geglu>>,
-        metal_attention: Option<Arc<crate::semantic_attention_metal::Attention>>,
         mapped: Option<&MappedWeights>,
     ) -> Result<Self> {
-        let attn =
-            ModernBertAttention::load(vb.pp("attn"), config, rotary_emb, metal_attention, mapped)?;
-        let mlp = ModernBertMLP::load(vb.pp("mlp"), config, metal_geglu, mapped)?;
+        let attn = ModernBertAttention::load(vb.pp("attn"), config, rotary_emb, mapped)?;
+        let mlp = ModernBertMLP::load(vb.pp("mlp"), config, mapped)?;
         let attn_norm = layer_norm_no_bias(
             config.hidden_size,
             config.layer_norm_eps,
@@ -814,7 +768,6 @@ impl ModernBertLayer {
         local_attention_mask: Option<&Tensor>,
         lengths: &[usize],
         tiled: bool,
-        metal_lengths: Option<&crate::semantic_attention_metal::Lengths>,
     ) -> Result<Tensor> {
         let residual = xs.clone();
         let mut xs = xs.clone();
@@ -830,14 +783,9 @@ impl ModernBertLayer {
             _ => None,
         };
         let radius = self.uses_local_attention.then_some(self.local_radius);
-        let xs = self.attn.forward(
-            &xs,
-            attention_mask.as_ref(),
-            lengths,
-            radius,
-            tiled,
-            metal_lengths,
-        )?;
+        let xs = self
+            .attn
+            .forward(&xs, attention_mask.as_ref(), lengths, radius, tiled)?;
         let xs = (xs + residual)?;
         let mlp_out = xs.apply(&self.mlp_norm)?.apply(&self.mlp)?;
         let xs = (xs + mlp_out)?;
@@ -902,7 +850,6 @@ pub struct ModernBert {
     dtype: DType,
     tiled_attention: bool,
     fused_residual: bool,
-    residual_kernel: Option<Arc<crate::semantic_norm::Kernel>>,
     #[cfg(target_os = "macos")]
     arena: Option<Arc<std::sync::Mutex<crate::semantic_arena::Arena>>>,
 }
@@ -947,34 +894,9 @@ impl ModernBert {
             vb.device(),
         )?);
 
-        let arena_selected = cfg!(target_os = "macos")
-            && vb.device().is_metal()
-            && matches!(
-                std::env::var("AGREP_SEM_ARENA")
-                    .unwrap_or_else(|_| "2".into())
-                    .as_str(),
-                "1" | "2"
-            );
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
-        // Embedder routes arena models before tensor-forward. Compiling the
-        // inactive tensor shaders adds three avoidable compiler-service calls.
-        let metal_geglu = if arena_selected {
-            None
-        } else {
-            crate::semantic_metal::Geglu::new(vb.device())?
-        };
-        let tiled_attention = crate::semantic_attention::kind() != 0;
-        let fused_residual = option("AGREP_SEM_FUSED_RESIDUAL", cfg!(target_os = "macos"));
-        let residual_kernel = if fused_residual && !arena_selected {
-            crate::semantic_norm::Kernel::new(vb.device())?
-        } else {
-            None
-        };
-        let metal_attention = if tiled_attention && !arena_selected {
-            crate::semantic_attention_metal::Attention::new(vb.device())?
-        } else {
-            None
-        };
+        let tiled_attention = cfg!(target_os = "macos");
+        let fused_residual = cfg!(target_os = "macos");
         for layer_id in 0..config.num_hidden_layers {
             let layer_uses_local_attention = layer_id % config.global_attn_every_n_layers != 0;
             layers.push(ModernBertLayer::load(
@@ -986,8 +908,6 @@ impl ModernBert {
                     global_rotary_emb.clone()
                 },
                 layer_uses_local_attention,
-                metal_geglu.clone(),
-                metal_attention.clone(),
                 mapped,
             )?);
         }
@@ -998,8 +918,9 @@ impl ModernBert {
             vb.pp("model.final_norm"),
         )?;
 
+        // Metal always embeds through the persistent arena; the tensor forward serves the CPU.
         #[cfg(target_os = "macos")]
-        let arena = if arena_selected {
+        let arena = if vb.device().is_metal() {
             use crate::semantic_arena::{Arena, Layer, View};
             let parts = layers
                 .iter()
@@ -1044,7 +965,6 @@ impl ModernBert {
             dtype: vb.dtype(),
             tiled_attention,
             fused_residual,
-            residual_kernel,
             #[cfg(target_os = "macos")]
             arena,
         })
@@ -1060,16 +980,6 @@ impl ModernBert {
         }
         let _ = capacity;
         Ok(())
-    }
-    pub(crate) fn uses_arena(&self) -> bool {
-        #[cfg(target_os = "macos")]
-        {
-            self.arena.is_some()
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            false
-        }
     }
     pub(crate) fn arena_embeddings(
         &self,
@@ -1091,16 +1001,8 @@ impl ModernBert {
 
     pub fn forward(&self, xs: &Tensor, mask: &Tensor, lengths: &[usize]) -> Result<Tensor> {
         let seq_len = xs.shape().dims()[1];
-        let metal_lengths = if self.tiled_attention && xs.device().is_metal() {
-            Some(crate::semantic_attention_metal::Lengths::new(
-                xs.device(),
-                lengths,
-            )?)
-        } else {
-            None
-        };
         let (global_attention_mask, local_attention_mask) = if self.tiled_attention
-            && (xs.device().is_cpu() || xs.device().is_metal())
+            && xs.device().is_cpu()
         {
             (None, None)
         } else {
@@ -1132,7 +1034,6 @@ impl ModernBert {
                         lengths,
                         layer.uses_local_attention.then_some(layer.local_radius),
                         self.tiled_attention,
-                        metal_lengths.as_ref(),
                     )?;
                     let (residual, mlp_input) = stage(xs.device(), "residual_norm", || {
                         crate::semantic_norm::forward(
@@ -1140,7 +1041,6 @@ impl ModernBert {
                             &xs,
                             &layer.mlp_norm.weight,
                             layer.mlp_norm.eps,
-                            self.residual_kernel.as_deref(),
                         )
                     })?;
                     let mlp = layer.mlp.forward(&mlp_input)?;
@@ -1155,7 +1055,6 @@ impl ModernBert {
                             &residual,
                             &next_norm.weight,
                             next_norm.eps,
-                            self.residual_kernel.as_deref(),
                         )
                     })
                 })?;
@@ -1175,7 +1074,6 @@ impl ModernBert {
                     local_attention_mask.as_ref(),
                     lengths,
                     self.tiled_attention,
-                    metal_lengths.as_ref(),
                 )
             })?;
         }

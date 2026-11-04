@@ -56,8 +56,8 @@ fn partial_semantic_zero_exits_one_and_reports_numbers() {
     let out = run(
         &t,
         &[
-            "--no-auto",
             "search",
+            "--no-auto",
             "-s",
             "--json",
             "database migration failure",
@@ -78,6 +78,57 @@ fn partial_semantic_zero_exits_one_and_reports_numbers() {
     );
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("semantic 0/1 rows"));
+}
+// Expected lines and fields are agrep 0.4.9's for `-s foo_bar` (py/search.py:7686-7719,
+// py/recall.py:2717-2747).
+#[test]
+fn explicit_semantic_refuses_an_identifier_query_as_0_4_9() {
+    let t = tempfile::tempdir().unwrap();
+    let r = DataRoot::open(t.path().join("data"), true).unwrap();
+    let c = store::writer(&r).unwrap();
+    semantic::initialize(&r).unwrap();
+    c.execute("INSERT INTO prose(source,agent,session,project,turn,who,model,model_source,ts,text,digest,extra) VALUES(1,'codex','session','p',1,'user','',0,0,'foo_bar text','digest','')",[]).unwrap();
+    fs::create_dir(t.path().join("model")).unwrap();
+    for (name, size, _) in agrep_core::semantic_model::FILES {
+        fs::File::create(t.path().join("model").join(name))
+            .unwrap()
+            .set_len(size)
+            .unwrap();
+    }
+    let refused = serde_json::json!({"state":"query-rejected","complete":false,
+        "fallback_recommended":true,"eligible":false,"reason":"identifier-query",
+        "min_score":0.82,"coverage":null});
+    for command in ["search", "recall"] {
+        let out = run(&t, &[command, "--no-auto", "-s", "foo_bar"]);
+        assert_eq!(out.status.code(), Some(2), "{command}");
+        assert!(out.stdout.is_empty(), "{command}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            "semantic search unavailable: identifier-query\n"
+        );
+    }
+    let out = run(&t, &["search", "--no-auto", "-s", "--json", "foo_bar"]);
+    assert_eq!(out.status.code(), Some(2));
+    let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(record["engine"], "semantic:policy");
+    assert_eq!(
+        record["error"],
+        serde_json::json!({"code":"semantic-unavailable"})
+    );
+    assert_eq!(record["semantic"], refused);
+    assert_eq!(record["semantic_coverage"], serde_json::Value::Null);
+    assert_eq!(record["semantic_partial"], false);
+    let out = run(&t, &["recall", "--no-auto", "-s", "--json", "foo_bar"]);
+    assert_eq!(out.status.code(), Some(2));
+    let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(record["engine"], "semantic:policy");
+    assert_eq!(record["score_kind"], "cosine");
+    assert_eq!(record["partial"], false);
+    assert_eq!(record["semantic_status"], refused);
+    assert_eq!(
+        record["error"],
+        serde_json::json!({"code":"semantic-unavailable"})
+    );
 }
 
 #[test]
@@ -132,6 +183,187 @@ fn optional_model_failure_keeps_a_completed_keyword_answer() {
     assert!(fs::read_to_string(t.path().join("data/log/agrep.log"))
         .unwrap()
         .contains("SHA-256 mismatch"));
+}
+
+/// The binary over `t` as home and data root, with nothing read-only.
+fn agrep(t: &tempfile::TempDir) -> Command {
+    let mut command = Command::new(support::binary());
+    command
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", t.path())
+        .env("AGREP_HOME", t.path())
+        .env("AGREP_DATA_DIR", t.path().join("data"))
+        .env("AGREP_MODEL_DIR", t.path().join("model"));
+    command
+}
+fn transcript(t: &tempfile::TempDir) -> std::path::PathBuf {
+    let dir = t.path().join(".pi/agent/sessions/fixture");
+    fs::create_dir_all(&dir).unwrap();
+    let session = dir.join("case.jsonl");
+    fs::write(&session, concat!(
+        "{\"type\":\"session\",\"id\":\"background-fixture\",\"version\":3,\"cwd\":\"/fixture\",\"timestamp\":\"2026-10-29T10:00:00Z\"}\n",
+        "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-10-29T10:01:00Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"database migration failure\"}]}}\n"
+    )).unwrap();
+    session
+}
+
+#[test]
+fn plain_index_neither_embeds_nor_waits_for_background_work() {
+    let t = tempfile::tempdir().unwrap();
+    let session = transcript(&t);
+    let index = || {
+        let out = agrep(&t).arg("index").output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    index();
+    // An installed model whose weights fail verification: an inline drain would fail.
+    fs::create_dir(t.path().join("model")).unwrap();
+    for (name, size, _) in agrep_core::semantic_model::FILES {
+        fs::File::create(t.path().join("model").join(name))
+            .unwrap()
+            .set_len(size)
+            .unwrap();
+    }
+    let mut file = fs::OpenOptions::new().append(true).open(&session).unwrap();
+    std::io::Write::write_all(&mut file, b"{\"type\":\"message\",\"id\":\"m2\",\"parentId\":\"m1\",\"timestamp\":\"2026-10-29T10:02:00Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"rollback plan for the failed migration\"}]}}\n").unwrap();
+    drop(file);
+    let r = DataRoot::open(t.path().join("data"), false).unwrap();
+    // A background drain holds work.lock with rows queued.
+    let work = r.work_lock(false).unwrap().unwrap();
+    index();
+    let coverage = semantic::coverage(&store::reader(&r).unwrap()).unwrap();
+    assert_eq!((coverage.embedded, coverage.total), (0, 2));
+    drop(work);
+    index();
+    // Holding work.lock until the directory goes keeps any worker the index started idle.
+    let _quiet = r.work_lock(true).unwrap().unwrap();
+}
+
+// agrep 0.4.9's `reindex --max-new` refusal word for word (reindex.py:190-194), given
+// before any work.
+#[test]
+fn reindex_max_new_is_a_count_of_at_least_one() {
+    let t = tempfile::tempdir().unwrap();
+    let reindex = |value: &str| {
+        agrep(&t)
+            .args(["reindex", "--max-new", value])
+            .output()
+            .unwrap()
+    };
+    for value in ["0", "-1"] {
+        let out = reindex(value);
+        assert_eq!(out.status.code(), Some(2), "{value}");
+        assert!(out.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            "agrep reindex: --max-new must be at least 1\n"
+        );
+    }
+    assert!(!t.path().join("data").exists());
+    let out = reindex("5");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// `--no-auto` skips automatic index/freshness work (help.rs), and so every worker: with the
+// archive on, a command that checks the stores would start one.
+#[test]
+fn no_auto_starts_no_background_work() {
+    let t = tempfile::tempdir().unwrap();
+    transcript(&t);
+    for args in [&["index"][..], &["archive", "--on"]] {
+        let out = agrep(&t).args(args).output().unwrap();
+        assert!(out.status.success(), "{args:?}");
+    }
+    for args in [
+        &["search", "--no-auto", "database migration"][..],
+        &["status", "--no-auto"],
+    ] {
+        let out = agrep(&t)
+            .env("AGREP_QUERY_TIMING", "1")
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!stderr.contains("worker_started"), "{args:?}: {stderr}");
+    }
+}
+
+// With the archive on, a command starts a worker only once a scheduled capture is due,
+// not for every query.
+#[test]
+fn archive_starts_no_worker_until_a_capture_is_due() {
+    let t = tempfile::tempdir().unwrap();
+    transcript(&t);
+    for args in [&["index"][..], &["archive", "--on"], &["archive"]] {
+        let out = agrep(&t).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let out = agrep(&t)
+        .env("AGREP_QUERY_TIMING", "1")
+        .args(["search", "database migration"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(r#""archive_due":false"#), "{stderr}");
+    assert!(!stderr.contains("worker_started"), "{stderr}");
+}
+
+// 0.4.9 left an empty recall unverified (exit 2) when its automatic meaning lane failed
+// (py/recall.py:2353-2357, 2766-2769); a keyword answer still exits 0.
+#[test]
+fn recall_with_a_failed_meaning_lane_and_no_match_is_unverified() {
+    let t = tempfile::tempdir().unwrap();
+    transcript(&t);
+    let out = agrep(&t).arg("index").output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let r = DataRoot::open(t.path().join("data"), false).unwrap();
+    semantic::initialize(&r).unwrap();
+    // Every row embedded, so no worker starts and the lane loads the model.
+    store::writer(&r)
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO semantic_refs SELECT id,digest,digest FROM prose; DELETE FROM semantic_queue;",
+        )
+        .unwrap();
+    // An installed model whose weights fail verification.
+    fs::create_dir(t.path().join("model")).unwrap();
+    for (name, size, _) in agrep_core::semantic_model::FILES {
+        fs::File::create(t.path().join("model").join(name))
+            .unwrap()
+            .set_len(size)
+            .unwrap();
+    }
+    for (query, code) in [
+        ("quantum entanglement teleportation", 2),
+        ("database migration failure", 0),
+    ] {
+        let out = agrep(&t).args(["recall", query]).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(code), "{query}: {stderr}");
+        assert!(
+            stderr.contains("semantic search failed"),
+            "{query}: {stderr}"
+        );
+    }
 }
 
 // 0.4.9 served the compact page, and so the automatic meaning lane, only on the default row

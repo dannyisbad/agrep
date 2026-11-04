@@ -78,17 +78,17 @@ visible prose, visible tool and source-error counts.
 - `Refresh` reports `sources`, `parsed`, `changed_rows`, `errors`, `resumed_sources`,
   `bytes_read`, `bytes_parsed` and timings (`census_ms`, `open_ms` for the writer
   connection with any WAL recovery, `parse_ms`, `write_ms`, `bounds_ms`, `stats_ms`,
-  `commit_ms`, `total_ms`, and per-adapter maps). `surface::refresh_json(refresh, extra)`
-  is the line `index` and `reindex` print once they finish; it omits `skipped_lock` and
-  appends `extra`: `data::lock_waits()` (`wait_foreground_lock_ms`,
-  `wait_writer_queue_ms`, `wait_writer_lock_ms`, `wait_work_lock_ms`, the time the whole
-  process was blocked on each lock file) and `after_refresh_ms`, the time from the
-  refresh's end to the line.
+  `commit_ms`, `total_ms`, and per-adapter maps).
 - `Explorer::with_freshness` takes a closure that runs the census and returns the
   pending-source count; `agrep serve` and `agrep ui` pass the command line's own, so the
   explorer reports the same count as the terminal.
 
 ## Profiling
 
-`AGREP_QUERY_TIMING` prints phase timings as JSON lines on stderr; `AGREP_SEM_PROFILE`
+`AGREP_QUERY_TIMING` prints phase timings as JSON lines on stderr. `index` and `reindex`
+add `{"index": …}`: the `Refresh` without `skipped_lock`, plus `after_refresh_ms`, the
+time from the refresh's end to the line. A blocking lock acquisition prints
+`{"lock_wait": {"lock": …, "ms": …}}` (`writer_queue`, `writer_lock`, `work_lock`), and
+an archive command that starts waiting for a capture or a SQLite writer in another
+process prints `{"wait": "archive.lock"}` or `{"wait": "sqlite"}`. `AGREP_SEM_PROFILE`
 adds model and batch detail. Normal commands print neither.

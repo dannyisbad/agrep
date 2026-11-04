@@ -7,6 +7,8 @@ use std::{
     path::Path,
     time::{Duration, Instant},
 };
+#[path = "exit.rs"]
+mod exit;
 
 /// How one lane's detached processes are recognized. On Unix every process a lane starts
 /// inherits its environment, so its unique data-directory path names it. On Windows this
@@ -64,7 +66,7 @@ pub fn end(lane: &Lane, deadline: Duration) -> Result<usize> {
             platform::kill(*pid);
         }
         for pid in &pids {
-            platform::wait_exit(*pid, left)?;
+            wait_exit(*pid, left)?;
         }
         ended += pids.len();
     }
@@ -85,9 +87,17 @@ pub fn wait_idle(lane: &Lane, deadline: Duration) -> Result<()> {
             );
         };
         for pid in pids {
-            platform::wait_exit(pid, left)?;
+            wait_exit(pid, left)?;
         }
     }
+}
+
+fn wait_exit(pid: u32, left: Duration) -> Result<()> {
+    anyhow::ensure!(
+        exit::wait(pid, left)?,
+        "process {pid} did not exit within {left:?}"
+    );
+    Ok(())
 }
 
 /// Waits until `path` no longer exists, waking on every change to its directory. Returns
@@ -186,56 +196,6 @@ mod platform {
             tv_sec: left.as_secs() as libc::time_t,
             tv_nsec: left.subsec_nanos() as libc::c_long,
         }
-    }
-
-    #[cfg(target_os = "macos")]
-    pub fn wait_exit(pid: u32, left: Duration) -> Result<()> {
-        let kq = Fd(unsafe { libc::kqueue() });
-        anyhow::ensure!(kq.0 >= 0, "kqueue: {}", std::io::Error::last_os_error());
-        let change = libc::kevent {
-            ident: pid as libc::uintptr_t,
-            filter: libc::EVFILT_PROC,
-            flags: libc::EV_ADD | libc::EV_ONESHOT,
-            fflags: libc::NOTE_EXIT,
-            data: 0,
-            udata: std::ptr::null_mut(),
-        };
-        let mut event = change;
-        let timeout = timespec(left);
-        let n = unsafe { libc::kevent(kq.0, &change, 1, &mut event, 1, &timeout) };
-        if n < 0 {
-            let error = std::io::Error::last_os_error();
-            // The process exited before it could be watched.
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                return Ok(());
-            }
-            anyhow::bail!("kevent: {error}");
-        }
-        anyhow::ensure!(n == 1, "process {pid} did not exit within {left:?}");
-        Ok(())
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    pub fn wait_exit(pid: u32, left: Duration) -> Result<()> {
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
-        if fd < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                return Ok(());
-            }
-            anyhow::bail!("pidfd_open: {error}");
-        }
-        let fd = Fd(fd as libc::c_int);
-        let mut poll = libc::pollfd {
-            fd: fd.0,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let millis = left.as_millis().min(i32::MAX as u128) as libc::c_int;
-        let n = unsafe { libc::poll(&mut poll, 1, millis) };
-        anyhow::ensure!(n >= 0, "poll: {}", std::io::Error::last_os_error());
-        anyhow::ensure!(n == 1, "process {pid} did not exit within {left:?}");
-        Ok(())
     }
 
     struct Fd(libc::c_int);
@@ -344,7 +304,7 @@ mod platform {
             Threading::{
                 GetCurrentProcess, GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW,
                 TerminateProcess, WaitForSingleObject, PROCESS_NAME_WIN32,
-                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
             },
         },
     };
@@ -392,7 +352,7 @@ mod platform {
     fn open(pid: u32) -> Option<Process> {
         let handle = unsafe {
             OpenProcess(
-                PROCESS_TERMINATE | PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
                 0,
                 pid,
             )
@@ -473,18 +433,6 @@ mod platform {
             unsafe {
                 TerminateProcess(process.0, 1);
             }
-        }
-    }
-
-    pub fn wait_exit(pid: u32, left: Duration) -> Result<()> {
-        let Some(process) = open(pid) else {
-            return Ok(());
-        };
-        let millis = left.as_millis().min(u32::MAX as u128 - 1) as u32;
-        match unsafe { WaitForSingleObject(process.0, millis) } {
-            WAIT_OBJECT_0 => Ok(()),
-            WAIT_TIMEOUT => anyhow::bail!("process {pid} did not exit within {left:?}"),
-            _ => anyhow::bail!("wait: {}", std::io::Error::last_os_error()),
         }
     }
 

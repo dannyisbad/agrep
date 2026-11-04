@@ -94,7 +94,17 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
             let matched = if direct {
                 identity.as_ref().is_some_and(|id| s.id.starts_with(id))
             } else {
-                let identity = format!("{} {} {}", s.id, s.project, s.title).to_lowercase();
+                // 0.4.9's haystack, less the concept 0.5 does not compute
+                // (py/search.py:8579-8583).
+                let identity = format!(
+                    "{} {} {} {} {}",
+                    s.id,
+                    s.agent,
+                    h::project_leaf(&s.project),
+                    s.project,
+                    s.title
+                )
+                .to_lowercase();
                 args.pattern
                     .iter()
                     .all(|p| identity.contains(&p.to_lowercase()))

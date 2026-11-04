@@ -47,7 +47,8 @@ pub fn run(
             _ => passed.push(word),
         }
     }
-    launch::capability(&agent)?;
+    // 0.4.9 logged the refusal as a bare line (cli.py:1814-1820).
+    launch::capability(&agent).map_err(|e| super::usage::refusal("", e))?;
     let Some(exe) = launch::choose_executable(&agent, None)? else {
         eprintln!("the {agent} CLI is not on PATH");
         return Ok(127);

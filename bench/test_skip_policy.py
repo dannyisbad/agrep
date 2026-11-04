@@ -54,7 +54,7 @@ class SkipPolicyTests(unittest.TestCase):
         self.reject_rust(source)
         self.policy['platform_inapplicable'] = [{
             'test': 'crates/probe.rs::probe',
-            'gates': ['cfg(target_os=LITERAL)', 'capability(semantic_device::metal_device)'],
+            'gates': ['cfg(target_os="macos")', 'capability(semantic_device::metal_device)'],
             'reason': 'The hosted platform has no GPU with the required features.',
         }]
         self.save()
@@ -68,9 +68,24 @@ class SkipPolicyTests(unittest.TestCase):
             source.replace('target_os="macos"', 'target_os="windows"').replace(guard, ''),
         ):
             self.reject_rust(altered)
-        self.policy['platform_inapplicable'][0]['gates'] = ['cfg(target_os=LITERAL)']
+        self.policy['platform_inapplicable'][0]['gates'] = ['cfg(target_os="macos")']
         self.save()
         self.reject_rust(source)
+
+    def test_a_registration_binds_the_platform_value_of_its_gate(self):
+        for field, source in (
+            ('platform_inapplicable', '#[cfg(target_os = "macos")] #[test] fn probe() {}'),
+            ('partial_assertions', '#[test] fn probe() { if cfg!(target_os = "macos") { assert!(true); } }'),
+        ):
+            gate = 'cfg!(target_os="macos")' if field == 'partial_assertions' else 'cfg(target_os="macos")'
+            self.policy = {'platform_inapplicable': [], 'partial_assertions': []}
+            self.policy[field] = [{'test': 'crates/probe.rs::probe', 'gates': [gate], 'reason': 'Apple-only API.'}]
+            self.save()
+            (self.root / 'crates/probe.rs').write_text(source, encoding='utf-8')
+            validate([], self.root)
+            # The same test moved to a platform that never runs it must not keep the grant.
+            self.reject_rust(source.replace('"macos"', '"none"'))
+            self.reject_rust(source.replace('"macos"', '"windows"'))
 
     def test_todo_skip_and_expected_failure_source_markers(self):
         for source in ('test.todo("later");', 'test("later", {todo:true}, () => {});', 'test("later", t => t.skip());', 'test("later", {skip:"reason"}, () => {});', 'test("later", {"todo":true}, () => {});'):

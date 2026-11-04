@@ -170,7 +170,7 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
             "retrieval":keyword.timings,"examined":keyword.examined,"blocks":keyword.blocks
         }));
     }
-    let mut keyword_ms = if s.semantic {
+    let keyword_ms = if s.semantic {
         0.
     } else {
         keyword_start.elapsed().as_secs_f64() * 1000.
@@ -203,19 +203,21 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
                 };
                 (result, Some(found.coverage), false)
             }
+            Err(error) if s.semantic => {
+                // An explicit matcher failure cannot silently change matcher semantics
+                // (py/search.py:7686-7719).
+                let freshness = render::machine_freshness(no_auto, finish_census(&root, census)?);
+                return unavailable(
+                    &s,
+                    pattern.trim(),
+                    semantic::failed(&error),
+                    caller.metadata(request, None),
+                    freshness,
+                );
+            }
             Err(error) => {
                 agrep_core::logging::semantic_failure(&root, &error);
-                let fallback = if s.semantic {
-                    let tick = std::time::Instant::now();
-                    let _span = agrep_core::semantic_profile::span("keyword_fallback");
-                    let result =
-                        caller::search(&c, &options, &caller, include_self, s.scope.no_self)?;
-                    keyword_ms += tick.elapsed().as_secs_f64() * 1000.;
-                    result
-                } else {
-                    keyword
-                };
-                (fallback, None, true)
+                (keyword, None, true)
             }
         }
     } else {
@@ -289,22 +291,14 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
             .chain(["-n".into(), n.to_string(), "--".into(), pattern.clone()])
             .collect()
     };
+    // 0.4.9's forced lane ran before the page rendered (py/search.py:7907-7914); it ranks
+    // by coverage whatever --sort said, and may repeat the page's rows.
     let coverage_hits = if s.coverage {
-        // 0.4.9 ranked the coverage lane by coverage whatever --sort said.
         let ranked = Options {
             sort: "score".into(),
             ..options.clone()
         };
-        let mut recovered = agrep_core::query::coverage(&c, &ranked)?;
-        recovered.hits.retain(|h| {
-            !result.hits.iter().any(|old| {
-                old.agent == h.agent
-                    && old.session == h.session
-                    && old.turn == h.turn
-                    && old.who == h.who
-            })
-        });
-        Some(recovered)
+        Some(caller::coverage(&c, &ranked, &caller)?.hits)
     } else {
         None
     };
@@ -387,28 +381,26 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
     if let Some(line) = agrep_core::query::meta_notice(result.meta_dropped, result.meta_retained) {
         eprintln!("{line}");
     }
+    // The block follows the page (py/search.py:8371-8380, 8415-8417), or on a miss the
+    // lines explaining it (py/search.py:8139-8157).
+    let coverage_block = coverage_hits
+        .map(|hits| render::coverage_block(&hits, &pattern, &style))
+        .unwrap_or_default();
+    let (after_page, after_miss) = if result.total == 0 {
+        (&[][..], &coverage_block[..])
+    } else {
+        (&coverage_block[..], &[][..])
+    };
     {
         let _span = agrep_core::semantic_profile::span("render");
-        render::emit_semantic(&result, &pattern, &f, &style, semantic_coverage.as_ref())?;
-    }
-    if let Some(recovered) = coverage_hits {
-        eprintln!(
-            "coverage lane (forced): {} additional rows",
-            recovered.hits.len()
-        );
-        agrep_core::surface::line("coverage recovery (partial term matches):")?;
-        if recovered.hits.is_empty() {
-            agrep_core::surface::line("no additional evidence")?;
-        }
-        for hit in recovered.hits {
-            agrep_core::surface::line(&format!(
-                "{} {} {}: {}",
-                hit.handle,
-                hit.agent,
-                hit.who,
-                agrep_core::surface::safe(&hit.snippet, false)
-            ))?;
-        }
+        render::emit_semantic(
+            &result,
+            &pattern,
+            &f,
+            &style,
+            semantic_coverage.as_ref(),
+            after_page,
+        )?;
     }
     // 0.4.9 named a coverage gap on a miss, and on a page of hits only in its terminal
     // footer or a compact page (py/search.py:8121-8126, 8381-8387, 8482-8485).
@@ -448,6 +440,9 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
     }
     if !s.json {
         agrep_core::coverage::disclose(&coverage);
+        for line in after_miss {
+            eprintln!("{line}");
+        }
         if let Some(line) = policy.zip(excluded).and_then(|(p, n)| p.notice(n, "hit")) {
             eprintln!("{line}");
         }
@@ -477,6 +472,40 @@ pub(crate) fn more(handle: &str) -> Result<i32> {
         );
     }
     Ok(0)
+}
+/// 0.4.9's answer to an explicit `-s` whose meaning lane did not answer: its one stderr
+/// line, or under `--json` its `semantic-unavailable` record, and exit 2
+/// (py/search.py:7686-7719).
+fn unavailable(
+    s: &Search,
+    query: &str,
+    status: serde_json::Value,
+    self_exclusion: serde_json::Value,
+    freshness: serde_json::Value,
+) -> Result<i32> {
+    if !s.json {
+        eprintln!("{}", semantic::unavailable_notice(&status));
+        return Ok(2);
+    }
+    let engine = if status["state"] == "query-rejected" {
+        "semantic:policy"
+    } else {
+        "semantic:unavailable"
+    };
+    let partial = status["partial"] == true;
+    let record = serde_json::json!({
+        "kind":"agrep-meta","query":query,"engine":engine,"hits":[],
+        "error":{"code":"semantic-unavailable"},"semantic":status,
+        "self_exclusion":self_exclusion,
+        "completeness":{"shown":0,"total":0,"total_basis":"floor",
+            "unit":if s.chats {"chat"} else {"row"},"truncated":true,
+            "action_unavailable_reason":"the query did not produce a result set"},
+        "filter_coverage":{"empty_dimensions":[],"checked":false,
+            "reason":"the query returned before the index was filtered"},
+        "freshness":freshness,"semantic_coverage":null,"semantic_partial":partial,
+    });
+    agrep_core::surface::line(&agrep_core::json_output::to_string(&record)?)?;
+    Ok(2)
 }
 /// 0.4.9's `-l` heads over a meaning page: lane confidence folds into score, and a meaning
 /// row's score is its keyword formula (py/search.py:1892-1898, 7584).

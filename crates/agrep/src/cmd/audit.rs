@@ -7,21 +7,45 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 type EvidenceRows = HashMap<(String, String, String, String), usize>;
 pub fn run(agents: Vec<String>, json_output: bool, strict: bool, full: bool) -> Result<i32> {
-    let root = DataRoot::discover()?;
-    root.validate(false)?;
-    let c = store::reader(&root)?;
-    let wanted: Vec<_> = agents
-        .iter()
-        .flat_map(|a| a.split(','))
-        .map(history::normalize_agent)
-        .collect();
-    for agent in &wanted {
-        if !ADAPTERS.iter().any(|a| a.name() == *agent) {
-            anyhow::bail!("unknown agent: {agent}")
-        }
+    // 0.4.9's parser refusals (py/audit.py:2457-2469), before anything is read.
+    let refuse = |message: String| super::usage::refusal("agrep audit", message);
+    if agents.len() > 1 {
+        return Err(refuse("--agent may be supplied only once".into()));
     }
+    let names: Vec<_> = ADAPTERS.iter().map(|a| a.name()).collect();
+    if agents.iter().any(|a| a.trim().is_empty()) {
+        return Err(refuse(format!(
+            "--agent needs a value ({}) - an empty value would silently match every agent",
+            names.join(", ")
+        )));
+    }
+    let wanted: Vec<_> = agents.iter().map(|a| history::normalize_agent(a)).collect();
+    if wanted.iter().any(|agent| !names.contains(agent)) {
+        return Err(refuse(format!(
+            "--agent must name one of: {}",
+            names.join(", ")
+        )));
+    }
+    let root = DataRoot::discover()?;
+    // Before the first index nothing is indexed, and 0.4.9 audited the sources anyway.
+    let unborn = std::fs::read_dir(&root.0).map_or_else(
+        |e| e.kind() == std::io::ErrorKind::NotFound,
+        |mut entries| entries.next().is_none(),
+    );
+    if !unborn {
+        root.validate(false)?;
+    }
+    let c = root
+        .db()
+        .exists()
+        .then(|| store::reader(&root))
+        .transpose()?;
     let selected = |agent: &str| wanted.is_empty() || wanted.contains(&agent);
-    let sources = diagnostics::source_rows(&c)?;
+    let sources = c
+        .as_ref()
+        .map(diagnostics::source_rows)
+        .transpose()?
+        .unwrap_or_default();
     let live = store::census()?;
     let mut gaps = vec![];
     let mut errors = vec![];
@@ -64,6 +88,10 @@ pub fn run(agents: Vec<String>, json_output: bool, strict: bool, full: bool) -> 
     let mut counts = serde_json::Map::new();
     let mut indexed = EvidenceRows::new();
     for table in ["prose", "tools"] {
+        let Some(c) = &c else {
+            counts.insert(table.into(), json!(0));
+            continue;
+        };
         if !full {
             let total: usize = c
                 .prepare(&format!(
@@ -221,16 +249,30 @@ pub fn run(agents: Vec<String>, json_output: bool, strict: bool, full: bool) -> 
             }
         }
     }
-    let exit = if !errors.is_empty() {
-        2
-    } else if strict && !gaps.is_empty() {
-        1
+    let discovered = live.iter().filter(|s| selected(&s.agent)).count();
+    // 0.4.9 certified nothing when no source file was found (py/audit.py:2383-2388).
+    let unavailable = discovered == 0 && gaps.is_empty() && errors.is_empty();
+    if unavailable {
+        errors.push(json!({"path":null,"reason":"no source file census completed; audit cannot certify completeness"}));
+    }
+    let (exit, status) = if !errors.is_empty() || (strict && !gaps.is_empty()) {
+        (2, "error")
+    } else if !gaps.is_empty() {
+        (1, "warning")
     } else {
-        0
+        (0, "clean")
     };
-    let v = json!({"version":1,"full":full,"strict":strict,"agents":agents,"counts":counts,"discovered_sources":live.iter().filter(|s|selected(&s.agent)).count(),"expected_rows":if full{Some(expected.values().sum::<usize>())}else{None},"status":if !errors.is_empty(){"incomplete"}else if !gaps.is_empty(){"gaps"}else{"clean"},"gaps":gaps.len(),"gap_details":gaps,"problem_count":errors.len(),"problems":errors,"exit_code":exit,"index_path":root.db()});
+    let v = json!({"version":1,"full":full,"strict":strict,"agents":agents,"counts":counts,"discovered_sources":discovered,"expected_rows":if full{Some(expected.values().sum::<usize>())}else{None},"status":status,"gaps":gaps.len(),"gap_details":gaps,"problem_count":errors.len(),"problems":errors,"exit_code":exit,"index_path":root.db()});
     if json_output {
         println!("{}", agrep_core::json_output::to_string(&v)?)
+    } else if unavailable {
+        let scope = match wanted.as_slice() {
+            [agent] => *agent,
+            _ => "supported",
+        };
+        println!(
+            "audit unavailable: no {scope} source files were found; no completeness claim was made."
+        );
     } else {
         println!(
             "audit: {} sources · {} prose rows · {} tool rows · {} gaps · {} errors",

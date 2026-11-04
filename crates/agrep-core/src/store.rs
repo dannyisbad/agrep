@@ -295,6 +295,15 @@ pub(crate) fn stamp_present(a: &str, p: &Path) -> Option<Stamp> {
     }
     Some(stamp_meta(a, p, meta))
 }
+/// Whether an indexed source the census did not stamp is gone: its stat proves it absent, or
+/// a directory stands at its path. Sources are files, so an indexed directory is stale: the
+/// error of a census that could not list it then, or a source a directory replaced.
+pub(crate) fn gone(path: &Path) -> bool {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => meta.is_dir(),
+        Err(e) => registry::stat_proves_absent(path, &e),
+    }
+}
 fn stamp_meta(a: &str, p: &Path, meta: std::io::Result<fs::Metadata>) -> Stamp {
     let result = (|| -> Result<(u64, i64, String)> {
         let m = meta?;
@@ -523,7 +532,7 @@ fn refresh_inner(
                 && !s.path.starts_with('@')
                 && !s.path.starts_with("token:")
                 && !discovered.contains(s.path.as_str())
-                && matches!(fs::symlink_metadata(&s.path),Err(e) if e.kind()==std::io::ErrorKind::NotFound)
+                && gone(Path::new(&s.path))
         })
         .map(|s| s.path.clone())
         .collect();

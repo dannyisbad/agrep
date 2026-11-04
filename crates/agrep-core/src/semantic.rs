@@ -70,52 +70,70 @@ pub fn schedule(root: &DataRoot) -> Result<()> {
     }
     let embedding_pending = embeddings && semantic_store::pending(&store::reader(root)?)?;
     let maintenance_pending = post_index_pending(root)?;
+    let archive_due = crate::archive::due(root)?;
     crate::semantic_profile::event(serde_json::json!({"work_state":{
-        "embedding_pending":embedding_pending,"maintenance_pending":maintenance_pending
+        "embedding_pending":embedding_pending,"maintenance_pending":maintenance_pending,
+        "archive_due":archive_due
     }}));
-    if !(root.config()?.archive.enabled || embedding_pending || maintenance_pending) {
+    if !(archive_due || embedding_pending || maintenance_pending) {
         return Ok(());
     }
     crate::freshness::spawn(root, &std::env::current_exe()?)?;
     Ok(())
 }
 
-/// A single process holds work.lock, reuses weights, and commits every bounded batch.
-pub fn work(root: &DataRoot) -> Result<usize> {
-    work_inner(root, false)
+/// How one queue drain runs.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Drain {
+    /// Embeds even with `embeddings` off (`index --semantic`).
+    pub explicit: bool,
+    /// Background work: stops between batches while a writer or explicit command waits.
+    pub background: bool,
+    /// The most queued rows this drain embeds, newest first (`reindex --max-new`).
+    pub limit: Option<usize>,
 }
-pub fn work_explicit(root: &DataRoot) -> Result<usize> {
-    work_inner(root, true)
+/// Embeds the queue in bounded batches, each committed before the next. The caller holds
+/// work.lock. Returns whether a background drain stopped for a waiting command.
+pub fn drain(root: &DataRoot, how: Drain) -> Result<bool> {
+    if !installed(root) || (!how.explicit && root.config()?.embeddings == "off") {
+        return Ok(false);
+    }
+    let mut model = None;
+    drain_with(root, how, |texts| {
+        let loaded = match model.take() {
+            Some(loaded) => loaded,
+            None => Embedder::background(root)?,
+        };
+        let vectors = loaded.embed(texts);
+        model = Some(loaded);
+        vectors
+    })
 }
-fn work_inner(root: &DataRoot, explicit: bool) -> Result<usize> {
-    if !installed(root) {
-        bail!("semantic model not installed: run agrep setup");
-    }
-    if !explicit && root.config()?.embeddings == "off" {
-        return Ok(0);
-    }
-    let Some(_work) = root.work_lock(explicit)? else {
-        return Ok(0);
-    };
-    drain(root, explicit)
-}
-/// Caller holds work.lock for the ordered background tasks.
-pub fn drain(root: &DataRoot, explicit: bool) -> Result<usize> {
-    if !installed(root) || (!explicit && root.config()?.embeddings == "off") {
-        return Ok(0);
-    }
+/// The drain's batches with `embed` producing each batch's vectors; it is called only for
+/// a batch holding text no published chunk has.
+fn drain_with(
+    root: &DataRoot,
+    how: Drain,
+    mut embed: impl FnMut(&[String]) -> Result<Vec<Vec<f32>>>,
+) -> Result<bool> {
     semantic_store::initialize_wait(root)?;
     if !semantic_store::pending(&store::reader(root)?)? {
-        return Ok(0);
+        return Ok(false);
     }
-    let embedder = Embedder::background(root)?;
-    let mut total = 0;
+    let mut left = how.limit;
     loop {
-        if !explicit && root.config()?.embeddings == "off" {
+        if !how.explicit && root.config()?.embeddings == "off" {
+            break;
+        }
+        if how.background && root.writer_queued()? {
+            return Ok(true);
+        }
+        let size = left.map_or(128, |n| n.min(128));
+        if size == 0 {
             break;
         }
         let c = store::reader(root)?;
-        let pending = semantic_store::batch(&c, 128)?;
+        let pending = semantic_store::batch(&c, size)?;
         if pending.is_empty() {
             break;
         }
@@ -132,11 +150,18 @@ pub fn drain(root: &DataRoot, explicit: bool) -> Result<usize> {
             }
         }
         drop(c);
-        let vectors = embedder.embed(&texts)?;
-        total += semantic_store::publish(root, &pending, &refs, &vectors)?;
+        let vectors = if texts.is_empty() {
+            Vec::new()
+        } else {
+            embed(&texts)?
+        };
+        semantic_store::publish(root, &pending, &refs, &vectors)?;
+        if let Some(n) = left.as_mut() {
+            *n -= pending.len();
+        }
         std::thread::yield_now();
     }
-    Ok(total)
+    Ok(false)
 }
 /// Scans of fewer vectors than this stay on one thread; at owner scale the scan is
 /// split across the Rayon pool.
@@ -214,8 +239,8 @@ pub fn begin(
     if !installed(root) {
         bail!("semantic model not installed: run agrep setup");
     }
-    if !semantic_policy::allowed(&o.pattern) {
-        bail!("semantic query requires natural language; use --lexical for identifiers");
+    if let Some(reason) = semantic_policy::rejection(&o.pattern) {
+        return Err(Rejected(reason).into());
     }
     // This first read pins the same WAL snapshot used by the lexical query.
     let coverage = {
@@ -294,17 +319,47 @@ pub fn search(root: &DataRoot, o: &Options, family_diverse: bool) -> Result<Sear
     let c = store::reader(root)?;
     finish(&c, begin(root, &c, o, family_diverse)?)
 }
-/// 0.4.9's `semantic_status` for one meaning lane: `found` is whether a row cleared the
-/// floor, and no coverage means the lane failed (py/search.py:563-599).
-pub fn status(coverage: Option<&Coverage>, found: bool) -> serde_json::Value {
-    let Some(coverage) = coverage else {
-        return serde_json::json!({"state":"unavailable","eligible":true,"reason":"retrieval-failed","min_score":FLOOR,"score_kind":"unavailable","coverage":null,"partial":true,"complete":false,"fallback_recommended":true});
-    };
+/// 0.4.9's `semantic_status` for one meaning lane that answered: `found` is whether a row
+/// cleared the floor (py/search.py:510-578).
+pub fn status(coverage: &Coverage, found: bool) -> serde_json::Value {
     let partial = coverage.partial();
     // py/surface_policy.py:2839-2852: complete, or within the 1% live-update tail.
     let usable = !partial
         || (coverage.total > 0 && coverage.embedded as f64 >= coverage.total as f64 * 0.99);
     serde_json::json!({"state":if found {"ready"} else {"no-confident-match"},"eligible":true,"reason":null,"min_score":FLOOR,"score_kind":"cosine","coverage":coverage,"partial":partial,"complete":!partial,"fallback_recommended":!found && !usable})
+}
+/// A query 0.4.9's meaning policy refuses, with its reason code.
+#[derive(Debug)]
+pub struct Rejected(pub &'static str);
+impl std::fmt::Display for Rejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("semantic query requires natural language; use --lexical for identifiers")
+    }
+}
+impl std::error::Error for Rejected {}
+/// 0.4.9's `semantic_status` of a lane that did not answer: a refused query carries its
+/// policy reason, a failed lane its cause, bounded as 0.4.9 bounded it
+/// (py/search.py:524-531, 581-610).
+pub fn failed(error: &anyhow::Error) -> serde_json::Value {
+    if let Some(Rejected(reason)) = error.downcast_ref() {
+        return serde_json::json!({"state":"query-rejected","complete":false,"fallback_recommended":true,"eligible":false,"reason":reason,"min_score":FLOOR,"coverage":null});
+    }
+    let cause: String = crate::surface::safe(&format!("{error:#}"), false)
+        .chars()
+        .take(140)
+        .collect();
+    serde_json::json!({"state":"unavailable","eligible":true,"reason":cause.trim(),"min_score":FLOOR,"score_kind":"unavailable","coverage":null,"partial":true,"complete":false,"fallback_recommended":true})
+}
+/// 0.4.9's `semantic_unavailable_notice`, the one line an explicit `-s` prints when its
+/// lane did not answer (py/surface_policy.py:2749-2761).
+pub fn unavailable_notice(status: &serde_json::Value) -> String {
+    let state = status["state"].as_str().unwrap_or("unavailable");
+    let detail = match status["reason"].as_str().filter(|r| !r.is_empty()) {
+        Some(reason) => reason,
+        None if state == "unavailable" => "the meaning lane did not answer",
+        None => state,
+    };
+    format!("semantic search unavailable: {detail}")
 }
 /// Marks 0.4.9's weak meaning rows (py/search.py:432-480, 632-636, 966-1036): a cosine
 /// below the strong band, less than half the query's terms, or a query none of whose
@@ -885,5 +940,70 @@ mod tests {
             semantic_store::batch(&store::reader(&r).unwrap(), 1).unwrap()[0].id,
             2
         );
+    }
+    #[test]
+    fn a_background_drain_yields_to_a_waiting_writer_before_it_loads_the_model() {
+        let (_t, r, _o) = setup();
+        insert(&r, 1, "root", "alpha");
+        // Sparse files of the pinned sizes: an installed model whose weights fail
+        // verification once a drain loads them.
+        let model = semantic_model::directory(&r);
+        std::fs::create_dir_all(&model).unwrap();
+        for (name, size, _) in semantic_model::FILES {
+            std::fs::File::create(model.join(name))
+                .unwrap()
+                .set_len(size)
+                .unwrap();
+        }
+        // What `DataRoot::lock(true)` and a blocking `work_lock` hold while they wait.
+        let queue = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(r.path().join("writer.queue"))
+            .unwrap();
+        queue.lock_shared().unwrap();
+        let background = Drain {
+            background: true,
+            ..Default::default()
+        };
+        assert!(drain(&r, background).unwrap());
+        assert!(semantic_store::pending(&store::reader(&r).unwrap()).unwrap());
+        queue.unlock().unwrap();
+        let error = drain(&r, background).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("SHA-256 mismatch"),
+            "{error:#}"
+        );
+    }
+    #[test]
+    fn a_capped_drain_embeds_only_the_newest_rows() {
+        let (_t, r, _o) = setup();
+        for id in 1..=3 {
+            insert(&r, id, &format!("family-{id}"), "alpha");
+        }
+        let mut calls = 0;
+        let capped = Drain {
+            limit: Some(2),
+            ..Default::default()
+        };
+        let yielded = drain_with(&r, capped, |texts| {
+            calls += 1;
+            let mut v = vec![0f32; semantic_model::DIM];
+            v[0] = 1.;
+            Ok(vec![v; texts.len()])
+        })
+        .unwrap();
+        assert!(!yielded);
+        assert_eq!(calls, 1);
+        let c = store::reader(&r).unwrap();
+        assert_eq!(coverage(&c).unwrap().embedded, 2);
+        let left: Vec<i64> = semantic_store::batch(&c, 128)
+            .unwrap()
+            .iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(left, [1]);
     }
 }

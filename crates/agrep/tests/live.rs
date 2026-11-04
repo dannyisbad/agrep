@@ -4,9 +4,14 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::Path,
     process::{Command, Stdio},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tempfile::TempDir;
+#[path = "../examples/support/exit.rs"]
+mod exit;
+#[cfg(unix)]
+#[path = "support/job.rs"]
+mod job;
 const BIN: &str = env!("CARGO_BIN_EXE_agrep");
 fn cli(home: &Path, data: &Path) -> Command {
     let mut c = Command::new(BIN);
@@ -147,6 +152,7 @@ mod pty {
             fd::{AsRawFd, FromRawFd},
             unix::process::CommandExt,
         },
+        time::Instant,
     };
     struct Terminal {
         master: Option<File>,
@@ -210,27 +216,30 @@ mod pty {
         fn read_until(&mut self, needle: &[u8]) -> Vec<u8> {
             let deadline = Instant::now() + Duration::from_secs(60);
             let mut out = vec![];
-            while Instant::now() < deadline {
+            loop {
                 let mut poll = libc::pollfd {
                     fd: self.master.as_ref().unwrap().as_raw_fd(),
                     events: libc::POLLIN,
                     revents: 0,
                 };
-                let n = unsafe { libc::poll(&mut poll, 1, 100) };
-                if n > 0 {
-                    let mut b = [0; 4096];
-                    match self.master.as_mut().unwrap().read(&mut b) {
-                        Ok(n) => {
-                            out.extend_from_slice(&b[..n]);
-                            if out.windows(needle.len()).any(|s| s == needle) {
-                                return out;
-                            }
+                let left = deadline.saturating_duration_since(Instant::now());
+                match unsafe { libc::poll(&mut poll, 1, left.as_millis() as libc::c_int) } {
+                    0 => panic!("missing pty output: {:?}", String::from_utf8_lossy(&out)),
+                    n if n < 0 => panic!("pty poll: {}", std::io::Error::last_os_error()),
+                    _ => {}
+                }
+                let mut b = [0; 4096];
+                match self.master.as_mut().unwrap().read(&mut b) {
+                    Ok(0) => panic!("pty closed: {:?}", String::from_utf8_lossy(&out)),
+                    Ok(n) => {
+                        out.extend_from_slice(&b[..n]);
+                        if out.windows(needle.len()).any(|s| s == needle) {
+                            return out;
                         }
-                        Err(e) => panic!("pty read: {e}; {:?}", String::from_utf8_lossy(&out)),
                     }
+                    Err(e) => panic!("pty read: {e}; {:?}", String::from_utf8_lossy(&out)),
                 }
             }
-            panic!("missing pty output: {:?}", String::from_utf8_lossy(&out))
         }
         fn finish(&mut self, code: i32) {
             self.read_until(b"\x1b[?1049l");
@@ -246,18 +255,11 @@ mod pty {
             assert_eq!(self.before.c_oflag, after.c_oflag);
             assert_eq!(self.before.c_cc, after.c_cc);
             self.master.take();
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                if let Some(status) = self.child.try_wait().unwrap() {
-                    assert_eq!(status.code(), Some(code));
-                    break;
-                }
-                if Instant::now() > deadline {
-                    self.child.kill().unwrap();
-                    panic!("board did not exit")
-                }
-                std::thread::sleep(Duration::from_millis(10));
+            if !exit::wait(self.child.id(), Duration::from_secs(10)).unwrap() {
+                self.child.kill().unwrap();
+                panic!("board did not exit")
             }
+            assert_eq!(self.child.wait().unwrap().code(), Some(code));
         }
     }
     impl Drop for Terminal {
@@ -314,12 +316,14 @@ mod pty {
     }
     #[test]
     fn ui_serves_while_browser_opener_is_running() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::{fs::PermissionsExt, net::UnixStream};
         let t = TempDir::new().unwrap();
         fixture(t.path());
         let bin = t.path().join("bin");
         fs::create_dir(&bin).unwrap();
-        let done = t.path().join("done");
+        // The opener reports its start, then runs until the test closes its end of the pair.
+        let (opener_end, test_end) = UnixStream::pair().unwrap();
+        let held = opener_end.as_raw_fd();
         let opener = bin.join(if cfg!(target_os = "macos") {
             "open"
         } else {
@@ -327,20 +331,27 @@ mod pty {
         });
         fs::write(
             &opener,
-            format!(
-                "#!/bin/sh\nwhile [ ! -f '{}' ]; do /bin/sleep 0.05; done\n",
-                done.display()
-            ),
+            format!("#!/bin/sh\necho started >&{held}\nread _ <&{held}\n"),
         )
         .unwrap();
         fs::set_permissions(&opener, fs::Permissions::from_mode(0o755)).unwrap();
-        let mut child = cli(t.path(), &t.path().join("data"))
+        let mut command = cli(t.path(), &t.path().join("data"));
+        command
             .env("PATH", &bin)
             .args(["ui", "--port", "0"])
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        // Only `ui`, and through it the opener, inherit `opener_end`; other copies close on exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(held, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        drop(opener_end);
         let mut reader = BufReader::new(child.stdout.take().unwrap());
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
@@ -351,6 +362,11 @@ mod pty {
             .split('/')
             .next()
             .unwrap();
+        test_end
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut started = String::new();
+        let report = BufReader::new(&test_end).read_line(&mut started);
         let mut stream = std::net::TcpStream::connect(authority).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -358,11 +374,13 @@ mod pty {
         write!(stream, "GET / HTTP/1.1\r\nHost: {authority}\r\n\r\n").unwrap();
         let mut response = String::new();
         let result = stream.read_to_string(&mut response);
-        fs::write(&done, "done").unwrap();
+        drop(test_end);
         unsafe {
             libc::kill(child.id() as i32, libc::SIGINT);
         }
         child.wait().unwrap();
+        report.unwrap();
+        assert_eq!(started, "started\n");
         result.unwrap();
         assert!(response.starts_with("HTTP/1.1 200"));
     }
@@ -390,24 +408,7 @@ mod pty {
             unsafe {
                 libc::kill(child.id() as i32, libc::SIGTSTP);
             }
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let stopped = loop {
-                let mut status = 0;
-                let pid = unsafe {
-                    libc::waitpid(
-                        child.id() as i32,
-                        &mut status,
-                        libc::WNOHANG | libc::WUNTRACED,
-                    )
-                };
-                if pid > 0 {
-                    break libc::WIFSTOPPED(status);
-                }
-                if Instant::now() > deadline {
-                    break false;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            };
+            let stopped = job::stops(child.id(), Duration::from_secs(5));
             unsafe {
                 libc::kill(child.id() as i32, libc::SIGCONT);
                 libc::kill(child.id() as i32, libc::SIGINT);
@@ -433,22 +434,10 @@ mod pty {
         term.read_until(b"\x1b[?2004h");
         term.master.as_mut().unwrap().write_all(b"\x1a").unwrap();
         term.read_until(b"\x1b[?1049l");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let mut status = 0;
-            let pid = unsafe {
-                libc::waitpid(
-                    term.child.id() as i32,
-                    &mut status,
-                    libc::WNOHANG | libc::WUNTRACED,
-                )
-            };
-            if pid > 0 && libc::WIFSTOPPED(status) {
-                break;
-            }
-            assert!(Instant::now() < deadline, "board did not suspend");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        assert!(
+            job::stops(term.child.id(), Duration::from_secs(5)),
+            "board did not suspend"
+        );
         unsafe {
             libc::kill(term.child.id() as i32, libc::SIGCONT);
         }
@@ -484,19 +473,12 @@ fn closed_tail_output_exits_successfully() {
     reader.join().unwrap();
     let mut f = fs::OpenOptions::new().append(true).open(path).unwrap();
     writeln!(f,"{}",json!({"type":"user","sessionId":"root-one","timestamp":chrono::Utc::now().to_rfc3339(),"message":{"content":"next"}})).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(status.success());
-            break;
-        }
-        if Instant::now() > deadline {
-            child.kill().unwrap();
-            let _ = child.wait();
-            panic!("tail did not stop on closed output")
-        }
-        std::thread::sleep(Duration::from_millis(10));
+    if !exit::wait(child.id(), Duration::from_secs(5)).unwrap() {
+        child.kill().unwrap();
+        let _ = child.wait();
+        panic!("tail did not stop on closed output")
     }
+    assert!(child.wait().unwrap().success());
 }
 
 #[test]
@@ -511,22 +493,15 @@ fn closed_output_before_ready_exits_successfully() {
         .spawn()
         .unwrap();
     drop(child.stdout.take());
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(status.success());
-            break;
-        }
-        if Instant::now() > deadline {
-            child.kill().unwrap();
-            let output = child.wait_with_output().unwrap();
-            panic!(
-                "tail did not stop before ready: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )
-        }
-        std::thread::sleep(Duration::from_millis(10));
+    if !exit::wait(child.id(), Duration::from_secs(5)).unwrap() {
+        child.kill().unwrap();
+        let output = child.wait_with_output().unwrap();
+        panic!(
+            "tail did not stop before ready: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
     }
+    assert!(child.wait().unwrap().success());
 }
 
 #[cfg(windows)]

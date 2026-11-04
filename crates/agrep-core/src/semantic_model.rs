@@ -580,14 +580,9 @@ impl Embedder {
                 serde_json::json!({"semantic_load":{"verify_ms":verified_ms,"tokenizer_ms":tokenizer_ms,"weights_ms":weights_ms,"total_ms":load_start.elapsed().as_secs_f64()*1000.}})
             );
         }
-        // Amortize matmuls in the bounded CPU pool and persistent Metal arena.
-        // The tensor fallback keeps its smaller Metal working set; the
+        // Amortize matmuls in the bounded CPU pool and persistent Metal arena; the
         // attention cap independently bounds long-row work.
-        let token_budget = if device.is_metal() && !model.uses_arena() {
-            1024
-        } else {
-            16384
-        };
+        let token_budget = 16384;
         let attention_budget = if device.is_metal() {
             8 * 1024 * 1024
         } else {
@@ -646,10 +641,7 @@ impl Embedder {
         Ok(self)
     }
     pub fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        if self.device.is_cpu()
-            && texts.len() >= 32
-            && std::env::var("AGREP_SEM_PARALLEL_BATCHES").map_or(true, |v| v == "1")
-        {
+        if self.device.is_cpu() && texts.len() >= 32 {
             // Both streams use the same bounded Rayon pool. While one reaches
             // a serial operation, the other can occupy an otherwise idle core.
             // Stripe rows so a length-ordered source cannot leave one stream

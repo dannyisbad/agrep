@@ -43,8 +43,8 @@ struct Workspace {
     generation: usize,
     buffers: Vec<View>,
     lengths: Arc<Buffer>,
-    global_mask: Option<Arc<Buffer>>,
-    local_mask: Option<Arc<Buffer>>,
+    global_mask: Arc<Buffer>,
+    local_mask: Arc<Buffer>,
 }
 pub(crate) struct Arena {
     device: MetalDevice,
@@ -62,7 +62,6 @@ pub(crate) struct Arena {
     norm_kernel: ComputePipeline,
     geglu: ComputePipeline,
     masks: ComputePipeline,
-    sdpa: bool,
     workspace: Option<Workspace>,
 }
 impl Arena {
@@ -116,7 +115,6 @@ impl Arena {
             norm_kernel: pipeline("residual_norm")?,
             geglu: pipeline("semantic_geglu")?,
             masks: pipeline("attention_masks")?,
-            sdpa: std::env::var("AGREP_SEM_ARENA").unwrap_or_else(|_| "2".into()) == "2",
             workspace: None,
         })
     }
@@ -155,22 +153,14 @@ impl Arena {
         let lengths = self
             .device
             .new_buffer(capacity, DType::U32, "semantic-lengths")?;
-        let (global_mask, local_mask) = if self.sdpa {
-            (
-                Some(
-                    self.device
-                        .new_private_buffer(capacity, DType::F16, "global-mask")?,
-                ),
-                Some(
-                    self.device
-                        .new_private_buffer(capacity * 1024, DType::F16, "local-mask")?,
-                ),
-            )
-        } else {
-            (None, None)
-        };
+        let global_mask = self
+            .device
+            .new_private_buffer(capacity, DType::F16, "global-mask")?;
+        let local_mask =
+            self.device
+                .new_private_buffer(capacity * 1024, DType::F16, "local-mask")?;
         crate::semantic_profile::event(
-            serde_json::json!({"arena_reserve":{"generation":generation,"tokens":capacity,"scratch_buffers":buffers.len()+1,"mask_buffers":if self.sdpa{2}else{0},"requested_bytes":capacity*(widths.iter().sum::<usize>()*2+4+if self.sdpa{2*(1024+1)}else{0})}}),
+            serde_json::json!({"arena_reserve":{"generation":generation,"tokens":capacity,"scratch_buffers":buffers.len()+1,"mask_buffers":2,"requested_bytes":capacity*(widths.iter().sum::<usize>()*2+4+2*(1024+1))}}),
         );
         self.workspace = Some(Workspace {
             capacity,
@@ -300,13 +290,13 @@ impl Arena {
             seq as u32,
             (self.hidden / self.heads) as u32,
         ];
-        if self.sdpa && seq > 8 {
+        if seq > 8 {
             stage(&self.kind, "attention_masks", || -> Result<()> {
                 let encoder = self.device.command_encoder()?;
                 encoder.set_compute_pipeline_state(&self.masks);
                 encoder.set_buffer(0, Some(&workspace.lengths), 0);
-                encoder.set_buffer(1, workspace.global_mask.as_deref(), 0);
-                encoder.set_buffer(2, workspace.local_mask.as_deref(), 0);
+                encoder.set_buffer(1, Some(&workspace.global_mask), 0);
+                encoder.set_buffer(2, Some(&workspace.local_mask), 0);
                 encoder.set_bytes(3, &(seq as u32));
                 encoder.set_bytes(4, &(batch as u32));
                 encoder.set_bytes(
@@ -367,7 +357,7 @@ impl Arena {
                 Ok(())
             })?;
             stage(&self.kind, "attention", || -> Result<()> {
-                if self.sdpa && seq > 8 {
+                if seq > 8 {
                     let d = self.hidden / self.heads;
                     let dims = [batch, self.heads, seq, d];
                     let qs = [self.heads * seq * d, seq * d, d, 1];
@@ -378,10 +368,10 @@ impl Arena {
                     } else {
                         [seq, 0, 0, 1]
                     };
-                    let mask = if layer.radius.is_some() {
-                        workspace.local_mask.as_ref()
+                    let mask: &Buffer = if layer.radius.is_some() {
+                        &workspace.local_mask
                     } else {
-                        workspace.global_mask.as_ref()
+                        &workspace.global_mask
                     };
                     let encoder = self.device.command_encoder()?;
                     return candle_metal_kernels::call_sdpa_full(
@@ -400,7 +390,7 @@ impl Arena {
                         &qkv.buffer,
                         &vs,
                         Some(candle_metal_kernels::SdpaDType::F16),
-                        mask.map(AsRef::as_ref),
+                        Some(mask),
                         Some(&ms),
                         &context.buffer,
                         &os,
@@ -500,7 +490,7 @@ impl Arena {
             })?;
         }
         crate::semantic_profile::event(
-            serde_json::json!({"arena_batch":{"rows":batch,"tokens":rows,"workspace_generation":workspace.generation,"reserved_tokens":workspace.capacity,"sdpa":self.sdpa,"synchronized_profile":crate::semantic_profile::enabled()}}),
+            serde_json::json!({"arena_batch":{"rows":batch,"tokens":rows,"workspace_generation":workspace.generation,"reserved_tokens":workspace.capacity,"synchronized_profile":crate::semantic_profile::enabled()}}),
         );
         // Exactly one output conversion/readback after the complete batch.
         let tensor = Tensor::from_storage(

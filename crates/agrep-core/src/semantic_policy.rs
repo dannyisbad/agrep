@@ -26,49 +26,53 @@ fn wordlike(letters: &str) -> bool {
         .count();
     common as f64 / pairs.len() as f64 >= 0.25
 }
-fn identifier(q: &str) -> bool {
+fn obvious_identifier(q: &str) -> bool {
     static IDENT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"[/\\:@_]|[A-Z][a-z]+[A-Z]|[a-z][A-Z]|^(?:0x)?[0-9a-fA-F]{8,}$|^[A-Za-z0-9_.-]+\.[A-Za-z][A-Za-z0-9]{1,7}$|^[vV]\d+(?:\.\d+){1,3}(?:[-+][0-9A-Za-z.-]+)?$").unwrap()
     });
-    IDENT.is_match(q)
-        || (q.len() >= 4 && q == q.to_uppercase())
-        || (q.len() >= 24
-            && !q
-                .chars()
-                .all(|c| c.is_ascii_alphabetic() || "'-".contains(c)))
+    IDENT.is_match(q) || (q.len() >= 4 && q == q.to_uppercase())
 }
-fn policy(q: &str) -> bool {
-    let q = q.trim();
-    if q.is_empty()
-        || q.chars().any(|c| c.is_control())
-        || !q.chars().any(|c| c.is_ascii_alphabetic())
-    {
-        return false;
-    }
-    if q.split_whitespace().count() != 1 {
-        return true;
-    }
-    let letters: String = q.chars().filter(char::is_ascii_alphabetic).collect();
-    if identifier(q) {
-        return false;
-    }
-    if letters.len() >= 7
-        && !letters
-            .to_lowercase()
-            .contains(['a', 'e', 'i', 'o', 'u', 'y'])
-    {
-        return false;
-    }
-    if !wordlike(&letters) {
-        return false;
-    }
-    !(q.len() >= 24
+fn long_token(q: &str) -> bool {
+    q.len() >= 24
         && !q
             .chars()
-            .all(|c| c.is_ascii_alphabetic() || "'-".contains(c)))
+            .all(|c| c.is_ascii_alphabetic() || "'-".contains(c))
 }
-pub fn allowed(query: &str) -> bool {
-    policy(query)
+fn identifier(q: &str) -> bool {
+    obvious_identifier(q) || long_token(q)
+}
+/// 0.4.9's `semantic_query_policy` (py/search.py:358-405): why a query is no request for
+/// meaning search, in its order of checks, or `None` when it is one.
+pub fn rejection(query: &str) -> Option<&'static str> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Some("empty-query");
+    }
+    if q.chars().any(|c| c.is_control()) {
+        return Some("control-characters");
+    }
+    if !q.chars().any(|c| c.is_ascii_alphabetic()) {
+        return Some("non-language-query");
+    }
+    if q.split_whitespace().count() != 1 {
+        return None;
+    }
+    let letters: String = q.chars().filter(char::is_ascii_alphabetic).collect();
+    if obvious_identifier(q) {
+        return Some("identifier-query");
+    }
+    if letters.len() >= 7
+        && (!letters
+            .to_lowercase()
+            .contains(['a', 'e', 'i', 'o', 'u', 'y'])
+            || !wordlike(&letters))
+    {
+        return Some("gibberish-query");
+    }
+    long_token(q).then_some("identifier-query")
+}
+fn policy(q: &str) -> bool {
+    rejection(q).is_none()
 }
 pub fn eligible(query: &str) -> bool {
     if !policy(query) {
@@ -135,6 +139,33 @@ mod tests {
             "connection\nreset",
         ] {
             assert!(!eligible(q), "{q}");
+        }
+    }
+    #[test]
+    fn rejection_reasons_match_0_4_9() {
+        // py/search.py:358-405 `semantic_query_policy(q)["reason"]` for each query.
+        for (q, reason) in [
+            ("", Some("empty-query")),
+            ("   ", Some("empty-query")),
+            ("a\x07b", Some("control-characters")),
+            ("1234 5678", Some("non-language-query")),
+            ("foo_bar", Some("identifier-query")),
+            ("foo/bar.rs", Some("identifier-query")),
+            ("deadbeef", Some("identifier-query")),
+            ("v1.2.3", Some("identifier-query")),
+            ("HTTPS", Some("identifier-query")),
+            ("server.yaml", Some("identifier-query")),
+            ("getUserName", Some("identifier-query")),
+            ("bcdfghjklm", Some("gibberish-query")),
+            ("qwertyuiop", Some("gibberish-query")),
+            ("abcdefghij", Some("gibberish-query")),
+            ("bcdfghjklmnpqrstvwxz1234", Some("gibberish-query")),
+            ("aaaaaaaaaaaaaaaaaaaaaaa1", Some("identifier-query")),
+            ("migration", None),
+            ("database migration failure", None),
+        ] {
+            assert_eq!(rejection(q), reason, "{q:?}");
+            assert_eq!(policy(q), reason.is_none(), "{q:?}");
         }
     }
     #[test]

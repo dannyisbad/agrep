@@ -90,6 +90,7 @@ fn board(a: crate::Board) -> Result<i32> {
         if let Some(code) = screen.signal(&signals)? {
             return Ok(code);
         }
+        // Key waits time out every 30 ms to pick up signals and new watcher snapshots.
         let key = screen.key(Duration::from_millis(30))?;
         let changed = watcher.snapshot_if_changed(&mut generation, &mut snap);
         if !changed && key.is_none() {

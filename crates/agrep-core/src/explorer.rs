@@ -266,13 +266,46 @@ impl Explorer {
                     });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(20))
+                    // Signal handlers only set a flag, so the wait wakes every 20 ms to check it.
+                    wait_for_connection(&self.listener, Duration::from_millis(20))?
                 }
                 Err(e) => return Err(e.into()),
             }
         }
         Ok(())
     }
+}
+/// Waits up to `limit` for a connection to arrive at `listener`.
+#[cfg(unix)]
+fn wait_for_connection(listener: &TcpListener, limit: Duration) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut poll = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    if unsafe { libc::poll(&mut poll, 1, limit.as_millis() as libc::c_int) } < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+/// Waits up to `limit` for a connection to arrive at `listener`.
+#[cfg(windows)]
+fn wait_for_connection(listener: &TcpListener, limit: Duration) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{WSAPoll, POLLRDNORM, WSAPOLLFD};
+    let mut poll = WSAPOLLFD {
+        fd: listener.as_raw_socket() as usize,
+        events: POLLRDNORM,
+        revents: 0,
+    };
+    if unsafe { WSAPoll(&mut poll, 1, limit.as_millis() as i32) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 impl State {
     fn connection(&self, stream: TcpStream) -> Result<()> {
@@ -499,6 +532,7 @@ impl State {
                     filters: Filters::default(),
                 };
                 let mut fallback = None;
+                let mut coverage = None;
                 let config = self.root.config()?;
                 let use_semantic = mode == "semantic"
                     || (sort == "score"
@@ -517,6 +551,11 @@ impl State {
                                 &mut found.result.hits,
                                 !keyword.hits.is_empty(),
                             )?;
+                            // Semantic mode always names its coverage, as 0.4.9's explorer
+                            // did; automatic hybrid only a gap the CLI would also name.
+                            if mode == "semantic" || found.coverage.gap() {
+                                coverage = Some(found.coverage);
+                            }
                             if mode == "semantic" {
                                 found.result
                             } else {
@@ -534,7 +573,7 @@ impl State {
                 };
                 Ok(Response::json(
                     200,
-                    json!({"query":q,"mode":mode,"sort":sort,"engine":if result.hits.iter().any(|h| h.matched=="semantic"){"keyword+semantic"}else{"keyword"},"notice":fallback,"freshness":crate::render::freshness(pending.is_some(),pending.unwrap_or(0)),"total":result.total,"totals_exact":result.total_basis=="exact","hits":result.hits}),
+                    json!({"query":q,"mode":mode,"sort":sort,"engine":if result.hits.iter().any(|h| h.matched=="semantic"){"keyword+semantic"}else{"keyword"},"notice":fallback,"semantic":coverage,"freshness":crate::render::freshness(pending.is_some(),pending.unwrap_or(0)),"total":result.total,"totals_exact":result.total_basis=="exact","hits":result.hits}),
                 ))
             }
             _ => Ok(Response::error(404, "not found")),
@@ -647,6 +686,37 @@ mod tests {
         worker.join().unwrap();
         assert!(body.starts_with("HTTP/1.1 200"));
         assert!(body.contains("\"messages\":1"));
+    }
+    #[test]
+    fn search_names_partial_semantic_coverage() {
+        let t = tempfile::tempdir().unwrap();
+        let root = DataRoot::open(t.path().join("data"), true).unwrap();
+        let c = store::writer(&root).unwrap();
+        crate::semantic::initialize(&root).unwrap();
+        c.execute_batch("INSERT INTO sessions VALUES('pi','session-one','demo','/work/demo','','session-one',0,'Title',1,100);INSERT INTO prose(source,agent,session,project,turn,who,model,model_source,ts,text,digest,extra,position,visible) VALUES(1,'pi','session-one','demo',0,'user','model','',1,'database migration failure','x','',0,1);").unwrap();
+        // With no row embedded the lane loads no weights, so files of the right sizes
+        // stand in for an installed model.
+        let model = crate::semantic_model::directory(&root);
+        std::fs::create_dir_all(&model).unwrap();
+        for (name, size, _) in crate::semantic_model::FILES {
+            std::fs::File::create(model.join(name))
+                .unwrap()
+                .set_len(size)
+                .unwrap();
+        }
+        let server = Explorer::bind(root, 0).unwrap();
+        let s = &server.state;
+        let headers = format!("Authorization: Bearer {}\r\n", s.auth);
+        for mode in ["semantic", "keyword"] {
+            let path = format!("/api/search?q=database+migration+failure&mode={mode}");
+            let r = s.route(&req(server.port(), "GET", &path, &headers));
+            assert_eq!(r.code, 200, "{mode}");
+            let body: Value = serde_json::from_slice(&r.body).unwrap();
+            let semantic = &body["semantic"];
+            assert_eq!(semantic["indexed"], 0, "{mode}: {body}");
+            assert_eq!(semantic["total"], 1, "{mode}");
+            assert_eq!(semantic["complete"], false, "{mode}");
+        }
     }
     #[test]
     fn query_decoder_and_duplicate_headers() {

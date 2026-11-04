@@ -223,7 +223,32 @@ fn install_file(path: PathBuf, bytes: &[u8], previous: &[Installed]) -> Result<I
         directories,
     })
 }
-// Replace only the top-level hooks value. Other user JSON stays byte-for-byte.
+/// 0.4.9's spaced one-line separators (`, ` and `: `), which serde_json's compact
+/// formatter lacks.
+struct Spaced;
+impl serde_json::ser::Formatter for Spaced {
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        w.write_all(if first { b"" } else { b", " })
+    }
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        w.write_all(if first { b"" } else { b", " })
+    }
+    fn begin_object_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        w.write_all(b": ")
+    }
+}
+// Replace only the top-level hooks value. Other user JSON stays byte-for-byte; the hooks
+// take the file's style as 0.4.9's `_render_settings` read it (py/hookinstall.py:325-342):
+// its indentation and line endings, spaced separators on one line when it has `": `, and
+// `\u` escapes when it holds one.
 fn render_json(value: &Value, old: &[u8]) -> Result<Vec<u8>> {
     use serde::Serialize;
     let raw = std::str::from_utf8(old)?;
@@ -247,17 +272,43 @@ fn render_json(value: &Value, old: &[u8]) -> Result<Vec<u8>> {
                 .then_some(&line[..line.len() - trimmed.len()])
         })
         .unwrap_or("  ");
+    let one_line = !raw.contains('\n');
+    let spaced = !one_line || raw.contains("\": ");
     let render = |hooks: &Value| -> Result<String> {
-        if !raw.contains('\n') {
-            return Ok(serde_json::to_string(hooks)?);
-        }
         let mut bytes = Vec::new();
-        let mut serializer = serde_json::Serializer::with_formatter(
-            &mut bytes,
-            serde_json::ser::PrettyFormatter::with_indent(indent.as_bytes()),
-        );
-        hooks.serialize(&mut serializer)?;
-        Ok(String::from_utf8(bytes)?.replace('\n', &format!("{eol}{indent}")))
+        if one_line && spaced {
+            hooks.serialize(&mut serde_json::Serializer::with_formatter(
+                &mut bytes, Spaced,
+            ))?;
+        } else if one_line {
+            hooks.serialize(&mut serde_json::Serializer::new(&mut bytes))?;
+        } else {
+            hooks.serialize(&mut serde_json::Serializer::with_formatter(
+                &mut bytes,
+                serde_json::ser::PrettyFormatter::with_indent(indent.as_bytes()),
+            ))?;
+        }
+        let mut text = String::from_utf8(bytes)?;
+        if raw.contains("\\u") {
+            text = text
+                .chars()
+                .map(|c| {
+                    if c.is_ascii() {
+                        c.to_string()
+                    } else {
+                        c.encode_utf16(&mut [0; 2])
+                            .iter()
+                            .map(|unit| format!("\\u{unit:04x}"))
+                            .collect()
+                    }
+                })
+                .collect();
+        }
+        Ok(if one_line {
+            text
+        } else {
+            text.replace('\n', &format!("{eol}{indent}"))
+        })
     };
     let mut result = raw.to_owned();
     match (fields.get("hooks"), value.get("hooks")) {
@@ -285,16 +336,19 @@ fn render_json(value: &Value, old: &[u8]) -> Result<Vec<u8>> {
         (None, Some(hooks)) => {
             let last = fields.values().map(|v| span(v).end).max();
             let start = last.unwrap_or_else(|| raw.find('{').unwrap() + 1);
-            let gap = if raw.contains('\n') {
+            let gap = if !one_line {
                 format!("{eol}{indent}")
+            } else if spaced && last.is_some() {
+                " ".into()
             } else {
                 String::new()
             };
             result.insert_str(
                 start,
                 &format!(
-                    "{}{gap}\"hooks\": {}",
+                    "{}{gap}\"hooks\"{}{}",
                     if last.is_some() { "," } else { "" },
+                    if spaced { ": " } else { ":" },
                     render(hooks)?
                 ),
             );
@@ -670,4 +724,33 @@ pub fn repair(root: &DataRoot) -> Result<Vec<String>> {
         }
     }
     Ok(errors)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Each expectation is what 0.4.9's `_render_settings` wrote for the same file and value.
+    #[test]
+    fn hooks_take_the_files_separators_and_escapes() {
+        let hooks = json!({"Stop": [{"command": "café"}]});
+        for (old, want) in [
+            (
+                r#"{"model": "opus"}"#,
+                r#"{"model": "opus", "hooks": {"Stop": [{"command": "café"}]}}"#,
+            ),
+            (
+                r#"{"model":"opus"}"#,
+                r#"{"model":"opus","hooks":{"Stop":[{"command":"café"}]}}"#,
+            ),
+            (
+                "{\n  \"a\": \"\\u00e9\"\n}\n",
+                "{\n  \"a\": \"\\u00e9\",\n  \"hooks\": {\n    \"Stop\": [\n      {\n        \"command\": \"caf\\u00e9\"\n      }\n    ]\n  }\n}\n",
+            ),
+        ] {
+            let mut value: Value = serde_json::from_str(old).unwrap();
+            value["hooks"] = hooks.clone();
+            let rendered = render_json(&value, old.as_bytes()).unwrap();
+            assert_eq!(String::from_utf8(rendered).unwrap(), want);
+        }
+    }
 }

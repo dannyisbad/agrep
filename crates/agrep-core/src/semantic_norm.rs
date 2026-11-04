@@ -1,35 +1,8 @@
 //! Residual addition and normalization share one pass; both outputs stay live.
-use candle_core::{CpuStorage, CustomOp3, Device, Layout, Result, Shape, Tensor};
-use std::sync::Arc;
+use candle_core::{CpuStorage, CustomOp3, Layout, Result, Shape, Tensor};
 
-pub(crate) struct Kernel {
-    #[cfg(target_os = "macos")]
-    pipeline: candle_metal_kernels::metal::ComputePipeline,
-}
-impl Kernel {
-    pub(crate) fn new(device: &Device) -> Result<Option<Arc<Self>>> {
-        #[cfg(target_os = "macos")]
-        if let Device::Metal(device) = device {
-            let library = device
-                .device()
-                .new_library_with_source(include_str!("semantic_norm.metal"), None)
-                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-            let function = library
-                .get_function("residual_norm", None)
-                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-            let pipeline = device
-                .device()
-                .new_compute_pipeline_state_with_function(&function)
-                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-            return Ok(Some(Arc::new(Self { pipeline })));
-        }
-        let _ = device;
-        Ok(None)
-    }
-}
-struct Op<'a> {
+struct Op {
     eps: f32,
-    kernel: Option<&'a Kernel>,
 }
 fn contiguous<'a>(s: &'a CpuStorage, l: &Layout) -> Result<&'a [f32]> {
     let CpuStorage::F32(s) = s else {
@@ -45,7 +18,7 @@ fn shape(l: &Layout) -> Shape {
     dims.extend(l.dims());
     Shape::from(dims)
 }
-impl CustomOp3 for Op<'_> {
+impl CustomOp3 for Op {
     fn name(&self) -> &'static str {
         "semantic-residual-norm"
     }
@@ -59,7 +32,6 @@ impl CustomOp3 for Op<'_> {
         wl: &Layout,
     ) -> Result<(CpuStorage, Shape)> {
         use rayon::prelude::*;
-        let _ = self.kernel;
         let x = contiguous(x, xl)?;
         let r = contiguous(r, rl)?;
         let w = contiguous(w, wl)?;
@@ -100,82 +72,31 @@ impl CustomOp3 for Op<'_> {
         }
         Ok((CpuStorage::F32(out), shape(xl)))
     }
-    #[cfg(target_os = "macos")]
-    fn metal_fwd(
-        &self,
-        x: &candle_core::MetalStorage,
-        xl: &Layout,
-        r: &candle_core::MetalStorage,
-        rl: &Layout,
-        w: &candle_core::MetalStorage,
-        wl: &Layout,
-    ) -> Result<(candle_core::MetalStorage, Shape)> {
-        use candle_core::{backend::BackendStorage, DType, MetalStorage};
-        use objc2_metal::MTLSize;
-        let kernel = self
-            .kernel
-            .ok_or_else(|| candle_core::Error::Msg("missing residual norm pipeline".into()))?;
-        if [x, r, w].iter().any(|s| s.dtype() != DType::F16)
-            || xl.dims() != rl.dims()
-            || xl.dims().last() != wl.dims().last()
-        {
-            candle_core::bail!("residual norm requires matching F16 tensors")
-        }
-        let count = xl.shape().elem_count();
-        let width = *xl.dims().last().unwrap();
-        let device = x.device();
-        let out = device.new_buffer(count * 2, DType::F16, "residual-norm")?;
-        let encoder = device.command_encoder()?;
-        encoder.set_compute_pipeline_state(&kernel.pipeline);
-        for (i, s, l) in [(0, x, xl), (1, r, rl), (2, w, wl)] {
-            let (offset, _) = l.contiguous_offsets().ok_or_else(|| {
-                candle_core::Error::Msg("residual norm requires contiguous input".into())
-            })?;
-            encoder.set_buffer(i, Some(s.buffer()), offset * 2);
-        }
-        encoder.set_buffer(3, Some(&out), 0);
-        encoder.set_bytes(4, &width);
-        encoder.set_bytes(5, &count);
-        encoder.set_bytes(6, &self.eps);
-        encoder.dispatch_thread_groups(
-            MTLSize {
-                width: count / width,
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width: 128,
-                height: 1,
-                depth: 1,
-            },
-        );
-        Ok((
-            MetalStorage::new(out, device.clone(), count * 2, DType::F16),
-            shape(xl),
-        ))
-    }
 }
 pub(crate) fn forward(
     x: &Tensor,
     residual: &Tensor,
     weight: &Tensor,
     eps: f32,
-    kernel: Option<&Kernel>,
 ) -> Result<(Tensor, Tensor)> {
-    let pair = x.apply_op3_no_bwd(residual, weight, &Op { eps, kernel })?;
+    let pair = x.apply_op3_no_bwd(residual, weight, &Op { eps })?;
     Ok((pair.get(0)?, pair.get(1)?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn compare(device: Device, tolerance: f32) {
+    use candle_core::Device;
+    fn compare(
+        device: Device,
+        tolerance: f32,
+        run: impl Fn(&Tensor, &Tensor, &Tensor) -> Result<(Tensor, Tensor)>,
+    ) {
         let dtype = if device.is_cpu() {
             candle_core::DType::F32
         } else {
             candle_core::DType::F16
         };
-        let kernel = Kernel::new(&device).unwrap();
         for rows in [3, 128] {
             let x = Tensor::from_vec(
                 (0..rows * 384)
@@ -192,7 +113,7 @@ mod tests {
             let zero = w.zeros_like().unwrap();
             let expected = (&x + &r).unwrap();
             let normalized = candle_nn::ops::layer_norm(&expected, &w, &zero, 1e-5).unwrap();
-            let (actual, norm) = forward(&x, &r, &w, 1e-5, kernel.as_deref()).unwrap();
+            let (actual, norm) = run(&x, &r, &w).unwrap();
             for (a, b) in [(actual, expected), (norm, normalized)] {
                 let values = |x: Tensor| {
                     x.flatten_all()
@@ -210,7 +131,80 @@ mod tests {
     }
     #[test]
     fn residual_norm_matches_cpu() {
-        compare(Device::Cpu, 1e-6)
+        compare(Device::Cpu, 1e-6, |x, r, w| forward(x, r, w, 1e-5))
+    }
+    /// The arena's `residual_norm` shader, dispatched on Candle tensors.
+    #[cfg(target_os = "macos")]
+    struct Metal<'a> {
+        pipeline: &'a candle_metal_kernels::metal::ComputePipeline,
+        eps: f32,
+    }
+    #[cfg(target_os = "macos")]
+    impl CustomOp3 for Metal<'_> {
+        fn name(&self) -> &'static str {
+            "semantic-residual-norm-metal"
+        }
+        fn cpu_fwd(
+            &self,
+            _: &CpuStorage,
+            _: &Layout,
+            _: &CpuStorage,
+            _: &Layout,
+            _: &CpuStorage,
+            _: &Layout,
+        ) -> Result<(CpuStorage, Shape)> {
+            candle_core::bail!("the residual norm shader runs on Metal")
+        }
+        fn metal_fwd(
+            &self,
+            x: &candle_core::MetalStorage,
+            xl: &Layout,
+            r: &candle_core::MetalStorage,
+            rl: &Layout,
+            w: &candle_core::MetalStorage,
+            wl: &Layout,
+        ) -> Result<(candle_core::MetalStorage, Shape)> {
+            use candle_core::{backend::BackendStorage, DType, MetalStorage};
+            use objc2_metal::MTLSize;
+            if [x, r, w].iter().any(|s| s.dtype() != DType::F16)
+                || xl.dims() != rl.dims()
+                || xl.dims().last() != wl.dims().last()
+            {
+                candle_core::bail!("residual norm requires matching F16 tensors")
+            }
+            let count = xl.shape().elem_count();
+            let width = *xl.dims().last().unwrap();
+            let device = x.device();
+            let out = device.new_buffer(count * 2, DType::F16, "residual-norm")?;
+            let encoder = device.command_encoder()?;
+            encoder.set_compute_pipeline_state(self.pipeline);
+            for (i, s, l) in [(0, x, xl), (1, r, rl), (2, w, wl)] {
+                let (offset, _) = l.contiguous_offsets().ok_or_else(|| {
+                    candle_core::Error::Msg("residual norm requires contiguous input".into())
+                })?;
+                encoder.set_buffer(i, Some(s.buffer()), offset * 2);
+            }
+            encoder.set_buffer(3, Some(&out), 0);
+            encoder.set_bytes(4, &width);
+            encoder.set_bytes(5, &count);
+            encoder.set_bytes(6, &self.eps);
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: count / width,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 128,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            Ok((
+                MetalStorage::new(out, device.clone(), count * 2, DType::F16),
+                shape(xl),
+            ))
+        }
     }
     #[test]
     #[cfg(target_os = "macos")]
@@ -219,10 +213,24 @@ mod tests {
             return;
         };
         use objc2_metal::MTLDevice;
-        eprintln!(
-            "Metal GPU: {}",
-            device.as_metal_device().unwrap().device().as_ref().name()
-        );
-        compare(device, 0.004)
+        let metal = device.as_metal_device().unwrap();
+        eprintln!("Metal GPU: {}", metal.device().as_ref().name());
+        let library = metal
+            .device()
+            .new_library_with_source(include_str!("semantic_norm.metal"), None)
+            .unwrap();
+        let function = library.get_function("residual_norm", None).unwrap();
+        let pipeline = metal
+            .device()
+            .new_compute_pipeline_state_with_function(&function)
+            .unwrap();
+        compare(device, 0.004, |x, r, w| {
+            let op = Metal {
+                pipeline: &pipeline,
+                eps: 1e-5,
+            };
+            let pair = x.apply_op3_no_bwd(r, w, &op)?;
+            Ok((pair.get(0)?, pair.get(1)?))
+        })
     }
 }

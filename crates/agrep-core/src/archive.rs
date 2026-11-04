@@ -41,6 +41,8 @@ pub struct Stats {
     pub full: usize,
     pub bytes_stored: u64,
     pub failures: Vec<String>,
+    /// One line per source captured, appended or failed, in pass order.
+    pub log: Vec<String>,
 }
 #[derive(Debug, Clone)]
 pub struct Source {
@@ -93,13 +95,14 @@ impl Archive {
             .create(true)
             .truncate(false)
             .open(dir.join("archive.lock"))?;
-        if blocking {
-            lock.lock()?;
-        } else if let Err(e) = lock.try_lock() {
-            if matches!(e, std::fs::TryLockError::WouldBlock) {
-                return Ok(None);
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) if blocking => {
+                crate::semantic_profile::event(serde_json::json!({"wait": "archive.lock"}));
+                lock.lock()?;
             }
-            return Err(e.into());
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(e) => return Err(e.into()),
         }
         let db = Connection::open(dir.join("catalog.db"))?;
         let version: u32 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -310,11 +313,18 @@ fn open_source(path: &Path) -> Result<File> {
     Ok(file)
 }
 fn copy_database(backup: &rusqlite::backup::Backup<'_, '_>, blocking: bool) -> Result<()> {
+    let mut waiting = false;
     loop {
         match backup.step(-1)? {
             rusqlite::backup::StepResult::Done => return Ok(()),
             rusqlite::backup::StepResult::More => continue,
-            _ if blocking => std::thread::sleep(Duration::from_millis(10)),
+            // SQLite file locks give no wake-up on release, so another process's lock is polled.
+            _ if blocking => {
+                if !std::mem::replace(&mut waiting, true) {
+                    crate::semantic_profile::event(serde_json::json!({"wait": "sqlite"}));
+                }
+                std::thread::sleep(Duration::from_millis(10))
+            }
             _ => bail!("could not snapshot SQLite source"),
         }
     }
@@ -404,7 +414,6 @@ fn capture_one(
     let mut chunks = Vec::new();
     let mut digest = Sha256::new();
     let mut size = 0;
-    let mut added = 0;
     let mut prefix_matches = !sqlite && previous.is_some();
     loop {
         let mut chunk = vec![0; CHUNK];
@@ -438,9 +447,8 @@ fn capture_one(
         }
         digest.update(&chunk);
         size += n as u64;
-        let (sha, bytes) = archive.store(&chunk)?;
+        let (sha, _) = archive.store(&chunk)?;
         chunks.push(sha);
-        added += bytes;
     }
     if !sqlite
         && (safe_fs::identity(&file.metadata()?) != before
@@ -484,12 +492,31 @@ fn capture_one(
         tx.execute("INSERT INTO chunks VALUES(?,?,?)", params![id, i, sha])?;
     }
     tx.commit()?;
-    if prefix_matches && previous.is_some_and(|(_, old, _)| size > old) {
+    // 0.4.9 counted an append's new suffix and a full capture's whole file as new content.
+    let grown = previous
+        .as_ref()
+        .filter(|(_, old, _)| prefix_matches && size > *old)
+        .map(|(_, old, _)| *old);
+    if let Some(old) = grown {
         stats.appended += 1;
+        stats.bytes_stored += size - old;
     } else {
         stats.full += 1;
+        stats.bytes_stored += size;
     }
-    stats.bytes_stored += added;
+    stats.log.push(format!(
+        "{} {} ({size} bytes)",
+        if grown.is_some() {
+            "appended"
+        } else {
+            "captured"
+        },
+        source
+            .path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+    ));
     Ok(())
 }
 
@@ -498,19 +525,13 @@ pub fn capture(root: &DataRoot, scheduled: bool) -> Result<Stats> {
         return Ok(Stats::default());
     };
     let policy = root.config()?.archive;
-    if scheduled {
-        let last: i64 = archive
-            .db
-            .query_row("SELECT value FROM meta WHERE key='last_capture'", [], |r| {
-                r.get(0)
-            })
-            .optional()?
-            .unwrap_or(0);
-        if !policy.enabled || now() - last < INTERVAL_MS {
-            return Ok(Stats::default());
-        }
+    if scheduled
+        && (!policy.enabled || now() - last_capture(&archive.db)?.unwrap_or(0) < INTERVAL_MS)
+    {
+        return Ok(Stats::default());
     }
     let (sources, failures) = discover();
+    let discovery = failures.len();
     let mut stats = Stats {
         files: sources.len(),
         failures,
@@ -518,10 +539,13 @@ pub fn capture(root: &DataRoot, scheduled: bool) -> Result<Stats> {
     };
     for source in sources {
         if let Err(e) = capture_one(&mut archive, &source, &mut stats, scheduled) {
-            stats
-                .failures
-                .push(format!("{}: {e:#}", source.path.display()));
+            let failure = format!("{}: {e:#}", source.path.display());
+            stats.log.push(format!("failed {failure}"));
+            stats.failures.push(failure);
         }
+    }
+    for failure in &stats.failures[..discovery] {
+        stats.log.push(format!("failed {failure}"));
     }
     archive.prune(policy.keep)?;
     archive.db.execute(
@@ -540,6 +564,30 @@ pub fn capture_if_due(root: &DataRoot) -> Result<Option<Stats>> {
         return Ok(None);
     }
     Ok(Some(capture(root, true)?))
+}
+fn last_capture(db: &Connection) -> rusqlite::Result<Option<i64>> {
+    db.query_row("SELECT value FROM meta WHERE key='last_capture'", [], |r| {
+        r.get(0)
+    })
+    .optional()
+}
+/// Whether [`capture_if_due`] would capture now, so that commands start no worker for
+/// nothing. A catalog this cannot read counts as due: the worker's capture then reports
+/// the error where it reports every capture failure, instead of every query failing.
+pub fn due(root: &DataRoot) -> Result<bool> {
+    if !root.config()?.archive.enabled {
+        return Ok(false);
+    }
+    let path = root.path().join("archive/catalog.db");
+    if !path.exists() {
+        return Ok(true);
+    }
+    let last = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .and_then(|db| last_capture(&db));
+    Ok(match last {
+        Ok(last) => now() - last.unwrap_or(0) >= INTERVAL_MS,
+        Err(_) => true,
+    })
 }
 pub fn prune(root: &DataRoot) -> Result<Option<(usize, u64)>> {
     let Some(mut a) = Archive::open(root, true)? else {
@@ -771,7 +819,7 @@ pub fn status(root: &DataRoot) -> Result<serde_json::Value> {
     let path = root.path().join("archive/catalog.db");
     if !path.exists() {
         return Ok(
-            serde_json::json!({"enabled":policy.enabled,"keep":policy.keep,"files":0,"versions":0,"stored_bytes":0,"source_bytes":0,"last_capture":null}),
+            serde_json::json!({"enabled":policy.enabled,"keep":policy.keep,"files":0,"versions":0,"stored_bytes":0,"source_bytes":0,"raw_bytes":0,"last_capture":null}),
         );
     }
     let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -780,22 +828,21 @@ pub fn status(root: &DataRoot) -> Result<serde_json::Value> {
         [],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
-    let mut stored = 0;
-    for entry in fs::read_dir(root.path().join("archive/blobs"))? {
-        let entry = entry?;
-        stored += entry.metadata()?.len();
-    }
-    let last: Option<i64> = db
-        .query_row("SELECT value FROM meta WHERE key='last_capture'", [], |r| {
-            r.get(0)
-        })
-        .optional()?;
+    let latest: u64 = db.query_row(
+        "SELECT coalesce(sum(size),0) FROM versions WHERE id IN (SELECT max(id) FROM versions GROUP BY path)",
+        [],
+        |r| r.get(0),
+    )?;
+    // A capture prunes blobs while this reads them; a blob gone before it is examined is
+    // no longer stored.
+    let (stored, _) = crate::diagnostics::disk_usage(&root.path().join("archive/blobs"))?;
+    let last = last_capture(&db)?;
     let errors: Option<String> = db
         .query_row("SELECT errors FROM health WHERE id=1", [], |r| r.get(0))
         .optional()?;
     let errors: Vec<String> = serde_json::from_str(errors.as_deref().unwrap_or("[]"))?;
     Ok(
-        serde_json::json!({"enabled":policy.enabled,"keep":policy.keep,"files":files,"versions":versions,"stored_bytes":stored,"source_bytes":size,"last_capture":last,"failures":errors}),
+        serde_json::json!({"enabled":policy.enabled,"keep":policy.keep,"files":files,"versions":versions,"stored_bytes":stored,"source_bytes":size,"raw_bytes":latest,"last_capture":last,"failures":errors}),
     )
 }
 
@@ -839,5 +886,35 @@ mod source_open_tests {
         let mut text = String::new();
         file.read_to_string(&mut text).unwrap();
         assert_eq!(text, "fixture");
+    }
+}
+
+#[cfg(test)]
+mod due_tests {
+    use super::*;
+    #[test]
+    fn a_capture_is_due_once_the_archive_is_on_and_the_interval_has_passed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = DataRoot::open(temp.path().join("data"), true).unwrap();
+        assert!(!due(&root).unwrap());
+        let mut config = root.config().unwrap();
+        config.archive.enabled = true;
+        root.save_config(&config).unwrap();
+        assert!(due(&root).unwrap());
+        let archive = Archive::open(&root, true).unwrap().unwrap();
+        assert!(due(&root).unwrap());
+        let captured = |at: i64| {
+            archive
+                .db
+                .execute("INSERT OR REPLACE INTO meta VALUES('last_capture',?)", [at])
+                .unwrap();
+        };
+        captured(now());
+        assert!(!due(&root).unwrap());
+        captured(now() - INTERVAL_MS);
+        assert!(due(&root).unwrap());
+        config.archive.enabled = false;
+        root.save_config(&config).unwrap();
+        assert!(!due(&root).unwrap());
     }
 }

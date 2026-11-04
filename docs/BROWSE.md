@@ -38,13 +38,19 @@ Cline are editor-owned. They receive an explicit unsupported answer. Fresh pi
 launches prefer the spelling requested, with the sibling as a PATH fallback.
 
 `run` and `resume` pass arguments directly to native processes. POSIX launches
-use a private process group, forward termination signals, return the first
-signal's conventional exit code, restore terminal ownership/attributes, and
-terminate remaining descendants. Windows binds the wrapper and descendants to
-a kill-on-close Job Object before spawning. A non-inheritable job handle stays
-open until process exit. No shell is used to assemble an argument string.
+use a private process group. With a terminal on both stdin and stdout the agent
+is lent the terminal's foreground; otherwise it runs in a session of its own, so
+the terminal stays with the caller's pipeline. Launches forward termination
+signals, return the first signal's conventional exit code, restore terminal
+ownership/attributes, and terminate remaining descendants. Windows binds the
+wrapper and descendants to a kill-on-close Job Object before spawning. A
+non-inheritable job handle stays open until process exit. No shell is used to
+assemble an argument string.
 
-`status` is a read-only snapshot, including when no index exists. It reports the
+`status` answers from the committed index without refreshing it inline, and with no
+index it creates neither an index nor the data root. With an index it runs the source
+census as other commands do (`--no-auto` skips it): changed sources are counted in
+`pending_sources` and start the background refresh. It reports the
 format marker, recursive disk bytes without following links, canonical counts,
 refresh timestamp, per-source parse errors, semantic model/coverage/backlog,
 recorded integrations, archive presence, and version. Coverage comes from the
@@ -54,14 +60,23 @@ block and reports missing/drifted enrollment.
 
 `doctor` adds integrity checks, safe explicit refresh, integration setup replay
 on `--fix`, and corrupt-index rebuilding only after terminal confirmation. The
-corrupt database is retained under the same data root. `audit` independently
+corrupt database is retained under the same data root. As in 0.4.9, `doctor`
+exits 0 once its report is complete, whatever it found, 1 when a repair `--fix`
+attempted could not finish (including a corrupt index with no terminal to
+confirm its rebuild), and 2 for invalid options. `audit` independently
 counts visible rows, compares census fingerprints, and `--full` reparses sources
 with the adapters and compares canonical text rather than cached counters.
-`--strict` turns proven gaps into exit 1; unreadable evidence exits 2. `why` never
+As in 0.4.9, gaps exit 1 and `--strict` makes them errors (exit 2); a source that
+fails to parse, unreadable evidence, or no source file to audit exits 2. `why` never
 refreshes and returns the version-1 reference/verdict/exit/summary/candidates/
 evidence/next_action object, naming index and source paths.
 
 Intentional 0.4.9 differences: full session ids are emitted instead of abbreviated
 ones, while both resolve; status/doctor omit all removed process/storage states;
 `why` describes the single SQLite snapshot; native launch never creates transcript
-links in an agent's store.
+links in an agent's store. `doctor --fix` does not download the semantic model as
+0.4.9's did: a missing model is not a fault in 0.5, and `agrep setup` installs it.
+`audit` reports sources, prose and tool rows, gaps and problems instead of 0.4.9's
+per-agent evidence-book table, and a source written since the last refresh is a gap
+where 0.4.9 called it live evidence: 0.5 keeps no evidence book and compares the
+index with the sources themselves.

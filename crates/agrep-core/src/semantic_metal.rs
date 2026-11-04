@@ -1,4 +1,5 @@
-//! One-pass F16 GeGLU; erf is Candle 0.9.2's A&S 7.1.26 expression.
+//! The arena's one-pass F16 GeGLU shader as a Candle op, for tests; erf is Candle 0.9.2's
+//! A&S 7.1.26 expression.
 use candle_core::{CustomOp1, Device, Result};
 use std::sync::Arc;
 

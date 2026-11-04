@@ -7,8 +7,9 @@ use agrep_core::{
 use rusqlite::Connection;
 use std::{
     fs,
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Child, Command, Output, Stdio},
 };
 use tempfile::TempDir;
 fn make_writable(path: &Path) {
@@ -41,17 +42,65 @@ impl Fixture {
             data,
         }
     }
-    fn cmd(&self, args: &[&str]) -> Output {
-        Command::new(support::binary())
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(support::binary());
+        command
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
             .env("AGREP_HOME", &self.home)
             .env("AGREP_DATA_DIR", &self.data)
-            .args(args)
-            .output()
-            .unwrap()
+            .args(args);
+        command
+    }
+    fn cmd(&self, args: &[&str]) -> Output {
+        self.command(args).output().unwrap()
+    }
+    /// Starts `agrep ARGS` and returns once it reports, as an `AGREP_QUERY_TIMING` event,
+    /// that it waits for `what`, which the caller holds.
+    fn waiting(&self, args: &[&str], what: &str) -> Waiting {
+        let mut child = self
+            .command(args)
+            .env("AGREP_QUERY_TIMING", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (sender, lines) = std::sync::mpsc::channel();
+        let stderr = BufReader::new(child.stderr.take().unwrap());
+        std::thread::spawn(move || {
+            for line in stderr.lines() {
+                if sender.send(line.unwrap()).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut seen = String::new();
+        loop {
+            // A watchdog, not synchronization: a command that waited without saying so
+            // would otherwise hold the test, and the lock, forever.
+            match lines.recv_timeout(std::time::Duration::from_secs(120)) {
+                Ok(line) => {
+                    if serde_json::from_str::<serde_json::Value>(&line)
+                        .is_ok_and(|e| e["wait"] == what)
+                    {
+                        return Waiting { child, lines };
+                    }
+                    seen.push_str(&line);
+                    seen.push('\n');
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    child.wait().unwrap();
+                    panic!("{args:?} ended without waiting for {what}: {seen}")
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("{args:?} never reported waiting for {what}: {seen}")
+                }
+            }
+        }
     }
     fn ok(&self, args: &[&str]) -> Output {
         let o = self.cmd(args);
@@ -71,6 +120,24 @@ impl Fixture {
     }
     fn root(&self) -> DataRoot {
         DataRoot::open(&self.data, true).unwrap()
+    }
+}
+/// A command that reported it waits for something the test holds.
+struct Waiting {
+    child: Child,
+    lines: std::sync::mpsc::Receiver<String>,
+}
+impl Waiting {
+    /// The command's output, once the test has released what it waited for.
+    fn finish(self) -> Output {
+        let mut output = self.child.wait_with_output().unwrap();
+        output.stderr = self
+            .lines
+            .iter()
+            .map(|l| l + "\n")
+            .collect::<String>()
+            .into_bytes();
+        output
     }
 }
 #[test]
@@ -350,14 +417,15 @@ fn archive_sqlite_wal_backup_force_restore_waits_for_writer() {
     drop(recovered);
     db.execute_batch("BEGIN IMMEDIATE; INSERT INTO example VALUES('uncommitted');")
         .unwrap();
-    let contender = Connection::open(&p).unwrap();
-    let error = contender.execute_batch("BEGIN IMMEDIATE").unwrap_err();
-    assert!(matches!(
-        error.sqlite_error_code(),
-        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
-    ));
+    // The forced restore meets the open write transaction and waits for its end.
+    let restore = f.waiting(&["restore", "opencode.db", "--force"], "sqlite");
     db.execute_batch("ROLLBACK").unwrap();
-    f.ok(&["restore", "opencode.db", "--force"]);
+    let out = restore.finish();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     db.execute("DELETE FROM example", []).unwrap();
     f.ok(&["restore", "opencode.db", "--force"]);
     assert_eq!(
@@ -423,6 +491,20 @@ fn scheduled_archive_runs_once_only_when_enabled() {
     assert_eq!(s["versions"], 1);
     f.ok(&["archive", "--off"]);
     assert_eq!(archive::status(&f.root()).unwrap()["versions"], 1);
+}
+/// `archive::status` reads the blob directory while a capture may prune it; what is gone
+/// before it is examined counts as no longer stored, as status's own walk does.
+#[test]
+fn archive_status_counts_blobs_removed_under_it_as_gone() {
+    let f = Fixture::new();
+    f.source("rollout-pruned.jsonl", b"pruned");
+    f.ok(&["archive"]);
+    let before = archive::status(&f.root()).unwrap();
+    assert!(before["stored_bytes"].as_u64().unwrap() > 0, "{before}");
+    fs::remove_dir_all(f.data.join("archive/blobs")).unwrap();
+    let after = archive::status(&f.root()).unwrap();
+    assert_eq!(after["stored_bytes"], 0);
+    assert_eq!(after["versions"], before["versions"]);
 }
 #[test]
 fn source_links_are_skipped_restore_is_strict_and_instruction_links_work() {
@@ -741,12 +823,15 @@ fn archive_operations_wait_for_concurrent_capture() {
         .write(true)
         .open(dir.join("archive.lock"))
         .unwrap();
-    assert!(matches!(
-        contender.try_lock(),
-        Err(std::fs::TryLockError::WouldBlock)
-    ));
+    // The capture meets the held archive lock and waits for it.
+    let capture = f.waiting(&["archive"], "archive.lock");
     lock.unlock().unwrap();
-    let out = f.ok(&["archive"]);
+    let out = capture.finish();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(!String::from_utf8_lossy(&out.stdout).contains("busy"));
     contender.try_lock().unwrap();
 }
