@@ -995,6 +995,16 @@ fn archived_sessions_root(home_dir: &str) -> PathBuf {
         .join("sessions")
 }
 
+pub(crate) fn source_order() -> HashMap<PathBuf, usize> {
+    PI_HOMES
+        .iter()
+        .flat_map(|home| [sessions_root(home), archived_sessions_root(home)])
+        .flat_map(|root| session_files("pi", &root))
+        .enumerate()
+        .map(|(rank, path)| (path, rank))
+        .collect()
+}
+
 fn collect_store(
     cache: &mut crate::intake_batch::IntakeBatch,
     agent: &'static str,

@@ -1,0 +1,2 @@
+{"type": "session", "version": 3, "id": "a3000000-0000-4000-8000-000000000003", "cwd": "/work/fixture"}
+{"type": "message", "id": "u", "timestamp": "2026-10-08T12:10:00Z", "message": {"role": "user", "content": "Check this part."}}

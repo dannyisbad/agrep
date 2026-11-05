@@ -813,7 +813,7 @@ fn todos(c: &Connection, events: &[Event]) -> Result<(Vec<String>, Option<String
                 unknown = None
             }
         } else {
-            unknown = Some("task operation cannot be resolved".into())
+            unknown = Some("todo list uses an op this build cannot replay".into())
         }
     }
     let (tasks, unknown) = if claude_last {
@@ -1266,7 +1266,7 @@ fn item(s: &Session, last: &Row, r: Record, source: &str) -> Value {
         "agent_work_incomplete" | "todo_open" => "medium",
         _ => "low",
     });
-    json!({"kind":"pending","status":r.status,"confidence":confidence,"project":history::project_leaf(&s.project),"project_label":s.project,"agent":s.agent,"session":s.id,"session_handle":history::target(&s.id),"last_ts":s.last_ts,"turn":last.turn,"handle":history::handle(&s.id,last),"source":source,"signals":r.signals,"evidence":r.evidence.chars().take(240).collect::<String>(),"items":r.items,"first_text":s.title,"caveats":r.caveats})
+    json!({"kind":"pending","status":r.status,"confidence":confidence,"project":history::project_leaf(&s.project),"project_label":s.project,"agent":s.agent,"session":s.id,"session_handle":history::target(&s.id),"last_ts":s.last_ts,"turn":last.turn,"handle":history::handle(&s.id,last),"source":source,"signals":r.signals,"evidence":r.evidence.chars().take(240).collect::<String>(),"items":r.items,"first_text":s.title.trim(),"caveats":r.caveats})
 }
 pub fn pending(
     c: &Connection,
@@ -1290,6 +1290,22 @@ pub fn side_pending(
         return Ok(None);
     };
     Ok(classify_side(c, s, rows, events, last)?.map(|r| item(s, last, r, "side-chat")))
+}
+
+pub fn latest_activity(rows: &[Row], events: &[Event<'_>]) -> i64 {
+    std::iter::once(last_turn(rows).map_or(0, |r| r.ts))
+        .chain(rows.iter().filter(|r| r.who == "recap").map(|r| r.ts))
+        .chain(
+            events
+                .iter()
+                .filter(|e| {
+                    e.kind != "control" || !matches!(e.name, "api_error" | "task_notification")
+                })
+                .map(|e| e.ts),
+        )
+        .max()
+        .unwrap_or(0)
+        .max(0)
 }
 /// A chat of a family: its session, rows and events.
 pub type Member<'a> = (&'a Session, Vec<Row>, Vec<Event<'a>>);

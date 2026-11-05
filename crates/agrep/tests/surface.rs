@@ -790,6 +790,148 @@ fn pending_signals_match_0_4_9() {
         serde_json::from_str(&fs::read_to_string(fixture.join("expected.json")).unwrap()).unwrap();
     assert_eq!(Value::Array(got), expected);
 }
+
+fn assert_family_summary_fixture(name: &str) {
+    let t = TempDir::new().unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    let (h, d) = (t.path().join("h"), t.path().join("d"));
+    copy(&fixture.join("home"), &h);
+    let expected: Value =
+        serde_json::from_str(&fs::read_to_string(fixture.join("expected.json")).unwrap()).unwrap();
+    ok(cli(&h, &d, &["index"], &[]));
+    for (key, column) in [("parents", "parent"), ("families", "family")] {
+        if let Some(want) = expected.get(key) {
+            let c = Connection::open(d.join("index.db")).unwrap();
+            let parents: serde_json::Map<String, Value> = c
+                .prepare(&format!("SELECT id,{column} FROM sessions ORDER BY id"))
+                .unwrap()
+                .query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, Value::String(r.get(1)?)))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(&Value::Object(parents), want);
+        }
+    }
+    let summary = values(&ok(cli(
+        &h,
+        &d,
+        &[
+            "summary",
+            "--since",
+            "2026-10-05",
+            "--until",
+            "2026-11-04",
+            "--self",
+            "--json",
+            "--no-auto",
+        ],
+        &[],
+    )));
+    for (key, value) in expected["counts"].as_object().unwrap() {
+        assert_eq!(&summary[0][key], value, "{key}");
+    }
+    let project = summary.iter().find(|r| r["kind"] == "project").unwrap();
+    assert_eq!(
+        project["worked_on"].as_array().unwrap().len(),
+        expected["worked_on"].as_array().unwrap().len()
+    );
+    for (got, want) in project["worked_on"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(expected["worked_on"].as_array().unwrap())
+    {
+        for (key, value) in want.as_object().unwrap() {
+            assert_eq!(&got[key], value, "{key}");
+        }
+    }
+    let chats = values(&ok(cli(
+        &h,
+        &d,
+        &[
+            "chats",
+            "--side",
+            "-n",
+            "0",
+            "--json",
+            "--no-auto",
+            "--self",
+        ],
+        &[],
+    )));
+    for want in expected["worked_on"].as_array().unwrap() {
+        if let Some(first) = want.get("first_text") {
+            let chat = chats
+                .iter()
+                .find(|r| r["session"] == want["session"])
+                .unwrap();
+            assert_eq!(&chat["first_text"], first);
+        }
+    }
+    let pending_output = cli(
+        &h,
+        &d,
+        &[
+            "summary",
+            "pending",
+            "--since",
+            "2026-10-05",
+            "--until",
+            "2026-11-04",
+            "--self",
+            "--json",
+            "--no-auto",
+        ],
+        &[],
+    );
+    assert_eq!(
+        pending_output.status.code(),
+        expected["pending_exit"].as_i64().map(|code| code as i32)
+    );
+    let pending = values(&pending_output);
+    assert_eq!(
+        pending.len() - 1,
+        expected["pending"].as_array().unwrap().len()
+    );
+    for (got, want) in pending[1..]
+        .iter()
+        .zip(expected["pending"].as_array().unwrap())
+    {
+        for (key, value) in want.as_object().unwrap() {
+            assert_eq!(&got[key], value, "{key}");
+        }
+    }
+}
+// Recorded from 0.4.9: a longer reply in a resumed container must not move
+// the shared side chat away from its first surviving parent.
+#[test]
+fn conflicting_family_parents_match_0_4_9() {
+    assert_family_summary_fixture("family_parents");
+}
+#[test]
+fn family_filename_alias_matches_0_4_9() {
+    assert_family_summary_fixture("family_alias");
+}
+#[test]
+fn malformed_records_retain_readable_summary_rows_as_0_4_9() {
+    assert_family_summary_fixture("malformed_records");
+}
+#[test]
+fn summary_first_request_and_unreplayable_todo_match_0_4_9() {
+    assert_family_summary_fixture("summary_metadata");
+}
+#[test]
+fn equal_quality_replay_keeps_first_discovered_metadata_as_0_4_9() {
+    assert_family_summary_fixture("replay_metadata");
+}
+#[test]
+fn summary_side_activity_includes_tools_as_0_4_9() {
+    assert_family_summary_fixture("summary_activity");
+}
 // Expected output is agrep 0.4.9's on the pi fixture (py/around.py:245-251,762-772): around's
 // metadata carries no freshness; a record after the rows says when they may be stale.
 #[test]

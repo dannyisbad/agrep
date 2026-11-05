@@ -1,0 +1,39 @@
+{
+  "counts": {
+    "chats": 2,
+    "side_chats": 3,
+    "unknown_timestamp_rows": 0,
+    "family_dedup_ms": 1800000
+  },
+  "worked_on": [
+    {
+      "session": "a1000000-0000-4000-8000-000000000001",
+      "side_chats": 1,
+      "estimated_active_ms": 1200000,
+      "first_text": "Check this part."
+    },
+    {
+      "session": "a2000000-0000-4000-8000-000000000002",
+      "side_chats": 2,
+      "estimated_active_ms": 1800000,
+      "first_text": "Check this part."
+    }
+  ],
+  "pending": [
+    {
+      "session": "a2000000-0000-4000-8000-000000000002",
+      "status": "agent_work_incomplete",
+      "confidence": "medium",
+      "source": "side-chat",
+      "turn": 0,
+      "signals": [
+        "side chat has no captured reply to its last turn"
+      ],
+      "evidence": "Check this part.",
+      "items": [],
+      "handle": "@a4000000:0.8400",
+      "first_text": "Check this part."
+    }
+  ],
+  "pending_exit": 0
+}

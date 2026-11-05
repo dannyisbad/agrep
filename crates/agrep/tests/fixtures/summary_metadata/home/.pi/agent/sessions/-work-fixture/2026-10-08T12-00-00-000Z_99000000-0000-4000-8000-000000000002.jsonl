@@ -1,0 +1,2 @@
+{"type": "session", "version": 3, "id": "99000000-0000-4000-8000-000000000002", "cwd": "/work/fixture"}
+{"type": "compaction", "id": "recap", "timestamp": "2026-10-08T12:00:00Z", "summary": "A compacted plan with no first human request."}

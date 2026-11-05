@@ -1,0 +1,33 @@
+{
+  "counts": {
+    "chats": 1,
+    "side_chats": 0,
+    "unknown_timestamp_rows": 0,
+    "family_dedup_ms": 0
+  },
+  "worked_on": [
+    {
+      "session": "88000000-0000-4000-8000-000000000001",
+      "side_chats": 0,
+      "estimated_active_ms": 600000,
+      "first_text": "Check retained records."
+    }
+  ],
+  "pending": [
+    {
+      "session": "88000000-0000-4000-8000-000000000001",
+      "status": "agent_work_incomplete",
+      "confidence": "medium",
+      "source": "root",
+      "turn": 1,
+      "signals": [
+        "no captured reply to the last turn"
+      ],
+      "evidence": "Run the next check.",
+      "items": [],
+      "handle": "@88000000:1.330c",
+      "first_text": "Check retained records."
+    }
+  ],
+  "pending_exit": 0
+}

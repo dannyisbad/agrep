@@ -1,0 +1,5 @@
+{"type": "session", "version": 3, "id": "a2000000-0000-4000-8000-000000000002", "cwd": "/work/fixture"}
+{"type": "message", "id": "u", "timestamp": "2026-10-08T12:00:00Z", "message": {"role": "user", "content": "Check this part."}}
+{"type": "message", "id": "a", "parentId": "u", "timestamp": "2026-10-08T12:20:00Z", "message": {"role": "assistant", "content": [{"type": "toolCall", "id": "call", "name": "read", "arguments": {"path": "part.txt"}}], "model": "fixture"}}
+{"type": "message", "id": "tool", "parentId": "a", "timestamp": "2026-10-08T12:20:01Z", "message": {"role": "toolResult", "toolCallId": "call", "toolName": "read", "content": "Read the part.", "isError": false}}
+{"type": "message", "id": "done", "parentId": "tool", "timestamp": "2026-10-08T12:20:02Z", "message": {"role": "assistant", "content": "Done.", "model": "fixture"}}

@@ -1,0 +1,33 @@
+{
+  "counts": {
+    "chats": 1,
+    "side_chats": 0,
+    "unknown_timestamp_rows": 0,
+    "family_dedup_ms": 0
+  },
+  "worked_on": [
+    {
+      "session": "c2000000-0000-4000-8000-000000000002",
+      "side_chats": 0,
+      "estimated_active_ms": 1200000,
+      "first_text": "First retained request."
+    }
+  ],
+  "pending": [
+    {
+      "session": "c2000000-0000-4000-8000-000000000002",
+      "status": "agent_work_incomplete",
+      "confidence": "medium",
+      "source": "root",
+      "turn": 2,
+      "signals": [
+        "no captured reply to the last turn"
+      ],
+      "evidence": "Later appended request.",
+      "items": [],
+      "handle": "@c2000000:2.1387",
+      "first_text": "First retained request."
+    }
+  ],
+  "pending_exit": 0
+}

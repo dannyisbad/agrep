@@ -323,12 +323,19 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
         if mode != "time" {
             let mut item = b::pending(&c, s, &root.1, &root.2)?;
             if item.is_none() {
-                let later: Vec<_> = members
+                let latest: Vec<_> = members
+                    .iter()
+                    .map(|(_, rows, events)| b::latest_activity(rows, events))
+                    .collect();
+                let mut later: Vec<_> = members
                     .iter()
                     .enumerate()
                     .skip(1)
-                    .filter(|(_, (side, _, _))| side.last_ts > s.last_ts)
+                    .filter(|(at, _)| latest[*at] > latest[0])
                     .collect();
+                later.sort_by(|(a, (sa, _, _)), (b, (sb, _, _))| {
+                    latest[*b].cmp(&latest[*a]).then(sa.id.cmp(&sb.id))
+                });
                 let reached = if later.is_empty() {
                     vec![]
                 } else {
@@ -343,7 +350,7 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
                         i["session"] = json!(s.id);
                         i["project"] = json!(h::project_leaf(&s.project));
                         i["project_label"] = json!(s.project);
-                        i["first_text"] = json!(s.title);
+                        i["first_text"] = json!(s.title.trim());
                         i["last_ts"] = json!(s.last_ts);
                         item = Some(i);
                         break;
@@ -396,7 +403,7 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
             .iter()
             .filter(|r| b::is_turn(&root.1, r))
             .max_by_key(|r| (r.turn, r.ts));
-        let mut chat = json!({"session":s.id,"session_handle":session_handle(&s.id),"agent":s.agent,"project_label":s.project,"first_text":s.title,"last_ts":s.last_ts,"turns":turns,"estimated_active_ms":ms,"latest_handle":last.map(|r| index.mint(&s.id, r.turn, &r.text)),"side_chats":members.len()-1});
+        let mut chat = json!({"session":s.id,"session_handle":session_handle(&s.id),"agent":s.agent,"project_label":s.project,"first_text":s.title.trim(),"last_ts":s.last_ts,"turns":turns,"estimated_active_ms":ms,"latest_handle":last.map(|r| index.mint(&s.id, r.turn, &r.text)),"side_chats":members.len()-1});
         if *withheld {
             chat["self"] = json!(true);
         }

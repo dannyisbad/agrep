@@ -1,0 +1,2 @@
+{"type": "session", "version": 3, "id": "b2000000-0000-4000-8000-000000000002", "cwd": "/work/fixture"}
+{"type": "message", "id": "tool", "timestamp": "2026-10-08T12:00:00Z", "message": {"role": "assistant", "content": [{"type": "toolCall", "id": "read", "name": "read", "arguments": {"path": "part.txt"}}]}}

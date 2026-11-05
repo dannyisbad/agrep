@@ -1,0 +1,3 @@
+{"type": "session", "version": 3, "id": "99000000-0000-4000-8000-000000000001", "cwd": "/work/fixture"}
+{"type": "message", "id": "u", "timestamp": "2026-10-08T12:00:00Z", "message": {"role": "user", "content": "Inspect the rendered summary. Keep the first request readable across line breaks and retain enough context to distingui trailing details."}}
+{"type": "message", "id": "a", "parentId": "u", "timestamp": "2026-10-08T12:01:00Z", "message": {"role": "assistant", "content": "Done.", "model": "fixture"}}

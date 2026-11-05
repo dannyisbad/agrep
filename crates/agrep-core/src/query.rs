@@ -10,6 +10,8 @@ use rusqlite::{params_from_iter, types::Value, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
+#[path = "tool_rank.rs"]
+mod tool_rank;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CallerFilter {
     pub agent: String,
@@ -763,9 +765,14 @@ impl Matcher {
             }
             ordered.sort_by_key(|v| (v.0, v.1));
             self.ordered_terms = ordered.into_iter().map(|v| v.2).collect();
-            // Disjunctions and counts read every group; other plans read the two rarest.
-            let read = if self.partial || self.quick_count {
+            // Phrase positions need three anchors; all-terms cursors use two.
+            let read = if self.partial
+                || self.quick_count
+                || (self.phase == 1 && estimate > 32_768 && self.terms.len() <= 16)
+            {
                 usize::MAX
+            } else if self.phase == 1 {
+                3
             } else {
                 2
             };
@@ -1303,9 +1310,6 @@ impl Matcher {
     fn word_positions(&self, blocks: Option<&[i64]>) -> Option<(String, Vec<u8>)> {
         if self.phase != 1
             || self.partial
-            // A selective term in a longer sentence is cheaper to drive once
-            // and verify than intersecting every common word-position stream.
-            || (self.terms.len() > 2 && self.estimated <= 32_768)
             || self.terms.iter().map(|v| v[0].len()).sum::<usize>() > 4096
             || self.terms.iter().flatten().any(|v| !v.is_ascii())
         {
@@ -1321,21 +1325,37 @@ impl Matcher {
             .collect();
         // A phrase prefilter needs only a necessary positional condition.
         // Intersecting every common word stream makes long questions expensive
-        // even when two selective terms already rule out almost all rows.
+        // even when three selective terms already rule out almost all rows.
         // Keep original ordinals so skipped words still contribute distance;
         // canonical text verifies the complete phrase afterwards.
-        if groups.len() > 2 {
-            groups.sort_by_key(|(i, group)| {
-                (
-                    self.ordered_terms
-                        .iter()
-                        .position(|ordered| ordered == *group)
-                        .unwrap_or(usize::MAX),
-                    *i,
-                )
-            });
-            groups.truncate(2);
-            groups.sort_by_key(|(i, _)| *i);
+        if groups.len() > 3 {
+            // A literal token phrase lets FTS reject scattered common words
+            // without enumerating their positions for the span verifier.
+            let consecutive = (self.estimated > 32_768 && self.terms.len() <= 16)
+                .then(|| {
+                    groups.windows(3).find(|run| {
+                        run.windows(2).all(|pair| pair[1].0 == pair[0].0 + 1)
+                            && run.iter().all(|(_, group)| {
+                                self.group_words(group, None) == [group[0].as_str()]
+                            })
+                    })
+                })
+                .flatten();
+            if let Some(run) = consecutive {
+                groups = run.to_vec();
+            } else {
+                groups.sort_by_key(|(i, group)| {
+                    (
+                        self.ordered_terms
+                            .iter()
+                            .position(|ordered| ordered == *group)
+                            .unwrap_or(usize::MAX),
+                        *i,
+                    )
+                });
+                groups.truncate(3);
+                groups.sort_by_key(|(i, _)| *i);
+            }
         }
         for (i, group) in groups {
             let words = self.group_words(group, blocks);
@@ -2201,6 +2221,37 @@ const RUN_BLOCKS: usize = 64;
 /// Consecutive blocks a run may step over: ones without a ceiling, already read, or
 /// below the page's cutoff.
 const RUN_GAP: usize = 8;
+/// A cheap necessary condition for the ordered span check. Keep the original
+/// clauses first: their phrase numbers are the span function's ordinals.
+fn tool_near(expression: &str, ordinals: &[u8]) -> Option<String> {
+    let words: Vec<_> = expression.split('"').skip(1).step_by(2).collect();
+    let positions: Vec<_> = ordinals
+        .chunks_exact(4)
+        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+        .collect();
+    if !(2..=3).contains(&words.len())
+        || positions.len() != words.len()
+        || positions.windows(2).any(|p| p[0] >= p[1])
+        || words
+            .iter()
+            .any(|w| !w.bytes().all(|b| b.is_ascii_alphanumeric()))
+        || words.iter().collect::<HashSet<_>>().len() != words.len()
+    {
+        return None;
+    }
+    let distance = positions.last()? - positions.first()?;
+    if positions.windows(2).all(|pair| pair[1] == pair[0] + 1) {
+        return Some(format!("{expression} AND \"{}\"", words.join(" ")));
+    }
+    Some(format!(
+        "{expression} AND NEAR({}, {distance})",
+        words
+            .iter()
+            .map(|word| format!("\"{word}\""))
+            .collect::<Vec<_>>()
+            .join(" ")
+    ))
+}
 /// The rows of a selective scope that its lane's text index admits, using the
 /// expressions unselective plans rely on as necessary conditions. Each run of
 /// consecutive scope blocks is one rowid-range query, so a word's postings are
@@ -2228,7 +2279,17 @@ fn scope_candidates(
             continue;
         }
         let blocks: Vec<i64> = run.iter().map(|&(block, _)| block).collect();
-        admit_run(c, m, table, expression, span, &blocks, None, &mut admitted)?;
+        admit_run(
+            c,
+            m,
+            table,
+            expression,
+            span,
+            &blocks,
+            None,
+            &mut admitted,
+            None,
+        )?;
     }
     Ok(admitted)
 }
@@ -2245,6 +2306,7 @@ fn admit_run(
     blocks: &[i64],
     max_gap: Option<i64>,
     admitted: &mut HashMap<i64, Vec<i64>>,
+    mut occurrences: Option<&mut HashMap<i64, u32>>,
 ) -> Result<()> {
     let (first, last) = (blocks[0], blocks[blocks.len() - 1]);
     // Tool blocks hold their own words; a required group without any word
@@ -2267,7 +2329,11 @@ fn admit_run(
     let (expression, ordinals) = own.as_ref().map_or((expression, span), |(e, o)| {
         (e.as_str(), Some(o.as_slice()))
     });
-    let sql = match (table, span) {
+    let near = (table == "tools" && span.is_some() && max_gap == Some(0))
+        .then(|| ordinals.and_then(|o| tool_near(expression, o)))
+        .flatten();
+    let expression = near.as_deref().unwrap_or(expression);
+    let mut sql = match (table, span) {
         ("tools", Some(_)) => "SELECT f.rowid FROM tools_fts f LEFT JOIN event_rows e INDEXED BY event_tool_id ON e.tool_id=f.rowid AND e.active=1 LEFT JOIN tool_blobs t ON t.id=e.blob WHERE tools_fts MATCH ?1 AND f.rowid>=?2 AND f.rowid<?3 AND agrep_word_span(tools_fts,?4,CASE WHEN t.ascii THEN 0 ELSE ?5 END)".to_owned(),
         (_, Some(_)) => format!("SELECT rowid FROM {table}_fts WHERE {table}_fts MATCH ?1 AND rowid>=?2 AND rowid<?3 AND agrep_word_span({table}_fts,?4,?5)"),
         (_, None) => format!("SELECT rowid FROM {table}_fts WHERE {table}_fts MATCH ?1 AND rowid>=?2 AND rowid<?3"),
@@ -2277,6 +2343,15 @@ fn admit_run(
         Value::Integer(first * BLOCK),
         Value::Integer((last + 1) * BLOCK),
     ];
+    if occurrences.is_some() {
+        let weights: Vec<u8> = m
+            .group_words(&m.ordered_terms[0], Some(blocks))
+            .iter()
+            .flat_map(|word| (word.matches(m.terms[0][0].as_str()).count() as u32).to_le_bytes())
+            .collect();
+        sql = "SELECT rowid,agrep_tool_occurrences(tools_fts,?4) FROM tools_fts WHERE tools_fts MATCH ?1 AND rowid>=?2 AND rowid<?3".into();
+        bind.push(Value::Blob(weights));
+    }
     if let Some(ordinals) = ordinals.filter(|_| span.is_some()) {
         // The widest gap of the run's blocks bounds every row in it.
         let max_gap = if table != "tools" {
@@ -2296,10 +2371,23 @@ fn admit_run(
     let mut rows: HashMap<i64, Vec<i64>> =
         blocks.iter().map(|&block| (block, Vec::new())).collect();
     let mut query = c.prepare_cached(&sql)?;
-    for id in query.query_map(params_from_iter(bind), |r| r.get::<_, i64>(0))? {
-        let id = id?;
+    let ranked = occurrences.is_some();
+    for row in query.query_map(params_from_iter(bind), |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            if ranked {
+                r.get::<_, Option<u32>>(1)?
+            } else {
+                None
+            },
+        ))
+    })? {
+        let (id, count) = row?;
         if let Some(ids) = rows.get_mut(&(id / BLOCK)) {
             ids.push(id);
+            if let (Some(count), Some(occurrences)) = (count, occurrences.as_deref_mut()) {
+                occurrences.insert(id, count);
+            }
         }
     }
     for ids in rows.values_mut() {
@@ -2505,6 +2593,15 @@ fn search_pass(
     coverage_stage: usize,
 ) -> Result<Results> {
     let started = Instant::now();
+    let _pass_span = crate::semantic_profile::span(if partial {
+        "keyword_content"
+    } else if phase == 1 {
+        "keyword_phrase"
+    } else if phase == 2 {
+        "keyword_all_terms"
+    } else {
+        "keyword_combined"
+    });
     let mut m = cache.matcher(o, c)?;
     m.partial = partial;
     m.phase = phase;
@@ -2616,10 +2713,25 @@ fn search_pass(
                     || f.until.is_some()
                     || f.no_side;
                 let sessions = f.chat.is_some() || f.session_rows.is_some() || f.sessions.is_some();
+                let metadata_scope = f.agent.is_some()
+                    || f.project.is_some()
+                    || f.exclude_project.is_some()
+                    || f.model.is_some()
+                    || f.since.is_some()
+                    || f.until.is_some();
+                let small_scope = if metadata_scope && !sessions {
+                    c.query_row(
+                        &format!("SELECT count(*) FROM (SELECT p.id FROM {table} p WHERE 1{filter_scope} LIMIT 4097)"),
+                        params_from_iter(values.clone()),
+                        |r| r.get::<_, usize>(0),
+                    )? <= 4096
+                } else {
+                    false
+                };
                 let prose = (table == "prose").then_some(expression.as_str());
                 result.timings.plan_ms += plan_started.elapsed().as_secs_f64() * 1000.;
                 let started = Instant::now();
-                let count = if sessions {
+                let count = if sessions || small_scope {
                     let rows = format!("SELECT p.id,p.session FROM {table} p WHERE 1{scope}");
                     let tally = f.sessions.is_some().then_some(&mut result.session_counts);
                     count_scope(c, &m, table, prose, &rows, &values, tally)?
@@ -2825,6 +2937,34 @@ fn search_pass(
         // Rows the text index admits in blocks still to visit, read for whole runs of
         // consecutive blocks at once.
         let mut runs: HashMap<i64, Vec<i64>> = HashMap::new();
+        let mut occurrences = (table == "tools"
+            && bounded
+            && !o.chats
+            && !partial
+            && m.phase == 1
+            && m.explicit.is_none()
+            && m.terms.len() == 1
+            && (3..=4096).contains(&m.terms[0][0].len())
+            && m.terms[0][0].bytes().all(|b| b.is_ascii_alphanumeric())
+            && m.ordered_terms[0]
+                .iter()
+                .all(|t| m.tool_supported.contains(t)))
+        .then(HashMap::new);
+        if occurrences.is_some() {
+            tool_rank::install(c)?;
+        }
+        let occurrence_weights = (occurrences.is_some()
+            && ids.is_none()
+            && !selective
+            && fts.as_ref().is_some_and(|f| f.matches('"').count() <= 16))
+        .then(|| {
+            m.group_words(&m.ordered_terms[0], None)
+                .iter()
+                .flat_map(|word| {
+                    (word.matches(m.terms[0][0].as_str()).count() as u32).to_le_bytes()
+                })
+                .collect::<Vec<_>>()
+        });
         let mut visited = HashSet::new();
         let mut coverage_tried = false;
         while let Some((block, bound, max_ts, min_session, min_turn, max_gap)) =
@@ -2886,7 +3026,12 @@ fn search_pass(
                     result.timings.sqlite_ms += tick.elapsed().as_secs_f64() * 1000.;
                 }
             }
-            let spanned = bounded && block >= 0 && !selective && ids.is_none() && fts.is_some();
+            let spanned = bounded
+                && block >= 0
+                && !selective
+                && ids.is_none()
+                && fts.is_some()
+                && occurrence_weights.is_none();
             if spanned && !runs.contains_key(&block) {
                 let page = (o.limit > 0 && result.hits.len() >= o.limit)
                     .then(|| &result.hits[o.limit - 1]);
@@ -2935,6 +3080,7 @@ fn search_pass(
                     &run,
                     Some(max_gap),
                     &mut runs,
+                    occurrences.as_mut(),
                 )?;
                 result.timings.sqlite_ms += tick.elapsed().as_secs_f64() * 1000.;
             }
@@ -2947,6 +3093,9 @@ fn search_pass(
             }
             result.blocks += 1;
             let mut bind = vec![];
+            if let Some(weights) = &occurrence_weights {
+                bind.push(Value::Blob(weights.clone()));
+            }
             let uses_fts = !selective && fts.is_some() && ids.is_none() && !spanned;
             let candidate_table = if table == "tools" && (uses_fts || ids.is_some() || bounded) {
                 crate::tool_store::CANDIDATES_BY_ID
@@ -2971,7 +3120,19 @@ fn search_pass(
             } else {
                 "NULL"
             };
-            let mut sql=format!("SELECT p.id,p.session,p.agent,{blob},p.position,p.who,NULL,NULL,p.ts,NULL,NULL,NULL FROM {from}{scope}");
+            let eager_prose = table == "prose"
+                && !selective
+                && !partial
+                && m.explicit.is_none()
+                && ((phase == 2 && m.terms.len() > 1) || fts.is_none());
+            let body = if eager_prose {
+                "p.text"
+            } else if occurrence_weights.is_some() {
+                "agrep_tool_occurrences(tools_fts,?)"
+            } else {
+                "NULL"
+            };
+            let mut sql=format!("SELECT p.id,p.session,p.agent,{blob},p.position,p.who,{body},NULL,p.ts,NULL,NULL,NULL FROM {from}{scope}");
             bind.extend(values.clone());
             if uses_fts {
                 if let Some((_, ordinals)) = &span_plan {
@@ -3029,6 +3190,18 @@ fn search_pass(
                 let who: String = r.get(5)?;
                 let ts: i64 = r.get(8)?;
                 let turn: i64 = r.get(4)?;
+                let cutoff = if o.sort == "score" && o.limit > 0 && result.hits.len() >= o.limit {
+                    let session: String = r.get(1)?;
+                    Some(Cutoff::of(
+                        &result.hits[o.limit - 1],
+                        o.chats,
+                        ts,
+                        &session,
+                        turn,
+                    ))
+                } else {
+                    None
+                };
                 if !o.exact && o.limit > 0 && result.hits.len() >= o.limit && o.sort == "score" {
                     let mut ceiling = weight(&who)
                         * if m.explicit.is_some() {
@@ -3048,9 +3221,9 @@ fn search_pass(
                     if bounded {
                         ceiling = ceiling.min(bound);
                     }
-                    let session: String = r.get(1)?;
-                    if Cutoff::of(&result.hits[o.limit - 1], o.chats, ts, &session, turn)
-                        .excludes(pass_tier, ceiling)
+                    if cutoff
+                        .as_ref()
+                        .is_some_and(|c| c.excludes(pass_tier, ceiling))
                     {
                         result.total_basis = "floor".into();
                         continue;
@@ -3065,31 +3238,48 @@ fn search_pass(
                         continue;
                     }
                 }
+                let bounded_occurrences = if occurrence_weights.is_some() {
+                    r.get::<_, Option<u32>>(6)?
+                } else {
+                    occurrences
+                        .as_ref()
+                        .and_then(|counts| counts.get(&r.get::<_, i64>(0).ok()?).copied())
+                }
+                .filter(|&n| n > 0);
+                let counted = bounded_occurrences.is_some_and(|n| {
+                    let ceiling =
+                        (1. - 2f64.powi(-(n.min(60) as i32))) * recency(ts, now) * weight("tool");
+                    cutoff.as_ref().is_some_and(|c| c.excludes(0, ceiling))
+                });
+                // The index and verifier read the same folded text. An ASCII
+                // alphanumeric occurrence cannot cross a unicode61 token boundary.
+                // Overlapping long-token chunks only raise its occurrence ceiling.
+                if counted {
+                    result.total += 1;
+                    result.rows += 1;
+                    result.tool_rows += 1;
+                    if o.filters.sessions.is_some() {
+                        *result.session_counts.entry(r.get(1)?).or_default() += 1;
+                    }
+                    continue;
+                }
                 let hydrate_started = Instant::now();
-                let bytes: Vec<u8> = match r.get::<_, Option<i64>>(3)? {
-                    Some(blob) => c
-                        .prepare_cached("SELECT body FROM tool_blobs WHERE id=?")?
-                        .query_row([blob], |r| r.get(0))?,
-                    None => c
-                        .prepare_cached(&format!("SELECT text FROM {table} WHERE id=?"))?
-                        .query_row([r.get::<_, i64>(0)?], |r| r.get(0))?,
+                let bytes: Vec<u8> = if eager_prose {
+                    r.get(6)?
+                } else {
+                    match r.get::<_, Option<i64>>(3)? {
+                        Some(blob) => c
+                            .prepare_cached("SELECT body FROM tool_blobs WHERE id=?")?
+                            .query_row([blob], |r| r.get(0))?,
+                        None => c
+                            .prepare_cached(&format!("SELECT text FROM {table} WHERE id=?"))?
+                            .query_row([r.get::<_, i64>(0)?], |r| r.get(0))?,
+                    }
                 };
                 let text = store::decode(table, bytes)?;
                 result.timings.hydrate_ms += hydrate_started.elapsed().as_secs_f64() * 1000.;
                 result.examined += 1;
                 let score_started = Instant::now();
-                let cutoff = if o.sort == "score" && o.limit > 0 && result.hits.len() >= o.limit {
-                    let session: String = r.get(1)?;
-                    Some(Cutoff::of(
-                        &result.hits[o.limit - 1],
-                        o.chats,
-                        ts,
-                        &session,
-                        turn,
-                    ))
-                } else {
-                    None
-                };
                 let evaluated = m.evaluate(&text, &who, turn, ts, now, cutoff.as_ref())?;
                 result.timings.score_ms += score_started.elapsed().as_secs_f64() * 1000.;
                 let Some(scored) = evaluated else {
@@ -3098,11 +3288,12 @@ fn search_pass(
                 let (tier, score) = (scored.tier, scored.score);
                 result.total += 1;
                 result.rows += 1;
-                let session: String = r.get(1)?;
                 if o.filters.sessions.is_some() {
-                    *result.session_counts.entry(session.clone()).or_default() += 1;
+                    *result.session_counts.entry(r.get(1)?).or_default() += 1;
                 }
-                sessions.insert((r.get::<_, String>(2)?, session));
+                if o.chats {
+                    sessions.insert((r.get::<_, String>(2)?, r.get::<_, String>(1)?));
+                }
                 if table == "tools" {
                     result.tool_rows += 1;
                 }
@@ -3127,7 +3318,7 @@ fn search_pass(
                     continue;
                 }
                 let session: String = r.get(1)?;
-                if !o.chats && o.limit > 0 && result.hits.len() >= o.limit {
+                if o.chats || (o.limit > 0 && result.hits.len() >= o.limit) {
                     let ranked = Hit {
                         session: session.clone(),
                         turn,
@@ -3138,7 +3329,20 @@ fn search_pass(
                         rowid: r.get(0)?,
                         ..Default::default()
                     };
-                    if compare(&ranked, &result.hits[o.limit - 1], &o.sort, false).is_ge() {
+                    let below_page = o.limit > 0
+                        && result.hits.len() >= o.limit
+                        && compare(&ranked, &result.hits[o.limit - 1], &o.sort, o.chats).is_ge();
+                    let below_head = if o.chats && !below_page {
+                        let agent: String = r.get(2)?;
+                        result.hits.iter().any(|old| {
+                            old.agent == agent
+                                && old.session == session
+                                && compare(&ranked, old, &o.sort, true).is_ge()
+                        })
+                    } else {
+                        false
+                    };
+                    if below_page || below_head {
                         // Matching/counting is already complete. Display joins,
                         // digests and snippets are only needed for page winners.
                         continue;
@@ -3521,6 +3725,130 @@ mod chat_scope_tests {
 #[cfg(test)]
 mod matcher_cache_tests {
     use super::*;
+    #[test]
+    fn native_tool_proximity_keeps_every_ordered_span() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE VIRTUAL TABLE f USING fts5(text,content='',tokenize='unicode61 remove_diacritics 0');
+            INSERT INTO f(rowid,text) VALUES(1,'alpha beta gamma'),(2,'alpha x beta gamma'),
+            (3,'gamma beta alpha'),(4,'alpha---beta gamma'),(5,'alpha beta gamma alpha x x beta gamma');")
+            .unwrap();
+        crate::fts_span::install(&c).unwrap();
+        let expression = "(\"alpha\") AND (\"beta\") AND (\"gamma\")";
+        let ordinals: Vec<_> = [0u32, 1, 2]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let near = tool_near(expression, &ordinals).unwrap();
+        let query = |expression: &str| {
+            c.prepare("SELECT rowid FROM f WHERE f MATCH ?1 AND agrep_word_span(f,?2,0)")
+                .unwrap()
+                .query_map(rusqlite::params![expression, ordinals], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(query(expression), [1, 4, 5]);
+        assert_eq!(query(&near), [1, 4, 5]);
+        assert!(tool_near("(\"foobar\") AND (\"foobar\")", &ordinals[..8]).is_none());
+    }
+
+    #[test]
+    fn tool_phrase_positions_load_all_three_anchor_expansions() {
+        let c = Connection::open_in_memory().unwrap();
+        store::schema(&c).unwrap();
+        let blocks = crate::tool_index::encode_blocks(&[0]);
+        for term in ["one", "two", "six"] {
+            c.execute(
+                "INSERT INTO tool_words(term,doc,blocks) VALUES(?1,200,?2)",
+                rusqlite::params![term, blocks],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO tool_trigrams(gram,doc) VALUES(?1,200)",
+                [i64::from_str_radix(term, 36).unwrap()],
+            )
+            .unwrap();
+        }
+        let o = Options {
+            pattern: "one two six".into(),
+            regex: false,
+            word: false,
+            sort: "score".into(),
+            limit: 40,
+            exact: false,
+            count_only: false,
+            count_by_tier: false,
+            content: false,
+            chats: false,
+            tools: true,
+            filters: Filters::default(),
+        };
+        let mut cache = PlanCache::default();
+        let mut matcher = cache.matcher(&o, &c).unwrap();
+        matcher.phase = 1;
+        matcher.order_for(&c, "tools", &mut cache).unwrap();
+        let (expression, ordinals) = matcher.word_positions(None).unwrap();
+        assert_eq!(expression, "(\"one\") AND (\"two\") AND (\"six\")");
+        assert_eq!(
+            ordinals,
+            [0u32, 1, 2]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+    }
+    #[test]
+    fn common_tool_questions_prefer_consecutive_literal_anchors() {
+        let c = Connection::open_in_memory().unwrap();
+        store::schema(&c).unwrap();
+        let blocks = crate::tool_index::encode_blocks(&[0]);
+        for (term, doc) in [
+            ("one", 40000),
+            ("two", 90000),
+            ("six", 80000),
+            ("nine", 50000),
+            ("ten", 35000),
+        ] {
+            c.execute(
+                "INSERT INTO tool_words(term,doc,blocks) VALUES(?1,?2,?3)",
+                rusqlite::params![term, doc, blocks],
+            )
+            .unwrap();
+            if term.len() == 3 {
+                c.execute(
+                    "INSERT INTO tool_trigrams(gram,doc) VALUES(?1,?2)",
+                    rusqlite::params![i64::from_str_radix(term, 36).unwrap(), doc],
+                )
+                .unwrap();
+            }
+        }
+        let o = Options {
+            pattern: "one two six nine ten".into(),
+            regex: false,
+            word: false,
+            sort: "score".into(),
+            limit: 40,
+            exact: false,
+            count_only: false,
+            count_by_tier: false,
+            content: false,
+            chats: false,
+            tools: true,
+            filters: Filters::default(),
+        };
+        let mut cache = PlanCache::default();
+        let mut matcher = cache.matcher(&o, &c).unwrap();
+        matcher.phase = 1;
+        matcher.order_for(&c, "tools", &mut cache).unwrap();
+        let (expression, ordinals) = matcher.word_positions(None).unwrap();
+        assert_eq!(expression, "(\"one\") AND (\"two\") AND (\"six\")");
+        assert_eq!(
+            tool_near(&expression, &ordinals).unwrap(),
+            "(\"one\") AND (\"two\") AND (\"six\") AND \"one two six\""
+        );
+    }
     // Every pass of a search clones one compiled matcher: a pass adjusts only its copy,
     // a count takes its own counting mode, and another pattern compiles anew.
     #[test]

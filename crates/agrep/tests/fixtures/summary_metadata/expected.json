@@ -1,0 +1,62 @@
+{
+  "counts": {
+    "chats": 3,
+    "side_chats": 0,
+    "unknown_timestamp_rows": 0,
+    "family_dedup_ms": 0
+  },
+  "worked_on": [
+    {
+      "session": "99000000-0000-4000-8000-000000000001",
+      "side_chats": 0,
+      "estimated_active_ms": 0,
+      "first_text": "Inspect the rendered summary. Keep the first request readable across line breaks and retain enough context to distingui"
+    },
+    {
+      "session": "99000000-0000-4000-8000-000000000002",
+      "side_chats": 0,
+      "estimated_active_ms": 0,
+      "first_text": ""
+    },
+    {
+      "session": "99000000-0000-4000-8000-000000000003",
+      "side_chats": 0,
+      "estimated_active_ms": 60000,
+      "first_text": "Check the task state."
+    }
+  ],
+  "pending": [
+    {
+      "session": "99000000-0000-4000-8000-000000000002",
+      "status": "agent_work_incomplete",
+      "confidence": "medium",
+      "source": "root",
+      "turn": 0,
+      "signals": [
+        "no captured reply to the last turn"
+      ],
+      "evidence": "A compacted plan with no first human request.",
+      "items": [],
+      "handle": "@99000000-0000-4000-8000-000000000002:0.682c",
+      "first_text": ""
+    },
+    {
+      "session": "99000000-0000-4000-8000-000000000003",
+      "status": "unknown",
+      "confidence": "low",
+      "source": "root",
+      "turn": 0,
+      "signals": [
+        "todo list uses an op this build cannot replay"
+      ],
+      "evidence": "Check the task state.",
+      "items": [],
+      "handle": "@99000000-0000-4000-8000-000000000003:0.222e",
+      "first_text": "Check the task state.",
+      "caveats": [
+        "todo list uses an op this build cannot replay"
+      ]
+    }
+  ],
+  "pending_exit": 0
+}

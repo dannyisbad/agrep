@@ -136,6 +136,9 @@ How commands use it (`ready` and `finish_census` in `crates/agrep/src/main.rs`):
      copied transcripts): every copy is kept, but only one copy of each turn is visible,
      the one with the longest reply, then the most metadata. Turns are renumbered by
      time only when their numbers collide. Duplicate tool calls keep one copy;
+     copied pi chats break equal-quality ties and keep the first surviving parent claim
+     in adapter discovery order. Their project and first request follow that order too.
+     Family roots follow unambiguous filename aliases after a root's header id changes;
    - the FTS changes (below), the tool dictionary, block bounds, session families, prose
      trigram counts and family token statistics;
    - the deletion of sessions left without rows, and the refresh time.
@@ -256,10 +259,19 @@ matching allows, and a match stands where neither neighbor is `\w` (`str.isalnum
 
 - Terms are ordered by estimated document frequency: in prose, the least frequent of the
   term's trigrams in `prose_terms`; in tools, the summed frequency of its words. Prose
-  ANDs every indexable term; the tool lane intersects the two rarest term groups and
-  verifies the rest.
+  ANDs every indexable term; the tool all-terms lane intersects the two rarest term
+  groups and verifies the rest. Tool phrase passes check the indexed positions of up
+  to three groups before decoding text. Common questions of at most sixteen terms
+  prefer three consecutive groups that each expand to one literal word; other plans
+  use the rarest groups. Distinct single-word expansions with no extra token gaps
+  first use FTS5's native phrase check for consecutive groups, or its proximity check
+  for spaced groups, then the same ordered-position verifier.
 - Terms shorter than three characters stay out of the FTS expression and are verified on
   row text. Every candidate is verified on its stored text before it scores.
+- For a single ASCII alphanumeric tool term, indexed word occurrences in the folded text bound
+  the snippet's repetition score. A positive literal occurrence count proves the match;
+  when its score ceiling loses to the page, it is counted without decoding or scoring.
+  Other query forms and rows that can enter the page retain canonical text verification.
 - Outside a selective scope, with more than 128 estimated matches, a page limit and
   score or time order, a pass visits blocks in descending ceiling order (newest first
   for time order) and stops once the page is full and the next block cannot beat the
@@ -274,13 +286,16 @@ matching allows, and a match stands where neither neighbor is `\w` (`str.isalnum
 Scores, snippets, boundary grading and tie order follow
 [SEARCH_RANKING.md](SEARCH_RANKING.md). `--no-meta` fetches at least 40 rows and drops
 the proven `~meta` rows from that page; counts with `--no-meta` are refused.
+Row and chat pages fetch display metadata and build handles only for candidates that
+can enter the page or improve an existing chat head; matching rows are still counted.
 
 ## Counts
 
 `-c` and `--count-by-tier` are exact. For `-c` without `-w`, `-E` or `--chats`, when
 every term has three or more characters and every tool term expands, the count comes
 from the FTS index rather than a verified scan: the match joined to the rows when
-filters narrow it, read through the session indexes for session scopes, and otherwise
+filters narrow it, read through the scope's indexes for session scopes or metadata
+scopes of at most 4,096 rows, and otherwise
 the corpus-wide count minus the matches in rows the caller filter withholds. Other
 counts run the verified scan.
 

@@ -1414,12 +1414,20 @@ fn set_visibility(
     });
     Ok(())
 }
+fn session_title(text: &str) -> String {
+    crate::history::one_line(text, 120)
+}
+
 fn refresh_session_bounds(tx: &Transaction<'_>, agent: &str, session: &str) -> Result<()> {
     // 0.4.9 bounded a chat by its turns alone: a tool row never moves first_ts/last_ts,
     // and a turn without a timestamp (0) is skipped rather than taken as the minimum.
     // Left to itself the planner answers min/max(ts) by walking prose_scope through the
     // agent's whole history, testing each row's session.
-    tx.prepare_cached("UPDATE sessions SET first_ts=coalesce((SELECT min(ts) FROM prose INDEXED BY prose_session WHERE agent=?1 AND session=?2 AND visible=1 AND ts>0),0),last_ts=coalesce((SELECT max(ts) FROM prose INDEXED BY prose_session WHERE agent=?1 AND session=?2 AND visible=1 AND ts>0),0),title=coalesce((SELECT substr(CAST(text AS TEXT),1,CASE WHEN instr(CAST(text AS TEXT),char(10))>0 THEN min(160,instr(CAST(text AS TEXT),char(10))-1) ELSE 160 END) FROM prose INDEXED BY prose_session WHERE agent=?1 AND session=?2 AND visible=1 AND who!='agent' ORDER BY position,id LIMIT 1),'') WHERE agent=?1 AND id=?2")?.execute(params![agent,session])?;
+    let first: Option<Vec<u8>> = tx.prepare_cached("SELECT text FROM prose INDEXED BY prose_session WHERE agent=?1 AND session=?2 AND visible=1 AND who NOT IN ('agent','recap') ORDER BY position,id LIMIT 1")?.query_row(params![agent, session], |r| r.get(0)).optional()?;
+    let title = first.map_or_else(String::new, |text| {
+        session_title(&String::from_utf8_lossy(&text))
+    });
+    tx.prepare_cached("UPDATE sessions SET first_ts=coalesce((SELECT min(ts) FROM prose INDEXED BY prose_session WHERE agent=?1 AND session=?2 AND visible=1 AND ts>0),0),last_ts=coalesce((SELECT max(ts) FROM prose INDEXED BY prose_session WHERE agent=?1 AND session=?2 AND visible=1 AND ts>0),0),title=?3 WHERE agent=?1 AND id=?2")?.execute(params![agent,session,title])?;
     Ok(())
 }
 /// Chats in `table` (with its session id in `column`) that hold no turn.
@@ -1486,6 +1494,7 @@ fn canonicalize(
     changes: &mut Changes,
     bulk: bool,
 ) -> Result<()> {
+    let mut pi_order = None;
     for (agent, session) in sessions {
         if bulk {
             let copies: usize = tx.query_row(
@@ -1571,14 +1580,38 @@ fn canonicalize(
                     .unwrap_or(false),
             });
         }
+        // Equal-quality copies and session metadata follow 0.4.9 discovery order.
+        if agent == "pi" && pi_order.is_none() {
+            let paths = crate::ingest::pi::source_order();
+            pi_order = Some(
+                tx.prepare("SELECT rowid,path FROM sources WHERE agent='pi'")?
+                    .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+                    .filter_map(|r| match r {
+                        Ok((id, path)) => paths.get(Path::new(&path)).map(|rank| Ok((id, *rank))),
+                        Err(e) => Some(Err(e)),
+                    })
+                    .collect::<rusqlite::Result<HashMap<_, _>>>()?,
+            );
+        }
+        let source_order = |m: &ReplayMessage| {
+            (
+                pi_order
+                    .as_ref()
+                    .and_then(|ranks| ranks.get(&rows[m.row].source))
+                    .copied()
+                    .unwrap_or(usize::MAX),
+                m.row,
+            )
+        };
         let mut best: BTreeMap<(i64, String), usize> = BTreeMap::new();
         for (i, m) in messages.iter().enumerate() {
             let r = &rows[m.row];
             let key = (r.turn, m.key_text.clone());
-            if best
-                .get(&key)
-                .is_none_or(|j| replay_cmp(m, &messages[*j], &rows, agent).is_gt())
-            {
+            if best.get(&key).is_none_or(|j| {
+                let prior = &messages[*j];
+                let quality = replay_cmp(m, prior, &rows, agent);
+                quality.is_gt() || (quality.is_eq() && source_order(m) < source_order(prior))
+            }) {
                 best.insert(key, i);
             }
         }
@@ -1665,29 +1698,32 @@ fn canonicalize(
                 bulk,
             )?;
         }
+        refresh_session_bounds(tx, agent, session)?;
         if let Some(m) = chosen
             .iter()
             .map(|i| &messages[*i])
-            .max_by(|a, b| replay_cmp(a, b, &rows, agent))
+            .min_by_key(|m| source_order(m))
         {
             let r = &rows[m.row];
+            let claims: Vec<_> = chosen
+                .iter()
+                .map(|i| &messages[*i])
+                .filter(|m| !m.parent.is_empty())
+                .collect();
+            let parent = claims
+                .into_iter()
+                .min_by_key(|m| source_order(m))
+                .map_or("", |m| m.parent.as_str());
             let title = chosen
                 .iter()
-                .min_by_key(|i| positions[i])
-                .map(|i| {
-                    rows[messages[*i].row]
-                        .text
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .chars()
-                        .take(160)
-                        .collect::<String>()
-                })
+                .map(|i| &messages[*i])
+                .filter(|m| !matches!(rows[m.row].who.as_str(), "agent" | "recap"))
+                .filter(|m| !rows[m.row].text.trim().is_empty())
+                .min_by_key(|m| source_order(m))
+                .map(|m| session_title(&rows[m.row].text))
                 .unwrap_or_default();
-            tx.execute("UPDATE sessions SET project=?3,parent=?4,side=?5,title=?6 WHERE agent=?1 AND id=?2",params![agent,session,r.project,m.parent,m.side,title])?;
+            tx.execute("UPDATE sessions SET project=?3,parent=?4,side=?5,title=?6 WHERE agent=?1 AND id=?2",params![agent,session,r.project,parent,m.side || !parent.is_empty(),title])?;
         }
-        refresh_session_bounds(tx, agent, session)?;
     }
     Ok(())
 }
@@ -1985,11 +2021,12 @@ fn replace(
             if m.text.is_empty() && m.reply.is_empty() {
                 continue;
             }
-            let title_turn = if !m.text.is_empty() && m.who.as_ref() != "agent" {
-                m.turn
-            } else {
-                u32::MAX
-            };
+            let title_turn =
+                if !m.text.trim().is_empty() && !matches!(m.who.as_ref(), "agent" | "recap") {
+                    m.turn
+                } else {
+                    u32::MAX
+                };
             let entry = initial_bounds.entry(&m.session).or_insert_with(|| {
                 (
                     0,
@@ -1998,13 +2035,7 @@ fn replace(
                     if title_turn == u32::MAX {
                         String::new()
                     } else {
-                        m.text
-                            .lines()
-                            .next()
-                            .unwrap_or("")
-                            .chars()
-                            .take(160)
-                            .collect()
+                        session_title(&m.text)
                     },
                 )
             });
@@ -2014,14 +2045,7 @@ fn replace(
             }
             if title_turn < entry.2 {
                 entry.2 = title_turn;
-                entry.3 = m
-                    .text
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .chars()
-                    .take(160)
-                    .collect();
+                entry.3 = session_title(&m.text);
             }
         }
     }
@@ -2273,20 +2297,17 @@ fn replace(
     Ok(count)
 }
 fn session(tx: &Transaction<'_>, m: &Message, cwd: &str) -> Result<()> {
-    let title = m
-        .text
-        .lines()
-        .next()
-        .unwrap_or("")
-        .chars()
-        .take(200)
-        .collect::<String>();
+    let title = if matches!(m.who.as_ref(), "agent" | "recap") {
+        String::new()
+    } else {
+        session_title(&m.text)
+    };
     let family = if m.parent.is_empty() {
         m.session.as_ref()
     } else {
         m.parent.as_ref()
     };
-    tx.prepare_cached("INSERT INTO sessions(agent,id,project,parent,family,side,title,first_ts,last_ts) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8) ON CONFLICT(agent,id) DO UPDATE SET project=?3,parent=?4,side=?6,first_ts=CASE WHEN ?8=0 THEN first_ts WHEN first_ts=0 THEN ?8 ELSE MIN(first_ts,?8) END,last_ts=MAX(last_ts,?8),title=CASE WHEN ?9=0 THEN ?7 ELSE title END")?.execute(params![m.agent,m.session.as_ref(),m.project.as_ref(),m.parent.as_ref(),family,m.side,title,m.ts.max(0),m.turn])?;
+    tx.prepare_cached("INSERT INTO sessions(agent,id,project,parent,family,side,title,first_ts,last_ts) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8) ON CONFLICT(agent,id) DO UPDATE SET project=?3,parent=?4,side=?6,first_ts=CASE WHEN ?8=0 THEN first_ts WHEN first_ts=0 THEN ?8 ELSE MIN(first_ts,?8) END,last_ts=MAX(last_ts,?8),title=CASE WHEN ?9=0 OR title='' THEN ?7 ELSE title END")?.execute(params![m.agent,m.session.as_ref(),m.project.as_ref(),m.parent.as_ref(),family,m.side,title,m.ts.max(0),m.turn])?;
     tx.prepare_cached("UPDATE sessions SET cwd=?3 WHERE agent=?1 AND id=?2 AND ?3!=''")?
         .execute(params![m.agent, m.session.as_ref(), cwd])?;
     Ok(())
@@ -2826,9 +2847,66 @@ pub fn counts(c: &Connection) -> Result<serde_json::Value> {
     )
 }
 
+fn family_aliases(tx: &Transaction<'_>) -> Result<HashMap<(String, String), String>> {
+    let indexed = tx
+        .prepare("SELECT agent,id FROM sessions s WHERE EXISTS(SELECT 1 FROM prose p INDEXED BY prose_session WHERE p.agent=s.agent AND p.session=s.id)")?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<HashSet<_>>>()?;
+    let mut claims = BTreeMap::<(String, String), Option<String>>::new();
+    let mut q = tx.prepare("SELECT ss.agent,ss.session,s.path FROM session_sources ss JOIN sources s ON s.rowid=ss.source JOIN sessions c ON c.agent=ss.agent AND c.id=ss.session")?;
+    for row in q.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })? {
+        let (agent, session, path) = row?;
+        if !indexed.contains(&(agent.clone(), session.clone())) {
+            continue;
+        }
+        let Some(alias) = registry::session_alias(&agent, Path::new(&path), &session) else {
+            continue;
+        };
+        let key = (agent, alias);
+        if indexed.contains(&key) {
+            claims.insert(key, None);
+        } else {
+            claims
+                .entry(key)
+                .and_modify(|prior| {
+                    if prior.as_ref() != Some(&session) {
+                        *prior = None;
+                    }
+                })
+                .or_insert(Some(session));
+        }
+    }
+    let mut seen = HashSet::new();
+    Ok(claims
+        .into_iter()
+        .filter_map(|((agent, alias), session)| {
+            let session = session?;
+            seen.insert((agent.clone(), session.clone()))
+                .then_some(((agent, alias), session))
+        })
+        .collect())
+}
+
 fn resolve_families(tx: &Transaction<'_>, changed: &HashSet<(String, String)>) -> Result<()> {
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let aliases = family_aliases(tx)?;
     let mut affected = changed.clone();
-    let mut queue: Vec<_> = changed.iter().cloned().collect();
+    // A filename alias can appear, disappear or become ambiguous without its
+    // children's files changing. Their raw parent names stay available to resolve again.
+    affected.extend(
+        tx.prepare("SELECT s.agent,s.id FROM sessions s WHERE s.parent!='' AND NOT EXISTS(SELECT 1 FROM sessions p WHERE p.agent=s.agent AND p.id=s.parent)")?
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+    );
+    let mut queue: Vec<_> = affected.iter().cloned().collect();
     while let Some((agent, id)) = queue.pop() {
         let children: Vec<String> = tx
             .prepare_cached("SELECT id FROM sessions WHERE agent=?1 AND parent=?2")?
@@ -2861,7 +2939,12 @@ fn resolve_families(tx: &Transaction<'_>, changed: &HashSet<(String, String)>) -
                 )
                 .optional()?;
             match parent.filter(|s| !s.is_empty()) {
-                Some(p) => cur = p,
+                Some(p) => {
+                    cur = aliases
+                        .get(&(agent.clone(), p.clone()))
+                        .cloned()
+                        .unwrap_or(p)
+                }
                 None => break cur,
             }
         };

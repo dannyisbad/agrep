@@ -1,0 +1,5 @@
+{"type": "session", "version": 3, "id": "99000000-0000-4000-8000-000000000003", "cwd": "/work/fixture"}
+{"type": "message", "id": "u", "timestamp": "2026-10-08T12:00:00Z", "message": {"role": "user", "content": "Check the task state."}}
+{"type": "message", "id": "a", "parentId": "u", "timestamp": "2026-10-08T12:01:00Z", "message": {"role": "assistant", "content": [{"type": "toolCall", "id": "todo-call", "name": "todo", "arguments": {"op": "future-operation"}}], "model": "fixture"}}
+{"type": "message", "id": "tool", "parentId": "a", "timestamp": "2026-10-08T12:02:00Z", "message": {"role": "toolResult", "toolCallId": "todo-call", "toolName": "todo", "content": "Recorded.", "isError": false}}
+{"type": "message", "id": "done", "parentId": "tool", "timestamp": "2026-10-08T12:03:00Z", "message": {"role": "assistant", "content": "Done.", "model": "fixture"}}

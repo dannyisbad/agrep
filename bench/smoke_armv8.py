@@ -14,7 +14,7 @@ TEXT = 'how do i fix the flaky timer test'
 
 def smoke(binary, model):
     binary, model = Path(binary).resolve(), Path(model).resolve()
-    for name in ('config.json', 'tokenizer.json', 'model.safetensors'):
+    for name in ('config.json', 'weights-f32.safetensors', 'tokenizer-compact.json', 'tokenizer-query.bin'):
         if not (model / name).is_file():
             raise FileNotFoundError(f'provision the model before the ARMv8.0 smoke: {name}')
     with tempfile.TemporaryDirectory(prefix='agrep-armv8-') as temporary:

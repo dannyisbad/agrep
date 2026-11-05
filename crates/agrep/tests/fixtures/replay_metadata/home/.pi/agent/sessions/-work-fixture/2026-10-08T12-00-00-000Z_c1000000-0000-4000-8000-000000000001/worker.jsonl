@@ -1,0 +1,4 @@
+{"type": "session", "version": 3, "id": "c2000000-0000-4000-8000-000000000002", "cwd": "/work/fixture"}
+{"type": "message", "id": "u0", "parentId": null, "timestamp": "2026-10-08T12:00:00Z", "message": {"role": "user", "content": "First retained request."}}
+{"type": "message", "id": "u1", "parentId": "u0", "timestamp": "2026-10-08T12:10:00Z", "message": {"role": "user", "content": "Second retained request."}}
+{"type": "message", "id": "u2", "parentId": "u1", "timestamp": "2026-10-08T12:20:00Z", "message": {"role": "user", "content": "Later appended request."}}

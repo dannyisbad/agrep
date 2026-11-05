@@ -879,12 +879,22 @@ pub fn parse(
                 Ok(Some((value, encoded)))
             })
             .collect();
-        drop(lines);
         let mut normalized = String::new();
+        let mut malformed = Vec::new();
         for (n, record) in records.into_iter().enumerate() {
-            let Some((value, encoded)) = record? else {
-                normalized.push('\n');
-                continue;
+            let (value, encoded) = match record {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    normalized.push('\n');
+                    continue;
+                }
+                Err(_) => {
+                    // The adapter counts malformed records and retains readable ones.
+                    normalized.push_str(lines[n]);
+                    normalized.push('\n');
+                    malformed.push(lines[n].to_owned());
+                    continue;
+                }
             };
             if value["type"] == "session" {
                 header = encoded.clone();
@@ -907,6 +917,7 @@ pub fn parse(
             normalized.push_str(&encoded);
             normalized.push('\n');
         }
+        drop(lines);
         data = normalized;
         if branched {
             let c = Connection::open_with_flags(
@@ -957,6 +968,10 @@ pub fn parse(
             data.push('\n');
             for record in chain.iter().rev() {
                 data.push_str(record);
+                data.push('\n');
+            }
+            for record in malformed {
+                data.push_str(&record);
                 data.push('\n');
             }
         }

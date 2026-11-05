@@ -1,0 +1,29 @@
+{
+  "counts": {
+    "chats": 2,
+    "side_chats": 1,
+    "unknown_timestamp_rows": 0,
+    "family_dedup_ms": 0
+  },
+  "worked_on": [
+    {
+      "session": "b3000000-0000-4000-8000-000000000003",
+      "side_chats": 0,
+      "estimated_active_ms": 0,
+      "first_text": "Check the orphan task."
+    },
+    {
+      "session": "66000000-0000-4000-8000-000000000002",
+      "side_chats": 1,
+      "estimated_active_ms": 0,
+      "first_text": "Finish the root task."
+    }
+  ],
+  "pending": [],
+  "families": {
+    "66000000-0000-4000-8000-000000000002": "66000000-0000-4000-8000-000000000002",
+    "77000000-0000-4000-8000-000000000003": "66000000-0000-4000-8000-000000000002",
+    "b3000000-0000-4000-8000-000000000003": "b1000000-0000-4000-8000-000000000001"
+  },
+  "pending_exit": 2
+}

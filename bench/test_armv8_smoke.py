@@ -14,7 +14,7 @@ class Armv8SmokeTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
-        for name in ('config.json', 'tokenizer.json', 'model.safetensors'):
+        for name in ('config.json', 'weights-f32.safetensors', 'tokenizer-compact.json', 'tokenizer-query.bin'):
             (self.root / name).touch()
         self.outputs = [
             (f'agrep {version()}\n', ''),
@@ -67,7 +67,7 @@ class Armv8SmokeTests(unittest.TestCase):
             self.execute()
 
     def test_missing_model_fails_before_running_the_binary(self):
-        (self.root / 'model.safetensors').unlink()
+        (self.root / 'weights-f32.safetensors').unlink()
         with patch('smoke_armv8.subprocess.run') as run:
             with self.assertRaises(FileNotFoundError):
                 smoke(self.root / 'agrep', self.root)

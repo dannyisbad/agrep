@@ -223,7 +223,7 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
             .or_else(|| latest_handle.clone())
             .unwrap_or_else(|| format!("@{}", index.target(&s.id)));
         if args.json {
-            let mut row = json!({"session":s.id,"agent":s.agent,"project":s.project,"turns":turns,"first_ts":s.first_ts,"last_ts":s.last_ts,"first_text":s.title,"side":s.side,"session_handle":format!("@{}", index.target(&s.id)),"last_turn":latest.as_ref().map(|r|r.turn),"latest_handle":latest_handle,"match_source":if hit.is_some(){"content"}else{"identity"}});
+            let mut row = json!({"session":s.id,"agent":s.agent,"project":s.project,"turns":turns,"first_ts":s.first_ts,"last_ts":s.last_ts,"first_text":s.title.trim(),"side":s.side,"session_handle":format!("@{}", index.target(&s.id)),"last_turn":latest.as_ref().map(|r|r.turn),"latest_handle":latest_handle,"match_source":if hit.is_some(){"content"}else{"identity"}});
             // 0.4.9 marked a chat's own family only when it withheld the caller's window
             // (py/search.py:8838-8846).
             if apply_self && caller.resolved && !direct {

@@ -345,8 +345,10 @@ fn parse_source(
         }
     });
     let diagnostics = crate::intake::take_diagnostics();
+    // A complete, nonempty parse can account for bad records without losing its good ones.
     let error = if !diagnostics.is_empty()
-        || crate::intake::errors(&bad)
+        || (crate::intake::errors(&bad)
+            && (o != Some(ReadOutcome::Complete) || (m.is_empty() && e.is_empty())))
         || o.is_some_and(|o| !o.licenses_replacement())
     {
         Some(

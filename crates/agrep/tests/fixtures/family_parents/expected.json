@@ -1,0 +1,45 @@
+{
+  "counts": {
+    "chats": 2,
+    "side_chats": 1,
+    "unknown_timestamp_rows": 0,
+    "family_dedup_ms": 0
+  },
+  "worked_on": [
+    {
+      "session": "22000000-0000-4000-8000-000000000002",
+      "side_chats": 0,
+      "estimated_active_ms": 0,
+      "first_text": "Finish the second part."
+    },
+    {
+      "session": "11000000-0000-4000-8000-000000000001",
+      "side_chats": 1,
+      "estimated_active_ms": 2400000,
+      "first_text": "Build the first part."
+    }
+  ],
+  "pending": [
+    {
+      "session": "11000000-0000-4000-8000-000000000001",
+      "evidence_session": "33000000-0000-4000-8000-000000000003",
+      "status": "agent_work_incomplete",
+      "confidence": "medium",
+      "source": "side-chat",
+      "turn": 2,
+      "signals": [
+        "side chat has no captured reply to its last turn"
+      ],
+      "evidence": "Run the final check.",
+      "items": [],
+      "handle": "@33000000:2.47ed",
+      "first_text": "Build the first part."
+    }
+  ],
+  "parents": {
+    "11000000-0000-4000-8000-000000000001": "",
+    "22000000-0000-4000-8000-000000000002": "",
+    "33000000-0000-4000-8000-000000000003": "11000000-0000-4000-8000-000000000001"
+  },
+  "pending_exit": 0
+}

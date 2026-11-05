@@ -1,0 +1,4 @@
+{"type": "session", "version": 3, "id": "33000000-0000-4000-8000-000000000003", "timestamp": "2026-10-08T12:00:00Z", "cwd": "/work/family"}
+{"type": "message", "id": "u", "timestamp": "2026-10-08T12:00:00Z", "message": {"role": "user", "content": [{"type": "text", "text": "Check the second part."}]}}
+{"type": "message", "id": "a", "parentId": "u", "timestamp": "2026-10-08T12:01:00Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "I checked the available options. Shall I continue with the next part?"}], "model": "fixture"}}
+{"type": "message", "id": "u2", "parentId": "a", "timestamp": "2026-10-09T12:00:00Z", "message": {"role": "user", "content": [{"type": "text", "text": "Run the final check."}]}}

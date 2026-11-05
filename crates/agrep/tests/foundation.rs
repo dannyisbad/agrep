@@ -2769,7 +2769,8 @@ fn initial_single_source_metadata_uses_visible_rows_and_first_prompt() {
             .unwrap()
             .timestamp_millis()
     );
-    assert_eq!(got.2, "first prompt");
+    // 0.4.9's aggregate_sessions joins whitespace before taking the first 120 characters.
+    assert_eq!(got.2, "first prompt body");
 }
 
 #[test]

@@ -1,0 +1,6 @@
+{"type": "session", "version": 3, "id": "88000000-0000-4000-8000-000000000001", "cwd": "/work/fixture"}
+{"broken":
+{"type": "message", "id": "u", "timestamp": "2026-10-08T12:00:00Z", "message": {"role": "user", "content": "Check retained records."}}
+{"type": "message", "id": "a", "parentId": "u", "timestamp": "2026-10-08T12:01:00Z", "message": {"role": "assistant", "content": "Done.", "model": "fixture"}}
+{"also_broken":
+{"type": "message", "id": "next", "parentId": "a", "timestamp": "2026-10-08T12:10:00Z", "message": {"role": "user", "content": "Run the next check."}}
