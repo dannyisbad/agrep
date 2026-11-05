@@ -7,6 +7,7 @@ pub mod codex;
 pub mod crush;
 pub mod cursor;
 pub mod gemini;
+pub(crate) mod jsonl;
 pub mod kimi;
 pub mod opencode;
 pub(crate) mod parse_guard;

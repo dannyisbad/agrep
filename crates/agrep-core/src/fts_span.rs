@@ -174,16 +174,16 @@ pub(crate) fn install(c: &Connection) -> Result<()> {
 }
 /// ASCII punctuation never creates a unicode61 word. Conservatively count every
 /// non-ASCII character that the phrase regex permits in a separator (including
-/// private-use and numeric symbols), even when unicode61 would also ignore it.
+/// private-use and numeric symbols), except the cut marker unicode61 ignores.
 pub(crate) fn gap_upper(text: &str) -> usize {
     if text.is_ascii() {
         return 0;
     }
     let (mut gap, mut maximum) = (0, 0);
     for c in text.chars() {
-        if c != '_' && regex_syntax::is_word_character(c) {
+        if crate::unicode_v16::is_alphanumeric(c) {
             gap = 0;
-        } else if !c.is_ascii() {
+        } else if !c.is_ascii() && c != crate::window::CUT {
             gap += 1;
             maximum = maximum.max(gap);
         }
@@ -201,6 +201,7 @@ mod tests {
         assert!(!possible(&mut [vec![8], vec![4]], &[0, 1], 20));
         assert_eq!(gap_upper("a_\u{e000} \u{e001} b"), 2);
         assert_eq!(gap_upper("a -\n _____ b"), 0);
+        assert_eq!(gap_upper("a…b"), 0);
     }
 }
 
@@ -250,6 +251,9 @@ mod sqlite_tests {
             (4, "bar foo"),
             (5, "foo \u{e000} bar"),
             (6, "foo-----bar"),
+            (7, "foo \u{e000} \u{345} \u{e001} bar"),
+            (8, "foo \u{e000} \u{301} \u{e001} bar"),
+            (9, "foo…bar"),
         ] {
             c.execute(
                 "INSERT INTO f(rowid,text) VALUES(?1,?2)",
@@ -268,6 +272,7 @@ mod sqlite_tests {
             .flat_map(u32::to_le_bytes)
             .collect();
         let got:Vec<i64>=c.prepare("SELECT f.rowid FROM f JOIN gaps g ON g.id=f.rowid WHERE f MATCH ?1 AND agrep_word_span(f,?2,g.n)").unwrap().query_map(rusqlite::params!["(\"foo\" OR \"foobar\") AND (\"bar\" OR \"foobar\")",plan],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
-        assert_eq!(got, [1, 3, 5, 6]);
+        // Python's phrase gap permits combining marks between these indexed words.
+        assert_eq!(got, [1, 3, 5, 6, 7, 8, 9]);
     }
 }

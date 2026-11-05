@@ -202,9 +202,11 @@ pub struct Marks {
     /// user's regex; none for a meaning-only result.
     pattern: Option<Pattern>,
     /// `_terms_hl_pat`: each content term, for keyword rows matched in any order.
-    terms: Option<Pattern>,
+    terms: std::sync::OnceLock<Option<Pattern>>,
+    query: String,
+    keyword: bool,
     /// The query's boundary terms, which place an any-order row's matches.
-    prepared: boundary_rank::PreparedQuery,
+    prepared: std::sync::OnceLock<boundary_rank::PreparedQuery>,
 }
 impl Marks {
     pub fn new(q: &str, s: &Style) -> Self {
@@ -219,50 +221,67 @@ impl Marks {
             let tokens: Vec<String> = q
                 .split(|c: char| py_space(c) || c == '-' || c == '_')
                 .filter(|t| !t.is_empty())
-                .map(regex::escape)
+                .map(crate::pattern::literal)
                 .collect();
             (!tokens.is_empty())
-                .then(|| Pattern::linear(&tokens.join(r"[\W_]*")).ok())
+                .then(|| {
+                    let gap = if tokens.len() > 1 {
+                        crate::unicode_v16::keyword_gap()
+                    } else {
+                        ""
+                    };
+                    Pattern::linear(&tokens.join(gap)).ok()
+                })
                 .flatten()
         };
-        let mut variants: Vec<String> = content_terms(q)
-            .iter()
-            .filter(|t| t.chars().count() >= 3)
-            .flat_map(|t| boundary_rank::term_variants(t))
-            .collect();
-        variants.sort_by(|a, b| {
-            b.chars()
-                .count()
-                .cmp(&a.chars().count())
-                .then_with(|| a.cmp(b))
-        });
-        variants.dedup();
-        let terms = (keyword && !variants.is_empty())
-            .then(|| {
-                Pattern::linear(
-                    &variants
-                        .iter()
-                        .map(|v| regex::escape(v))
-                        .collect::<Vec<_>>()
-                        .join("|"),
-                )
-                .ok()
-            })
-            .flatten();
         Self {
             pattern,
-            terms,
-            prepared: boundary_rank::prepare_query(q, &boundary_rank::Stats::new()),
+            terms: std::sync::OnceLock::new(),
+            query: q.to_owned(),
+            keyword,
+            prepared: std::sync::OnceLock::new(),
         }
+    }
+    fn terms(&self) -> Option<&Pattern> {
+        self.terms
+            .get_or_init(|| {
+                if !self.keyword {
+                    return None;
+                }
+                let mut variants: Vec<String> = content_terms(&self.query)
+                    .iter()
+                    .filter(|t| t.chars().count() >= 3)
+                    .flat_map(|t| boundary_rank::term_variants(t))
+                    .collect();
+                variants.sort_by(|a, b| {
+                    b.chars()
+                        .count()
+                        .cmp(&a.chars().count())
+                        .then_with(|| a.cmp(b))
+                });
+                variants.dedup();
+                (!variants.is_empty())
+                    .then(|| {
+                        Pattern::linear(
+                            &variants
+                                .iter()
+                                .map(|v| crate::pattern::literal(v))
+                                .collect::<Vec<_>>()
+                                .join("|"),
+                        )
+                        .ok()
+                    })
+                    .flatten()
+            })
+            .as_ref()
     }
     /// `_hl` with `_row_hl_pat`: the sanitized snippet with each match painted.
     fn paint(&self, h: &Hit, color: bool) -> String {
         let snippet = safe(&h.snippet);
-        let pattern = match &self.terms {
-            Some(terms) if ["all-terms", "content-terms"].contains(&h.matched.as_str()) => {
-                Some(terms)
-            }
-            _ => self.pattern.as_ref(),
+        let pattern = if ["all-terms", "content-terms"].contains(&h.matched.as_str()) {
+            self.terms().or(self.pattern.as_ref())
+        } else {
+            self.pattern.as_ref()
         };
         let Some(p) = pattern.filter(|_| color) else {
             return snippet;
@@ -291,6 +310,9 @@ impl Marks {
                     .map_or(text.len(), |(b, _)| b)
             };
             self.prepared
+                .get_or_init(|| {
+                    boundary_rank::prepare_query(&self.query, &boundary_rank::Stats::new())
+                })
                 .evaluate(text, None, true)
                 .map(|score| {
                     score
@@ -414,7 +436,7 @@ pub fn emit_semantic(
 ) -> Result<()> {
     let truncated = ((!s.count && !s.tiers) && r.hits.len() < r.total) || r.total_basis != "exact";
     let exhaustible = !s.semantic && !r.hits.iter().any(|h| h.matched == "semantic");
-    let marks = Marks::new(q, s);
+    let marks = std::cell::LazyCell::new(|| Marks::new(q, s));
     let mut out = String::new();
     let mut footer = None;
     if s.count {
@@ -458,7 +480,11 @@ pub fn emit_semantic(
                 safe(&project(&h.project)),
                 h.turn,
                 safe(&h.who),
-                marks.paint(h, s.color)
+                if s.color {
+                    marks.paint(h, true)
+                } else {
+                    safe(&h.snippet)
+                }
             );
         }
     } else if s.compact {
@@ -705,6 +731,33 @@ fn completeness_line(r: &Results, s: &Style, exhaustible: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 0.4.9's `_hl` / `_hl_regex` paint raw-text Python re.I matches.
+    #[test]
+    fn keyword_marks_use_the_same_raw_case_classes_as_retrieval() {
+        for (query, snippet, expected) in [
+            (
+                "kit",
+                "KİT kıt kit",
+                "\x1b[1;31mKİT\x1b[0m \x1b[1;31mkıt\x1b[0m \x1b[1;31mkit\x1b[0m",
+            ),
+            (
+                "cafe kit",
+                "cafe\u{301}—kit",
+                "\x1b[1;31mcafe\u{301}—kit\x1b[0m",
+            ),
+            ("office", "oﬃce office", "oﬃce \x1b[1;31moffice\x1b[0m"),
+            ("...", "… ...", "… \x1b[1;31m...\x1b[0m"),
+        ] {
+            let marks = Marks::new(query, &Style::default());
+            let hit = Hit {
+                snippet: snippet.into(),
+                matched: "phrase".into(),
+                ..Hit::default()
+            };
+            assert_eq!(marks.paint(&hit, true), expected, "{query:?}");
+        }
+    }
+
     #[test]
     fn semantic_rows_name_the_meaning_lane() {
         let hit = Hit {

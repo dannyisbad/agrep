@@ -34,14 +34,6 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   turn by 0.45 like any other query, where 0.4.9's fast path for such a query without
   filters left ASCII rows unscaled: 0.4.9 scaled the same rows once a filter sent that
   query down its ordinary path, so its order depended on whether a filter was given.
-- Keyword search, and `-w` with a term of three or more characters, miss two kinds of rows
-  0.4.9 found, in prose and tool output alike: a decomposed accent directly after the term
-  (`cafe` followed by U+0301 COMBINING ACUTE ACCENT), and dotless ı or dotted İ standing
-  for i (`kıt` or `KİT` for `kit`). `-w` with a shorter term reads every row and matches
-  them as 0.4.9 did. 0.5 indexes, and matches keywords in, text normalized to NFKC and
-  case-folded, which composes the accent into its letter and keeps ı and İ apart from i,
-  and keeps no list of the rows holding a case exception of Python's `re`, which 0.4.9
-  added to the candidates of such a term.
 - A tool event keeps only its trimmed search text, so `--tool-output` and JSON
   `input`/`output` lack the surrounding whitespace 0.4.9 stored separately, and
   `[+N indexed chars]` counts the trimmed output: the index stores one text per event.

@@ -1,0 +1,45 @@
+{
+  "texts": [
+    "an\u0130b\u0130c",
+    "ani\u0307b\u0130c",
+    "an\u0130bi\u0307c",
+    "ani\u0307bi\u0307c",
+    "anibic",
+    "ani\u0307bic",
+    "an\u0131\u0307b\u0130c",
+    "an\u0130b\u0131\u0307c"
+  ],
+  "pattern": "ani\u0307bi\u0307c",
+  "cases": [
+    {
+      "word": false,
+      "rows": [
+        {
+          "who": "user",
+          "snippet": "ani\u0307bi\u0307c"
+        },
+        {
+          "who": "user",
+          "snippet": "an\u0130b\u0130c"
+        },
+        {
+          "who": "user",
+          "snippet": "ani\u0307b\u0130c"
+        },
+        {
+          "who": "user",
+          "snippet": "an\u0130bi\u0307c"
+        }
+      ]
+    },
+    {
+      "word": true,
+      "rows": [
+        {
+          "who": "user",
+          "snippet": "ani\u0307bi\u0307c"
+        }
+      ]
+    }
+  ]
+}

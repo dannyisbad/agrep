@@ -14,7 +14,7 @@ The root is `AGREP_DATA_DIR` if set, otherwise `~/Library/Application Support/ag
 on macOS, `$XDG_DATA_HOME/agrep/0.5` (or `~/.local/share/agrep/0.5`) on Linux and
 `%LOCALAPPDATA%\agrep\0.5` on Windows.
 
-`FORMAT` holds exactly `agrep-data 1\n`. An absent or empty root is initialized; the
+`FORMAT` holds exactly `agrep-data 2\n`. An absent or empty root is initialized; the
 marker is created with `create_new`, so racing initializers agree. Other marker bytes,
 or a non-empty root without a marker, are refused with one line naming the path. On Unix
 the root and its `archive`, `model` and `log` directories are created with mode 0700,
@@ -125,6 +125,25 @@ How commands use it (`ready` and `finish_census` in `crates/agrep/src/main.rs`):
    previous leaf is a branch: the active branch is rebuilt from the stored entry graph
    (`parser_graph`) instead of rereading the file. Other formats re-parse the changed
    source.
+   Changed file sources parse ahead in source order within a 512 MiB reservation
+   window, including the source being written. Active parses reserve their input
+   size; completed parses return unused credit after conservatively accounting for
+   retained rows, the compact graph and prepared tool text. A dedicated feeder can
+   reuse that credit while the writer is busy. A larger source initially reserves
+   the whole window. Checkpointed JSONL uses a 16 MiB raw buffer; a record which
+   exceeds that buffer spills to a private temporary file. A completed spill up to
+   256 MiB uses a read-only view for slice parsing; only one view is live at a time,
+   and it is released before row extraction. Larger records keep using the bounded
+   reader. Oversized plain ASCII
+   strings are validated in bounded chunks and decoded only if projection retains
+   them; escaped, non-ASCII or malformed strings use the ordinary reader to preserve
+   decoding and diagnostics. Pi validates unused
+   metadata without building its JSON tree and borrows its compact graph during
+   row extraction, avoiding a second tree. Large Claude and Codex inputs use a
+   private temporary snapshot whose lines can be replayed for attribution.
+   Normalized rows and pi's compact graph remain live until that source is written;
+   retained message content and an individual decoded JSON string can exceed the
+   raw buffer.
 5. Writes, in one transaction:
    - the directory listings, and the removal of removed sources' rows;
    - each parsed source's rows, classified (user, subagent, recap, control, synthetic,
@@ -185,8 +204,19 @@ without reading its old rows.
 ## FTS indexes
 
 - `prose_fts`: contentless FTS5 (`contentless_delete=1`), trigram tokenizer,
-  `detail=full`, over normalized text: ASCII lowercased, other characters NFKC and case
-  folded.
+  `detail=full`, over Python `re.IGNORECASE` equivalence keys. Each input character
+  maps to one representative of its case class; accents are not composed and
+  compatibility characters are not expanded. The same keys feed tool words and
+  block bounds. Verification maps matches back to original characters and uses
+  Python's raw word boundaries. The Greek iota class, whose case key changes word
+  membership, uses a raw matcher. 0.4.9's lowercase shortcut for dotted İ is
+  preserved, including lowercase-first occurrence selection and the raw literal
+  fallback. Python Unicode 16 lowercase data also pins contextual final sigma.
+  Sparse `prose_case_fts` and `tools_case_fts` indexes reuse the prepared keys only
+  for rows where that shortcut differs from the case key; plural counts verify
+  their matches with one sparse MATCH query. Both sparse indexes use literal
+  trigrams so the tool dictionary need not expand words a second time.
+  NFKC remains in the separate boundary-ranking statistics.
 - `tools_fts`: contentless FTS5 with `unicode61 remove_diacritics 0` word tokens and
   positions. SQLite truncates tokens at 32 KiB, so words over 8 KiB are indexed as
   overlapping 8 KiB windows and literals up to 4 KiB stay findable.

@@ -61,9 +61,10 @@ S = round(T * R * W * B, 4)
   counted as the snippet shows them. Repetitions elsewhere in a long reply, or a
   tighter match outside the snippet, do not count; a match spread over a
   whitespace run counts as its collapsed width. Matches are found on the same
-  NFKC case-folded text as eligibility, so where that folding and 0.4.9's
-  case-insensitive matching agree (ASCII and most Unicode text) the counts are
-  0.4.9's. An all-terms row takes the larger
+  original text as eligibility, with Python's `re.IGNORECASE` character classes
+  and its `[\W_]*` separator rule. The single-token lowercase shortcut also
+  preserves 0.4.9's expanding dotted İ. Accents and compatibility spellings
+  retain their original characters. An all-terms row takes the larger
   of that phrase strength over its stitched snippet and its proximity: the share
   of terms the boundary scorer finds in the snippet times
   `0.5 + 0.5 * min(1, query_characters / spread) * scale`, where `spread` covers
@@ -109,7 +110,7 @@ S_view = S * L, where L = 1.0 (phrase), 0.7 (all terms), 0.5 (content fallback)
 This lets strong human prose represent a chat ahead of a weak phrase found in
 tool output without changing ordinary row-search ordering.
 
-The content fallback matches each content word literally (folded, no spelling
+The content fallback matches each content word literally (Python lowercase, no spelling
 variants) and weighs it by `ln(1 + N / (df + 1))`, where `N` counts the rows in
 scope (prose only unless tool rows are searched) and `df` the rows holding the
 word; a word under three characters counts as in every row. Only rows holding one
@@ -132,8 +133,9 @@ separators, `lowerCase` transitions, `HTTPServer` acronym-to-word transitions,
 letter/digit transitions, and Unicode script changes. Apostrophes between
 letters are joiners, so the `t` in `don't` is not promoted. Combining marks,
 variation selectors, skin-tone modifiers, Hangul clusters, and emoji ZWJ
-sequences stay attached to their base. NFKC case-folded matching maps spans back
-to the original text before grading boundaries.
+sequences stay attached to their base. Boundary grading uses NFKC case-folded
+clusters and maps spans back to the original text; literal eligibility does not
+normalize those clusters.
 
 For token `t`, ingest commits short-token statistics:
 

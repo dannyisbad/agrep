@@ -3,6 +3,7 @@ use crate::{
     data::DataRoot,
     ingest::registry::{self, Adapter, ADAPTERS},
     intake_batch::{IntakeBatch, SourceBatch},
+    intake_pipeline::{parse_ahead, Parsed},
     model::Message,
 };
 use anyhow::Result;
@@ -179,6 +180,7 @@ CREATE TRIGGER IF NOT EXISTS prose_user_count_visibility AFTER UPDATE OF visible
             "trigram case_sensitive 1"
         };
         c.execute_batch(&format!("CREATE VIRTUAL TABLE IF NOT EXISTS {table}_fts USING fts5({columns},content='',contentless_delete=1,tokenize='{tokenizer}',detail=full);"))?;
+        c.execute_batch(&format!("CREATE VIRTUAL TABLE IF NOT EXISTS {table}_case_fts USING fts5(text,content='',contentless_delete=1,tokenize='trigram case_sensitive 1',detail=full);"))?;
         c.execute_batch(&format!(
             "CREATE VIRTUAL TABLE IF NOT EXISTS {table}_vocab USING fts5vocab({table}_fts, row);"
         ))?;
@@ -242,6 +244,24 @@ pub fn normalize(text: &str) -> String {
     }
     crate::boundary_rank::normalize_token(text)
 }
+/// A literal-search key: Python `re.I` equivalences, without compatibility
+/// normalization or expansions. Boundary statistics keep their separate NFKC fold.
+pub(crate) fn search_fold(text: &str) -> String {
+    if text.is_ascii() {
+        return text.to_ascii_lowercase();
+    }
+    crate::unicode_v16::sre_fold_text(text, |_, _, _| {})
+}
+
+fn search_key(text: &str) -> (String, bool) {
+    if text.is_ascii() {
+        return (text.to_ascii_lowercase(), false);
+    }
+    let mut aliases = false;
+    let key = crate::unicode_v16::sre_fold_text(text, |_, _, mask| aliases |= mask != 0);
+    (key, aliases)
+}
+
 /// Remove precisely the separators the phrase matcher permits between query terms.
 pub fn joined(text: &str) -> String {
     if text.is_ascii() {
@@ -704,6 +724,7 @@ fn refresh_inner(
                 tx.execute("DELETE FROM prose", [])?;
             }
             tx.execute(&format!("DELETE FROM {t}_fts"), [])?;
+            tx.execute(&format!("DELETE FROM {t}_case_fts"), [])?;
         }
         tx.execute("DELETE FROM event_rows", [])?;
         tx.execute("DELETE FROM sessions", [])?;
@@ -1018,98 +1039,11 @@ fn refresh_inner(
     drop(lock);
     Ok(info)
 }
-/// A parsed source and the texts of its events, prepared beside the parse.
-type Parsed = (SourceBatch, Vec<Option<crate::tool_store::Prepared>>);
-/// Hands `pending` to `write` in order while `parsers` threads parse the sources after it,
-/// up to AHEAD_BYTES of them, so a refresh holds a bounded slice of its history's parse
-/// whatever the history's size. Returns how long `write` waited for a parse.
-///
-/// Each source parses start to finish on a thread of its own; only the work inside one
-/// source goes to the rayon pool. As pool tasks, a source waiting on its own parallel
-/// work would run later sources on top of itself, and the writer would wait for them.
-fn parse_ahead(
-    parsers: usize,
-    pending: Vec<crate::intake_batch::Pending>,
-    sizes: &HashMap<&str, u64>,
-    mut write: impl FnMut(Parsed) -> Result<()>,
-) -> Result<std::time::Duration> {
-    const AHEAD_BYTES: u64 = 512 << 20;
-    type Job = (
-        crate::intake_batch::Pending,
-        std::sync::mpsc::SyncSender<Parsed>,
-    );
-    if pending.is_empty() {
-        return Ok(std::time::Duration::ZERO);
-    }
-    let parsers = parsers.clamp(1, pending.len());
-    let mut pending = pending.into_iter().map(|source| {
-        let size = sizes
-            .get(source.path.to_string_lossy().as_ref())
-            .copied()
-            .unwrap_or(0);
-        (size.max(64 << 10), source)
-    });
-    let (queue, jobs) = std::sync::mpsc::channel::<Job>();
-    let jobs = std::sync::Mutex::new(jobs);
-    std::thread::scope(|scope| {
-        for _ in 0..parsers {
-            scope.spawn(|| loop {
-                let Ok(Ok((source, send))) = jobs.lock().map(|jobs| jobs.recv()) else {
-                    break;
-                };
-                let source = source.parse();
-                // Digesting and compressing tool text here keeps it off the writer;
-                // a text that fails to prepare is formatted again, in order, there.
-                let prepared = source
-                    .events
-                    .par_iter()
-                    .map(|e| {
-                        (source.error.is_none() && e.kind != "control")
-                            .then(|| crate::tool_store::prepare(e).ok())
-                            .flatten()
-                    })
-                    .collect();
-                let _ = send.send((source, prepared));
-            });
-        }
-        // Owning the queue, the writer closes it however it returns, which ends the
-        // parser threads once they drain what it queued.
-        let queue = queue;
-        let mut parsing = std::collections::VecDeque::new();
-        let mut ahead = 0;
-        let mut waited = std::time::Duration::ZERO;
-        loop {
-            while ahead < AHEAD_BYTES {
-                let Some((size, source)) = pending.next() else {
-                    break;
-                };
-                let (send, receive) = std::sync::mpsc::sync_channel(1);
-                queue
-                    .send((source, send))
-                    .map_err(|_| anyhow::anyhow!("source parsers ended"))?;
-                ahead += size;
-                parsing.push_back((size, receive));
-            }
-            let Some((size, receive)) = parsing.pop_front() else {
-                break;
-            };
-            let tick = Instant::now();
-            // A parse that panicked sent nothing; the scope rethrows its panic.
-            let parsed = receive
-                .recv()
-                .map_err(|_| anyhow::anyhow!("source parse ended"))?;
-            waited += tick.elapsed();
-            ahead -= size;
-            write(parsed)?;
-        }
-        Ok(waited)
-    })
-}
 type FtsInput = Vec<(i64, Vec<u8>)>;
-type FtsPrepared = Vec<(i64, String)>;
+type FtsPrepared = Vec<(i64, String, bool)>;
 type FtsWords = Vec<(i64, Vec<Box<[u8]>>)>;
 /// A prepared row: its id, indexed text and distinct dictionary words.
-type FtsRow = (i64, String, Vec<Box<[u8]>>);
+type FtsRow = (i64, String, Vec<Box<[u8]>>, bool);
 fn read_fts_batch(rows: &mut rusqlite::Rows<'_>) -> Result<FtsInput> {
     let mut input = Vec::with_capacity(1024);
     for _ in 0..1024 {
@@ -1128,9 +1062,9 @@ fn prepare_fts_batch(
         .map_init(
             || tokenizers.map(|t| t.tokenizer()),
             |tokenizer, (id, bytes)| {
-                let text = normalize(&decode(table, bytes)?);
+                let (text, aliases) = search_key(&decode(table, bytes)?);
                 if table != "tools" {
-                    return Ok((id, text, Vec::new()));
+                    return Ok((id, text, Vec::new(), aliases));
                 }
                 let text = crate::tool_index::index_text(&text).into_owned();
                 let words = match tokenizer {
@@ -1138,14 +1072,14 @@ fn prepare_fts_batch(
                     Some(Err(error)) => anyhow::bail!("{error:#}"),
                     None => Vec::new(),
                 };
-                Ok((id, text, words))
+                Ok((id, text, words, aliases))
             },
         )
         .collect::<Result<_>>()?;
     let mut prepared = Vec::with_capacity(rows.len());
     let mut words = Vec::with_capacity(rows.len());
-    for (id, text, row_words) in rows {
-        prepared.push((id, text));
+    for (id, text, row_words, aliases) in rows {
+        prepared.push((id, text, aliases));
         words.push((id, row_words));
     }
     Ok((prepared, words))
@@ -1223,8 +1157,14 @@ fn build_fts(tx: &Transaction<'_>) -> Result<Option<crate::tool_index::Presence>
                     let mut insert = tx.prepare_cached(&format!(
                         "INSERT INTO {table}_fts(rowid,text) VALUES(?1,?2)"
                     ))?;
-                    for (id, text) in &prepared {
+                    let mut mark = tx.prepare_cached(&format!(
+                        "INSERT INTO {table}_case_fts(rowid,text) VALUES(?1,?2)"
+                    ))?;
+                    for (id, text, aliases) in &prepared {
                         insert.execute(params![id, text])?;
+                        if *aliases {
+                            mark.execute(params![id, text])?;
+                        }
                     }
                 }
                 Ok(())
@@ -1242,6 +1182,10 @@ fn build_fts(tx: &Transaction<'_>) -> Result<Option<crate::tool_index::Presence>
         })?;
         tx.execute(
             &format!("INSERT INTO {table}_fts({table}_fts) VALUES('optimize')"),
+            [],
+        )?;
+        tx.execute(
+            &format!("INSERT INTO {table}_case_fts({table}_case_fts) VALUES('optimize')"),
             [],
         )?;
         crate::fts_segments::configure(tx, &format!("{table}_fts"))?;
@@ -1290,10 +1234,24 @@ impl FtsWrites {
             for (id, (before, after)) in std::mem::take(rows) {
                 if before {
                     delete.execute([id])?;
+                    tx.execute(&format!("DELETE FROM {table}_case_fts WHERE rowid=?"), [id])?;
                 }
                 if after {
-                    let normalized =
-                        normalize(&decode(table, text.query_row([id], |r| r.get(0))?)?);
+                    let (normalized, aliases) =
+                        search_key(&decode(table, text.query_row([id], |r| r.get(0))?)?);
+                    if aliases {
+                        tx.execute(
+                            &format!("INSERT INTO {table}_case_fts(rowid,text) VALUES(?1,?2)"),
+                            params![
+                                id,
+                                if table == "tools" {
+                                    crate::tool_index::index_text(&normalized)
+                                } else {
+                                    std::borrow::Cow::Borrowed(normalized.as_str())
+                                }
+                            ],
+                        )?;
+                    }
                     if table == "tools" {
                         insert.execute(params![
                             id,
@@ -2461,7 +2419,7 @@ fn build_bounds(key: i64, rows: Vec<BoundRow>) -> Result<BuiltBounds> {
         }
         let decoded = decode(table, text)?;
         all_ascii &= decoded.is_ascii();
-        let text = normalize(&decoded);
+        let text = search_fold(&decoded);
         max_gap = max_gap.max(crate::fts_span::gap_upper(&text));
         texts.push((text, ts, who));
     }
@@ -3293,7 +3251,7 @@ pub fn refresh_phrase_gaps(root: &DataRoot) -> Result<usize> {
         while let Some(row) = rows.next()? {
             let id: i64 = row.get(0)?;
             let text = decode("tools", row.get(1)?)?;
-            let gap = crate::fts_span::gap_upper(&normalize(&text));
+            let gap = crate::fts_span::gap_upper(&search_fold(&text));
             blocks
                 .entry(id / BLOCK)
                 .and_modify(|n| *n = (*n).max(gap))

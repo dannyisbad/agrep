@@ -1,0 +1,302 @@
+{
+  "texts": [
+    "k\u0131t padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding kit",
+    "xk\u0131tx padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding k\u0131t",
+    "C\u0130TY kit",
+    "CITY kit",
+    "c\u0131ties kit",
+    "cities kit",
+    "\u03a3 padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding \u03c3",
+    "A\u03a3 padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding \u03c3",
+    "\u017fit padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding sit",
+    "\u0130 padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding i",
+    "\u0130slands kit",
+    "island kit"
+  ],
+  "cases": [
+    {
+      "args": [
+        "kit",
+        "-n",
+        "0"
+      ],
+      "rows": [
+        {
+          "who": "user",
+          "snippet": "island kit"
+        },
+        {
+          "who": "user",
+          "snippet": "\u0130slands kit"
+        },
+        {
+          "who": "user",
+          "snippet": "cities kit"
+        },
+        {
+          "who": "user",
+          "snippet": "c\u0131ties kit"
+        },
+        {
+          "who": "user",
+          "snippet": "CITY kit"
+        },
+        {
+          "who": "user",
+          "snippet": "C\u0130TY kit"
+        },
+        {
+          "who": "user",
+          "snippet": "\u2026padding padding padding padding padding padding padding padding padding padding kit"
+        },
+        {
+          "who": "user",
+          "snippet": "xk\u0131tx padding padding padding padding padding padding padding padding padding paddin\u2026"
+        },
+        {
+          "who": "tool",
+          "snippet": "bash: printf unicode island kit"
+        },
+        {
+          "who": "tool",
+          "snippet": "bash: printf unicode \u0130slands kit"
+        },
+        {
+          "who": "tool",
+          "snippet": "bash: printf unicode cities kit"
+        },
+        {
+          "who": "tool",
+          "snippet": "bash: printf unicode c\u0131ties kit"
+        },
+        {
+          "who": "tool",
+          "snippet": "bash: printf unicode CITY kit"
+        },
+        {
+          "who": "tool",
+          "snippet": "bash: printf unicode C\u0130TY kit"
+        },
+        {
+          "who": "tool",
+          "snippet": "\u2026padding padding padding padding padding padding padding padding padding padding kit"
+        },
+        {
+          "who": "tool",
+          "snippet": "bash: printf unicode xk\u0131tx padding padding padding padding padding padding padding padding padding paddin\u2026"
+        }
+      ],
+      "count": 16
+    },
+    {
+      "args": [
+        "cities kit",
+        "-n",
+        "0"
+      ],
+      "rows": [
+        {
+          "who": "user",
+          "snippet": "cities kit"
+        },
+        {
+          "who": "user",
+          "snippet": "c\u0131ties kit"
+        },
+        {
+          "who": "tool",
+          "snippet": "bash: printf unicode cities kit"
+        },
+        {
+          "who": "tool",
+          "snippet": "bash: printf unicode c\u0131ties kit"
+        },
+        {
+          "who": "user",
+          "snippet": "CITY kit"
+        },
+        {
+          "who": "tool",
+          "snippet": "bash: printf unicode CITY kit"
+        }
+      ],
+      "count": 6
+    },
+    {
+      "args": [
+        "islands kit",
+        "-n",
+        "0"
+      ],
+      "rows": [
+        {
+          "who": "user",
+          "snippet": "\u0130slands kit"
+        },
+        {
+          "who": "tool",
+          "snippet": "bash: printf unicode \u0130slands kit"
+        },
+        {
+          "who": "user",
+          "snippet": "island kit"
+        },
+        {
+          "who": "tool",
+          "snippet": "bash: printf unicode island kit"
+        }
+      ],
+      "count": 4
+    },
+    {
+      "args": [
+        "\u03c3",
+        "-n",
+        "0"
+      ],
+      "rows": [
+        {
+          "who": "user",
+          "snippet": "\u2026padding padding padding padding padding padding padding padding padding padding \u03c3"
+        },
+        {
+          "who": "user",
+          "snippet": "\u03a3 padding padding padding padding padding padding padding padding padding padding\u2026"
+        },
+        {
+          "who": "tool",
+          "snippet": "\u2026padding padding padding padding padding padding padding padding padding padding \u03c3"
+        },
+        {
+          "who": "tool",
+          "snippet": "bash: printf unicode \u03a3 padding padding padding padding padding padding padding padding padding padding\u2026"
+        }
+      ],
+      "count": 4
+    },
+    {
+      "args": [
+        "sit",
+        "-n",
+        "0"
+      ],
+      "rows": [
+        {
+          "who": "user",
+          "snippet": "\u2026padding padding padding padding padding padding padding padding padding padding sit"
+        },
+        {
+          "who": "tool",
+          "snippet": "\u2026padding padding padding padding padding padding padding padding padding padding sit"
+        }
+      ],
+      "count": 2
+    },
+    {
+      "args": [
+        "i",
+        "-n",
+        "0"
+      ],
+      "rows": [
+        {
+          "who": "user",
+          "snippet": "\u0130 padding padding padding padding padding padding padding padding padding padding\u2026"
+        },
+        {
+          "who": "user",
+          "snippet": "island kit"
+        },
+        {
+          "who": "user",
+          "snippet": "\u0130slands kit"
+        },
+        {
+          "who": "tool",
+          "snippet": "bash: printf unicode \u0130 padding padding padding padding padding padding padding padding padding padding\u2026"
+        },
+        {
+          "who": "user",
+          "snippet": "\u017fit padding padding padding padding padding padding padding padding padding paddin\u2026"
+        },
+        {
+          "who": "user",
+          "snippet": "A\u03a3 padding padding padding padding padding padding padding padding padding padding paddi\u2026"
+        },
+        {
+          "who": "user",
+          "snippet": "\u03a3 padding padding padding padding padding padding padding padding padding padding paddi\u2026"
+        },
+        {
+          "who": "user",
+          "snippet": "xk\u0131tx padding padding padding padding padding padding padding padding padding padding paddi\u2026"
+        },
+        {
+          "who": "user",
+          "snippet": "k\u0131t padding padding padding padding padding padding padding padding padding padding paddi\u2026"
+        },
+        {
+          "who": "tool",
+          "snippet": "bash: printf unicode island kit"
+        },
+        {
+          "who": "tool",
+          "snippet": "bash: printf unicode \u0130slands kit"
+        },
+        {
+          "who": "user",
+          "snippet": "cities kit"
+        },
+        {
+          "who": "user",
+          "snippet": "c\u0131ties kit"
+        },
+        {
+          "who": "user",
+          "snippet": "CITY kit"
+        },
+        {
+          "who": "user",
+          "snippet": "C\u0130TY kit"
+        },
+        {
+          "who": "tool",
+          "snippet": "bash: printf unicode \u017fit padding padding padding padding padding padding padding padding \u2026"
+        },
+        {
+          "who": "tool",
+          "snippet": "bash: printf unicode A\u03a3 padding padding padding padding padding padding padding padding p\u2026"
+        },
+        {
+          "who": "tool",
+          "snippet": "bash: printf unicode \u03a3 padding padding padding padding padding padding padding padding pa\u2026"
+        },
+        {
+          "who": "tool",
+          "snippet": "bash: printf unicode xk\u0131tx padding padding padding padding padding padding padding paddin\u2026"
+        },
+        {
+          "who": "tool",
+          "snippet": "bash: printf unicode k\u0131t padding padding padding padding padding padding padding padding \u2026"
+        },
+        {
+          "who": "tool",
+          "snippet": "bash: printf unicode cities kit"
+        },
+        {
+          "who": "tool",
+          "snippet": "bash: printf unicode c\u0131ties kit"
+        },
+        {
+          "who": "tool",
+          "snippet": "bash: printf unicode CITY kit"
+        },
+        {
+          "who": "tool",
+          "snippet": "bash: printf unicode C\u0130TY kit"
+        }
+      ],
+      "count": 24
+    }
+  ]
+}

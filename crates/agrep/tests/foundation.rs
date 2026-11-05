@@ -2160,6 +2160,13 @@ fn pi_branch_switches_replay_persisted_nodes_and_match_full_parse() {
         ("b", "m0", "fork prompt"),
         ("c", "m2", "restored branch prompt"),
     ] {
+        use std::io::Write;
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{malformed before branch\n")
+            .unwrap();
         write_records(
             &path,
             &[
@@ -2167,6 +2174,12 @@ fn pi_branch_switches_replay_persisted_nodes_and_match_full_parse() {
             ],
             true,
         );
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{malformed after branch\n")
+            .unwrap();
         let info = indexed(&h, &d);
         assert!(info["bytes_read"].as_u64().unwrap() < 20_000);
         if full.exists() {

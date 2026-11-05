@@ -1,13 +1,13 @@
 //! 0.4.9's keyword hit windows. A hit shows its selected match with [`PAD`] characters on
 //! each side, whitespace collapsed and cuts marked, and its keyword score counts the query
 //! only inside that snippet.
-use crate::{boundary_rank, unicode_v16};
+use crate::unicode_v16;
 use std::cmp::Ordering;
 use std::ops::Range;
 
 /// Characters a window keeps on each side of its match.
 pub const PAD: usize = 80;
-/// The cut marker. Folding turns it into three periods, so no folded token holds it.
+/// The cut marker used in displayed snippet windows.
 pub const CUT: char = '…';
 
 /// Python's `round(value, 4)` for a score: the multiple of 1e-4 nearest the exact binary
@@ -69,11 +69,14 @@ fn half_above(value: f64, floor: f64, places: u32) -> Ordering {
     }
 }
 
-/// A row's folded text (`store::normalize`) and the original bytes each folded byte
+/// A row's Python-case-equivalent text and the original bytes each folded byte
 /// came from.
 pub(crate) struct Folded<'a> {
     pub text: &'a str,
     pub low: String,
+    pub raw: bool,
+    pub aliases: u8,
+    lower: std::cell::OnceCell<Box<Folded<'a>>>,
     /// Each non-ASCII cluster: folded start and end, original start and end. Bytes
     /// between clusters are ASCII and fold one for one.
     clusters: Vec<[usize; 4]>,
@@ -86,14 +89,51 @@ impl<'a> Folded<'a> {
                 text,
                 low: text.to_ascii_lowercase(),
                 clusters: Vec::new(),
+                raw: false,
+                aliases: 0,
+                lower: Default::default(),
             };
         }
-        let (low, clusters) = boundary_rank::normalize_mapped(text);
+        let mut clusters = Vec::new();
+        let mut raw = false;
+        let mut aliases = 0;
+        let low = unicode_v16::sre_fold_text(text, |folded, original, mask| {
+            aliases |= mask;
+            raw |= matches!(&text[original.clone()], "Ι" | "ι" | "ι");
+            clusters.push([folded.start, folded.end, original.start, original.end]);
+        });
         Self {
             text,
             low,
             clusters,
+            raw,
+            aliases,
+            lower: Default::default(),
         }
+    }
+    pub fn lowercase(text: &'a str) -> Self {
+        if text.is_ascii() {
+            return Self::new(text);
+        }
+        let mut clusters = Vec::new();
+        let low = unicode_v16::lowercase_mapped(text, |folded, original| {
+            clusters.push([folded.start, folded.end, original.start, original.end]);
+        });
+        Self {
+            text,
+            low,
+            clusters,
+            raw: false,
+            aliases: 0,
+            lower: Default::default(),
+        }
+    }
+    pub fn lower_span(&self, spellings: &[String]) -> Option<Range<usize>> {
+        insensitive_span(
+            self.lower
+                .get_or_init(|| Box::new(Self::lowercase(self.text))),
+            spellings,
+        )
     }
     fn cluster(&self, index: usize) -> Option<[usize; 4]> {
         index.checked_sub(1).map(|index| self.clusters[index])
@@ -117,19 +157,29 @@ impl<'a> Folded<'a> {
             None => at,
         }
     }
-    /// The folded offset of the first whole cluster at or after original byte `at`.
+    pub fn matching_text(&self) -> &str {
+        if self.raw {
+            self.text
+        } else {
+            &self.low
+        }
+    }
+    pub fn matching_span(&self, range: Range<usize>) -> Range<usize> {
+        if self.raw {
+            range
+        } else {
+            self.start(range.start)..self.end(range.end)
+        }
+    }
     fn from(&self, at: usize) -> usize {
         match self.cluster(self.clusters.partition_point(|c| c[2] <= at)) {
             Some([start, _, original, _]) if original == at => start,
-            Some([_, end, _, original]) if at < original => end,
             Some([_, end, _, original]) => end + (at - original),
             None => at,
         }
     }
-    /// The folded offset where the whole clusters before original byte `at` end.
     fn to(&self, at: usize) -> usize {
         match self.cluster(self.clusters.partition_point(|c| c[2] < at)) {
-            Some([start, _, _, original]) if at < original => start,
             Some([_, end, _, original]) => end + (at - original),
             None => at,
         }
@@ -319,11 +369,10 @@ fn render(text: &str, body: Range<usize>, out: &mut String) -> (Piece, usize) {
     (Piece { body, at }, count)
 }
 
-/// The folded text a snippet's matches are found in: each window's whole clusters, with
-/// its cut markers and the joining spaces kept as they are, so no token matches them.
+/// A snippet's matching windows with their original positions.
 pub(crate) struct View {
     pub text: String,
-    /// For each folded run: its view offset, folded offset, length and window.
+    /// For each raw run: its view offset, original offset, length and window.
     runs: Vec<[usize; 4]>,
 }
 
@@ -338,10 +387,14 @@ impl View {
             if piece.body.start > 0 {
                 text.push(CUT);
             }
-            let (from, to) = (row.from(piece.body.start), row.to(piece.body.end));
+            let (from, to) = if row.raw {
+                (piece.body.start, piece.body.end)
+            } else {
+                (row.from(piece.body.start), row.to(piece.body.end))
+            };
             if from < to {
                 runs.push([text.len(), from, to - from, index]);
-                text.push_str(&row.low[from..to]);
+                text.push_str(&row.matching_text()[from..to]);
             }
             if piece.body.end < row.text.len() {
                 text.push(CUT);
@@ -349,20 +402,22 @@ impl View {
         }
         Self { text, runs }
     }
-    /// The snippet characters of the view range `range`, which starts and ends inside
-    /// folded runs because tokens never match the markers or spaces between them.
+    /// The snippet characters of a match in the raw windows.
     pub fn span(&self, row: &Folded, snip: &Snip, range: Range<usize>) -> Range<usize> {
         let locate = |at: usize, end: bool| -> usize {
             let index = self
                 .runs
                 .partition_point(|run| if end { run[0] < at } else { run[0] <= at })
                 .saturating_sub(1);
-            let [view, folded, length, piece] = self.runs[index];
+            let [view, original, length, piece] = self.runs[index];
             let offset = (at.max(view) - view).min(length);
-            let original = if end {
-                row.end(folded + offset)
+            let original = original + offset;
+            let original = if row.raw {
+                original
+            } else if end {
+                row.end(original)
             } else {
-                row.start(folded + offset)
+                row.start(original)
             };
             snip.index(piece, original)
         };
@@ -500,19 +555,15 @@ mod tests {
     }
 
     #[test]
-    fn folded_offsets_map_back_to_original_clusters() {
-        let text = "Café e\u{301}x ﬁle Σ";
+    fn literal_offsets_do_not_compose_or_expand_characters() {
+        let text = "Café e\u{301}x ﬁle İ ı Σ";
         let row = Folded::new(text);
-        assert_eq!(row.low, "café éx file σ");
-        let at = row.low.find("éx").unwrap();
-        assert_eq!(&text[row.start(at)..row.end(at + "éx".len())], "e\u{301}x");
-        let at = row.low.find("fi").unwrap();
-        assert_eq!(&text[row.start(at)..row.end(at + 2)], "ﬁ");
-        assert_eq!(&text[row.start(at + 1)..row.end(at + 2)], "ﬁ");
-        // A window edge inside a cluster drops the partial cluster.
-        let inside = text.find('\u{301}').unwrap();
-        assert_eq!(&row.low[row.from(inside)..row.to(text.len())], "x file σ");
-        assert_eq!(&row.low[row.from(0)..row.to(inside)], "café ");
+        assert_eq!(row.low, "café e\u{301}x ﬁle i i ς");
+        for token in ["e\u{301}", "ﬁ", "i", "ς"] {
+            let at = row.low.find(token).unwrap();
+            let original = &text[row.start(at)..row.end(at + token.len())];
+            assert_eq!(crate::store::search_fold(original), token);
+        }
     }
 
     #[test]
@@ -534,7 +585,7 @@ mod tests {
         let end = text.find("beta").unwrap() + 4;
         let snip = Snip::new(&text, std::slice::from_ref(&(at..end)));
         let view = View::new(&row, &snip);
-        let found = regex::Regex::new(r"alpha[\W_]*beta").unwrap();
+        let found = regex::Regex::new(r"(?i:alpha[\W_]*beta)").unwrap();
         let m = found.find(&view.text).unwrap();
         let span = view.span(&row, &snip, m.range());
         let chars: Vec<char> = snip.text.chars().collect();

@@ -43,8 +43,8 @@ const GZIP_DECOMPRESSED_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 /// One decoded JSONL line plus its position, so the tree walk can order by file
 /// arrival without re-parsing.
-struct Record {
-    value: serde_json::Value,
+struct Record<'a> {
+    value: &'a serde_json::Value,
     ordinal: usize,
 }
 
@@ -76,7 +76,7 @@ fn text_of(value: Option<&serde_json::Value>) -> String {
 /// The active branch, oldest first. The last record in the file is the current
 /// leaf; walking parentId back to the root drops branches the user abandoned.
 /// A record whose parent is missing ends the walk rather than failing the file.
-fn active_branch(records: &[Record]) -> Vec<usize> {
+fn active_branch(records: &[Record<'_>]) -> Vec<usize> {
     let mut by_id: HashMap<&str, usize> = HashMap::new();
     for (index, record) in records.iter().enumerate() {
         if let Some(id) = record.value.get("id").and_then(|i| i.as_str()) {
@@ -112,7 +112,7 @@ fn active_branch(records: &[Record]) -> Vec<usize> {
 /// Outputs of every toolResult on the branch, keyed by the call they answer, so
 /// a toolCall can be emitted with its result even though they are separate rows.
 fn tool_results(
-    records: &[Record],
+    records: &[Record<'_>],
     branch: &[usize],
 ) -> HashMap<String, (String, Option<bool>, usize, usize)> {
     let mut results = HashMap::new();
@@ -205,45 +205,321 @@ pub fn compact_record(mut v: serde_json::Value) -> serde_json::Value {
             }
         }
         if let Some(fields) = m.as_object_mut() {
-            fields.retain(|key, _| {
-                matches!(
-                    key.as_str(),
-                    "role"
-                        | "content"
-                        | "model"
-                        | "timestamp"
-                        | "synthetic"
-                        | "toolCallId"
-                        | "isError"
-                        | "command"
-                        | "output"
-                        | "cancelled"
-                        | "exitCode"
-                        | "__agrep_chars"
-                        | "__agrep_bytes"
-                )
-            });
+            fields.retain(|key, _| keep_message_field(key));
         }
     }
     if let Some(fields) = v.as_object_mut() {
-        fields.retain(|key, _| {
-            matches!(
-                key.as_str(),
-                "type"
-                    | "id"
-                    | "parentId"
-                    | "timestamp"
-                    | "version"
-                    | "cwd"
-                    | "modelId"
-                    | "model"
-                    | "summary"
-                    | "message"
-                    | "__agrep_ordinal"
-            )
-        });
+        fields.retain(|key, _| keep_record_field(key));
     }
     v
+}
+
+fn keep_message_field(key: &str) -> bool {
+    matches!(
+        key,
+        "role"
+            | "content"
+            | "model"
+            | "timestamp"
+            | "synthetic"
+            | "toolCallId"
+            | "isError"
+            | "command"
+            | "output"
+            | "cancelled"
+            | "exitCode"
+            | "__agrep_chars"
+            | "__agrep_bytes"
+    )
+}
+fn keep_record_field(key: &str) -> bool {
+    matches!(
+        key,
+        "type"
+            | "id"
+            | "parentId"
+            | "timestamp"
+            | "version"
+            | "cwd"
+            | "modelId"
+            | "model"
+            | "summary"
+            | "message"
+            | "__agrep_ordinal"
+    )
+}
+
+/// Validate discarded fields too: IgnoredAny accepts numbers and escaped strings
+/// which a Value would reject. The visitor borrows strings and retains no tree.
+struct Validate;
+impl<'de> serde::Deserialize<'de> for Validate {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Validate;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON value")
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Validate, E> {
+                Ok(Validate)
+            }
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Validate, E> {
+                Ok(Validate)
+            }
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Validate, E> {
+                Ok(Validate)
+            }
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Validate, E> {
+                Ok(Validate)
+            }
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Validate, E> {
+                Ok(Validate)
+            }
+            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Validate, E> {
+                Ok(Validate)
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> Result<Validate, A::Error> {
+                while a.next_element::<Validate>()?.is_some() {}
+                Ok(Validate)
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> Result<Validate, A::Error> {
+                while a.next_entry::<Validate, Validate>()?.is_some() {}
+                Ok(Validate)
+            }
+        }
+        d.deserialize_any(Visitor)
+    }
+}
+
+pub(crate) fn validate_record(bytes: &[u8]) -> serde_json::Result<()> {
+    serde_json::from_slice::<Validate>(bytes).map(|_| ())
+}
+pub(crate) fn validate_record_reader(reader: impl std::io::Read) -> serde_json::Result<()> {
+    serde_json::from_reader::<_, Validate>(reader).map(|_| ())
+}
+
+struct Projection {
+    message: bool,
+}
+impl<'de> serde::de::DeserializeSeed<'de> for Projection {
+    type Value = serde_json::Value;
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_any(self)
+    }
+}
+impl<'de> serde::de::Visitor<'de> for Projection {
+    type Value = serde_json::Value;
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a JSON value")
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+    fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+        Ok(v.into())
+    }
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+        Ok(v.into())
+    }
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+        Ok(v.into())
+    }
+    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+        Ok(v.into())
+    }
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(v.into())
+    }
+    fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+        Ok(v.into())
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
+        let mut values = Vec::new();
+        while let Some(value) = a.next_element()? {
+            values.push(value);
+        }
+        Ok(serde_json::Value::Array(values))
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
+        let mut fields = serde_json::Map::new();
+        while let Some(key) = a.next_key::<String>()? {
+            let keep = if self.message {
+                keep_message_field(&key)
+            } else {
+                keep_record_field(&key)
+            };
+            if keep {
+                let value = if !self.message && key == "message" {
+                    a.next_value_seed(Projection { message: true })?
+                } else {
+                    a.next_value()?
+                };
+                fields.insert(key, value);
+            } else {
+                a.next_value::<Validate>()?;
+            }
+        }
+        Ok(serde_json::Value::Object(fields))
+    }
+}
+
+/// Discard unused metadata before it becomes an owned JSON tree. In particular,
+/// tool-result `details` can be hundreds of MB beside only a few KB of text.
+pub(crate) fn projected_record(line: &str) -> serde_json::Result<serde_json::Value> {
+    use serde::de::DeserializeSeed;
+    let mut deserializer = serde_json::Deserializer::from_str(line);
+    let value = Projection { message: false }.deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(value)
+}
+
+fn projected_decoded_record_reader(
+    reader: impl std::io::Read,
+) -> serde_json::Result<serde_json::Value> {
+    use serde::de::DeserializeSeed;
+    // serde_json reads one byte at a time; buffer the decoded stream too.
+    let decoded = std::io::BufReader::with_capacity(64 << 10, reader);
+    let mut deserializer = serde_json::Deserializer::from_reader(decoded);
+    let value = Projection { message: false }.deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(value)
+}
+
+#[cfg(test)]
+fn projected_record_reader(reader: impl std::io::Read) -> serde_json::Result<serde_json::Value> {
+    projected_decoded_record_reader(crate::ingest::jsonl::LossyReader::new(reader))
+}
+
+pub(crate) fn optional_projected_record_reader(
+    reader: impl std::io::Read,
+) -> serde_json::Result<Option<serde_json::Value>> {
+    let mut decoded = crate::ingest::jsonl::LossyReader::new(reader);
+    let value = projected_decoded_record_reader(&mut decoded);
+    if value.is_err() && decoded.only_whitespace() {
+        std::io::copy(&mut decoded, &mut std::io::sink()).map_err(serde_json::Error::io)?;
+        if decoded.only_whitespace() {
+            return Ok(None);
+        }
+    }
+    value.map(Some)
+}
+
+fn restore_string(text: &mut String, file: &mut std::fs::File) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let Some(marker) = text.strip_prefix(crate::ingest::jsonl::STRING_MARKER) else {
+        return Ok(());
+    };
+    let (offset, length) = marker
+        .split_once(':')
+        .ok_or(std::io::ErrorKind::InvalidData)?;
+    let offset: u64 = offset
+        .parse()
+        .map_err(|_| std::io::ErrorKind::InvalidData)?;
+    let length: usize = length
+        .parse()
+        .map_err(|_| std::io::ErrorKind::InvalidData)?;
+    let end = offset
+        .checked_add(length as u64)
+        .ok_or(std::io::ErrorKind::InvalidData)?;
+    if end > file.metadata()?.len() {
+        return Err(std::io::ErrorKind::InvalidData.into());
+    }
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = vec![0; length];
+    file.read_exact(&mut bytes)?;
+    *text = String::from_utf8(bytes).map_err(|_| std::io::ErrorKind::InvalidData)?;
+    Ok(())
+}
+fn restore_strings(value: &mut serde_json::Value, file: &mut std::fs::File) -> std::io::Result<()> {
+    match value {
+        serde_json::Value::String(text) => restore_string(text, file)?,
+        serde_json::Value::Array(values) => {
+            for value in values {
+                restore_strings(value, file)?;
+            }
+        }
+        serde_json::Value::Object(values) => {
+            if values
+                .keys()
+                .any(|key| key.starts_with(crate::ingest::jsonl::STRING_MARKER))
+            {
+                for (mut key, mut value) in std::mem::take(values) {
+                    restore_string(&mut key, file)?;
+                    restore_strings(&mut value, file)?;
+                    values.insert(key, value);
+                }
+            } else {
+                for value in values.values_mut() {
+                    restore_strings(value, file)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+const MAPPED_RECORD_BYTES: u64 = 256 << 20;
+static RECORD_VIEW: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(crate) fn optional_projected_record_file(
+    file: &mut std::fs::File,
+    length: u64,
+) -> serde_json::Result<Option<serde_json::Value>> {
+    projected_record_file(file, length, MAPPED_RECORD_BYTES)
+}
+
+fn projected_record_file(
+    file: &mut std::fs::File,
+    length: u64,
+    mapped_limit: u64,
+) -> serde_json::Result<Option<serde_json::Value>> {
+    use std::io::{Read, Seek};
+    file.rewind().map_err(serde_json::Error::io)?;
+    if length > 0
+        && length <= mapped_limit
+        && length <= file.metadata().map_err(serde_json::Error::io)?.len()
+    {
+        let mapped = {
+            let _view = RECORD_VIEW
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // SAFETY: callers own a completed private spill with no other writer or pathname.
+            let map = unsafe { memmap2::MmapOptions::new().len(length as usize).map(&*file) };
+            map.ok().and_then(|map| {
+                let text = std::str::from_utf8(&map).ok()?;
+                if text.trim().is_empty() {
+                    Some(None)
+                } else {
+                    projected_record(text).ok().map(Some)
+                }
+            })
+        };
+        // Values own their strings; release the capped view before row extraction.
+        if let Some(value) = mapped {
+            return Ok(value);
+        }
+    }
+    let value = projected_decoded_record_reader(crate::ingest::jsonl::LargeStrings::new(
+        std::io::BufReader::with_capacity(64 << 10, (&mut *file).take(length)),
+    ))
+    .and_then(|mut value| {
+        restore_strings(&mut value, file).map_err(serde_json::Error::io)?;
+        Ok(value)
+    });
+    match value {
+        Ok(value) => Ok(Some(value)),
+        Err(_) => {
+            // Preserve lossy UTF-8, whitespace handling and original JSON error positions.
+            file.rewind().map_err(serde_json::Error::io)?;
+            optional_projected_record_reader(file.take(length))
+        }
+    }
 }
 
 fn is_role(message: &serde_json::Value, role: &str) -> bool {
@@ -350,7 +626,7 @@ fn parse_with_tally(
             return (Vec::new(), Vec::new(), outcome);
         }
     };
-    parse_data(agent, path, parent, tally, &data, None).0
+    parse_data(agent, path, parent, tally, Input::Text(&data), None).0
 }
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
@@ -369,9 +645,41 @@ struct PiState {
     side: bool,
     ordinal: usize,
 }
-pub(crate) fn resume_parse(
+#[derive(Clone)]
+pub(crate) enum PreparedRecord {
+    Value(serde_json::Value),
+    Malformed {
+        error: String,
+        raw: Box<crate::ingest::jsonl::RawRecord>,
+    },
+}
+impl PreparedRecord {
+    pub(crate) fn value(&self) -> Option<&serde_json::Value> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Malformed { .. } => None,
+        }
+    }
+    pub(crate) fn into_value(self) -> Option<serde_json::Value> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Malformed { .. } => None,
+        }
+    }
+    pub(crate) fn encoded_len(&self) -> serde_json::Result<usize> {
+        match self {
+            Self::Value(value) => serde_json::to_vec(value).map(|v| v.len() + 1),
+            Self::Malformed { raw, .. } => Ok(raw.len() + 1),
+        }
+    }
+}
+enum Input<'a> {
+    Text(&'a str),
+    Prepared(&'a [PreparedRecord]),
+}
+pub(crate) fn resume_prepared(
     path: &Path,
-    data: &str,
+    values: &[PreparedRecord],
     previous: Option<&str>,
 ) -> anyhow::Result<(
     Vec<Message>,
@@ -385,17 +693,18 @@ pub(crate) fn resume_parse(
         path,
         side_parent(path),
         crate::intake::tally(),
-        data,
+        Input::Prepared(values),
         state,
     );
     Ok((m, e, o, serde_json::to_string(&next)?))
 }
+
 fn parse_data(
     agent: &'static str,
     path: &Path,
     parent: Option<String>,
     tally: std::sync::Arc<crate::intake::Tally>,
-    data: &str,
+    data: Input<'_>,
     previous: Option<PiState>,
 ) -> (Parsed, PiState) {
     let resumed = previous.is_some();
@@ -411,27 +720,64 @@ fn parse_data(
         parent.unwrap_or_default()
     };
     let ordinal = state.ordinal;
-    let mut records: Vec<Record> = Vec::new();
-    for (offset, line) in data.lines().enumerate() {
-        let ordinal = ordinal + offset;
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<serde_json::Value>(line) {
-            Ok(value) => {
-                let value = compact_record(value);
-                let ordinal = value
-                    .get("__agrep_ordinal")
-                    .and_then(|v| v.as_u64())
-                    .map_or(ordinal, |v| v as usize);
-                records.push(Record { value, ordinal });
+    let owned;
+    let mut offsets = Vec::new();
+    let (values, line_count) = match data {
+        Input::Prepared(input) => {
+            let mut values = Vec::new();
+            for record in input {
+                match record {
+                    PreparedRecord::Value(value) => values.push(value),
+                    PreparedRecord::Malformed { error, raw } => {
+                        // The adapter counts malformed records and retains readable ones.
+                        tally.seen();
+                        match raw.sample() {
+                            Ok(sample) => tally.error(&format!("{error}: {sample}")),
+                            Err(error) => {
+                                tally.error(&format!("cannot read malformed record: {error}"))
+                            }
+                        }
+                    }
+                }
             }
-            Err(error) => {
-                tally.seen();
-                tally.error(&format!("{error}: {}", crate::intake::clip(line, 80)));
-            }
+            (values, input.len())
         }
-    }
+        Input::Text(data) => {
+            let mut values = Vec::new();
+            for (offset, line) in data.lines().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match projected_record(line) {
+                    Ok(value) => {
+                        let value = compact_record(value);
+                        offsets.push(ordinal + offset);
+                        values.push(value);
+                    }
+                    Err(error) => {
+                        tally.seen();
+                        tally.error(&format!("{error}: {}", crate::intake::clip(line, 80)));
+                    }
+                }
+            }
+            owned = values;
+            (owned.iter().collect(), data.lines().count())
+        }
+    };
+    let records: Vec<_> = values
+        .iter()
+        .enumerate()
+        .map(|(offset, value)| Record {
+            value,
+            ordinal: value
+                .get("__agrep_ordinal")
+                .and_then(|v| v.as_u64())
+                .map_or_else(
+                    || offsets.get(offset).copied().unwrap_or(ordinal + offset),
+                    |v| v as usize,
+                ),
+        })
+        .collect();
     let header = records
         .iter()
         .find(|record| record.value.get("type").and_then(|t| t.as_str()) == Some("session"));
@@ -784,7 +1130,7 @@ fn parse_data(
         project,
         parent,
         side,
-        ordinal: ordinal + data.lines().count(),
+        ordinal: ordinal + line_count,
     };
     let messages = out
         .into_iter()
@@ -1054,5 +1400,148 @@ impl crate::ingest::registry::Adapter for Pi {
     }
     fn session_alias(&self, path: &Path, session: &str) -> Option<String> {
         session_alias(path, session)
+    }
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+
+    fn file_projection(bytes: &[u8]) -> serde_json::Result<Option<serde_json::Value>> {
+        use std::io::Write;
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(bytes).unwrap();
+        let mapped = optional_projected_record_file(&mut file, bytes.len() as u64);
+        let streamed = projected_record_file(&mut file, bytes.len() as u64, 0);
+        assert_eq!(
+            mapped.as_ref().map_err(ToString::to_string),
+            streamed.as_ref().map_err(ToString::to_string)
+        );
+        mapped
+    }
+
+    #[test]
+    fn oversized_plain_strings_preserve_retained_values_and_duplicate_keys() {
+        let big = "x".repeat((1 << 20) + 13);
+        for body in [
+            format!(
+                r#"{{"type":"message","message":{{"role":"toolResult","content":"ok","details":{{"padding":"{big}"}}}}}}"#
+            ),
+            format!(r#"{{"type":"message","message":{{"role":"user","content":"{big}"}}}}"#),
+            format!(
+                r#"{{"type":"message","message":{{"content":[{{"type":"toolCall","arguments":{{"{big}":1,"keep":3,"{big}":2}}}}]}}}}"#
+            ),
+        ] {
+            let expected = projected_record(&body).unwrap();
+            let actual = file_projection(body.as_bytes()).unwrap().unwrap();
+            assert_eq!(
+                serde_json::to_vec(&actual).unwrap(),
+                serde_json::to_vec(&expected).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_reader_fallback_preserves_text_and_error_positions() {
+        let big = "x".repeat((1 << 20) + 13);
+        let bodies = [
+            format!(r#"{{"message":{{"content":"{}"}}}}"#, "é".repeat(1 << 20)).into_bytes(),
+            format!(r#"{{"message":{{"content":"\u0000agrep_raw:0:999","details":"{big}"}}}}"#)
+                .into_bytes(),
+            format!(
+                r#"{{"message":{{"content":"{}","details":"{big}"}}}}"#,
+                "line\\n".repeat(1 << 18)
+            )
+            .into_bytes(),
+            format!(r#"{{"discard":"{big}","bad":1e9999}}"#).into_bytes(),
+            format!(r#"{{"discard":"{big}","bad":"\ud800"}}"#).into_bytes(),
+            format!(r#"{{"discard":"{big}" trailing}}"#).into_bytes(),
+        ];
+        for body in bodies {
+            let expected = optional_projected_record_reader(body.as_slice());
+            let actual = file_projection(&body);
+            match (actual, expected) {
+                (Ok(actual), Ok(expected)) => assert_eq!(actual, expected),
+                (Err(actual), Err(expected)) => {
+                    assert_eq!(actual.to_string(), expected.to_string())
+                }
+                pair => panic!("different parse outcomes: {pair:?}"),
+            }
+        }
+        let mut invalid = format!(r#"{{"message":{{"content":"{big}"}}}}"#).into_bytes();
+        let mut control = invalid.clone();
+        control[100] = 1;
+        assert_eq!(
+            file_projection(&control).unwrap_err().to_string(),
+            optional_projected_record_reader(control.as_slice())
+                .unwrap_err()
+                .to_string()
+        );
+        invalid[100] = 0xff;
+        assert_eq!(
+            file_projection(&invalid).unwrap(),
+            optional_projected_record_reader(invalid.as_slice()).unwrap()
+        );
+    }
+
+    #[test]
+    fn streamed_blank_records_match_trim_and_do_not_hide_late_errors() {
+        for blank in [" \t\r\n", "\u{a0}\u{2003}\n"] {
+            assert!(optional_projected_record_reader(blank.as_bytes())
+                .unwrap()
+                .is_none());
+            let mut late_error = blank.repeat(64 << 10);
+            late_error.push_str("not JSON");
+            assert!(optional_projected_record_reader(late_error.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn projection_preserves_compacted_values_and_key_order() {
+        for body in [
+            r#"{"discard":{"nested":[null,true,2.5,"text"]},"type":"message","id":"r","message":{"role":"toolResult","details":{"large":"ignored"},"content":[{"type":"text","text":"first"},{"type":"image","data":"ignored"},{"type":"text","text":"last"}],"isError":false}}"#,
+            r#"{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"reply"},{"type":"thinking","thinking":"ignored"},{"type":"toolCall","id":"c","name":"bash","arguments":{"command":"true"}}]},"id":"first","discard":0,"id":"last"}"#,
+            r#"{"type":"session","id":"s","message":null,"timestamp":18446744073709551615,"discard":-0.0}"#,
+            r#"{"type":"custom","message":[{"details":1}],"summary":"kept","\u0064iscard":"ignored"}"#,
+            r#"{"type":"message","message":{"role":"toolResult","content":"kept","__agrep_chars":4,"__agrep_bytes":4,"details":{}}}"#,
+        ] {
+            let expected = compact_record(serde_json::from_str(body).unwrap());
+            let actual = compact_record(projected_record(body).unwrap());
+            assert_eq!(
+                compact_record(projected_record_reader(body.as_bytes()).unwrap()),
+                expected
+            );
+            assert_eq!(
+                serde_json::to_vec(&actual).unwrap(),
+                serde_json::to_vec(&expected).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn discarded_fields_keep_json_validation_and_depth_limits() {
+        for body in [
+            r#"{"discard":1e9999}"#.to_owned(),
+            r#"{"discard":"\ud800"}"#.to_owned(),
+            r#"{"discard":[1,]}"#.to_owned(),
+            r#"{"discard":true} trailing"#.to_owned(),
+        ] {
+            assert!(serde_json::from_str::<serde_json::Value>(&body).is_err());
+            assert!(projected_record(&body).is_err());
+            assert!(validate_record_reader(body.as_bytes()).is_err());
+            assert!(projected_record_reader(body.as_bytes()).is_err());
+        }
+        for depth in 1..=130 {
+            let body = format!(
+                "{{\"discard\":{}0{}}}",
+                "[".repeat(depth),
+                "]".repeat(depth)
+            );
+            assert_eq!(
+                projected_record(&body).is_ok(),
+                serde_json::from_str::<serde_json::Value>(&body).is_ok(),
+                "depth {depth}"
+            );
+        }
     }
 }

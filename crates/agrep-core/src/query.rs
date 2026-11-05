@@ -361,10 +361,11 @@ struct PlanCache {
 impl PlanCache {
     fn matcher(&mut self, o: &Options, c: &Connection) -> Result<Matcher> {
         let key = (o.pattern.clone(), o.regex, o.word);
+        let needs_phrase = !o.regex && !o.word && (!o.count_only || o.count_by_tier);
         if self
             .matcher
             .as_ref()
-            .is_none_or(|(cached, _)| *cached != key)
+            .is_none_or(|(cached, m)| *cached != key || (needs_phrase && m.phrase.is_none()))
         {
             self.matcher = Some((key, Matcher::new(o, c)?));
         }
@@ -532,16 +533,32 @@ impl PlanCache {
     }
 }
 #[derive(Clone)]
+struct LowercaseTerm {
+    lowercase: Vec<String>,
+    mask: u8,
+    special: bool,
+    original: String,
+    raw: std::sync::Arc<std::sync::OnceLock<std::result::Result<regex::Regex, regex::Error>>>,
+}
+
+#[derive(Clone)]
 struct Matcher {
     quick_count: bool,
     partial: bool,
     phase: u8,
     terms: Vec<Vec<String>>,
     ordered_terms: Vec<Vec<String>>,
+    lowercase_terms: Vec<LowercaseTerm>,
+    dotted_candidates: Vec<String>,
+    content_literals: Vec<String>,
+    content_patterns: Vec<Option<regex::Regex>>,
     estimated: usize,
     phrase: Option<regex::Regex>,
     /// The phrase with one group per query token, for boundary spans.
     capture: Option<regex::Regex>,
+    raw_query: String,
+    raw_capture:
+        std::sync::Arc<std::sync::OnceLock<std::result::Result<regex::Regex, regex::Error>>>,
     explicit: Option<Pattern>,
     /// 0.4.9's query length for explicit scores: zero for a regular expression.
     explicit_chars: usize,
@@ -574,7 +591,7 @@ fn literal_terms(s: &str) -> Vec<String> {
         };
         let literal = String::from_utf8_lossy(literal.as_bytes());
         if !literal.is_empty() {
-            let literal = store::normalize(&literal);
+            let literal = store::search_fold(&literal);
             if !out.contains(&literal) {
                 out.push(literal);
             }
@@ -627,9 +644,88 @@ pub fn regex_error(pattern: &str) -> Option<String> {
 }
 impl Matcher {
     fn new(o: &Options, c: &Connection) -> Result<Self> {
-        let terms: Vec<Vec<String>> = boundary_rank::query_tokens(&o.pattern)
+        let tokens = boundary_rank::query_tokens(&o.pattern);
+        let mut lowercase_terms = Vec::new();
+        let dotted_candidates = if !o.word && !o.regex {
+            tokens
+                .iter()
+                .filter(|t| t.contains('İ'))
+                .map(|t| crate::unicode_v16::lowercase(t))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let terms: Vec<Vec<String>> = tokens
             .iter()
-            .map(|t| boundary_rank::term_variants(t))
+            .map(|token| {
+                let mut variants = vec![store::search_fold(token)];
+                if tokens.len() > 1 {
+                    for variant in boundary_rank::term_variants(token) {
+                        let variant = store::search_fold(&variant);
+                        if !variants.contains(&variant) {
+                            variants.push(variant);
+                        }
+                    }
+                }
+                // Python's lowercase shortcut expands İ, unlike re.I's one-character
+                // case classes. Widen candidates but retain the original spellings.
+                if !o.word
+                    && !o.regex
+                    && (token.contains('İ') || variants.iter().any(|v| v.contains("i\u{307}")))
+                {
+                    let lowercase = if tokens.len() == 1 {
+                        vec![crate::unicode_v16::lowercase(token)]
+                    } else {
+                        boundary_rank::term_variants(token)
+                            .iter()
+                            .map(|v| crate::unicode_v16::lowercase(v))
+                            .collect()
+                    };
+                    for variant in &lowercase {
+                        let variant = store::search_fold(variant);
+                        if !variants.contains(&variant) {
+                            variants.push(variant);
+                        }
+                    }
+                    for variant in variants.clone() {
+                        let anchor = variant
+                            .split('\u{307}')
+                            .max_by_key(|part| part.chars().count())
+                            .unwrap_or("")
+                            .to_owned();
+                        if !anchor.is_empty() && !variants.contains(&anchor) {
+                            variants.push(anchor);
+                        }
+                    }
+                }
+                if !o.word && !o.regex {
+                    let lowercase = if tokens.len() == 1 {
+                        vec![crate::unicode_v16::lowercase(token)]
+                    } else {
+                        boundary_rank::term_variants(token)
+                            .iter()
+                            .map(|v| crate::unicode_v16::lowercase(v))
+                            .collect()
+                    };
+                    let mask = variants.iter().flat_map(|v| v.chars()).fold(0, |mask, c| {
+                        mask | match c {
+                            'i' => 1,
+                            's' => 2,
+                            c if !c.is_ascii() => 4,
+                            _ => 0,
+                        }
+                    });
+                    let special = lowercase != variants;
+                    lowercase_terms.push(LowercaseTerm {
+                        lowercase,
+                        mask,
+                        special,
+                        original: (*token).to_owned(),
+                        raw: Default::default(),
+                    });
+                }
+                variants
+            })
             .collect();
         if o.pattern.is_empty() || (terms.is_empty() && !o.regex && !o.word) {
             bail!("a nonempty search pattern is required")
@@ -637,7 +733,7 @@ impl Matcher {
         let (explicit, required, phrase, capture) = if o.word {
             (
                 Some(Pattern::word(&o.pattern)?),
-                vec![store::normalize(&o.pattern)],
+                vec![store::search_fold(&o.pattern)],
                 None,
                 None,
             )
@@ -648,18 +744,22 @@ impl Matcher {
                 None,
                 None,
             )
+        } else if o.count_only && !o.count_by_tier {
+            // Presence counts return before phrase matching or snippet scoring.
+            (None, vec![], None, None)
         } else {
             let tokens: Vec<String> = boundary_rank::query_tokens(&o.pattern)
                 .iter()
-                .map(|t| regex::escape(&store::normalize(t)))
+                .map(|t| regex::escape(&store::search_fold(t)))
                 .collect();
             let groups: Vec<String> = tokens.iter().map(|t| format!("({t})")).collect();
-            (
-                None,
-                vec![],
-                Some(regex::Regex::new(&tokens.join(r"[\W_]*"))?),
-                Some(regex::Regex::new(&groups.join(r"[\W_]*"))?),
-            )
+            let gap = if tokens.len() > 1 {
+                crate::unicode_v16::keyword_gap()
+            } else {
+                ""
+            };
+            let capture = regex::Regex::new(&groups.join(gap))?;
+            (None, vec![], Some(capture.clone()), Some(capture))
         };
         let query_chars = boundary_rank::query_tokens(&o.pattern)
             .iter()
@@ -684,10 +784,16 @@ impl Matcher {
             partial: false,
             phase: 0,
             ordered_terms: terms.clone(),
+            lowercase_terms,
+            dotted_candidates,
+            content_literals: Vec::new(),
+            content_patterns: Vec::new(),
             estimated: usize::MAX,
             terms,
             phrase,
             capture,
+            raw_query: o.pattern.clone(),
+            raw_capture: Default::default(),
             explicit,
             explicit_chars: if o.word { query_chars } else { 0 },
             explicit_once: o.regex && matches_once(&o.pattern),
@@ -839,6 +945,112 @@ impl Matcher {
         self.estimated = if indexed { estimate } else { usize::MAX };
         Ok(())
     }
+    fn content(&mut self, pattern: &str) -> Result<()> {
+        self.content_literals = content_terms(pattern)
+            .into_iter()
+            .map(|v| v[0].clone())
+            .collect();
+        self.terms = self
+            .content_literals
+            .iter()
+            .map(|v| vec![store::search_fold(v)])
+            .collect();
+        self.content_patterns = self
+            .content_literals
+            .iter()
+            .map(|v| {
+                if v.chars().count() >= 3 && v.contains("i\u{307}") {
+                    regex::Regex::new(&crate::pattern::literal(v)).map(Some)
+                } else {
+                    Ok(None)
+                }
+            })
+            .collect::<std::result::Result<_, _>>()?;
+        self.lowercase_terms.clear();
+        self.dotted_candidates.clear();
+        Ok(())
+    }
+    fn matching_expression(&self, row: &Folded) -> Result<&regex::Regex> {
+        if !row.raw {
+            return Ok(self.phrase.as_ref().unwrap());
+        }
+        // Ι, ι and ι share a case key with combining U+0345; only that
+        // class changes Python's word membership when folded.
+        self.raw_capture
+            .get_or_init(|| {
+                let groups: Vec<_> = boundary_rank::query_tokens(&self.raw_query)
+                    .iter()
+                    .map(|t| format!("({})", crate::pattern::literal(t)))
+                    .collect();
+                regex::Regex::new(&groups.join(crate::unicode_v16::keyword_gap()))
+            })
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+    }
+    fn term_span(&self, row: &Folded, index: usize) -> Result<Option<std::ops::Range<usize>>> {
+        if let Some(term) = self.lowercase_terms.get(index) {
+            if term.special || row.aliases & term.mask != 0 {
+                if let Some(span) = row.lower_span(&term.lowercase) {
+                    return Ok(Some(span));
+                }
+                let raw = term
+                    .raw
+                    .get_or_init(|| regex::Regex::new(&crate::pattern::literal(&term.original)))
+                    .as_ref()
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                return Ok(raw.find(row.text).map(|m| m.range()));
+            }
+        }
+        Ok(insensitive_span(row, &self.terms[index]))
+    }
+    fn term_present(&self, row: &Folded, index: usize) -> bool {
+        if self.partial {
+            return row.low.contains(&self.content_literals[index]);
+        }
+        let terms = &self.terms[index];
+        // Each key character is one re.I case class, so this proves the raw fallback.
+        if row.low.contains(&terms[0]) {
+            return true;
+        }
+        if let Some(term) = self.lowercase_terms.get(index) {
+            if term.special || row.aliases & term.mask != 0 {
+                return row.lower_span(&term.lowercase).is_some();
+            }
+        }
+        terms.iter().skip(1).any(|v| row.low.contains(v))
+    }
+    fn count_needs_verification(&self) -> bool {
+        self.terms
+            .iter()
+            .any(|group| group.iter().any(|v| !v.contains(&group[0])))
+    }
+    fn case_expression(&self) -> String {
+        let quote = |v: &str| format!("\"{}\"", v.replace('"', "\"\""));
+        let expression = self
+            .terms
+            .iter()
+            .map(|group| {
+                format!(
+                    "({})",
+                    group
+                        .iter()
+                        .map(|v| quote(v))
+                        .collect::<Vec<_>>()
+                        .join(" OR ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let originals = self
+            .terms
+            .iter()
+            .filter(|group| group.iter().any(|v| !v.contains(&group[0])))
+            .map(|group| quote(&group[0]))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        // Every other candidate already proves the original token's raw fallback.
+        format!("({expression}) NOT ({originals})")
+    }
     fn evaluate(
         &self,
         text: &str,
@@ -877,13 +1089,39 @@ impl Matcher {
                 span: Some(span),
             }));
         }
-        let row = Folded::new(text);
+        if !self.dotted_candidates.is_empty() && !text.contains(['İ', 'ı', 'ſ', 'K']) {
+            // 0.4.9 lowercased keyword tokens before the FTS/LIKE candidate
+            // filter, widening only to its case-exception rows.
+            let lowercase = crate::unicode_v16::lowercase(text);
+            if self.dotted_candidates.iter().any(|term| {
+                !lowercase.contains(term) && (term.chars().count() >= 3 || text.is_ascii())
+            }) {
+                return Ok(None);
+            }
+        }
+        let row = if self.partial {
+            Folded::lowercase(text)
+        } else {
+            Folded::new(text)
+        };
         let low = &row.low;
+        if self.partial {
+            // The legacy content FTS lane had no rare-case widening. A
+            // lowercase expansion alone cannot supply an indexed trigram.
+            let candidate = |i: usize| {
+                low.contains(&self.content_literals[i])
+                    && self.content_patterns[i]
+                        .as_ref()
+                        .is_none_or(|p| p.is_match(text))
+            };
+            if self.coverage_term.is_some_and(|i| !candidate(i))
+                || self.coverage_excluded.iter().any(|&i| candidate(i))
+            {
+                return Ok(None);
+            }
+        }
         if self.quick_count {
-            let mut matches = self
-                .terms
-                .iter()
-                .map(|variants| variants.iter().any(|v| low.contains(v)));
+            let mut matches = (0..self.terms.len()).map(|i| self.term_present(&row, i));
             let found = if self.partial {
                 matches.any(|v| v)
             } else {
@@ -893,13 +1131,8 @@ impl Matcher {
         }
         let mut found = Vec::new();
         let mut found_weight = 0.;
-        for (i, variants) in self.terms.iter().enumerate() {
-            let present = variants.iter().any(|v| low.contains(v.as_str()));
-            if (present && self.coverage_excluded.contains(&i))
-                || (!present && self.coverage_term == Some(i))
-            {
-                return Ok(None);
-            }
+        for i in 0..self.terms.len() {
+            let present = self.term_present(&row, i);
             if !present {
                 if self.partial {
                     continue;
@@ -915,8 +1148,12 @@ impl Matcher {
         }
         let first = if self.partial {
             None
+        } else if self.terms.len() == 1 {
+            self.term_span(&row, 0)?
         } else {
-            self.phrase.as_ref().unwrap().find(low)
+            self.matching_expression(&row)?
+                .find(row.matching_text())
+                .map(|m| row.matching_span(m.range()))
         };
         if (self.phase == 1 && first.is_none()) || (self.phase == 2 && first.is_some()) {
             return Ok(None);
@@ -924,15 +1161,10 @@ impl Matcher {
         if let Some(first) = first {
             // 0.4.9 anchors a lone word at its first aligned occurrence and a phrase at
             // its first match.
-            let anchor = if self.terms.len() == 1 {
-                insensitive_span(&row, &self.terms[0][..1])
-            } else {
-                None
-            }
-            .unwrap_or_else(|| row.start(first.start())..row.end(first.end()));
+            let anchor = first;
             let snip = Snip::new(text, std::slice::from_ref(&anchor));
             let view = View::new(&row, &snip);
-            let strength = self.phrase_strength(&row, &snip, &view);
+            let strength = self.phrase_strength(&row, &snip, &view)?;
             let (w, s) = speaker(who);
             // Boundary factors never exceed one, so this is the row's best score.
             if cutoff.is_some_and(|c| c.excludes(0, strength * rec * w * s * meta_scale(meta))) {
@@ -951,14 +1183,15 @@ impl Matcher {
             let Some(spans) = self
                 .terms
                 .iter()
-                .map(|variants| insensitive_span(&row, variants))
-                .collect::<Option<Vec<_>>>()
+                .enumerate()
+                .map(|(i, _)| self.term_span(&row, i))
+                .collect::<Result<Option<Vec<_>>>>()?
             else {
                 return Ok(None);
             };
             let snip = Snip::new(text, &spans);
             let view = View::new(&row, &snip);
-            let phrase = self.phrase_strength(&row, &snip, &view);
+            let phrase = self.phrase_strength(&row, &snip, &view)?;
             let graded = boundary_rank::decut_text(&snip.text, true);
             let b = self.boundary.evaluate(&graded, None, true)?;
             let shift = i64::from(snip.text.starts_with(window::CUT));
@@ -986,9 +1219,9 @@ impl Matcher {
             found
                 .iter()
                 .filter_map(|&i| {
-                    let spellings = &self.terms[i];
-                    let at = |v: &String| low.find(v.as_str()).map(|at| (at, at + v.len()));
-                    at(&spellings[0]).or_else(|| spellings[1..].iter().filter_map(at).min())
+                    let literal = &self.content_literals[i];
+                    low.find(literal.as_str())
+                        .map(|at| (at, at + literal.len()))
                 })
                 .min_by_key(|&(at, _)| at)
                 .map(|(at, end)| row.start(at)..row.end(end))
@@ -1019,39 +1252,18 @@ impl Matcher {
     }
     /// 0.4.9's phrase strength in a snippet: its matches counted, the tightest measured in
     /// snippet characters.
-    fn phrase_strength(&self, row: &Folded, snip: &Snip, view: &View) -> f64 {
+    fn phrase_strength(&self, row: &Folded, snip: &Snip, view: &View) -> Result<f64> {
         let (mut n, mut best) = (0, 0);
         if snip.chars >= self.query_chars {
-            let tokens = self.capture.as_ref().map_or(1, |c| c.captures_len() - 1);
-            for m in self.phrase.as_ref().unwrap().find_iter(&view.text) {
+            for m in self.matching_expression(row)?.find_iter(&view.text) {
                 n += 1;
-                let mut length = view.span(row, snip, m.range()).len();
-                if tokens > 1 && length < self.query_chars + tokens - 1 {
-                    // Folding can make a match span fewer original characters than its
-                    // folded tokens and separators. Block ceilings count each separator
-                    // the folded text holds, so a match is never measured shorter.
-                    if let Some(groups) = self
-                        .capture
-                        .as_ref()
-                        .and_then(|c| c.captures_at(&view.text, m.start()))
-                    {
-                        let gaps = (2..groups.len())
-                            .filter(|&i| {
-                                groups
-                                    .get(i)
-                                    .zip(groups.get(i - 1))
-                                    .is_some_and(|(next, prior)| next.start() > prior.end())
-                            })
-                            .count();
-                        length = length.max(self.query_chars + gaps);
-                    }
-                }
+                let length = view.span(row, snip, m.range()).len();
                 if best == 0 || length < best {
                     best = length;
                 }
             }
         }
-        window::strength(n, best, self.query_chars)
+        Ok(window::strength(n, best, self.query_chars))
     }
     /// 0.4.9's phrase boundary factor: graded on the de-cut snippet at each match's token
     /// spans, the best factor, then the shorter match.
@@ -1061,11 +1273,12 @@ impl Matcher {
         snip: &Snip,
         view: &View,
     ) -> Result<(f64, &'static str)> {
-        let Some(capture) = self
-            .capture
-            .as_ref()
-            .filter(|c| c.captures_len() - 1 == self.boundary.len())
-        else {
+        let capture = if row.raw {
+            self.matching_expression(row)?
+        } else {
+            self.capture.as_ref().unwrap()
+        };
+        if capture.captures_len() - 1 != self.boundary.len() {
             return Ok((1., "aligned"));
         };
         let graded = boundary_rank::decut_text(&snip.text, false);
@@ -1214,7 +1427,11 @@ impl Matcher {
         for group in groups {
             // A literal phrase cannot use a plural-only variant. In the other
             // tiers a shorter substring already admits every containing variant.
-            let terms: Vec<_> = if self.phase == 1 && !self.partial && self.explicit.is_none() {
+            let terms: Vec<_> = if self.phase == 1
+                && !self.partial
+                && self.explicit.is_none()
+                && !self.lowercase_terms.iter().any(|t| t.special)
+            {
                 group.iter().take(1).collect()
             } else {
                 group
@@ -1977,14 +2194,17 @@ fn content_words(pattern: &str) -> Vec<String> {
         .into_iter()
         .map(|t| t.trim_matches(|c: char| c.is_ascii_punctuation()))
         .filter(|t| {
-            t.chars().count() >= 2 && !STOP.split_whitespace().any(|s| s == store::normalize(t))
+            t.chars().count() >= 2
+                && !STOP
+                    .split_whitespace()
+                    .any(|s| s == crate::unicode_v16::lowercase(t))
         })
-        .map(boundary_rank::normalize_token)
+        .map(crate::unicode_v16::lowercase)
         .filter(|t| !t.is_empty())
         .collect()
 }
 /// The content fallback's terms as 0.4.9's content lane read them (py/corpusdb.py:4871):
-/// folded, deduplicated, each matching literally without spelling variants.
+/// lowercased, deduplicated, each matching literally without spelling variants.
 fn content_terms(pattern: &str) -> Vec<Vec<String>> {
     let mut seen = HashSet::new();
     content_words(pattern)
@@ -2011,7 +2231,7 @@ fn automatic_content(pattern: &str) -> bool {
         && words
             != boundary_rank::query_tokens(pattern)
                 .iter()
-                .map(|s| store::normalize(s))
+                .map(|s| crate::unicode_v16::lowercase(s))
                 .collect::<Vec<_>>()
 }
 /// 0.4.9's content-lane term weights (py/corpusdb.py:4863-4884): `ln(1 + N / (df + 1))`,
@@ -2071,7 +2291,7 @@ pub fn coverage(c: &Connection, o: &Options) -> Result<Results> {
         .filter(|w| !w.is_empty())
         .collect();
     let mut words: Vec<String> = vec![];
-    for word in raw.iter().map(|w| store::normalize(w)) {
+    for word in raw.iter().map(|w| crate::unicode_v16::lowercase(w)) {
         if !word.is_empty() && !words.contains(&word) {
             words.push(word);
         }
@@ -2084,7 +2304,7 @@ pub fn coverage(c: &Connection, o: &Options) -> Result<Results> {
     if raw.len() < 2 || long.is_empty() {
         return Ok(result);
     }
-    let quote = |w: &str| format!("\"{}\"", w.replace('"', "\"\""));
+    let quote = |w: &str| format!("\"{}\"", store::search_fold(w).replace('"', "\"\""));
     let who = |role: &str| {
         o.filters
             .who
@@ -2138,9 +2358,9 @@ pub fn coverage(c: &Connection, o: &Options) -> Result<Results> {
     ranked.truncate(400);
     let echo = regex::Regex::new(
         &raw.iter()
-            .map(|w| regex::escape(&store::normalize(w)))
+            .map(|w| crate::pattern::literal(w))
             .collect::<Vec<_>>()
-            .join(r"[\W_]*"),
+            .join(crate::unicode_v16::keyword_gap()),
     )?;
     let (mut chats, mut families) = (HashSet::new(), HashSet::new());
     for (bm25, table, id) in ranked {
@@ -2175,7 +2395,7 @@ pub fn coverage(c: &Connection, o: &Options) -> Result<Results> {
             },
         )?;
         let (span, echoed) = {
-            let row = Folded::new(&h.text);
+            let row = Folded::lowercase(&h.text);
             // Trigram candidates are a superset; the lead is the earliest word the row holds.
             let Some((at, end)) = words
                 .iter()
@@ -2184,7 +2404,7 @@ pub fn coverage(c: &Connection, o: &Options) -> Result<Results> {
             else {
                 continue;
             };
-            (row.start(at)..row.end(end), echo.is_match(&row.low))
+            (row.start(at)..row.end(end), echo.is_match(&h.text))
         };
         let family = if h.family.is_empty() {
             h.session.clone()
@@ -2608,7 +2828,7 @@ fn search_pass(
     // The tier this pass's rows take; a pass over both tiers is bounded as phrase rows.
     let pass_tier = if partial { 2 } else { u8::from(phase == 2) };
     if partial {
-        m.terms = content_terms(&o.pattern);
+        m.content(&o.pattern)?;
         if m.terms.is_empty() {
             return Ok(Results {
                 total_basis: "exact".into(),
@@ -2688,6 +2908,7 @@ fn search_pass(
         if m.quick_count
             && !o.chats
             && m.explicit.is_none()
+            && !m.lowercase_terms.iter().any(|t| t.special)
             && !partial
             && m.terms.iter().flatten().all(|t| t.chars().count() >= 3)
             && (table != "tools"
@@ -2759,6 +2980,28 @@ fn search_pass(
                         None => all,
                     }
                 };
+                let mut count = count;
+                if m.count_needs_verification() {
+                    // A lowercase plural variant may match while the original token's
+                    // re.I fallback does not. Only case-alias rows need correction.
+                    let sql = format!("SELECT p.text,p.session FROM {table}_case_fts f CROSS JOIN {table} p ON p.id=f.rowid WHERE {table}_case_fts MATCH ?{scope}");
+                    let mut bind = vec![Value::Text(m.case_expression())];
+                    bind.extend(values.clone());
+                    let mut statement = c.prepare(&sql)?;
+                    let mut rows = statement.query(params_from_iter(bind))?;
+                    while let Some(row) = rows.next()? {
+                        let text = store::decode(table, row.get(0)?)?;
+                        if m.evaluate(&text, "tool", 0, 0, 0, None)?.is_none() {
+                            count -= 1;
+                            if f.sessions.is_some() {
+                                let session: String = row.get(1)?;
+                                if let Some(n) = result.session_counts.get_mut(&session) {
+                                    *n -= 1;
+                                }
+                            }
+                        }
+                    }
+                }
                 result.timings.sqlite_ms += started.elapsed().as_secs_f64() * 1000.;
                 result.total += count;
                 if table == "tools" {
@@ -3501,7 +3744,7 @@ pub fn snippet(text: &str, query: &str, max: usize) -> String {
         .copied()
         .unwrap_or(query)
         .to_lowercase();
-    let low = text.to_lowercase();
+    let low = crate::unicode_v16::lowercase(text);
     let at = low
         .find(&needle)
         .map(|p| low[..p].chars().count())
@@ -3591,10 +3834,24 @@ mod window_tests {
         let mut m = Matcher::new(&options, &c).unwrap();
         (m.phase, m.partial) = (phase, partial);
         if partial {
-            m.terms = content_terms(pattern);
+            m.content(pattern).unwrap();
         }
         m.evaluate(text, "tool", 1, 0, 0, None).unwrap().unwrap()
     }
+    // The 0.4.9 CLI returns the combining-mark row as a phrase and the three
+    // letter rows as all-terms for `kit cafe` on this four-row pi fixture.
+    #[test]
+    fn case_keys_do_not_turn_greek_letters_into_phrase_separators() {
+        for (text, tier) in [
+            ("kitΙcafe", 1),
+            ("kitιcafe", 1),
+            ("kitιcafe", 1),
+            ("kit\u{345}cafe", 0),
+        ] {
+            assert_eq!(evaluate("kit cafe", text, 0, false).tier, tier, "{text:?}");
+        }
+    }
+
     // Expected spans were produced by agrep 0.4.9's own matchers: the `[\W_]*` phrase
     // search, `console.insensitive_span` with and without `_keyword_term_specs` variants,
     // and `corpusdb.content`'s earliest lowered occurrence.
@@ -3879,6 +4136,14 @@ mod matcher_cache_tests {
         assert_eq!(second.terms.len(), 2);
         o.pattern = "deployment".into();
         assert_eq!(cache.matcher(&o, &c).unwrap().terms.len(), 1);
+        o.count_only = false;
+        let scored = cache
+            .matcher(&o, &c)
+            .unwrap()
+            .evaluate("deployment", "user", 1, 0, 0, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(scored.snippet, "deployment");
     }
 }
 #[cfg(test)]

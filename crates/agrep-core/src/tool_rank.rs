@@ -111,7 +111,7 @@ mod tests {
         for (i, text) in texts.iter().enumerate() {
             c.execute(
                 "INSERT INTO f(rowid,text) VALUES(?1,?2)",
-                rusqlite::params![i as i64 + 1, crate::store::normalize(text)],
+                rusqlite::params![i as i64 + 1, crate::store::search_fold(text)],
             )
             .unwrap();
         }
@@ -139,7 +139,7 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(counts, [2, 2, 3, 2]);
+        assert_eq!(counts, [2, 1, 3, 2]);
     }
 
     #[test]

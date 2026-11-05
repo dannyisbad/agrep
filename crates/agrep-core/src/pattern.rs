@@ -18,9 +18,9 @@ pub enum Pattern {
 }
 
 impl Pattern {
-    /// A case-insensitive expression the regex crate supports.
+    /// A linear-time expression whose case classes the caller has supplied.
     pub fn linear(pattern: &str) -> Result<Self> {
-        Ok(Self::Linear(regex::Regex::new(&format!("(?i:{pattern})"))?))
+        Ok(Self::Linear(regex::Regex::new(pattern)?))
     }
     /// A user's `-E` expression, case-insensitive.
     pub fn regex(pattern: &str) -> Result<Self> {
@@ -74,22 +74,8 @@ pub struct WholeWord {
 impl WholeWord {
     fn new(term: &str) -> Result<Self, regex::Error> {
         debug_assert!(!term.is_empty());
-        let mut pattern = String::new();
-        let mut buffer = [0; 4];
-        for character in term.chars() {
-            let class = unicode_v16::sre_case_class(character);
-            if class.len() > 1 {
-                pattern.push('[');
-            }
-            for &member in &class {
-                pattern.push_str(&regex::escape(member.encode_utf8(&mut buffer)));
-            }
-            if class.len() > 1 {
-                pattern.push(']');
-            }
-        }
         Ok(Self {
-            literal: regex::Regex::new(&pattern)?,
+            literal: regex::Regex::new(&literal(term))?,
         })
     }
     /// The first match starting at or after `at`. The character before `at` still bounds
@@ -105,6 +91,25 @@ impl WholeWord {
         }
         None
     }
+}
+
+/// An escaped literal with Python's single-character `re.I` equivalences.
+pub(crate) fn literal(term: &str) -> String {
+    let mut pattern = String::new();
+    let mut buffer = [0; 4];
+    for character in term.chars() {
+        let class = unicode_v16::sre_case_class(character);
+        if class.len() > 1 {
+            pattern.push('[');
+        }
+        for &member in &class {
+            pattern.push_str(&regex::escape(member.encode_utf8(&mut buffer)));
+        }
+        if class.len() > 1 {
+            pattern.push(']');
+        }
+    }
+    pattern
 }
 
 /// `\w` in a Python `re` pattern on `str`.

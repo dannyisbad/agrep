@@ -280,7 +280,7 @@ fn presence(tx: &Transaction<'_>) -> Result<Presence> {
                 let mut tokenizer = tokenizers.tokenizer()?;
                 let mut seen: HashSet<Box<[u8]>> = HashSet::new();
                 for bytes in texts {
-                    let text = store::normalize(&store::decode("tools", bytes)?);
+                    let text = store::search_fold(&store::decode("tools", bytes)?);
                     tokenizer.tokens(&index_text(&text), |token| {
                         if dictionary_word(token) && !seen.contains(token) {
                             seen.insert(token.into());
@@ -422,7 +422,7 @@ pub(crate) fn refresh(
             let mut rows = q.query([])?;
             while let Some(row) = rows.next()? {
                 let block = u32::try_from(row.get::<_, i64>(0)? / store::BLOCK)?;
-                let text = store::normalize(&store::decode("tools", row.get(1)?)?);
+                let text = store::search_fold(&store::decode("tools", row.get(1)?)?);
                 let text = index_text(&text);
                 tokenizer.tokens(&text, |token| {
                     if dictionary_word(token) {
@@ -439,7 +439,7 @@ pub(crate) fn refresh(
             let mut q = tx.prepare("SELECT text FROM tool_word_old")?;
             let mut rows = q.query([])?;
             while let Some(row) = rows.next()? {
-                let text = store::normalize(&store::decode("tools", row.get(0)?)?);
+                let text = store::search_fold(&store::decode("tools", row.get(0)?)?);
                 insert.execute([index_text(&text).as_ref()])?;
             }
         }
@@ -605,7 +605,7 @@ mod fixture {
         if visible {
             tx.execute(
                 "INSERT INTO tools_fts(rowid,text) VALUES(?1,?2)",
-                params![id, index_text(&store::normalize(text)).as_ref()],
+                params![id, index_text(&store::search_fold(text)).as_ref()],
             )
             .unwrap();
         }
@@ -762,7 +762,8 @@ mod presence_tests {
                 .unwrap();
             let mut rows = q.query([]).unwrap();
             while let Some(row) = rows.next().unwrap() {
-                let text = store::normalize(&store::decode("tools", row.get(1).unwrap()).unwrap());
+                let text =
+                    store::search_fold(&store::decode("tools", row.get(1).unwrap()).unwrap());
                 let words = row_words(&mut tokenizer, &index_text(&text)).unwrap();
                 add_rows(&mut presence, vec![(row.get(0).unwrap(), words)]).unwrap();
             }

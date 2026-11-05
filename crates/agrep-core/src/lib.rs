@@ -7,6 +7,7 @@ pub mod data;
 pub mod ingest;
 pub mod intake;
 pub mod intake_batch;
+mod intake_pipeline;
 pub mod integrations;
 pub mod model;
 mod pattern;

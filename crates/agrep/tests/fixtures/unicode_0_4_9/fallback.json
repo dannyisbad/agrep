@@ -1,0 +1,235 @@
+[
+  {
+    "args": [
+      "why cafe",
+      "-n",
+      "40"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "cafe\u0301 other"
+      },
+      {
+        "who": "user",
+        "snippet": "kit cafe\u0301"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe\u0301\u2014kit"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe\u0301 kit"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe\u0301"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301 other"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode kit cafe\u0301"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301\u2014kit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301 kit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301"
+      }
+    ]
+  },
+  {
+    "args": [
+      "why kit",
+      "-n",
+      "40"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "kit cafe\u0301"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe\u0301\u2014kit"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe\u0301 kit"
+      },
+      {
+        "who": "user",
+        "snippet": "\u212ait"
+      },
+      {
+        "who": "user",
+        "snippet": "kit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode kit cafe\u0301"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301\u2014kit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301 kit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u212ait"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode kit"
+      }
+    ]
+  },
+  {
+    "args": [
+      "why office",
+      "-n",
+      "40"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "office"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode office"
+      }
+    ]
+  },
+  {
+    "args": [
+      "why o\ufb03ce",
+      "-n",
+      "40"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "o\ufb03ce"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode o\ufb03ce"
+      }
+    ]
+  },
+  {
+    "args": [
+      "why \uff43\uff41\uff46\uff45",
+      "-n",
+      "40"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "\uff43\uff41\uff46\uff45"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \uff43\uff41\uff46\uff45"
+      }
+    ]
+  },
+  {
+    "args": [
+      "why caf\u00e9",
+      "-n",
+      "40"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "caf\u00e9"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode caf\u00e9"
+      }
+    ]
+  },
+  {
+    "args": [
+      "why Stra\u00dfe",
+      "-n",
+      "40"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "Stra\u00dfe"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode Stra\u00dfe"
+      }
+    ]
+  },
+  {
+    "args": [
+      "why strasse",
+      "-n",
+      "40"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "strasse"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode strasse"
+      }
+    ]
+  },
+  {
+    "args": [
+      "why \uff21\uff22\uff23",
+      "-n",
+      "40"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "\uff21\uff22\uff23"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \uff21\uff22\uff23"
+      }
+    ]
+  },
+  {
+    "args": [
+      "why K\u0130T",
+      "-n",
+      "40"
+    ],
+    "rows": []
+  }
+]

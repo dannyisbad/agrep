@@ -427,12 +427,13 @@ struct Submissions {
 }
 
 impl Submissions {
-    fn collect(data: &str) -> Self {
+    fn collect(data: &(impl crate::ingest::jsonl::Text + ?Sized)) -> Self {
         let legacy_finder = memmem::Finder::new(b"\"user_message\"");
         let desktop_finder = memmem::Finder::new(b"\"UserMessage\"");
         let mut texts: Vec<String> = Vec::new();
         let mut desktop = Vec::new();
         for line in data.lines() {
+            let line = line.as_ref();
             if legacy_finder.find(line.as_bytes()).is_none()
                 && desktop_finder.find(line.as_bytes()).is_none()
             {
@@ -871,7 +872,7 @@ struct CodexState {
 }
 pub(crate) fn resume_parse(
     path: &Path,
-    data: &str,
+    data: &(impl crate::ingest::jsonl::Text + ?Sized),
     previous: Option<&str>,
 ) -> anyhow::Result<(
     Vec<Message>,
@@ -886,7 +887,7 @@ pub(crate) fn resume_parse(
 fn parse_data(
     path: &Path,
     tally: std::sync::Arc<crate::intake::Tally>,
-    data: &str,
+    data: &(impl crate::ingest::jsonl::Text + ?Sized),
     previous: Option<CodexState>,
 ) -> (
     (Vec<Message>, Vec<Event>, crate::intake_batch::ReadOutcome),
@@ -939,6 +940,7 @@ fn parse_data(
         .and_then(|stem| stem.to_str())
         .unwrap_or("rollout");
     for (offset, line) in data.lines().enumerate() {
+        let line = line.as_ref();
         let record_ordinal = ordinal + offset;
         if line.is_empty() {
             continue;

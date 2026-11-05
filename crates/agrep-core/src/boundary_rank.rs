@@ -140,20 +140,6 @@ pub fn normalize_token(token: &str) -> String {
     String::from_utf8(out).expect("normalized clusters preserve UTF-8")
 }
 
-/// `normalize_token(text)` with the source of each non-ASCII cluster: its folded byte
-/// range and original byte range, in order. Every other byte folds one for one.
-pub(crate) fn normalize_mapped(text: &str) -> (String, Vec<[usize; 4]>) {
-    let mut out = Vec::with_capacity(text.len());
-    let mut clusters: Vec<[usize; 4]> = Vec::new();
-    fold(text, &mut out, |folded, original| {
-        clusters.push([folded.start, folded.end, original.start, original.end])
-    });
-    (
-        String::from_utf8(out).expect("normalized clusters preserve UTF-8"),
-        clusters,
-    )
-}
-
 fn fold(
     token: &str,
     out: &mut Vec<u8>,

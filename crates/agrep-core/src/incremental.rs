@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::OpenOptions,
-    io::{Read, Seek, SeekFrom},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::Path,
 };
 
@@ -787,6 +787,150 @@ fn identity(path: &Path, m: &std::fs::Metadata) -> Result<String> {
         Ok(format!("{:?}", m.created()?))
     }
 }
+const READ_CHUNK: usize = 16 * CHECKPOINT_CHUNK;
+
+fn checkpoint_bytes(chunks: &mut Vec<[u8; 32]>, tail: &mut Vec<u8>, mut bytes: &[u8]) {
+    if !tail.is_empty() {
+        let take = bytes.len().min(CHECKPOINT_CHUNK - tail.len());
+        tail.extend_from_slice(&bytes[..take]);
+        bytes = &bytes[take..];
+        if tail.len() == CHECKPOINT_CHUNK {
+            chunks.push(Sha256::digest(&*tail).into());
+            tail.clear();
+        }
+    }
+    let full = bytes.len() / CHECKPOINT_CHUNK * CHECKPOINT_CHUNK;
+    chunks.extend(chunk_hashes(&bytes[..full]));
+    tail.extend_from_slice(&bytes[full..]);
+}
+
+enum JsonlBlock<'a> {
+    Bytes(&'a [u8]),
+    Record(&'a mut std::fs::File),
+}
+impl JsonlBlock<'_> {
+    fn chunks(&mut self, mut consume: impl FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        match self {
+            Self::Bytes(bytes) => consume(bytes),
+            Self::Record(file) => {
+                file.rewind()?;
+                let mut bytes = vec![0; 64 << 10];
+                loop {
+                    let n = file.read(&mut bytes)?;
+                    if n == 0 {
+                        break;
+                    }
+                    consume(&bytes[..n])?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Keep raw input bounded even when a single JSONL record is enormous. Oversized
+/// records spill to disk and are deserialized from a buffered reader.
+fn read_jsonl_blocks(
+    file: impl Read,
+    length: u64,
+    mut consume: impl FnMut(JsonlBlock<'_>) -> Result<()>,
+) -> Result<(usize, usize)> {
+    let read_capacity = length.clamp(1, 64 << 10) as usize;
+    let mut reader = BufReader::with_capacity(read_capacity, file.take(length));
+    let mut block = Vec::with_capacity(length.min(READ_CHUNK as u64) as usize);
+    let mut read = 0;
+    let mut complete = 0;
+    loop {
+        let n = (&mut reader)
+            .take((READ_CHUNK - block.len()) as u64)
+            .read_until(b'\n', &mut block)?;
+        read += n;
+        if n == 0 {
+            if !block.is_empty() {
+                let tail = block.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+                if ingest::pi::validate_record(&block[tail..]).is_err() {
+                    block.truncate(tail);
+                }
+                complete += block.len();
+                consume(JsonlBlock::Bytes(&block))?;
+            }
+            break;
+        }
+        if block.len() < READ_CHUNK {
+            continue;
+        }
+        if block.last() == Some(&b'\n') {
+            complete += block.len();
+            consume(JsonlBlock::Bytes(&block))?;
+            block.clear();
+            continue;
+        }
+        let tail = block.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+        if tail > 0 {
+            complete += tail;
+            consume(JsonlBlock::Bytes(&block[..tail]))?;
+            let remaining = block.len() - tail;
+            block.copy_within(tail.., 0);
+            block.truncate(remaining);
+            continue;
+        }
+        let mut record = tempfile::tempfile()?;
+        record.write_all(&block)?;
+        let mut record_len = block.len();
+        loop {
+            block.clear();
+            let n = (&mut reader)
+                .take(READ_CHUNK as u64)
+                .read_until(b'\n', &mut block)?;
+            read += n;
+            record.write_all(&block)?;
+            record_len += n;
+            if n == 0 || block.last() == Some(&b'\n') {
+                let terminated = block.last() == Some(&b'\n');
+                record.rewind()?;
+                if terminated || ingest::pi::validate_record_reader(BufReader::new(&record)).is_ok()
+                {
+                    complete += record_len;
+                    consume(JsonlBlock::Record(&mut record))?;
+                }
+                break;
+            }
+        }
+        block.clear();
+    }
+    Ok((read, complete))
+}
+
+#[cfg(test)]
+fn read_jsonl(
+    file: impl Read,
+    length: u64,
+    mut consume: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<(usize, usize)> {
+    read_jsonl_blocks(file, length, |mut block| block.chunks(&mut consume))
+}
+
+fn malformed_record(
+    spool: &mut Option<ingest::jsonl::RawRecords>,
+    error: serde_json::Error,
+    reader: impl Read,
+) -> Result<ingest::pi::PreparedRecord> {
+    if error.is_io() {
+        return Err(error.into());
+    }
+    if spool.is_none() {
+        *spool = Some(ingest::jsonl::RawRecords::new()?);
+    }
+    let raw = spool
+        .as_mut()
+        .expect("created malformed spool")
+        .push(reader)?;
+    Ok(ingest::pi::PreparedRecord::Malformed {
+        error: error.to_string(),
+        raw: Box::new(raw),
+    })
+}
+
 pub fn parse(
     agent: &str,
     path: &Path,
@@ -830,164 +974,229 @@ pub fn parse(
     }
     let start = old.as_ref().map_or(0, |c| c.offset);
     file.seek(SeekFrom::Start(start))?;
-    let mut bytes = Vec::new();
-    std::io::Read::by_ref(&mut file)
-        .take(meta.len().saturating_sub(start))
-        .read_to_end(&mut bytes)?;
-    bytes_read += bytes.len();
-    // A torn final JSON record waits for the next append; valid non-newline-terminated JSON is complete.
-    let tail_start = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
-    let complete = if tail_start == bytes.len()
-        || serde_json::from_slice::<serde_json::Value>(&bytes[tail_start..]).is_ok()
-    {
-        bytes.len()
-    } else {
-        tail_start
-    };
-    let prefix_chunks = if let Some(cursor) = &old {
-        let mut chunks = cursor.prefix_chunks[..cursor.offset as usize / CHECKPOINT_CHUNK].to_vec();
-        partial_chunk.extend_from_slice(&bytes[..complete]);
-        chunks.extend(chunk_hashes(&partial_chunk));
-        chunks
-    } else {
-        chunk_hashes(&bytes[..complete])
-    };
-    let mut data = String::from_utf8_lossy(&bytes[..complete]).into_owned();
-    drop(bytes);
-    let records = old.as_ref().map_or(0, |c| c.records) + data.lines().count();
+    let mut prefix_chunks = old.as_ref().map_or_else(Vec::new, |cursor| {
+        cursor.prefix_chunks[..cursor.offset as usize / CHECKPOINT_CHUNK].to_vec()
+    });
+    let mut data = String::new();
+    let mut spool = (agent != "pi" && meta.len().saturating_sub(start) > READ_CHUNK as u64)
+        .then(tempfile::tempfile)
+        .transpose()?;
+    let mut records = old.as_ref().map_or(0, |c| c.records);
     let mut header = old.as_ref().map_or_else(String::new, |c| c.header.clone());
     let mut leaf = old.as_ref().and_then(|c| c.leaf.clone());
-    let mut nodes = vec![];
+    let mut pi_values = vec![];
+    let mut malformed = None;
+    let mut replay = None;
     let mut branched = false;
-    if agent == "pi" {
-        // Records parse independently, so a large source spreads over the pool; the
-        // header, leaf and graph below still follow file order.
-        let base = old.as_ref().map_or(0, |c| c.records);
-        let lines: Vec<&str> = data.lines().collect();
-        let records: Vec<Result<Option<(serde_json::Value, String)>>> = lines
-            .par_iter()
-            .enumerate()
-            .map(|(n, line)| {
-                if line.trim().is_empty() {
-                    return Ok(None);
+    let (read, complete) =
+        read_jsonl_blocks(&mut file, meta.len().saturating_sub(start), |mut block| {
+            block.chunks(|bytes| {
+                checkpoint_bytes(&mut prefix_chunks, &mut partial_chunk, bytes);
+                if agent != "pi" {
+                    if let Some(file) = &mut spool {
+                        file.write_all(bytes)?;
+                    } else {
+                        data.push_str(&String::from_utf8_lossy(bytes));
+                    }
                 }
-                let mut value: serde_json::Value = serde_json::from_str(line)
-                    .with_context(|| format!("invalid JSONL record {}", n + 1))?;
-                value = ingest::pi::compact_record(value);
-                value["__agrep_ordinal"] = serde_json::json!(base + n);
-                let encoded = serde_json::to_string(&value)?;
-                Ok(Some((value, encoded)))
-            })
-            .collect();
-        let mut normalized = String::new();
-        let mut malformed = Vec::new();
-        for (n, record) in records.into_iter().enumerate() {
-            let (value, encoded) = match record {
-                Ok(Some(record)) => record,
-                Ok(None) => {
-                    normalized.push('\n');
-                    continue;
+                Ok(())
+            })?;
+            let base = records;
+            if agent != "pi" {
+                records += match &mut block {
+                    JsonlBlock::Bytes(bytes) => String::from_utf8_lossy(bytes).lines().count(),
+                    JsonlBlock::Record(_) => 1,
+                };
+                return Ok(());
+            }
+            let compact = |value, ordinal| -> Result<_> {
+                let mut value = ingest::pi::compact_record(value);
+                value["__agrep_ordinal"] = serde_json::json!(ordinal);
+                Ok(Some(value))
+            };
+            let parsed: Vec<ingest::pi::PreparedRecord> = match block {
+                JsonlBlock::Bytes(bytes) => {
+                    let text = String::from_utf8_lossy(bytes);
+                    let lines: Vec<_> = text.lines().collect();
+                    records += lines.len();
+                    let parsed: Vec<_> = lines
+                        .par_iter()
+                        .enumerate()
+                        .map(|(n, line)| {
+                            if line.trim().is_empty() {
+                                return Ok(None);
+                            }
+                            compact(ingest::pi::projected_record(line)?, base + n)
+                        })
+                        .collect();
+                    let mut records = Vec::new();
+                    for (n, value) in parsed.into_iter().enumerate() {
+                        match value {
+                            Ok(Some(value)) => {
+                                records.push(ingest::pi::PreparedRecord::Value(value))
+                            }
+                            Ok(None) => {}
+                            Err(error) => records.push(malformed_record(
+                                &mut malformed,
+                                error.downcast::<serde_json::Error>()?,
+                                lines[n].as_bytes(),
+                            )?),
+                        }
+                    }
+                    records
                 }
-                Err(_) => {
-                    // The adapter counts malformed records and retains readable ones.
-                    normalized.push_str(lines[n]);
-                    normalized.push('\n');
-                    malformed.push(lines[n].to_owned());
-                    continue;
+                JsonlBlock::Record(file) => {
+                    records += 1;
+                    file.rewind()?;
+                    let mut length = file.metadata()?.len();
+                    if length > 0 {
+                        let mut tail = [0; 2];
+                        let n = length.min(2) as usize;
+                        read_at(file, &mut tail[..n], length - n as u64)?;
+                        if tail[n - 1] == b'\n' {
+                            length -= 1;
+                            if n == 2 && tail[0] == b'\r' {
+                                length -= 1;
+                            }
+                        }
+                    }
+                    let value = ingest::pi::optional_projected_record_file(file, length);
+                    match value {
+                        Ok(Some(value)) => vec![ingest::pi::PreparedRecord::Value(
+                            compact(value, base)?.expect("compacted record"),
+                        )],
+                        Ok(None) => Vec::new(),
+                        Err(error) => {
+                            file.rewind()?;
+                            vec![malformed_record(&mut malformed, error, file.take(length))?]
+                        }
+                    }
                 }
             };
-            if value["type"] == "session" {
-                header = encoded.clone();
-            } else if let Some(entry) = value.get("id").and_then(|v| v.as_str()) {
-                let parent = value
-                    .get("parentId")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned);
-                if old.is_some() && parent != leaf {
-                    branched = true;
-                }
-                leaf = Some(entry.to_string());
-                nodes.push(Node {
-                    id: entry.into(),
-                    parent,
-                    ordinal: base + n,
-                    body: value,
-                });
-            }
-            normalized.push_str(&encoded);
-            normalized.push('\n');
-        }
-        drop(lines);
-        data = normalized;
-        if branched {
-            let c = Connection::open_with_flags(
-                database.context("pi branch requires prior index")?,
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )?;
-            c.execute_batch("BEGIN")?;
-            let fresh: HashMap<_, _> = nodes.iter().map(|n| (n.id.as_str(), n)).collect();
-            let mut at = leaf.clone();
-            let mut seen = HashSet::new();
-            let mut chain = Vec::new();
-            let source: i64 = c.query_row(
-                "SELECT rowid FROM sources WHERE path=?",
-                [path.to_string_lossy()],
-                |r| r.get(0),
-            )?;
-            let mut graphs = HashMap::new();
-            let mut texts = HashMap::new();
-            let mut event_cache = HashMap::new();
-            while let Some(id) = at {
-                if !seen.insert(id.clone()) {
-                    break;
-                }
-                let (parent, body) = if let Some(n) = fresh.get(id.as_str()) {
-                    (n.parent.clone(), serde_json::to_vec(&n.body)?)
-                } else {
-                    let key = bucket(&id);
-                    if let std::collections::hash_map::Entry::Vacant(e) = graphs.entry(key) {
-                        e.insert(graph(&c, source, key)?);
-                    }
-                    let Some(node) = graphs[&key].get(&id) else {
-                        break;
-                    };
-                    let mut record = node.record.clone();
-                    restore_text(&c, &mut record, &mut texts, &mut event_cache)?;
-                    if record.is_null() {
-                        record = serde_json::json!({"type":"noop"});
-                    }
-                    record["id"] = serde_json::json!(id);
-                    record["parentId"] = serde_json::json!(node.parent);
-                    record["__agrep_ordinal"] = serde_json::json!(node.ordinal);
-                    (node.parent.clone(), serde_json::to_vec(&record)?)
+            for record in parsed {
+                let Some(value) = record.value() else {
+                    pi_values.push(record);
+                    continue;
                 };
-                chain.push(String::from_utf8(body)?);
-                at = parent;
+                if value["type"] == "session" {
+                    header = serde_json::to_string(&value)?;
+                } else if let Some(entry) = value.get("id").and_then(|v| v.as_str()) {
+                    let parent = value
+                        .get("parentId")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned);
+                    if old.is_some() && parent != leaf {
+                        branched = true;
+                    }
+                    leaf = Some(entry.to_string());
+                }
+                pi_values.push(record);
             }
-            data = header.clone();
-            data.push('\n');
-            for record in chain.iter().rev() {
-                data.push_str(record);
-                data.push('\n');
-            }
-            for record in malformed {
-                data.push_str(&record);
-                data.push('\n');
-            }
-        }
+            Ok(())
+        })?;
+    bytes_read += read;
+    if !partial_chunk.is_empty() {
+        prefix_chunks.push(Sha256::digest(&partial_chunk).into());
     }
+    if agent == "pi" && branched {
+        let c = Connection::open_with_flags(
+            database.context("pi branch requires prior index")?,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        c.execute_batch("BEGIN")?;
+        let fresh: HashMap<_, _> = pi_values
+            .iter()
+            .filter_map(ingest::pi::PreparedRecord::value)
+            .filter_map(|v| v.get("id").and_then(|v| v.as_str()).map(|id| (id, v)))
+            .collect();
+        let mut at = leaf.clone();
+        let mut seen = HashSet::new();
+        let mut chain = Vec::new();
+        let source: i64 = c.query_row(
+            "SELECT rowid FROM sources WHERE path=?",
+            [path.to_string_lossy()],
+            |r| r.get(0),
+        )?;
+        let mut graphs = HashMap::new();
+        let mut texts = HashMap::new();
+        let mut event_cache = HashMap::new();
+        while let Some(id) = at {
+            if !seen.insert(id.clone()) {
+                break;
+            }
+            let (parent, body) = if let Some(n) = fresh.get(id.as_str()) {
+                (
+                    n.get("parentId")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned),
+                    (*n).clone(),
+                )
+            } else {
+                let key = bucket(&id);
+                if let std::collections::hash_map::Entry::Vacant(e) = graphs.entry(key) {
+                    e.insert(graph(&c, source, key)?);
+                }
+                let Some(node) = graphs[&key].get(&id) else {
+                    break;
+                };
+                let mut record = node.record.clone();
+                restore_text(&c, &mut record, &mut texts, &mut event_cache)?;
+                if record.is_null() {
+                    record = serde_json::json!({"type":"noop"});
+                }
+                record["id"] = serde_json::json!(id);
+                record["parentId"] = serde_json::json!(node.parent);
+                record["__agrep_ordinal"] = serde_json::json!(node.ordinal);
+                (node.parent.clone(), record)
+            };
+            chain.push(body);
+            at = parent;
+        }
+        let mut rebuilt = Vec::new();
+        if !header.is_empty() {
+            rebuilt.push(ingest::pi::PreparedRecord::Value(serde_json::from_str(
+                &header,
+            )?));
+        }
+        rebuilt.extend(
+            chain
+                .into_iter()
+                .rev()
+                .map(ingest::pi::PreparedRecord::Value),
+        );
+        // Malformed append records follow the rebuilt readable chain, as in a full replay.
+        rebuilt.extend(pi_values.iter().filter(|v| v.value().is_none()).cloned());
+        replay = Some(rebuilt);
+    }
+
     let prior = if branched {
         None
     } else {
         old.as_ref().map(|c| c.state.as_str())
     };
-    let bytes_parsed = if branched { data.len() } else { complete };
+    let bytes_parsed = match &replay {
+        Some(records) => records
+            .iter()
+            .map(ingest::pi::PreparedRecord::encoded_len)
+            .sum::<serde_json::Result<usize>>()?,
+        None => complete,
+    };
+    let input = spool.map(ingest::jsonl::FileText::new);
     let (messages, events, outcome, state) = match agent {
-        "claude" => ingest::claude::resume_parse(path, &data, prior)?,
-        "codex" => ingest::codex::resume_parse(path, &data, prior)?,
-        "pi" => ingest::pi::resume_parse(path, &data, prior)?,
+        "claude" => match &input {
+            Some(input) => ingest::claude::resume_parse(path, input, prior)?,
+            None => ingest::claude::resume_parse(path, &data, prior)?,
+        },
+        "codex" => match &input {
+            Some(input) => ingest::codex::resume_parse(path, input, prior)?,
+            None => ingest::codex::resume_parse(path, &data, prior)?,
+        },
+        "pi" => ingest::pi::resume_prepared(path, replay.as_deref().unwrap_or(&pi_values), prior)?,
         _ => anyhow::bail!("unsupported incremental adapter"),
     };
+    if let Some(input) = &input {
+        input.check()?;
+    }
     let mut state: serde_json::Value = serde_json::from_str(&state)?;
     let reset = state
         .get("reset")
@@ -1004,6 +1213,27 @@ pub fn parse(
         header,
         leaf,
     };
+    let nodes = pi_values
+        .into_iter()
+        .filter_map(ingest::pi::PreparedRecord::into_value)
+        .filter_map(|body| {
+            if body["type"] == "session" {
+                return None;
+            }
+            let id = body.get("id")?.as_str()?.to_owned();
+            let parent = body
+                .get("parentId")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            let ordinal = body["__agrep_ordinal"].as_u64()? as usize;
+            Some(Node {
+                id,
+                parent,
+                ordinal,
+                body,
+            })
+        })
+        .collect();
     Ok(Parsed {
         messages,
         events,
@@ -1015,4 +1245,308 @@ pub fn parse(
         bytes_read,
         bytes_parsed,
     })
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_final_records_keep_the_original_completion_rules() {
+        let mut source = b"{}\n{\"ignored\":\"".to_vec();
+        source.resize(2 * READ_CHUNK, b'x');
+        for (tail, valid) in [
+            (b"\"}".as_slice(), true),
+            (b"\xff\"}", false),
+            (b"unfinished", false),
+        ] {
+            let mut input = source.clone();
+            input.extend_from_slice(tail);
+            let mut consumed = 0;
+            let extent = read_jsonl_blocks(input.as_slice(), input.len() as u64, |mut block| {
+                block.chunks(|bytes| {
+                    consumed += bytes.len();
+                    Ok(())
+                })
+            })
+            .unwrap();
+            let expected = if valid { input.len() } else { 3 };
+            assert_eq!(extent, (input.len(), expected));
+            assert_eq!(consumed, expected);
+        }
+    }
+
+    #[test]
+    fn a_single_large_record_spills_before_deserialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = tempfile::tempfile_in(dir.path()).unwrap();
+        file.write_all(b"{\"details\":\"").unwrap();
+        let padding = vec![b'x'; 64 << 10];
+        for _ in 0..1024 {
+            file.write_all(&padding).unwrap();
+        }
+        file.write_all(b"\"}\n").unwrap();
+        let length = file.metadata().unwrap().len();
+        file.rewind().unwrap();
+        let mut spilled = 0;
+        let (read, complete) = read_jsonl_blocks(file, length, |block| {
+            match block {
+                JsonlBlock::Bytes(bytes) => assert!(bytes.len() <= READ_CHUNK),
+                JsonlBlock::Record(file) => {
+                    assert_eq!(file.metadata()?.len(), length);
+                    spilled += 1;
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!((read as u64, complete as u64), (length, length));
+        assert_eq!(spilled, 1);
+    }
+
+    #[test]
+    fn checkpoints_do_not_depend_on_read_boundaries() {
+        let bytes: Vec<_> = (0..CHECKPOINT_CHUNK * 2 + 37).map(|i| i as u8).collect();
+        for size in [17, CHECKPOINT_CHUNK - 1, CHECKPOINT_CHUNK + 13] {
+            let mut hashes = Vec::new();
+            let mut tail = Vec::new();
+            for block in bytes.chunks(size) {
+                checkpoint_bytes(&mut hashes, &mut tail, block);
+                assert!(tail.len() < CHECKPOINT_CHUNK);
+            }
+            if !tail.is_empty() {
+                hashes.push(Sha256::digest(&tail).into());
+            }
+            assert_eq!(hashes, chunk_hashes(&bytes));
+        }
+    }
+
+    #[test]
+    fn streamed_jsonl_keeps_the_complete_extent() {
+        for (source, expected) in [
+            (
+                b"{}\r\n\n{\"a\":1}".as_slice(),
+                b"{}\r\n\n{\"a\":1}".as_slice(),
+            ),
+            (b"{}\n{\"a\":".as_slice(), b"{}\n".as_slice()),
+            (b"{}\n\xff\n".as_slice(), b"{}\n\xff\n".as_slice()),
+            (b"broken".as_slice(), b"".as_slice()),
+        ] {
+            let mut got = Vec::new();
+            let (read, complete) = read_jsonl(source, source.len() as u64, |block| {
+                got.extend_from_slice(block);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(read, source.len());
+            assert_eq!(complete, expected.len());
+            assert_eq!(got, expected);
+        }
+        let mut got = Vec::new();
+        let (read, complete) = read_jsonl(b"{}\nappended".as_slice(), 3, |block| {
+            got.extend_from_slice(block);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!((read, complete), (3, 3));
+        assert_eq!(got, b"{}\n");
+    }
+
+    #[test]
+    fn large_jsonl_reads_are_bounded_by_block_and_record() {
+        let mut file = tempfile::tempfile().unwrap();
+        let record = format!(
+            "{{\"type\":\"noop\",\"ignored\":\"{}\"}}\n",
+            "x".repeat(64 << 10)
+        );
+        let count = 4096;
+        for _ in 0..count {
+            std::io::Write::write_all(&mut file, record.as_bytes()).unwrap();
+        }
+        file.seek(SeekFrom::Start(0)).unwrap();
+        struct Streaming<R> {
+            reader: R,
+            read: usize,
+            consumed: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+        impl<R: Read> Read for Streaming<R> {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.reader.read(bytes)?;
+                self.read += n;
+                assert!(self.read <= self.consumed.get() + 2 * READ_CHUNK);
+                Ok(n)
+            }
+        }
+        let consumed = std::rc::Rc::new(std::cell::Cell::new(0));
+        let reader = Streaming {
+            reader: file,
+            read: 0,
+            consumed: consumed.clone(),
+        };
+        let mut peak = 0;
+        let mut records = 0;
+        let length = record.len() * count;
+        let extent = read_jsonl(reader, length as u64, |block| {
+            consumed.set(consumed.get() + block.len());
+            peak = peak.max(block.len());
+            records += block.iter().filter(|&&b| b == b'\n').count();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(extent, (length, length));
+        assert_eq!(records, count);
+        assert!(peak <= READ_CHUNK + record.len());
+        assert!(peak < length / 8);
+    }
+}
+
+#[cfg(test)]
+mod spill_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn large_codex_snapshot_preserves_parser_and_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-stream.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"session_meta","payload":{{"id":"stream","cwd":"/work/test"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"turn_context","payload":{{"model":"model-one"}}}}"#
+        )
+        .unwrap();
+        writeln!(file, r#"{{"type":"response_item","timestamp":"2026-01-01T00:00:00Z","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"streamed prompt"}}]}}}}"#).unwrap();
+        let ignored = format!(
+            "{{\"type\":\"noop\",\"padding\":\"{}\"}}\n",
+            "x".repeat(8 << 10)
+        );
+        for _ in 0..=READ_CHUNK / ignored.len() {
+            file.write_all(ignored.as_bytes()).unwrap();
+        }
+        writeln!(file, r#"{{"type":"event_msg","timestamp":"2026-01-01T00:00:00Z","payload":{{"type":"user_message","message":"streamed prompt"}}}}"#).unwrap();
+        writeln!(file, r#"{{"type":"response_item","timestamp":"2026-01-01T00:00:01Z","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"streamed reply"}}]}}}}"#).unwrap();
+        drop(file);
+        let parsed = parse("codex", &path, None, None).unwrap();
+        assert_eq!(parsed.outcome, ReadOutcome::Complete);
+        assert_eq!(parsed.messages.len(), 1);
+        // 0.4.9's codex::parse_file_with_tally attaches output_text to the
+        // preceding attested user message, even across ignored records.
+        assert_eq!(&*parsed.messages[0].text, "streamed prompt");
+        assert_eq!(&*parsed.messages[0].reply, "streamed reply");
+        let bytes = std::fs::read(&path).unwrap();
+        let cursor: Cursor =
+            serde_json::from_slice(&lz4_flex::decompress_size_prepended(&parsed.cursor).unwrap())
+                .unwrap();
+        assert_eq!(cursor.prefix_chunks, chunk_hashes(&bytes));
+        assert_eq!(cursor.offset, bytes.len() as u64);
+        assert_eq!(parsed.bytes_read, bytes.len());
+        assert_eq!(parsed.bytes_parsed, bytes.len());
+    }
+}
+
+#[cfg(test)]
+mod large_metadata_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn malformed_records_in_blocks_and_spills_keep_readable_rows_and_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"session","id":"malformed","cwd":"/work/test"}}"#
+        )
+        .unwrap();
+        file.write_all(b"{broken\n{\"broken\":\"").unwrap();
+        let padding = vec![b'x'; 64 << 10];
+        for _ in 0..=READ_CHUNK / padding.len() {
+            file.write_all(&padding).unwrap();
+        }
+        file.write_all(b"\" invalid}\n").unwrap();
+        writeln!(file, r#"{{"type":"message","id":"u","parentId":null,"message":{{"role":"user","content":"readable prompt"}}}}"#).unwrap();
+        drop(file);
+        let (parsed, tallies) = crate::intake::scoped(|| parse("pi", &path, None, None).unwrap());
+        assert!(crate::intake::errors(&tallies));
+        assert_eq!(parsed.outcome, ReadOutcome::Complete);
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(&*parsed.messages[0].text, "readable prompt");
+        let raw = std::fs::read(&path).unwrap();
+        let cursor: Cursor =
+            serde_json::from_slice(&lz4_flex::decompress_size_prepended(&parsed.cursor).unwrap())
+                .unwrap();
+        assert_eq!(cursor.prefix_chunks, chunk_hashes(&raw));
+        assert_eq!(cursor.records, 4);
+    }
+
+    #[test]
+    fn oversized_blank_record_is_skipped_before_the_next_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"session","id":"blank-record","cwd":"/work/test"}}"#
+        )
+        .unwrap();
+        let blank = vec![b' '; 64 << 10];
+        for _ in 0..=READ_CHUNK / blank.len() {
+            file.write_all(&blank).unwrap();
+        }
+        file.write_all(b"\n").unwrap();
+        writeln!(file, r#"{{"type":"message","id":"u","parentId":null,"message":{{"role":"user","content":"blank record prompt"}}}}"#).unwrap();
+        drop(file);
+        let parsed = parse("pi", &path, None, None).unwrap();
+        assert_eq!(parsed.outcome, ReadOutcome::Complete);
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(&*parsed.messages[0].text, "blank record prompt");
+    }
+
+    #[test]
+    fn huge_ignored_tool_metadata_keeps_rows_and_raw_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"session","id":"large-details","cwd":"/work/test"}}"#
+        )
+        .unwrap();
+        writeln!(file, r#"{{"type":"message","id":"u","parentId":null,"message":{{"role":"user","content":"prompt"}}}}"#).unwrap();
+        writeln!(file, r#"{{"type":"message","id":"a","parentId":"u","message":{{"role":"assistant","content":[{{"type":"toolCall","id":"call","name":"bash","arguments":{{"command":"true"}}}}]}}}}"#).unwrap();
+        write!(file, r#"{{"type":"message","id":"r","parentId":"a","message":{{"role":"toolResult","toolCallId":"call","content":"ok","details":{{"rows":["#).unwrap();
+        let item = format!("{{\"padding\":\"{}\"}}", "x".repeat(2048));
+        for i in 0..=READ_CHUNK / item.len() {
+            if i > 0 {
+                file.write_all(b",").unwrap();
+            }
+            file.write_all(item.as_bytes()).unwrap();
+        }
+        file.write_all(b"]}}}\n").unwrap();
+        drop(file);
+        let parsed = parse("pi", &path, None, None).unwrap();
+        assert_eq!(parsed.outcome, ReadOutcome::Complete);
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(&*parsed.messages[0].text, "prompt");
+        // 0.4.9's pi parser discards tool details and takes the text as the output.
+        assert_eq!(parsed.events.len(), 1);
+        assert_eq!(parsed.events[0].output, "ok");
+        assert_eq!(parsed.events[0].output_chars, 2);
+        assert!(parsed
+            .nodes
+            .iter()
+            .all(|n| n.body["message"].get("details").is_none()));
+        let raw = std::fs::read(&path).unwrap();
+        let cursor: Cursor =
+            serde_json::from_slice(&lz4_flex::decompress_size_prepended(&parsed.cursor).unwrap())
+                .unwrap();
+        assert_eq!(cursor.prefix_chunks, chunk_hashes(&raw));
+        assert_eq!(cursor.offset, raw.len() as u64);
+    }
 }

@@ -1,0 +1,1681 @@
+[
+  {
+    "args": [
+      "cafe",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "cafe"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe\u0301 other"
+      },
+      {
+        "who": "user",
+        "snippet": "kit cafe\u0301"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe\u0301\u2014kit"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe\u0301 kit"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe\u0301"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301 other"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode kit cafe\u0301"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301\u2014kit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301 kit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301"
+      }
+    ]
+  },
+  {
+    "args": [
+      "cafe",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "cafe\u0301 other"
+      },
+      {
+        "who": "user",
+        "snippet": "kit cafe\u0301"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe\u0301\u2014kit"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe\u0301 kit"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe\u0301"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301 other"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode kit cafe\u0301"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301\u2014kit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301 kit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301"
+      }
+    ]
+  },
+  {
+    "args": [
+      "fe",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "fe\u0301"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode fe\u0301"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe\u0301 other"
+      },
+      {
+        "who": "user",
+        "snippet": "kit cafe\u0301"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe\u0301\u2014kit"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe\u0301 kit"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe\u0301"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301 other"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode kit cafe\u0301"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301\u2014kit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301 kit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301"
+      }
+    ]
+  },
+  {
+    "args": [
+      "fe",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "fe\u0301"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode fe\u0301"
+      }
+    ]
+  },
+  {
+    "args": [
+      "kit",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "kit cafe\u0301"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe\u0301\u2014kit"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe\u0301 kit"
+      },
+      {
+        "who": "user",
+        "snippet": "\u212ait"
+      },
+      {
+        "who": "user",
+        "snippet": "K\u0130T"
+      },
+      {
+        "who": "user",
+        "snippet": "k\u0131t"
+      },
+      {
+        "who": "user",
+        "snippet": "kit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode kit cafe\u0301"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301\u2014kit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301 kit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u212ait"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode K\u0130T"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode k\u0131t"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode kit"
+      }
+    ]
+  },
+  {
+    "args": [
+      "kit",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "kit cafe\u0301"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe\u0301\u2014kit"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe\u0301 kit"
+      },
+      {
+        "who": "user",
+        "snippet": "\u212ait"
+      },
+      {
+        "who": "user",
+        "snippet": "K\u0130T"
+      },
+      {
+        "who": "user",
+        "snippet": "k\u0131t"
+      },
+      {
+        "who": "user",
+        "snippet": "kit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode kit cafe\u0301"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301\u2014kit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301 kit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u212ait"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode K\u0130T"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode k\u0131t"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode kit"
+      }
+    ]
+  },
+  {
+    "args": [
+      "it",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "kit cafe\u0301"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe\u0301\u2014kit"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe\u0301 kit"
+      },
+      {
+        "who": "user",
+        "snippet": "\u212ait"
+      },
+      {
+        "who": "user",
+        "snippet": "\u017fit"
+      },
+      {
+        "who": "user",
+        "snippet": "K\u0130T"
+      },
+      {
+        "who": "user",
+        "snippet": "k\u0131t"
+      },
+      {
+        "who": "user",
+        "snippet": "kit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode kit cafe\u0301"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301\u2014kit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301 kit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u212ait"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u017fit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode K\u0130T"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode k\u0131t"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode kit"
+      }
+    ]
+  },
+  {
+    "args": [
+      "it",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": []
+  },
+  {
+    "args": [
+      "i",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "\u0130"
+      },
+      {
+        "who": "user",
+        "snippet": "\u0131"
+      },
+      {
+        "who": "user",
+        "snippet": "istanbul"
+      },
+      {
+        "who": "user",
+        "snippet": "\u0130stanbul"
+      },
+      {
+        "who": "user",
+        "snippet": "IV"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u0130"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u0131"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode istanbul"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u0130stanbul"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode IV"
+      },
+      {
+        "who": "user",
+        "snippet": "kit cafe\u0301"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe\u0301\u2014kit"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe\u0301 kit"
+      },
+      {
+        "who": "user",
+        "snippet": "office"
+      },
+      {
+        "who": "user",
+        "snippet": "\u212ait"
+      },
+      {
+        "who": "user",
+        "snippet": "\u017fit"
+      },
+      {
+        "who": "user",
+        "snippet": "K\u0130T"
+      },
+      {
+        "who": "user",
+        "snippet": "k\u0131t"
+      },
+      {
+        "who": "user",
+        "snippet": "kit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode kit cafe\u0301"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301\u2014kit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301 kit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode office"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u212ait"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u017fit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode K\u0130T"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode k\u0131t"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode kit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode a\u0000bc"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u00e4bc"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode a\u0308bc"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301 other"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u03c3ab"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u03c2ab"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u03bcab"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u00b5ab"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u2163"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u24b6\u24b7\u24b8"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode ABC"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \uff21\uff22\uff23"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode strasse"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode Stra\u00dfe"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode ..."
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u2026"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \uff43\uff41\uff46\uff45"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode o\ufb03ce"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode fe\u0301"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode caf\u00e9"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301"
+      }
+    ]
+  },
+  {
+    "args": [
+      "i",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "\u0130"
+      },
+      {
+        "who": "user",
+        "snippet": "\u0131"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u0130"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u0131"
+      }
+    ]
+  },
+  {
+    "args": [
+      "sit",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "\u017fit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u017fit"
+      }
+    ]
+  },
+  {
+    "args": [
+      "sit",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "\u017fit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u017fit"
+      }
+    ]
+  },
+  {
+    "args": [
+      "office",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "office"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode office"
+      }
+    ]
+  },
+  {
+    "args": [
+      "office",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "office"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode office"
+      }
+    ]
+  },
+  {
+    "args": [
+      "ffi",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "office"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode office"
+      }
+    ]
+  },
+  {
+    "args": [
+      "ffi",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": []
+  },
+  {
+    "args": [
+      "caf\u00e9",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "caf\u00e9"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode caf\u00e9"
+      }
+    ]
+  },
+  {
+    "args": [
+      "caf\u00e9",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "caf\u00e9"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode caf\u00e9"
+      }
+    ]
+  },
+  {
+    "args": [
+      "\uff43\uff41\uff46\uff45",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "\uff43\uff41\uff46\uff45"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \uff43\uff41\uff46\uff45"
+      }
+    ]
+  },
+  {
+    "args": [
+      "\uff43\uff41\uff46\uff45",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "\uff43\uff41\uff46\uff45"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \uff43\uff41\uff46\uff45"
+      }
+    ]
+  },
+  {
+    "args": [
+      "...",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "..."
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode ..."
+      }
+    ]
+  },
+  {
+    "args": [
+      "...",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "..."
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode ..."
+      }
+    ]
+  },
+  {
+    "args": [
+      "\u2026",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "\u2026"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u2026"
+      }
+    ]
+  },
+  {
+    "args": [
+      "\u2026",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "\u2026"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u2026"
+      }
+    ]
+  },
+  {
+    "args": [
+      "strasse",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "strasse"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode strasse"
+      }
+    ]
+  },
+  {
+    "args": [
+      "strasse",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "strasse"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode strasse"
+      }
+    ]
+  },
+  {
+    "args": [
+      "Stra\u00dfe",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "Stra\u00dfe"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode Stra\u00dfe"
+      }
+    ]
+  },
+  {
+    "args": [
+      "Stra\u00dfe",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "Stra\u00dfe"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode Stra\u00dfe"
+      }
+    ]
+  },
+  {
+    "args": [
+      "ABC",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "ABC"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode ABC"
+      }
+    ]
+  },
+  {
+    "args": [
+      "ABC",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "ABC"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode ABC"
+      }
+    ]
+  },
+  {
+    "args": [
+      "\uff21\uff22\uff23",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "\uff21\uff22\uff23"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \uff21\uff22\uff23"
+      }
+    ]
+  },
+  {
+    "args": [
+      "\uff21\uff22\uff23",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "\uff21\uff22\uff23"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \uff21\uff22\uff23"
+      }
+    ]
+  },
+  {
+    "args": [
+      "IV",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "IV"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode IV"
+      }
+    ]
+  },
+  {
+    "args": [
+      "IV",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "IV"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode IV"
+      }
+    ]
+  },
+  {
+    "args": [
+      "\u2163",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "\u2163"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u2163"
+      }
+    ]
+  },
+  {
+    "args": [
+      "\u2163",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "\u2163"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u2163"
+      }
+    ]
+  },
+  {
+    "args": [
+      "\u00b5ab",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "\u03bcab"
+      },
+      {
+        "who": "user",
+        "snippet": "\u00b5ab"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u03bcab"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u00b5ab"
+      }
+    ]
+  },
+  {
+    "args": [
+      "\u00b5ab",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "\u03bcab"
+      },
+      {
+        "who": "user",
+        "snippet": "\u00b5ab"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u03bcab"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u00b5ab"
+      }
+    ]
+  },
+  {
+    "args": [
+      "\u03c3ab",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "\u03c3ab"
+      },
+      {
+        "who": "user",
+        "snippet": "\u03c2ab"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u03c3ab"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u03c2ab"
+      }
+    ]
+  },
+  {
+    "args": [
+      "\u03c3ab",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "\u03c3ab"
+      },
+      {
+        "who": "user",
+        "snippet": "\u03c2ab"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u03c3ab"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u03c2ab"
+      }
+    ]
+  },
+  {
+    "args": [
+      "cafe kit",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "cafe\u0301\u2014kit"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe\u0301 kit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301\u2014kit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301 kit"
+      },
+      {
+        "who": "user",
+        "snippet": "kit cafe\u0301"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode kit cafe\u0301"
+      }
+    ]
+  },
+  {
+    "args": [
+      "cafe kit",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": []
+  },
+  {
+    "args": [
+      "istanbul",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "istanbul"
+      },
+      {
+        "who": "user",
+        "snippet": "\u0130stanbul"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode istanbul"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u0130stanbul"
+      }
+    ]
+  },
+  {
+    "args": [
+      "istanbul",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "istanbul"
+      },
+      {
+        "who": "user",
+        "snippet": "\u0130stanbul"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode istanbul"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u0130stanbul"
+      }
+    ]
+  },
+  {
+    "args": [
+      "abc",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "ABC"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode ABC"
+      }
+    ]
+  },
+  {
+    "args": [
+      "abc",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "ABC"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode ABC"
+      }
+    ]
+  },
+  {
+    "args": [
+      "a\u0308bc",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "a\u0308bc"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode a\u0308bc"
+      }
+    ]
+  },
+  {
+    "args": [
+      "a\u0308bc",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "a\u0308bc"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode a\u0308bc"
+      }
+    ]
+  },
+  {
+    "args": [
+      "\u00e4bc",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "\u00e4bc"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u00e4bc"
+      }
+    ]
+  },
+  {
+    "args": [
+      "\u00e4bc",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "\u00e4bc"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u00e4bc"
+      }
+    ]
+  },
+  {
+    "args": [
+      "i\u0307",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u0130stanbul"
+      },
+      {
+        "who": "user",
+        "snippet": "\u0130stanbul"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u0130"
+      },
+      {
+        "who": "user",
+        "snippet": "\u0130"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode K\u0130T"
+      },
+      {
+        "who": "user",
+        "snippet": "K\u0130T"
+      }
+    ]
+  },
+  {
+    "args": [
+      "i\u0307",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": []
+  },
+  {
+    "args": [
+      "i\u0307stanbul",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u0130stanbul"
+      },
+      {
+        "who": "user",
+        "snippet": "\u0130stanbul"
+      }
+    ]
+  },
+  {
+    "args": [
+      "i\u0307stanbul",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": []
+  },
+  {
+    "args": [
+      "k i\u0307",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "K\u0130T"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode K\u0130T"
+      }
+    ]
+  },
+  {
+    "args": [
+      "k i\u0307",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": []
+  },
+  {
+    "args": [
+      "K\u0130T",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "\u212ait"
+      },
+      {
+        "who": "user",
+        "snippet": "K\u0130T"
+      },
+      {
+        "who": "user",
+        "snippet": "k\u0131t"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u212ait"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode K\u0130T"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode k\u0131t"
+      }
+    ]
+  },
+  {
+    "args": [
+      "K\u0130T",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "kit cafe\u0301"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe\u0301\u2014kit"
+      },
+      {
+        "who": "user",
+        "snippet": "cafe\u0301 kit"
+      },
+      {
+        "who": "user",
+        "snippet": "\u212ait"
+      },
+      {
+        "who": "user",
+        "snippet": "K\u0130T"
+      },
+      {
+        "who": "user",
+        "snippet": "k\u0131t"
+      },
+      {
+        "who": "user",
+        "snippet": "kit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode kit cafe\u0301"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301\u2014kit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode cafe\u0301 kit"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u212ait"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode K\u0130T"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode k\u0131t"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode kit"
+      }
+    ]
+  },
+  {
+    "args": [
+      "\u0130stanbul",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "\u0130stanbul"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u0130stanbul"
+      }
+    ]
+  },
+  {
+    "args": [
+      "\u0130stanbul",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "istanbul"
+      },
+      {
+        "who": "user",
+        "snippet": "\u0130stanbul"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode istanbul"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u0130stanbul"
+      }
+    ]
+  },
+  {
+    "args": [
+      "\u0131stanbul",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "istanbul"
+      },
+      {
+        "who": "user",
+        "snippet": "\u0130stanbul"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode istanbul"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u0130stanbul"
+      }
+    ]
+  },
+  {
+    "args": [
+      "\u0131stanbul",
+      "-w",
+      "-n",
+      "0"
+    ],
+    "rows": [
+      {
+        "who": "user",
+        "snippet": "istanbul"
+      },
+      {
+        "who": "user",
+        "snippet": "\u0130stanbul"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode istanbul"
+      },
+      {
+        "who": "tool",
+        "snippet": "bash: printf unicode \u0130stanbul"
+      }
+    ]
+  }
+]

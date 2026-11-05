@@ -3,9 +3,10 @@ mod help;
 use agrep_core::{data::DataRoot, query::Filters, render, semantic, store};
 use anyhow::{bail, Context, Result};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
-// On hosted Windows runners the allocation-heavy index phases (parsing, page
-// packing) ran 2-3x slower than the same work on macOS under the system heap.
-#[cfg(windows)]
+// Parse workers create and retire many differently sized strings. Return empty
+// pages after the writer frees them instead of retaining the parse high-water mark.
+#[cfg(target_os = "macos")]
+mod allocator;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[derive(Parser)]
@@ -1115,6 +1116,8 @@ fn run(cli: Cli, invocation: &cmd::usage::Invocation) -> Result<i32> {
     }
 }
 fn main() {
+    #[cfg(target_os = "macos")]
+    allocator::initialize();
     agrep_core::semantic_profile::process_endpoint("process_entry_ns");
     let parse_span = agrep_core::semantic_profile::span("cli_parse");
     let mut args: Vec<_> = std::env::args_os().collect();

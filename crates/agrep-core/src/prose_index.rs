@@ -10,7 +10,7 @@ pub(crate) fn schema(c: &Connection) -> Result<()> {
 }
 
 fn terms(text: &str) -> HashSet<String> {
-    let normal = store::normalize(text);
+    let normal = store::search_fold(text);
     normal
         .chars()
         .collect::<Vec<_>>()
@@ -81,7 +81,7 @@ CREATE VIRTUAL TABLE prose_vocab USING fts5vocab(prose_fts,row);").unwrap();
             tx.execute("DELETE FROM prose_fts", []).unwrap();
             tx.execute("DELETE FROM prose", []).unwrap();
             if let Some(text) = text {
-                let normal = store::normalize(text);
+                let normal = store::search_fold(text);
                 tx.execute("INSERT INTO prose VALUES(1,?,1)", [text.as_bytes()])
                     .unwrap();
                 tx.execute("INSERT OR IGNORE INTO stats_dirty VALUES(1,NULL)", [])

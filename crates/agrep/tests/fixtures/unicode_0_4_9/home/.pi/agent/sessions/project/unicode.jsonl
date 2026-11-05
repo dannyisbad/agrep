@@ -1,0 +1,73 @@
+{"type": "session", "id": "unicode-session", "version": 3, "cwd": "/work/project", "timestamp": "2099-01-01T01:00:00Z"}
+{"type": "message", "id": "m1", "parentId": null, "timestamp": "2099-01-01T01:00:00Z", "message": {"role": "user", "content": "cafe\u0301"}}
+{"type": "message", "id": "m2", "parentId": "m1", "timestamp": "2099-01-01T01:00:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "cafe\u0301", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m3", "parentId": "m2", "timestamp": "2099-01-01T01:01:00Z", "message": {"role": "user", "content": "cafe"}}
+{"type": "message", "id": "m4", "parentId": "m3", "timestamp": "2099-01-01T01:01:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "cafe", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m5", "parentId": "m4", "timestamp": "2099-01-01T01:02:00Z", "message": {"role": "user", "content": "caf\u00e9"}}
+{"type": "message", "id": "m6", "parentId": "m5", "timestamp": "2099-01-01T01:02:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "caf\u00e9", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m7", "parentId": "m6", "timestamp": "2099-01-01T01:03:00Z", "message": {"role": "user", "content": "fe\u0301"}}
+{"type": "message", "id": "m8", "parentId": "m7", "timestamp": "2099-01-01T01:03:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "fe\u0301", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m9", "parentId": "m8", "timestamp": "2099-01-01T01:04:00Z", "message": {"role": "user", "content": "kit"}}
+{"type": "message", "id": "m10", "parentId": "m9", "timestamp": "2099-01-01T01:04:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "kit", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m11", "parentId": "m10", "timestamp": "2099-01-01T01:05:00Z", "message": {"role": "user", "content": "k\u0131t"}}
+{"type": "message", "id": "m12", "parentId": "m11", "timestamp": "2099-01-01T01:05:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "k\u0131t", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m13", "parentId": "m12", "timestamp": "2099-01-01T01:06:00Z", "message": {"role": "user", "content": "K\u0130T"}}
+{"type": "message", "id": "m14", "parentId": "m13", "timestamp": "2099-01-01T01:06:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "K\u0130T", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m15", "parentId": "m14", "timestamp": "2099-01-01T01:07:00Z", "message": {"role": "user", "content": "\u0131"}}
+{"type": "message", "id": "m16", "parentId": "m15", "timestamp": "2099-01-01T01:07:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "\u0131", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m17", "parentId": "m16", "timestamp": "2099-01-01T01:08:00Z", "message": {"role": "user", "content": "\u0130"}}
+{"type": "message", "id": "m18", "parentId": "m17", "timestamp": "2099-01-01T01:08:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "\u0130", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m19", "parentId": "m18", "timestamp": "2099-01-01T01:09:00Z", "message": {"role": "user", "content": "\u017fit"}}
+{"type": "message", "id": "m20", "parentId": "m19", "timestamp": "2099-01-01T01:09:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "\u017fit", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m21", "parentId": "m20", "timestamp": "2099-01-01T01:10:00Z", "message": {"role": "user", "content": "\u212ait"}}
+{"type": "message", "id": "m22", "parentId": "m21", "timestamp": "2099-01-01T01:10:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "\u212ait", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m23", "parentId": "m22", "timestamp": "2099-01-01T01:11:00Z", "message": {"role": "user", "content": "o\ufb03ce"}}
+{"type": "message", "id": "m24", "parentId": "m23", "timestamp": "2099-01-01T01:11:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "o\ufb03ce", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m25", "parentId": "m24", "timestamp": "2099-01-01T01:12:00Z", "message": {"role": "user", "content": "office"}}
+{"type": "message", "id": "m26", "parentId": "m25", "timestamp": "2099-01-01T01:12:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "office", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m27", "parentId": "m26", "timestamp": "2099-01-01T01:13:00Z", "message": {"role": "user", "content": "\uff43\uff41\uff46\uff45"}}
+{"type": "message", "id": "m28", "parentId": "m27", "timestamp": "2099-01-01T01:13:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "\uff43\uff41\uff46\uff45", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m29", "parentId": "m28", "timestamp": "2099-01-01T01:14:00Z", "message": {"role": "user", "content": "\u2026"}}
+{"type": "message", "id": "m30", "parentId": "m29", "timestamp": "2099-01-01T01:14:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "\u2026", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m31", "parentId": "m30", "timestamp": "2099-01-01T01:15:00Z", "message": {"role": "user", "content": "..."}}
+{"type": "message", "id": "m32", "parentId": "m31", "timestamp": "2099-01-01T01:15:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "...", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m33", "parentId": "m32", "timestamp": "2099-01-01T01:16:00Z", "message": {"role": "user", "content": "Stra\u00dfe"}}
+{"type": "message", "id": "m34", "parentId": "m33", "timestamp": "2099-01-01T01:16:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "Stra\u00dfe", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m35", "parentId": "m34", "timestamp": "2099-01-01T01:17:00Z", "message": {"role": "user", "content": "strasse"}}
+{"type": "message", "id": "m36", "parentId": "m35", "timestamp": "2099-01-01T01:17:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "strasse", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m37", "parentId": "m36", "timestamp": "2099-01-01T01:18:00Z", "message": {"role": "user", "content": "\uff21\uff22\uff23"}}
+{"type": "message", "id": "m38", "parentId": "m37", "timestamp": "2099-01-01T01:18:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "\uff21\uff22\uff23", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m39", "parentId": "m38", "timestamp": "2099-01-01T01:19:00Z", "message": {"role": "user", "content": "ABC"}}
+{"type": "message", "id": "m40", "parentId": "m39", "timestamp": "2099-01-01T01:19:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "ABC", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m41", "parentId": "m40", "timestamp": "2099-01-01T01:20:00Z", "message": {"role": "user", "content": "\u24b6\u24b7\u24b8"}}
+{"type": "message", "id": "m42", "parentId": "m41", "timestamp": "2099-01-01T01:20:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "\u24b6\u24b7\u24b8", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m43", "parentId": "m42", "timestamp": "2099-01-01T01:21:00Z", "message": {"role": "user", "content": "\u2163"}}
+{"type": "message", "id": "m44", "parentId": "m43", "timestamp": "2099-01-01T01:21:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "\u2163", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m45", "parentId": "m44", "timestamp": "2099-01-01T01:22:00Z", "message": {"role": "user", "content": "IV"}}
+{"type": "message", "id": "m46", "parentId": "m45", "timestamp": "2099-01-01T01:22:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "IV", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m47", "parentId": "m46", "timestamp": "2099-01-01T01:23:00Z", "message": {"role": "user", "content": "\u00b5ab"}}
+{"type": "message", "id": "m48", "parentId": "m47", "timestamp": "2099-01-01T01:23:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "\u00b5ab", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m49", "parentId": "m48", "timestamp": "2099-01-01T01:24:00Z", "message": {"role": "user", "content": "\u03bcab"}}
+{"type": "message", "id": "m50", "parentId": "m49", "timestamp": "2099-01-01T01:24:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "\u03bcab", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m51", "parentId": "m50", "timestamp": "2099-01-01T01:25:00Z", "message": {"role": "user", "content": "\u03c2ab"}}
+{"type": "message", "id": "m52", "parentId": "m51", "timestamp": "2099-01-01T01:25:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "\u03c2ab", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m53", "parentId": "m52", "timestamp": "2099-01-01T01:26:00Z", "message": {"role": "user", "content": "\u03c3ab"}}
+{"type": "message", "id": "m54", "parentId": "m53", "timestamp": "2099-01-01T01:26:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "\u03c3ab", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m55", "parentId": "m54", "timestamp": "2099-01-01T01:27:00Z", "message": {"role": "user", "content": "cafe\u0301 kit"}}
+{"type": "message", "id": "m56", "parentId": "m55", "timestamp": "2099-01-01T01:27:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "cafe\u0301 kit", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m57", "parentId": "m56", "timestamp": "2099-01-01T01:28:00Z", "message": {"role": "user", "content": "cafe\u0301\u2014kit"}}
+{"type": "message", "id": "m58", "parentId": "m57", "timestamp": "2099-01-01T01:28:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "cafe\u0301\u2014kit", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m59", "parentId": "m58", "timestamp": "2099-01-01T01:29:00Z", "message": {"role": "user", "content": "kit cafe\u0301"}}
+{"type": "message", "id": "m60", "parentId": "m59", "timestamp": "2099-01-01T01:29:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "kit cafe\u0301", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m61", "parentId": "m60", "timestamp": "2099-01-01T01:30:00Z", "message": {"role": "user", "content": "cafe\u0301 other"}}
+{"type": "message", "id": "m62", "parentId": "m61", "timestamp": "2099-01-01T01:30:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "cafe\u0301 other", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m63", "parentId": "m62", "timestamp": "2099-01-01T01:31:00Z", "message": {"role": "user", "content": "\u0130stanbul"}}
+{"type": "message", "id": "m64", "parentId": "m63", "timestamp": "2099-01-01T01:31:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "\u0130stanbul", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m65", "parentId": "m64", "timestamp": "2099-01-01T01:32:00Z", "message": {"role": "user", "content": "istanbul"}}
+{"type": "message", "id": "m66", "parentId": "m65", "timestamp": "2099-01-01T01:32:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "istanbul", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m67", "parentId": "m66", "timestamp": "2099-01-01T01:33:00Z", "message": {"role": "user", "content": "a\u0308bc"}}
+{"type": "message", "id": "m68", "parentId": "m67", "timestamp": "2099-01-01T01:33:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "a\u0308bc", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m69", "parentId": "m68", "timestamp": "2099-01-01T01:34:00Z", "message": {"role": "user", "content": "\u00e4bc"}}
+{"type": "message", "id": "m70", "parentId": "m69", "timestamp": "2099-01-01T01:34:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "\u00e4bc", "exitCode": 0, "cancelled": false, "truncated": false}}
+{"type": "message", "id": "m71", "parentId": "m70", "timestamp": "2099-01-01T01:35:00Z", "message": {"role": "user", "content": "a\u0000bc"}}
+{"type": "message", "id": "m72", "parentId": "m71", "timestamp": "2099-01-01T01:35:00Z", "message": {"role": "bashExecution", "command": "printf unicode", "output": "a\u0000bc", "exitCode": 0, "cancelled": false, "truncated": false}}

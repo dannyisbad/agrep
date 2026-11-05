@@ -694,7 +694,7 @@ struct ClaudeState {
 }
 pub(crate) fn resume_parse(
     path: &Path,
-    data: &str,
+    data: &(impl crate::ingest::jsonl::Text + ?Sized),
     previous: Option<&str>,
 ) -> anyhow::Result<(
     Vec<Message>,
@@ -709,7 +709,7 @@ pub(crate) fn resume_parse(
 fn parse_data(
     path: &Path,
     tally: std::sync::Arc<crate::intake::Tally>,
-    data: &str,
+    data: &(impl crate::ingest::jsonl::Text + ?Sized),
     previous: Option<ClaudeState>,
 ) -> (
     (Vec<Message>, Vec<Event>, crate::intake_batch::ReadOutcome),
@@ -767,11 +767,12 @@ fn parse_data(
     // else the dir stem. A parent that flips mid-file splits one child across two ids.
     if is_side && !resumed {
         let f_sess = memmem::Finder::new(b"\"sessionId\":\"");
-        if let Some(pid) = data
-            .lines()
-            .find_map(|line| raw_str_value(&f_sess, line.as_bytes()).filter(|s| !s.is_empty()))
-        {
-            side_parent = Some(pid.to_string());
+        if let Some(pid) = data.lines().find_map(|line| {
+            raw_str_value(&f_sess, line.as_bytes())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        }) {
+            side_parent = Some(pid);
         }
     }
     let row_session = |l: &Line| match l.session_id.as_deref() {
@@ -779,6 +780,7 @@ fn parse_data(
         _ => file_session.clone(),
     };
     for (offset, line) in data.lines().enumerate() {
+        let line = line.as_ref();
         let record_ordinal = ordinal + offset;
         if line.is_empty() {
             continue;
@@ -1112,10 +1114,9 @@ fn parse_data(
     }
     let read_outcome = if out.is_empty()
         && events.is_empty()
-        && data
-            .lines()
-            .any(|line| !line.trim().is_empty() && serde_json::from_str::<&RawValue>(line).is_err())
-    {
+        && data.lines().any(|line| {
+            !line.trim().is_empty() && serde_json::from_str::<&RawValue>(&line).is_err()
+        }) {
         crate::intake_batch::ReadOutcome::Invalid
     } else {
         crate::intake_batch::ReadOutcome::Complete
