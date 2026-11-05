@@ -477,7 +477,8 @@ fn owned_directories_are_private_and_exposure_is_reported() {
     let model = model_parent.join("granite");
     fs::create_dir_all(&model).unwrap();
     fs::set_permissions(&model_parent, fs::Permissions::from_mode(0o755)).unwrap();
-    fs::write(model.join("config.json"), b"invalid").unwrap();
+    // Fail after permission repair without attempting a model download.
+    fs::create_dir(model.join("download.lock")).unwrap();
     assert!(agrep_core::semantic_model::provision_at(&model).is_err());
     assert_eq!(mode(&model), 0o700);
     assert_eq!(mode(&model_parent), 0o700);

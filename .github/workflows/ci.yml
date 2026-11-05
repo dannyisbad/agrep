@@ -72,6 +72,14 @@ jobs:
           "${matched[@]}" --workload semantic --model-dir "$model" --output matched-semantic.json || performance_status=1
           nice -n 10 python bench/semantic_owner.py --binary "target/release/agrep$suffix" --builder "target/release/examples/semantic_scale$suffix" --evaluator "target/release/examples/semantic_eval$suffix" --model "$model" --runs 20 --output semantic-owner.json || performance_status=1
           exit "$performance_status"
+      - name: Guard the ARMv8.0 CPU baseline
+        if: matrix.os == 'ubuntu-24.04-arm'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends qemu-user
+          nice -n 10 python bench/smoke_armv8.py --binary target/release/agrep --model "$RUNNER_TEMP/agrep-model"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:

@@ -17,7 +17,7 @@ def assert_semantic_ranking(output):
     assert rows[0].get('sem_score') is not None or rows[0].get('lane') == 'semantic', output
 
 
-def smoke(command, semantic=False):
+def smoke(command, semantic=False, model=None):
     with tempfile.TemporaryDirectory(prefix='agrep-smoke-') as temporary:
         root = Path(temporary)
         home = root / 'home'
@@ -45,6 +45,9 @@ def smoke(command, semantic=False):
                    XDG_DATA_HOME=str(home / '.local/share'), XDG_CACHE_HOME=str(root / 'cache'),
                    LOCALAPPDATA=str(root / 'cache'), APPDATA=str(home / '.config'), AGREP_PROFILE='classic')
 
+        if model is not None:
+            env['AGREP_MODEL_DIR'] = str(Path(model).resolve())
+
         def run(*args, expected=0):
             result = subprocess.run([*command, *args], env=env, capture_output=True, text=True, encoding='utf-8', timeout=300)
             if result.returncode != expected:
@@ -55,7 +58,7 @@ def smoke(command, semantic=False):
         assert run('--version').strip() == f'agrep {version()}'
         if semantic:
             run('setup', '--yes')
-        run('index')
+        run('index', *(['--semantic'] if semantic else []))
         output = run('cobalt lantern', '--lexical', '--json')
         objects = [json.loads(line) for line in output.splitlines()]
         assert objects[0]['kind'] == 'agrep-meta'
@@ -66,7 +69,6 @@ def smoke(command, semantic=False):
         status = run('status', '--json')
         assert json.loads(status), status
         if semantic:
-            run('__work')
             semantic_output = run('where was the project migration checklist saved', '-s', '--json')
             assert_semantic_ranking(semantic_output)
         print('smoke OK: version, index, keyword hit/miss, around, status' + (', semantic' if semantic else ''))
@@ -75,6 +77,7 @@ def smoke(command, semantic=False):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--semantic', action='store_true')
+    parser.add_argument('--model', type=Path, help='reuse and retain a model outside the temporary data root')
     parser.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command
@@ -82,4 +85,4 @@ if __name__ == '__main__':
         command = command[1:]
     if not command:
         parser.error('supply the installed command after --')
-    smoke(command, semantic=args.semantic)
+    smoke(command, semantic=args.semantic, model=args.model)

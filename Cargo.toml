@@ -1,6 +1,7 @@
 [workspace]
 members = ["crates/agrep-core", "crates/agrep"]
 resolver = "2"
+exclude = ["vendor/gemm-common"]
 [workspace.package]
 edition = "2021"
 version = "0.5.0"
@@ -26,3 +27,6 @@ strip = true
 [profile.dev]
 debug = 0
 incremental = false
+
+[patch.crates-io]
+gemm-common = { path = "vendor/gemm-common" }

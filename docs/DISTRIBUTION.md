@@ -130,7 +130,15 @@ in [ENGINE.md](ENGINE.md); gate failures remain failures.
 
 ## Packages
 
-Cargo uses a portable CPU baseline; runtime SIMD dispatch can select supported instructions.
+Cargo uses a portable CPU baseline (ARMv8.0-A on Linux and Windows arm64);
+runtime SIMD dispatch can select supported instructions. CPU inference uses F32.
+`vendor/gemm-common` patches four FP16 assembly helpers in 0.19.0 with
+per-function `neon,fp16` annotations, retaining the existing runtime feature
+checks without enabling FP16 across the binary. See its
+[patch notes](../vendor/gemm-common/PATCH.md).
+The Linux arm64 CI test job and release binary smoke run version, fixture
+indexing, keyword search, recall and CPU meaning search under Cortex-A72 QEMU
+emulation with the job's provisioned model; any non-zero exit fails the job.
 The release helper remaps build paths in binaries on Windows and Unix.
 
 `bench/targets.json` lists the six target/asset/wheel mappings. A wheel is

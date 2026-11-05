@@ -1,7 +1,0 @@
-# Candle's gemm-common 0.19 assembles FP16 vector instructions in functions compiled without
-# the FP16 feature. Apple targets enable FP16 by default; other aarch64 targets need it set.
-[target.aarch64-unknown-linux-gnu]
-rustflags = ["-C", "target-feature=+fp16"]
-
-[target.aarch64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+fp16"]

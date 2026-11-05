@@ -12,18 +12,26 @@ machinery is described in [ENGINE.md](ENGINE.md), output contracts in
 - The model is `ibm-granite/granite-embedding-small-english-r2` at revision
   `2ab6fa8ea2d674564defd37171ae19079b864b33` (ModernBERT, 384 dimensions), run with
   Candle 0.9.2. On macOS Candle uses Accelerate on the CPU and Metal on the GPU.
-- `semantic_model::FILES` pins the length and SHA-256 of `config.json`, `tokenizer.json`
-  and `model.safetensors`. They live in `model/granite-embedding-small-english-r2/`
-  under the data root, or in `AGREP_MODEL_DIR`.
+- `semantic_model::FILES` pins the length and SHA-256 of the installed `config.json`,
+  `weights-f32.safetensors`, `tokenizer-compact.json` and `tokenizer-query.bin`.
+  They occupy about 194 MB (185 MiB), including verification metadata, in
+  `model/granite-embedding-small-english-r2/` under the data root, or in
+  `AGREP_MODEL_DIR`.
 - Only `agrep setup` (after consent) and `agrep index --semantic` download the model
   (`semantic::provision`). Automatic hybrid search never downloads. The files come from
   huggingface.co over HTTPS (ureq with rustls), each into a `.partial` file that is
   fsynced and verified before it is renamed; a failed download leaves verified files in
   place. `download.lock` serializes provisioning.
-- Provisioning records the verified files' sizes, times and identities in
-  `verified.json`, so later loads hash again only when that metadata changed. It also
-  writes F32 and F16 safetensors, a compact tokenizer and the query tokenizer's tables,
-  bound to their sources by `converted.json`.
+- Provisioning verifies the pinned downloads, converts the checkpoint to F32 and
+  writes the compact tokenizer and query tables. Each conversion must match its
+  pinned digest before replacing an installed file. Only after verifying the entire
+  runtime set does it delete the downloaded checkpoint and full tokenizer. There is
+  no saved F16 checkpoint; Metal converts the F32 weights to F16 in memory at load.
+- `verified.json` records the installed files' sizes, times and identities, so later
+  loads hash again only when that metadata changed. Verification covers every runtime
+  artifact, without needing the original downloads or a conversion marker. Setup
+  replaces corrupt or missing files through the same verified download/conversion
+  path. An earlier development build's model directory can be provisioned again.
 - `agrep set embeddings off` turns off automatic hybrid search and background embedding;
   `-s` still searches the vectors already stored, and `index --semantic` still embeds.
 

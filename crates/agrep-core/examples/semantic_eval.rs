@@ -232,12 +232,7 @@ fn query_gate(
     expected: &[Vec<f32>],
     ids: &[Vec<u32>],
 ) -> Result<(serde_json::Value, bool)> {
-    let mut parity = true;
-    for name in ["tokenizer.json", "tokenizer-compact.json"] {
-        if path.join(name).exists() {
-            parity &= agrep_core::semantic_tokenizer::parity(&path.join(name))?;
-        }
-    }
+    let parity = agrep_core::semantic_tokenizer::parity(&path.join("tokenizer-compact.json"))?;
     // Every vocabulary entry's text and the oracle texts, query tables against the library.
     let tables = agrep_core::semantic_tokenizer::query_parity(path, texts)?;
     let query = Embedder::load_query(path)?;

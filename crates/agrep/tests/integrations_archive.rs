@@ -661,17 +661,17 @@ fn config_preserves_other_settings_and_semantic_optout_does_not_download() {
 }
 
 #[test]
-fn model_provisioning_validates_before_downloading() {
+fn model_provisioning_preserves_files_when_the_lock_cannot_be_opened() {
     let f = Fixture::new();
     let root = f.root();
     let dir = root.path().join("model-test");
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("config.json"), b"corrupt").unwrap();
-    let error = agrep_core::semantic_model::provision_at(&dir)
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("incorrect model file size"));
+    fs::create_dir(dir.join("download.lock")).unwrap();
+    assert!(agrep_core::semantic_model::provision_at(&dir).is_err());
+    assert_eq!(fs::read(dir.join("config.json")).unwrap(), b"corrupt");
     assert!(!dir.join("tokenizer.json").exists());
+    assert!(!dir.join("weights-f32.safetensors").exists());
 }
 
 #[test]

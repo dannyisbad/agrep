@@ -84,9 +84,10 @@ def _normalized_text(path: Path) -> str:
 
 
 def generate() -> str:
+    # Patched dependencies have no registry source but still need notices.
     packages = sorted(
         (package for package in _metadata()["packages"]
-         if package.get("source") is not None),
+         if package["name"] not in ("agrep", "agrep-core")),
         key=lambda package: (package["name"].lower(), package["version"]))
     texts: dict[str, list[str]] = {}
     inventory = []

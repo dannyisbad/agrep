@@ -18,7 +18,7 @@ use unicode_normalization::UnicodeNormalization;
 pub const MODEL_ID: &str = "granite-embedding-small-english-r2";
 pub const REVISION: &str = "2ab6fa8ea2d674564defd37171ae19079b864b33";
 pub const DIM: usize = 384;
-pub const FILES: [(&str, u64, &str); 3] = [
+const DOWNLOADS: [(&str, u64, &str); 3] = [
     (
         "config.json",
         1315,
@@ -33,6 +33,26 @@ pub const FILES: [(&str, u64, &str); 3] = [
         "model.safetensors",
         95332048,
         "dcbfaf2ee50d358763cbc0c08e5b045ecbf6aeb02dc0e86ffb910029bf9ebb5f",
+    ),
+];
+/// The complete installed runtime set. Converted bytes are pinned independently
+/// of the disposable downloads, so verification never needs a second checkpoint.
+pub const FILES: [(&str, u64, &str); 4] = [
+    DOWNLOADS[0],
+    (
+        "weights-f32.safetensors",
+        190656984,
+        "d0cc63d6a469f4686f1f517fb45c9752eeffe01f490dcc0cf29c9953009ef1fe",
+    ),
+    (
+        "tokenizer-compact.json",
+        1571945,
+        "f64652c0d4292921662f8a34068ed38c9db4a8e78daae667eaff88a30494ef8b",
+    ),
+    (
+        "tokenizer-query.bin",
+        1574699,
+        "dc30764c4899f2a90fb9c2759bed05186c7e695ca3f4ae94771b76255f1ddd83",
     ),
 ];
 pub fn directory(root: &DataRoot) -> PathBuf {
@@ -66,30 +86,10 @@ pub fn prefetch_query(root: &DataRoot) -> Option<std::thread::JoinHandle<()>> {
             .name("agrep-model-read-ahead".into())
             .spawn(move || {
                 let _span = crate::semantic_profile::span("model_read_ahead");
-                let Ok(source) = stamps(&path, &FILES) else {
+                let Ok(weights) = MappedWeights::open(&path.join("weights-f32.safetensors")) else {
                     return;
                 };
-                // A query reads converted weights in place, apart from most of the token
-                // embedding table; without them it copies the whole source checkpoint.
-                let (weights, source_map);
-                let (map, ranges) = if conversion_matches(&path, &source) {
-                    let Ok(mapped) = MappedWeights::open(&path.join("weights-f32.safetensors"))
-                    else {
-                        return;
-                    };
-                    weights = mapped;
-                    (weights.mapping(), weights.query_ranges())
-                } else {
-                    let Ok(file) = File::open(path.join("model.safetensors")) else {
-                        return;
-                    };
-                    let Ok(map) = (unsafe { memmap2::Mmap::map(&file) }) else {
-                        return;
-                    };
-                    source_map = map;
-                    (&source_map, std::iter::once(0..source_map.len()).collect())
-                };
-                read_ahead(map, &ranges);
+                read_ahead(weights.mapping(), &weights.query_ranges());
             })
             .ok()
     }
@@ -167,113 +167,39 @@ struct Verified {
     revision: String,
     files: Vec<ArtifactStamp>,
 }
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Converted {
-    version: u8,
-    source: Verified,
-    output: Verified,
-}
-
-fn conversion_matches(path: &Path, source: &Verified) -> bool {
-    let marker = path.join("converted.json");
-    if !marker.metadata().is_ok_and(|m| m.len() <= 8192) {
-        return false;
-    }
-    let Ok(bytes) = fs::read(marker) else {
-        return false;
-    };
-    let Ok(record) = serde_json::from_slice::<Converted>(&bytes) else {
-        return false;
-    };
-    let expected = [
-        "weights-f32.safetensors",
-        "weights-f16.safetensors",
-        "tokenizer-compact.json",
-        "tokenizer-query.bin",
-    ];
-    if record.version != 2
-        || record.source != *source
-        || record
-            .output
-            .files
-            .iter()
-            .map(|s| s.name.as_str())
-            .ne(expected)
-    {
-        return false;
-    }
-    let files: Vec<_> = record
-        .output
-        .files
-        .iter()
-        .map(|s| (s.name.as_str(), s.bytes, s.sha256.as_str()))
-        .collect();
-    stamps(path, &files).is_ok_and(|now| now == record.output)
+fn publish_converted(path: &Path, artifact: (&str, u64, &str)) -> Result<()> {
+    let (name, size, sha) = artifact;
+    let temp = path.join(format!("{name}.partial"));
+    OpenOptions::new().write(true).open(&temp)?.sync_all()?;
+    verify(&temp, size, sha)?;
+    fs::rename(temp, path.join(name))?;
+    Ok(())
 }
 
 fn convert_weights(path: &Path) -> Result<()> {
-    let source = stamps(path, &FILES)?;
-    if conversion_matches(path, &source) {
-        return Ok(());
-    }
-    let mut files = Vec::new();
-    for (name, dtype) in [
-        ("weights-f32.safetensors", DType::F32),
-        ("weights-f16.safetensors", DType::F16),
-    ] {
-        let tensors = candle_core::safetensors::load(path.join("model.safetensors"), &Device::Cpu)?;
-        let tensors = tensors
-            .into_iter()
-            .map(|(k, v)| Ok((k, v.to_dtype(dtype)?)))
-            .collect::<candle_core::Result<std::collections::HashMap<_, _>>>()?;
-        let temp = path.join(format!("{name}.partial"));
-        candle_core::safetensors::save(&tensors, &temp)?;
-        OpenOptions::new().write(true).open(&temp)?.sync_all()?;
-        fs::rename(temp, path.join(name))?;
-        files.push((
-            name,
-            path.join(name).metadata()?.len(),
-            digest(&path.join(name))?,
-        ));
-    }
-    let name = "tokenizer-compact.json";
+    let source = stamps(path, &DOWNLOADS)?;
+    let tensors = candle_core::safetensors::load(path.join("model.safetensors"), &Device::Cpu)?;
+    let tensors = tensors
+        .into_iter()
+        .map(|(k, v)| Ok((k, v.to_dtype(DType::F32)?)))
+        .collect::<candle_core::Result<std::collections::HashMap<_, _>>>()?;
+    // Safetensors sorts tensor names before serialization, making the digest stable.
+    candle_core::safetensors::save(&tensors, path.join("weights-f32.safetensors.partial"))?;
+    publish_converted(path, FILES[1])?;
     let json: serde_json::Value = serde_json::from_slice(&fs::read(path.join("tokenizer.json"))?)?;
-    let temp = path.join(format!("{name}.partial"));
-    let mut file = File::create(&temp)?;
-    file.write_all(&serde_json::to_vec(&json)?)?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(temp, path.join(name))?;
-    files.push((
-        name,
-        path.join(name).metadata()?.len(),
-        digest(&path.join(name))?,
-    ));
-    let name = "tokenizer-query.bin";
-    semantic_tokenizer::write_query(&path.join("tokenizer.json"), &path.join(name))?;
-    files.push((
-        name,
-        path.join(name).metadata()?.len(),
-        digest(&path.join(name))?,
-    ));
-    let tuples: Vec<_> = files.iter().map(|(n, b, h)| (*n, *b, h.as_str())).collect();
-    let output = stamps(path, &tuples)?;
-    if stamps(path, &FILES)? != source {
+    fs::write(
+        path.join("tokenizer-compact.json.partial"),
+        serde_json::to_vec(&json)?,
+    )?;
+    publish_converted(path, FILES[2])?;
+    semantic_tokenizer::write_query(
+        &path.join("tokenizer.json"),
+        &path.join("tokenizer-query.bin.partial"),
+    )?;
+    publish_converted(path, FILES[3])?;
+    if stamps(path, &DOWNLOADS)? != source {
         bail!("model changed during weight conversion");
     }
-    let record = Converted {
-        version: 2,
-        source,
-        output,
-    };
-    let temp = path.join("converted.json.partial");
-    let mut file = File::create(&temp)?;
-    file.write_all(&serde_json::to_vec(&record)?)?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(temp, path.join("converted.json"))?;
-    #[cfg(unix)]
-    File::open(path)?.sync_all()?;
     Ok(())
 }
 fn stamps(path: &Path, files: &[(&str, u64, &str)]) -> Result<Verified> {
@@ -364,9 +290,6 @@ fn verify(path: &Path, size: u64, expected: &str) -> Result<()> {
     }
     Ok(())
 }
-fn digest(path: &Path) -> Result<String> {
-    digest_file(File::open(path)?)
-}
 fn digest_file(mut file: File) -> Result<String> {
     let mut hash = Sha256::new();
     let mut buffer = [0u8; 65536];
@@ -402,6 +325,45 @@ pub fn provision_at(path: &Path) -> Result<()> {
         .truncate(false)
         .open(path.join("download.lock"))?;
     lock.lock()?;
+    if verify_installed_at(path).is_err() {
+        download_sources(path)?;
+        convert_weights(path)?;
+    }
+    if !cached_verification(path, &FILES) {
+        record_verification(path, &FILES)?;
+    }
+    // Delete the source only after independently pinned runtime files are verified.
+    for name in [
+        "model.safetensors",
+        "tokenizer.json",
+        "weights-f16.safetensors",
+        "converted.json",
+        "weights-f16.safetensors.partial",
+        "converted.json.partial",
+        "verified.json.partial",
+        "tokenizer-query.partial",
+        "tokenizer-query.bin.partial.partial",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .chain(
+        DOWNLOADS
+            .iter()
+            .chain(&FILES)
+            .map(|(name, _, _)| format!("{name}.partial")),
+    ) {
+        match fs::remove_file(path.join(name)) {
+            Ok(()) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    #[cfg(unix)]
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+fn download_sources(path: &Path) -> Result<()> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .tls_config(
             ureq::tls::TlsConfig::builder()
@@ -412,10 +374,9 @@ pub fn provision_at(path: &Path) -> Result<()> {
         )
         .build()
         .into();
-    for (name, size, digest) in FILES {
+    for (name, size, digest) in DOWNLOADS {
         let dest = path.join(name);
-        if dest.exists() {
-            verify(&dest, size, digest)?;
+        if verify(&dest, size, digest).is_ok() {
             continue;
         }
         let temp = path.join(format!("{name}.partial"));
@@ -446,8 +407,6 @@ pub fn provision_at(path: &Path) -> Result<()> {
         }
         outcome?;
     }
-    record_verification(path, &FILES)?;
-    convert_weights(path)?;
     Ok(())
 }
 
@@ -502,10 +461,9 @@ impl Embedder {
             verify_installed_at(path)?;
         }
         let verified_ms = load_start.elapsed().as_secs_f64() * 1000.;
-        let converted = conversion_matches(path, &stamps(path, &FILES)?);
-        let mapped = query && converted;
+        let mapped = query;
         crate::semantic_profile::event(serde_json::json!({"model_cache":{
-            "verified":verified,"converted":converted,"writes":0,"metal":device.is_metal(),"mapped":mapped
+            "verified":verified,"converted":true,"writes":0,"metal":device.is_metal(),"mapped":mapped
         }}));
         let dtype = if device.is_metal() {
             DType::F16
@@ -518,36 +476,28 @@ impl Embedder {
                 let start = std::time::Instant::now();
                 // Explicit provisioning writes the query tables beside the other
                 // converted files; bulk embedding builds the library's model.
-                let mut tok = if query && converted {
+                let mut tok = if query {
                     TextTokenizer::Query(Box::new(semantic_tokenizer::load_query(
                         &path.join("tokenizer-query.bin"),
                     )?))
                 } else {
-                    TextTokenizer::Library(Box::new(semantic_tokenizer::load(&path.join(
-                        if converted {
-                            "tokenizer-compact.json"
-                        } else {
-                            "tokenizer.json"
-                        },
-                    ))?))
+                    TextTokenizer::Library(Box::new(semantic_tokenizer::load(
+                        &path.join("tokenizer-compact.json"),
+                    )?))
                 };
                 tok.window(1024)?;
                 Ok((tok, start.elapsed().as_secs_f64() * 1000.))
             });
             let start = std::time::Instant::now();
             let config: Config = serde_json::from_slice(&fs::read(path.join("config.json"))?)?;
-            // Verified source, or metadata-bound output of explicit provisioning.
+            // The same F32 checkpoint backs mapped queries and bulk CPU tensors.
+            // Metal converts it to F16 once at load, retaining no second file.
             let vb = unsafe {
-                let name = if converted {
-                    if dtype == DType::F16 {
-                        "weights-f16.safetensors"
-                    } else {
-                        "weights-f32.safetensors"
-                    }
-                } else {
-                    "model.safetensors"
-                };
-                VarBuilder::from_mmaped_safetensors(&[path.join(name)], dtype, &device)?
+                VarBuilder::from_mmaped_safetensors(
+                    &[path.join("weights-f32.safetensors")],
+                    dtype,
+                    &device,
+                )?
             }
             .rename_f(|name| checkpoint_name(name).to_owned());
             let (model, weights) = {
@@ -822,68 +772,41 @@ mod tests {
         assert_eq!(batch_end(&ids, &order, 2, 16384, 4194304, 5), 3);
     }
     #[test]
-    fn converted_cache_is_bound_to_all_sources_and_outputs() {
+    fn installed_requires_every_runtime_artifact_with_its_pinned_size() {
         let t = tempfile::tempdir().unwrap();
-        fs::write(t.path().join("source"), b"abc").unwrap();
-        let inputs = [("source", 3, "source-hash")];
-        let outputs = [
-            ("weights-f32.safetensors", 3, "a"),
-            ("weights-f16.safetensors", 3, "b"),
-            ("tokenizer-compact.json", 3, "c"),
-            ("tokenizer-query.bin", 3, "d"),
-        ];
-        for (name, _, _) in outputs {
-            fs::write(t.path().join(name), b"123").unwrap();
+        assert!(!installed_at(t.path()));
+        assert!(FILES.iter().map(|(_, size, _)| size).sum::<u64>() < 200_000_000);
+        for (name, size, _) in FILES {
+            File::create(t.path().join(name))
+                .unwrap()
+                .set_len(size)
+                .unwrap();
         }
-        let record = Converted {
-            version: 2,
-            source: stamps(t.path(), &inputs).unwrap(),
-            output: stamps(t.path(), &outputs).unwrap(),
-        };
-        fs::write(
-            t.path().join("converted.json"),
-            serde_json::to_vec(&record).unwrap(),
-        )
-        .unwrap();
-        let source = stamps(t.path(), &inputs).unwrap();
-        assert!(conversion_matches(t.path(), &source));
-        // A first-format record, without query tokenizer tables, is converted again.
-        let old = Converted {
-            version: 1,
-            source: stamps(t.path(), &inputs).unwrap(),
-            output: stamps(t.path(), &outputs[..3]).unwrap(),
-        };
-        fs::write(
-            t.path().join("converted.json"),
-            serde_json::to_vec(&old).unwrap(),
-        )
-        .unwrap();
-        assert!(!conversion_matches(t.path(), &source));
-        fs::write(
-            t.path().join("converted.json"),
-            serde_json::to_vec(&record).unwrap(),
-        )
-        .unwrap();
-        assert!(conversion_matches(t.path(), &source));
-        fs::write(t.path().join("weights-f32.safetensors"), b"changed").unwrap();
-        assert!(!conversion_matches(t.path(), &source));
-        fs::write(t.path().join("weights-f32.safetensors"), b"123").unwrap();
-        let record = Converted {
-            version: 2,
-            source: stamps(t.path(), &inputs).unwrap(),
-            output: stamps(t.path(), &outputs).unwrap(),
-        };
-        fs::write(
-            t.path().join("converted.json"),
-            serde_json::to_vec(&record).unwrap(),
-        )
-        .unwrap();
-        assert!(conversion_matches(t.path(), &source));
-        fs::write(t.path().join("source"), b"other").unwrap();
-        assert!(!conversion_matches(
-            t.path(),
-            &stamps(t.path(), &[("source", 5, "source-hash")]).unwrap()
-        ));
+        assert!(installed_at(t.path()));
+        for (name, size, _) in FILES {
+            let p = t.path().join(name);
+            fs::remove_file(&p).unwrap();
+            assert!(!installed_at(t.path()));
+            let file = File::create(&p).unwrap();
+            file.set_len(size + 1).unwrap();
+            assert!(!installed_at(t.path()));
+            file.set_len(size).unwrap();
+            assert!(installed_at(t.path()));
+        }
+    }
+    #[test]
+    fn converted_digest_is_checked_before_replacing_an_installed_file() {
+        let t = tempfile::tempdir().unwrap();
+        let artifact = ("weights", 3, crate::store::digest("new"));
+        let spec = (artifact.0, artifact.1, artifact.2.as_str());
+        fs::write(t.path().join("weights"), b"old").unwrap();
+        fs::write(t.path().join("weights.partial"), b"bad").unwrap();
+        assert!(publish_converted(t.path(), spec).is_err());
+        assert_eq!(fs::read(t.path().join("weights")).unwrap(), b"old");
+        fs::write(t.path().join("weights.partial"), b"new").unwrap();
+        publish_converted(t.path(), spec).unwrap();
+        assert_eq!(fs::read(t.path().join("weights")).unwrap(), b"new");
+        assert!(!t.path().join("weights.partial").exists());
     }
     #[test]
     fn reference_chunks() {

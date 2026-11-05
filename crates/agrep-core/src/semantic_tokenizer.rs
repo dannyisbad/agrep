@@ -160,7 +160,7 @@ pub(crate) fn write_query(source: &Path, dest: &Path) -> Result<()> {
     for token in tokens {
         out.extend(token.as_bytes());
     }
-    let temp = dest.with_extension("partial");
+    let temp = dest.with_added_extension("partial");
     fs::write(&temp, &out)?;
     fs::OpenOptions::new().write(true).open(&temp)?.sync_all()?;
     fs::rename(temp, dest)?;
@@ -404,12 +404,12 @@ impl Model for QueryBpe {
 }
 
 /// Compares the query tokenizer in `model_dir` with the library tokenizer read from
-/// its `tokenizer.json`: vocabulary, and the ids and offsets of `texts` and of every
+/// its `tokenizer-compact.json`: vocabulary, and the ids and offsets of `texts` and of every
 /// vocabulary entry's decoded text. Returns the number of compared encodings.
 #[doc(hidden)]
 pub fn query_parity(model_dir: &Path, texts: &[String]) -> Result<usize> {
-    let reference =
-        Tokenizer::from_file(model_dir.join("tokenizer.json")).map_err(|e| anyhow!("{e}"))?;
+    let reference = Tokenizer::from_file(model_dir.join("tokenizer-compact.json"))
+        .map_err(|e| anyhow!("{e}"))?;
     let query = load_query(&model_dir.join("tokenizer-query.bin"))?;
     let size = reference.get_vocab_size(true);
     if query.get_vocab_size(true) != size {
@@ -539,13 +539,13 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let file = fixture();
         fs::write(
-            t.path().join("tokenizer.json"),
+            t.path().join("tokenizer-compact.json"),
             serde_json::to_vec(&file).unwrap(),
         )
         .unwrap();
-        assert!(parity(&t.path().join("tokenizer.json")).unwrap());
+        assert!(parity(&t.path().join("tokenizer-compact.json")).unwrap());
         write_query(
-            &t.path().join("tokenizer.json"),
+            &t.path().join("tokenizer-compact.json"),
             &t.path().join("tokenizer-query.bin"),
         )
         .unwrap();
@@ -574,8 +574,8 @@ mod tests {
         }
         let compared = query_parity(t.path(), &texts).unwrap();
         assert!(compared > texts.len());
-        let reference = Tokenizer::from_file(t.path().join("tokenizer.json")).unwrap();
-        let loaded = load(&t.path().join("tokenizer.json")).unwrap();
+        let reference = Tokenizer::from_file(t.path().join("tokenizer-compact.json")).unwrap();
+        let loaded = load(&t.path().join("tokenizer-compact.json")).unwrap();
         for text in &texts {
             let (a, b) = (
                 reference.encode(text.as_str(), true).unwrap(),
@@ -588,11 +588,11 @@ mod tests {
         let mut other = file.clone();
         other["version"] = "2.0".into();
         fs::write(
-            t.path().join("tokenizer.json"),
+            t.path().join("tokenizer-compact.json"),
             serde_json::to_vec(&other).unwrap(),
         )
         .unwrap();
-        assert!(load(&t.path().join("tokenizer.json")).is_err());
+        assert!(load(&t.path().join("tokenizer-compact.json")).is_err());
     }
 
     #[test]

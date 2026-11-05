@@ -1399,7 +1399,7 @@ fn run_owns_a_pipeline_agent_and_ends_its_descendants() {
 #[cfg(unix)]
 #[test]
 fn run_follows_shell_job_control() {
-    use std::io::{Read, Write};
+    use std::io::{BufRead, Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::{net::UnixStream, process::CommandExt};
     use std::time::{Duration, Instant};
@@ -1569,6 +1569,50 @@ fn run_follows_shell_job_control() {
     assert_eq!(
         fs::read_to_string(t.path().join("argv.txt")).unwrap(),
         "typed after a running agent was brought forward"
+    );
+    // A running background job gets no SIGCONT from `fg`. Until the agent touches the
+    // terminal, Ctrl-Z therefore targets agrep, which must stop the agent's group first
+    // (0.4.9's _supervise_owned forwards suspend_requested before mirroring its stop).
+    fake_agent(
+        &t,
+        "codex",
+        "printf '%s %s\\n' \"$$\" \"$PPID\" >&3; read go <&3; read answer; printf '%s' \"$answer\" > \"$OUTPUT\"",
+    );
+    shell.expect("shell> ");
+    shell.type_line("\"$CLI\" run codex &");
+    shell.expect("shell> ");
+    gate.set_read_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
+    let mut ids = String::new();
+    std::io::BufReader::new(&gate).read_line(&mut ids).unwrap();
+    let ids: Vec<i32> = ids.split_whitespace().map(|s| s.parse().unwrap()).collect();
+    assert_eq!(ids.len(), 2);
+    fg(&mut shell);
+    assert_eq!(
+        unsafe { libc::tcgetpgrp(shell.master.as_ref().unwrap().as_raw_fd()) },
+        ids[1],
+        "agrep must still hold the terminal before the agent touches it"
+    );
+    shell.press(b"\x1a");
+    shell.expect("Stopped");
+    shell.expect("shell> ");
+    let state = Command::new("/bin/ps")
+        .args(["-o", "stat=", "-p", &ids[0].to_string()])
+        .output()
+        .unwrap();
+    assert!(state.status.success());
+    let state = String::from_utf8(state.stdout).unwrap();
+    assert!(
+        state.trim().starts_with('T'),
+        "Ctrl-Z stopped agrep but left its agent running: {state:?}"
+    );
+    fg(&mut shell);
+    (&gate).write_all(b"go\n").unwrap();
+    shell.type_line("typed after wrapper Ctrl-Z");
+    shell.expect("fg-status:0");
+    assert_eq!(
+        fs::read_to_string(t.path().join("argv.txt")).unwrap(),
+        "typed after wrapper Ctrl-Z"
     );
     // Once the agent has read from the terminal `fg` lent it, Ctrl-Z stops the agent and
     // the job with it; `bg` continues agrep in the background, where it must neither hand

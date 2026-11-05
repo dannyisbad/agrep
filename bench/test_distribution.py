@@ -115,20 +115,28 @@ class DistributionTests(unittest.TestCase):
     def test_build_remaps_spaces_without_losing_existing_flags(self):
         env = build_environment(self.root / 'source with spaces', {
             'RUSTFLAGS': '-C opt-level=3', 'CARGO_HOME': '/home/private-builder/cargo home'
-        }, 'x86_64-unknown-linux-gnu')
+        })
         flags = env['CARGO_ENCODED_RUSTFLAGS'].split('\x1f')
         self.assertEqual(flags[:2], ['-C', 'opt-level=3'])
         self.assertIn('--remap-path-prefix=/home/private-builder/cargo home=/build', flags)
         self.assertNotIn('RUSTFLAGS', env)
 
-    def test_build_keeps_the_targets_config_rustflags(self):
-        (self.root / '.cargo').mkdir()
-        shutil.copy2(ROOT / '.cargo/config.toml', self.root / '.cargo/config.toml')
-        arm = build_environment(self.root, {'RUSTFLAGS': '-C opt-level=3'},
-                                'aarch64-unknown-linux-gnu')['CARGO_ENCODED_RUSTFLAGS'].split('\x1f')
-        self.assertEqual(arm[:4], ['-C', 'target-feature=+fp16', '-C', 'opt-level=3'])
-        mac = build_environment(self.root, {}, 'aarch64-apple-darwin')['CARGO_ENCODED_RUSTFLAGS']
-        self.assertNotIn('fp16', mac)
+    def test_build_preserves_portable_baseline(self):
+        flags = build_environment(ROOT, {'RUSTFLAGS': '-C opt-level=3'})[
+            'CARGO_ENCODED_RUSTFLAGS'].split('\x1f')
+        self.assertEqual(flags[:2], ['-C', 'opt-level=3'])
+        self.assertFalse(any('target-feature' in flag or 'target-cpu' in flag
+                             for flag in flags))
+
+    def test_license_notice_includes_local_patched_dependencies(self):
+        from third_party_licenses import generate
+        package = dict(name='patched-dependency', version='1.0.0', source=None,
+                       manifest_path=str(self.root / 'Cargo.toml'), license='MIT',
+                       authors=['Example'], repository='https://example.com/repo')
+        with patch('third_party_licenses._metadata', return_value={'packages': [package]}):
+            notice = generate()
+        self.assertIn('patched-dependency 1.0.0 | MIT', notice)
+        self.assertIn('Copyright (c) Example', notice)
 
     def test_privacy_rejects_builder_paths_and_secrets(self):
         with self.assertRaises(InvalidBinary):

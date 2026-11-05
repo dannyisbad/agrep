@@ -175,11 +175,12 @@ pub fn run(exe: &Path, args: &[OsString], cwd: &Path) -> Result<i32> {
 mod unix {
     use anyhow::Result;
     use std::{
-        sync::atomic::{AtomicI32, Ordering},
+        sync::atomic::{AtomicBool, AtomicI32, Ordering},
         time::{Duration, Instant},
     };
     static PID: AtomicI32 = AtomicI32::new(0);
     static SIGNAL: AtomicI32 = AtomicI32::new(0);
+    static SUSPEND: AtomicBool = AtomicBool::new(false);
     extern "C" fn relay(sig: i32) {
         let _ = SIGNAL.compare_exchange(0, sig, Ordering::SeqCst, Ordering::SeqCst);
         let pid = PID.load(Ordering::SeqCst);
@@ -193,6 +194,25 @@ mod unix {
     /// foreground. macOS does not wake a stopped parent's waitid for a child that stops
     /// meanwhile, so this is also the wakeup that notices such a stop.
     extern "C" fn wake(_: i32) {}
+    extern "C" fn suspend(_: i32) {
+        SUSPEND.store(true, Ordering::SeqCst);
+        let pid = PID.load(Ordering::SeqCst);
+        if pid > 0 {
+            unsafe {
+                libc::kill(-pid, libc::SIGTSTP);
+            }
+        }
+    }
+    fn continue_group(pid: u32) {
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGCONT);
+            // A pending suspend needs a fresh stop notification: this continue may have
+            // canceled its signal, and the caller may have consumed the previous stop.
+            if SUSPEND.load(Ordering::SeqCst) {
+                libc::kill(-(pid as i32), libc::SIGTSTP);
+            }
+        }
+    }
     fn holds_terminal() -> bool {
         unsafe { libc::tcgetpgrp(0) == libc::getpgrp() }
     }
@@ -216,10 +236,14 @@ mod unix {
                 },
             };
             SIGNAL.store(0, Ordering::SeqCst);
+            SUSPEND.store(false, Ordering::SeqCst);
             for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
                 s.handle(sig, relay as *const () as usize)?;
             }
             s.handle(libc::SIGCONT, wake as *const () as usize)?;
+            if interactive {
+                s.handle(libc::SIGTSTP, suspend as *const () as usize)?;
+            }
             Ok(s)
         }
         fn handle(&mut self, sig: i32, action: libc::sighandler_t) -> Result<()> {
@@ -243,6 +267,11 @@ mod unix {
         /// True when it lent the terminal, which also continues the agent.
         fn foreground(&mut self, pid: u32) -> bool {
             PID.store(pid as i32, Ordering::SeqCst);
+            if SUSPEND.load(Ordering::SeqCst) {
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGTSTP);
+                }
+            }
             let lent = self.lend(pid);
             let sig = self.signal();
             if sig != 0 {
@@ -258,12 +287,14 @@ mod unix {
         /// asks again, as 0.4.9's poll did. True when it lent the terminal.
         fn lend(&self, pid: u32) -> bool {
             let group = pid as i32;
-            if !self.interactive || !holds_terminal() || unsafe { libc::tcsetpgrp(0, group) } != 0 {
+            if !self.interactive
+                || SUSPEND.load(Ordering::SeqCst)
+                || !holds_terminal()
+                || unsafe { libc::tcsetpgrp(0, group) } != 0
+            {
                 return false;
             }
-            unsafe {
-                libc::kill(-group, libc::SIGCONT);
-            }
+            continue_group(pid);
             true
         }
         fn holds(&self, pid: u32) -> bool {
@@ -308,29 +339,35 @@ mod unix {
                     }
                     // Reading or configuring the terminal outside its foreground stopped the
                     // agent; once the terminal is this job's, the agent just goes on.
-                    if libc::WIFSTOPPED(status)
+                    if !SUSPEND.load(Ordering::SeqCst)
+                        && libc::WIFSTOPPED(status)
                         && matches!(libc::WSTOPSIG(status), libc::SIGTTIN | libc::SIGTTOU)
                     {
                         if self.lend(pid) {
                             continue;
                         }
                         if self.holds(pid) {
-                            unsafe {
-                                libc::kill(-(pid as i32), libc::SIGCONT);
-                            }
+                            continue_group(pid);
                             continue;
                         }
                     }
                     self.take_back(pid);
                     unsafe {
-                        libc::raise(libc::SIGTSTP);
+                        let mut default: libc::sigaction = std::mem::zeroed();
+                        default.sa_sigaction = libc::SIG_DFL;
+                        libc::sigemptyset(&mut default.sa_mask);
+                        let mut previous = std::mem::zeroed();
+                        if libc::sigaction(libc::SIGTSTP, &default, &mut previous) != 0 {
+                            return Err(std::io::Error::last_os_error().into());
+                        }
+                        SUSPEND.store(false, Ordering::SeqCst);
+                        libc::kill(0, libc::SIGTSTP);
+                        libc::sigaction(libc::SIGTSTP, &previous, std::ptr::null_mut());
                     }
                     // One SIGCONT only: on macOS, a second one right after the lend's now and
                     // then left the agent ignoring its next Ctrl-Z.
                     if !self.foreground(pid) {
-                        unsafe {
-                            libc::kill(-(pid as i32), libc::SIGCONT);
-                        }
+                        continue_group(pid);
                     }
                 } else {
                     return Ok(());

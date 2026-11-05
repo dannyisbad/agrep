@@ -86,7 +86,15 @@ jobs:
           if [ "$RUNNER_OS" = Windows ]; then vpython=installed/Scripts/python.exe; launcher=installed/Scripts/agrep.exe
           else vpython=installed/bin/python; launcher=installed/bin/agrep; fi
           "$vpython" -m pip install --no-deps dist/*.whl
-          nice -n 10 python bench/smoke.py --semantic -- "$launcher"
+          nice -n 10 python bench/smoke.py --semantic --model "$RUNNER_TEMP/agrep-model" -- "$launcher"
+      - name: Guard the Linux arm64 release asset on ARMv8.0
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends qemu-user
+          nice -n 10 python bench/smoke_armv8.py --binary target/aarch64-unknown-linux-gnu/release/agrep --model "$RUNNER_TEMP/agrep-model"
       - name: Validate the manylinux ABI policy
         if: runner.os == 'Linux'
         env:

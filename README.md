@@ -15,8 +15,7 @@ agrep setup
 [Standalone binaries](https://github.com/dannyisbad/agrep/releases) need neither
 Python nor Node. Wheels bundle the binary; npm downloads its version's binary
 from GitHub and verifies the SHA-256 pinned in the package. Linux glibc 2.28+,
-macOS 11+, and Windows: x64 and arm64. Linux and Windows arm64 need ARMv8.2-A
-with FP16 (Raspberry Pi 5, Graviton2 and later; not Raspberry Pi 3/4 or Graviton1).
+macOS 11+, and Windows: x64 and arm64.
 
 Five commands to remember:
 
@@ -34,8 +33,8 @@ keywords only, or `-s` for meaning search. `agrep --help` lists the rest.
 `agrep setup` adds instructions and compaction hooks for supported agents,
 with consent. Agents learn to find previous solutions and open the source before
 citing it. `agrep remove` removes agrep's integrations, preserving your other
-instructions. `agrep setup` downloads and verifies the meaning-search model once; keyword search works
-without it.
+instructions. `agrep setup` downloads and verifies the meaning-search model once
+(about 194 MB installed); keyword search works without it.
 
 The index and configuration live in:
 
@@ -51,7 +50,7 @@ Search reads the committed index and checks for changed sources. Updates are pro
 automatically; `--no-auto` reads without checking. The first index is built inline.
 
 Compared with 0.4.9, median wall time for a complete command on a hosted
-Ubuntu x64 runner, 100,000-row history:
+Ubuntu x64 runner, on a 100,000-row history unless noted:
 
 | Command | 0.4.9 | 0.5 |
 |---|---:|---:|
@@ -60,8 +59,8 @@ Ubuntu x64 runner, 100,000-row history:
 | refresh after one new turn | 3.0 s | 28 ms |
 | keyword search | 927 ms | 33 ms |
 | `recall` | 569 ms | 49 ms |
-| first meaning query after setup | 1.07 s | 62 ms |
-| meaning-only search (CPU) | 135 ms | 46 ms |
+| first meaning query after setup (1,000-row history) | 1.07 s | 62 ms |
+| meaning-only search, CPU (1,000-row history) | 135 ms | 46 ms |
 
 On a 1.2-million-row personal history (Apple M2 Max) the first index takes
 84 s against 0.4.9's 319 s. CI repeats the comparison on Linux, macOS and
