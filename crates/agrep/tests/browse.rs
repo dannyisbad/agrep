@@ -1588,8 +1588,20 @@ fn run_follows_shell_job_control() {
     let ids: Vec<i32> = ids.split_whitespace().map(|s| s.parse().unwrap()).collect();
     assert_eq!(ids.len(), 2);
     fg(&mut shell);
+    // bash prints the job before it hands the job the terminal, and nothing signals the
+    // handoff itself, so wait (bounded) while the terminal still belongs to the shell.
+    let master = shell.master.as_ref().unwrap().as_raw_fd();
+    let shell_group = shell.process.id() as i32;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while unsafe { libc::tcgetpgrp(master) } == shell_group {
+        assert!(
+            Instant::now() < deadline,
+            "bash never handed the job the terminal"
+        );
+        std::thread::yield_now();
+    }
     assert_eq!(
-        unsafe { libc::tcgetpgrp(shell.master.as_ref().unwrap().as_raw_fd()) },
+        unsafe { libc::tcgetpgrp(master) },
         ids[1],
         "agrep must still hold the terminal before the agent touches it"
     );
