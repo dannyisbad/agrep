@@ -17,7 +17,7 @@
   "runner_classes": {
     "ubuntu-24.04": "Design targets on hosted x64 Linux, without host-specific slack; the matched gate runs on this runner.",
     "ubuntu-24.04-arm": "Same targets on hosted arm64 Linux; architecture is not grounds for widening them.",
-    "macos-14": "M-series reference class; the targets apply directly.",
+    "macos-15": "M-series reference class; the targets apply directly.",
     "macos-15-intel": "Same targets on hosted x64 macOS; architecture is not grounds for widening them.",
     "windows-latest": "Same targets on hosted x64 Windows, including process startup.",
     "windows-11-arm": "Same targets on hosted arm64 Windows, including process startup."

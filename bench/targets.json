@@ -22,7 +22,7 @@
     "platform": "macosx_11_0_arm64",
     "os": "darwin",
     "arch": "arm64",
-    "runner": "macos-14",
+    "runner": "macos-15",
     "asset": "agrep-macos-arm64",
     "exe": "agrep"
   },
