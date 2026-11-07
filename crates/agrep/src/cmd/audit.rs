@@ -58,7 +58,7 @@ pub fn run(agents: Vec<String>, json_output: bool, strict: bool, full: bool) -> 
             Some(s) => {
                 if s["bytes"].as_u64() != Some(source.size)
                     || s["mtime_ns"].as_i64() != Some(source.mtime_ns)
-                    || s["change_token"].as_str() != Some(source.token.as_str())
+                    || s["change_token"].as_str() != Some(source.token.to_string().as_str())
                 {
                     gaps.push(json!({"path":source.path,"reason":"source changed since refresh"}));
                 }

@@ -22,7 +22,8 @@ struct Cursor {
     records: usize,
     identity: String,
     state: String,
-    prefix_chunks: Vec<[u8; 32]>,
+    first_chunk: [u8; 32],
+    last_chunk: [u8; 32],
     header: String,
     leaf: Option<String>,
 }
@@ -43,13 +44,52 @@ pub struct Parsed {
     pub bytes_read: usize,
     pub bytes_parsed: usize,
 }
-const CHECKPOINT_CHUNK: usize = 1024 * 1024;
+const CHECKPOINT_CHUNK: usize = 64 * 1024;
 
-fn chunk_hashes(bytes: &[u8]) -> Vec<[u8; 32]> {
-    bytes
-        .par_chunks(CHECKPOINT_CHUNK)
-        .map(|chunk| Sha256::digest(chunk).into())
-        .collect()
+fn chunk_digest(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+struct Checkpoint {
+    first: Option<[u8; 32]>,
+    last: [u8; 32],
+    tail: Vec<u8>,
+}
+impl Checkpoint {
+    fn new(cursor: Option<&Cursor>, tail: Vec<u8>) -> Self {
+        Self {
+            first: cursor
+                .filter(|c| c.offset >= CHECKPOINT_CHUNK as u64)
+                .map(|c| c.first_chunk),
+            last: cursor.map_or_else(|| chunk_digest(&[]), |c| c.last_chunk),
+            tail,
+        }
+    }
+    fn extend(&mut self, mut bytes: &[u8]) {
+        if !self.tail.is_empty() {
+            let take = bytes.len().min(CHECKPOINT_CHUNK - self.tail.len());
+            self.tail.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if self.tail.len() == CHECKPOINT_CHUNK {
+                self.last = chunk_digest(&self.tail);
+                self.first.get_or_insert(self.last);
+                self.tail.clear();
+            }
+        }
+        let full = bytes.len() / CHECKPOINT_CHUNK * CHECKPOINT_CHUNK;
+        if full != 0 {
+            self.first
+                .get_or_insert_with(|| chunk_digest(&bytes[..CHECKPOINT_CHUNK]));
+            self.last = chunk_digest(&bytes[full - CHECKPOINT_CHUNK..full]);
+        }
+        self.tail.extend_from_slice(&bytes[full..]);
+    }
+    fn finish(mut self) -> ([u8; 32], [u8; 32]) {
+        if !self.tail.is_empty() {
+            self.last = chunk_digest(&self.tail);
+        }
+        (self.first.unwrap_or(self.last), self.last)
+    }
 }
 
 fn read_at(file: &std::fs::File, mut bytes: &mut [u8], mut offset: u64) -> std::io::Result<()> {
@@ -72,41 +112,38 @@ fn read_at(file: &std::fs::File, mut bytes: &mut [u8], mut offset: u64) -> std::
     Ok(())
 }
 
-/// Verify every prior byte. Independent chunk digests permit parallel reads and
-/// hashing; the final partial chunk is returned for the next checkpoint.
-fn verify_chunks(file: &std::fs::File, cursor: &Cursor) -> Result<(bool, Vec<u8>)> {
-    anyhow::ensure!(
-        cursor.prefix_chunks.len() == (cursor.offset as usize).div_ceil(CHECKPOINT_CHUNK),
-        "invalid prefix checkpoint"
-    );
-    let checked: Vec<_> = cursor
-        .prefix_chunks
-        .par_iter()
-        .enumerate()
-        .map(|(i, expected)| -> Result<_> {
-            let offset = i * CHECKPOINT_CHUNK;
-            let length = (cursor.offset as usize - offset).min(CHECKPOINT_CHUNK);
-            let mut bytes = vec![0; length];
-            read_at(file, &mut bytes, offset as u64)?;
-            let valid = <[u8; 32]>::from(Sha256::digest(&bytes)) == *expected;
-            Ok((
-                valid,
-                if length < CHECKPOINT_CHUNK {
-                    bytes
-                } else {
-                    Vec::new()
-                },
-            ))
-        })
-        .collect::<Result<_>>()?;
-    let valid = checked.iter().all(|(valid, _)| *valid);
+/// Append-only logs need only the first and last parsed chunks checked.
+fn verify_chunks(file: &std::fs::File, cursor: &Cursor) -> Result<(bool, Vec<u8>, usize)> {
+    let length = usize::try_from(cursor.offset)?;
+    if length == 0 {
+        return Ok((
+            cursor.first_chunk == chunk_digest(&[]) && cursor.last_chunk == chunk_digest(&[]),
+            Vec::new(),
+            0,
+        ));
+    }
+    let mut first = vec![0; length.min(CHECKPOINT_CHUNK)];
+    read_at(file, &mut first, 0)?;
+    let first_valid = chunk_digest(&first) == cursor.first_chunk;
+    let last_at = (length - 1) / CHECKPOINT_CHUNK * CHECKPOINT_CHUNK;
+    let (last, read) = if last_at == 0 {
+        let read = first.len();
+        (first, read)
+    } else {
+        let mut last = vec![0; length - last_at];
+        read_at(file, &mut last, last_at as u64)?;
+        let read = first.len() + last.len();
+        (last, read)
+    };
+    let valid = first_valid && chunk_digest(&last) == cursor.last_chunk;
     Ok((
         valid,
-        checked
-            .into_iter()
-            .last()
-            .map(|(_, tail)| tail)
-            .unwrap_or_default(),
+        if last.len() < CHECKPOINT_CHUNK {
+            last
+        } else {
+            Vec::new()
+        },
+        read,
     ))
 }
 /// Packed native graph pages use DEFLATE; row text uses its independent codec.
@@ -129,38 +166,88 @@ struct GraphNode {
 #[cfg(test)]
 mod graph_codec_tests {
     use super::*;
+    use std::io::Write;
+
+    fn source(path: &Path, padding: usize) -> Vec<u8> {
+        let header =
+            serde_json::json!({"type":"session","version":3,"id":"resume-test","cwd":"/work/test"});
+        let message = serde_json::json!({"type":"message","id":"m0","parentId":null,"message":{"role":"user","content":"x".repeat(padding)}});
+        let bytes = format!("{header}\n{message}\n").into_bytes();
+        std::fs::write(path, &bytes).unwrap();
+        bytes
+    }
+
     #[test]
-    fn chunk_checkpoints_detect_edits_at_every_boundary() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("source");
-        let original = vec![b'x'; 3 * CHECKPOINT_CHUNK + 17];
-        std::fs::write(&path, &original).unwrap();
-        let cursor = Cursor {
-            offset: original.len() as u64,
-            records: 0,
-            identity: String::new(),
-            state: String::new(),
-            prefix_chunks: chunk_hashes(&original),
-            header: String::new(),
-            leaf: None,
-        };
-        let file = std::fs::File::open(&path).unwrap();
-        let (valid, tail) = verify_chunks(&file, &cursor).unwrap();
-        assert!(valid);
-        assert_eq!(tail, vec![b'x'; 17]);
-        for at in [
-            0,
-            CHECKPOINT_CHUNK - 1,
-            CHECKPOINT_CHUNK,
-            2 * CHECKPOINT_CHUNK + 1,
-            original.len() - 1,
-        ] {
-            let mut changed = original.clone();
-            changed[at] = b'y';
-            std::fs::write(&path, changed).unwrap();
-            assert!(!verify_chunks(&file, &cursor).unwrap().0, "edit at {at}");
+    fn resumes_read_append_plus_at_most_two_chunks() {
+        for padding in [17, CHECKPOINT_CHUNK - 17, 4 * CHECKPOINT_CHUNK + 17] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("session.jsonl");
+            source(&path, padding);
+            let mut parsed = parse("pi", &path, None, None).unwrap();
+            for n in 1..=3 {
+                let append = format!(
+                    "{}\n",
+                    serde_json::json!({"type":"message","id":format!("m{n}"),"parentId":format!("m{}",n-1),"message":{"role":"user","content":"appended"}})
+                );
+                OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(append.as_bytes())
+                    .unwrap();
+                parsed = parse("pi", &path, Some(&parsed.cursor), None).unwrap();
+                assert!(parsed.append);
+                assert_eq!(&*parsed.messages.last().unwrap().text, "appended");
+                assert_eq!(parsed.bytes_parsed, append.len());
+                assert!(parsed.bytes_read <= append.len() + 2 * CHECKPOINT_CHUNK);
+            }
         }
     }
+
+    #[test]
+    fn replacement_truncation_and_boundary_rewrites_restart_parser() {
+        for change in ["replacement", "truncation", "first", "last"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("session.jsonl");
+            let original = source(&path, 4 * CHECKPOINT_CHUNK + 17);
+            let first = parse("pi", &path, None, None).unwrap();
+            match change {
+                "replacement" => {
+                    let replacement = temp.path().join("replacement");
+                    std::fs::write(&replacement, &original).unwrap();
+                    std::fs::remove_file(&path).unwrap();
+                    std::fs::rename(replacement, &path).unwrap();
+                }
+                "truncation" => {
+                    let header = original.iter().position(|&b| b == b'\n').unwrap() + 1;
+                    OpenOptions::new()
+                        .write(true)
+                        .open(&path)
+                        .unwrap()
+                        .set_len(header as u64)
+                        .unwrap();
+                }
+                _ => {
+                    let at = if change == "first" {
+                        original.iter().position(|&b| b == b'x').unwrap()
+                    } else {
+                        original.len() - 20
+                    };
+                    assert_eq!(original[at], b'x');
+                    let mut writer = OpenOptions::new().write(true).open(&path).unwrap();
+                    writer.seek(SeekFrom::Start(at as u64)).unwrap();
+                    writer.write_all(b"y").unwrap();
+                }
+            }
+            let restarted = parse("pi", &path, Some(&first.cursor), None).unwrap();
+            let fresh = parse("pi", &path, None, None).unwrap();
+            assert!(!restarted.append, "{change}");
+            assert_eq!(restarted.messages.len(), fresh.messages.len());
+            assert_eq!(restarted.cursor, fresh.cursor);
+            assert_eq!(restarted.bytes_parsed, fresh.bytes_parsed);
+        }
+    }
+
     #[test]
     fn packed_graph_preserves_hex_and_named_identifiers() {
         let mut nodes = Graph::new();
@@ -536,14 +623,14 @@ fn event_blob(
 /// source left the writer waiting on the pool for every source. A refresh saves
 /// each source at most once, so no save reads a page that is still batched.
 pub(crate) struct GraphPages {
-    /// Idle while sources parse on threads of their own, whose work fills the global pool.
-    pool: &'static rayon::ThreadPool,
+    /// Small updates do not initialize workers just to compress one graph page.
+    pool: &'static std::sync::LazyLock<rayon::ThreadPool>,
     batch: Vec<(i64, i64, Graph)>,
     nodes: usize,
 }
 impl GraphPages {
     const BATCH_NODES: usize = 8_192;
-    pub(crate) fn new(pool: &'static rayon::ThreadPool) -> Self {
+    pub(crate) fn new(pool: &'static std::sync::LazyLock<rayon::ThreadPool>) -> Self {
         Self {
             pool,
             batch: Vec::new(),
@@ -567,12 +654,13 @@ impl GraphPages {
     }
     fn flush(&mut self, tx: &Transaction<'_>) -> Result<()> {
         let batch = std::mem::take(&mut self.batch);
-        let packed: Vec<(i64, i64, Vec<u8>)> = self.pool.install(|| {
-            batch
-                .into_par_iter()
-                .map(|(source, bucket, graph)| Ok((source, bucket, pack_graph(&graph)?)))
-                .collect::<Result<_>>()
-        })?;
+        let pack = |(source, bucket, graph)| Ok((source, bucket, pack_graph(&graph)?));
+        let packed: Vec<(i64, i64, Vec<u8>)> = if batch.len() <= 1 || self.nodes <= 512 {
+            batch.into_iter().map(pack).collect::<Result<_>>()?
+        } else {
+            self.pool
+                .install(|| batch.into_par_iter().map(pack).collect::<Result<_>>())?
+        };
         self.nodes = 0;
         for (source, bucket, body) in packed {
             tx.prepare_cached("INSERT INTO parser_graph VALUES(?1,?2,?3) ON CONFLICT(source,bucket) DO UPDATE SET body=excluded.body")?.execute(params![source,bucket,body])?;
@@ -769,40 +857,25 @@ pub(crate) fn save_nodes(
 pub fn supports(agent: &str, path: &Path) -> bool {
     matches!(agent, "pi" | "claude" | "codex") && path.extension().is_some_and(|s| s == "jsonl")
 }
-fn identity(path: &Path, m: &std::fs::Metadata) -> Result<String> {
+fn identity(path: &Path, m: &std::fs::Metadata, file: &std::fs::File) -> Result<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let _ = path;
+        let _ = (path, file);
         Ok(format!("{}:{}", m.dev(), m.ino()))
     }
     #[cfg(windows)]
     {
-        Ok(registry::metadata_change_token_with_file_identity(path, m)?
-            .1
-            .cache_key())
+        let _ = (path, m);
+        Ok(registry::opened_file_identity(file)?.cache_key())
     }
     #[cfg(not(any(unix, windows)))]
     {
+        let _ = (path, file);
         Ok(format!("{:?}", m.created()?))
     }
 }
-const READ_CHUNK: usize = 16 * CHECKPOINT_CHUNK;
-
-fn checkpoint_bytes(chunks: &mut Vec<[u8; 32]>, tail: &mut Vec<u8>, mut bytes: &[u8]) {
-    if !tail.is_empty() {
-        let take = bytes.len().min(CHECKPOINT_CHUNK - tail.len());
-        tail.extend_from_slice(&bytes[..take]);
-        bytes = &bytes[take..];
-        if tail.len() == CHECKPOINT_CHUNK {
-            chunks.push(Sha256::digest(&*tail).into());
-            tail.clear();
-        }
-    }
-    let full = bytes.len() / CHECKPOINT_CHUNK * CHECKPOINT_CHUNK;
-    chunks.extend(chunk_hashes(&bytes[..full]));
-    tail.extend_from_slice(&bytes[full..]);
-}
+const READ_CHUNK: usize = 16 * 1024 * 1024;
 
 enum JsonlBlock<'a> {
     Bytes(&'a [u8]),
@@ -949,14 +1022,12 @@ pub fn parse(
     if !meta.is_file() {
         anyhow::bail!("source is not a regular file")
     }
-    let id = identity(path, &meta)?;
+    let id = identity(path, &meta, &file)?;
     let mut old: Option<Cursor> = previous
         .and_then(|b| lz4_flex::decompress_size_prepended(b).ok())
         .and_then(|b| serde_json::from_slice(&b).ok());
     let mut bytes_read = 0;
     if let Some(c) = &old {
-        // Every prior chunk is checked below; identity/length only reject an
-        // obviously replaced or truncated source before doing that work.
         let valid = c.identity == id && meta.len() >= c.offset;
         if !valid {
             old = None;
@@ -964,8 +1035,8 @@ pub fn parse(
     }
     let mut partial_chunk = Vec::new();
     if let Some(cursor) = &old {
-        let (valid, tail) = verify_chunks(&file, cursor)?;
-        bytes_read += cursor.offset as usize;
+        let (valid, tail, read) = verify_chunks(&file, cursor)?;
+        bytes_read += read;
         if valid {
             partial_chunk = tail;
         } else {
@@ -974,9 +1045,7 @@ pub fn parse(
     }
     let start = old.as_ref().map_or(0, |c| c.offset);
     file.seek(SeekFrom::Start(start))?;
-    let mut prefix_chunks = old.as_ref().map_or_else(Vec::new, |cursor| {
-        cursor.prefix_chunks[..cursor.offset as usize / CHECKPOINT_CHUNK].to_vec()
-    });
+    let mut checkpoint = Checkpoint::new(old.as_ref(), partial_chunk);
     let mut data = String::new();
     let mut spool = (agent != "pi" && meta.len().saturating_sub(start) > READ_CHUNK as u64)
         .then(tempfile::tempfile)
@@ -991,7 +1060,7 @@ pub fn parse(
     let (read, complete) =
         read_jsonl_blocks(&mut file, meta.len().saturating_sub(start), |mut block| {
             block.chunks(|bytes| {
-                checkpoint_bytes(&mut prefix_chunks, &mut partial_chunk, bytes);
+                checkpoint.extend(bytes);
                 if agent != "pi" {
                     if let Some(file) = &mut spool {
                         file.write_all(bytes)?;
@@ -1019,16 +1088,17 @@ pub fn parse(
                     let text = String::from_utf8_lossy(bytes);
                     let lines: Vec<_> = text.lines().collect();
                     records += lines.len();
-                    let parsed: Vec<_> = lines
-                        .par_iter()
-                        .enumerate()
-                        .map(|(n, line)| {
-                            if line.trim().is_empty() {
-                                return Ok(None);
-                            }
-                            compact(ingest::pi::projected_record(line)?, base + n)
-                        })
-                        .collect();
+                    let parse = |(n, line): (usize, &&str)| {
+                        if line.trim().is_empty() {
+                            return Ok(None);
+                        }
+                        compact(ingest::pi::projected_record(line)?, base + n)
+                    };
+                    let parsed: Vec<_> = if lines.len() <= 1 || bytes.len() <= 64 << 10 {
+                        lines.iter().enumerate().map(parse).collect()
+                    } else {
+                        lines.par_iter().enumerate().map(parse).collect()
+                    };
                     let mut records = Vec::new();
                     for (n, value) in parsed.into_iter().enumerate() {
                         match value {
@@ -1095,9 +1165,7 @@ pub fn parse(
             Ok(())
         })?;
     bytes_read += read;
-    if !partial_chunk.is_empty() {
-        prefix_chunks.push(Sha256::digest(&partial_chunk).into());
-    }
+    let (first_chunk, last_chunk) = checkpoint.finish();
     if agent == "pi" && branched {
         let c = Connection::open_with_flags(
             database.context("pi branch requires prior index")?,
@@ -1209,7 +1277,8 @@ pub fn parse(
         records,
         identity: id,
         state: state.to_string(),
-        prefix_chunks,
+        first_chunk,
+        last_chunk,
         header,
         leaf,
     };
@@ -1306,18 +1375,19 @@ mod stream_tests {
 
     #[test]
     fn checkpoints_do_not_depend_on_read_boundaries() {
-        let bytes: Vec<_> = (0..CHECKPOINT_CHUNK * 2 + 37).map(|i| i as u8).collect();
-        for size in [17, CHECKPOINT_CHUNK - 1, CHECKPOINT_CHUNK + 13] {
-            let mut hashes = Vec::new();
-            let mut tail = Vec::new();
-            for block in bytes.chunks(size) {
-                checkpoint_bytes(&mut hashes, &mut tail, block);
-                assert!(tail.len() < CHECKPOINT_CHUNK);
+        for length in [0, 37, CHECKPOINT_CHUNK, CHECKPOINT_CHUNK * 3 + 37] {
+            let bytes: Vec<_> = (0..length).map(|i| (i % 251) as u8).collect();
+            let first = chunk_digest(&bytes[..length.min(CHECKPOINT_CHUNK)]);
+            let last_at = length.saturating_sub(1) / CHECKPOINT_CHUNK * CHECKPOINT_CHUNK;
+            let last = chunk_digest(&bytes[last_at..]);
+            for size in [17, CHECKPOINT_CHUNK - 1, CHECKPOINT_CHUNK + 13] {
+                let mut checkpoint = Checkpoint::new(None, Vec::new());
+                for block in bytes.chunks(size) {
+                    checkpoint.extend(block);
+                    assert!(checkpoint.tail.len() < CHECKPOINT_CHUNK);
+                }
+                assert_eq!(checkpoint.finish(), (first, last));
             }
-            if !tail.is_empty() {
-                hashes.push(Sha256::digest(&tail).into());
-            }
-            assert_eq!(hashes, chunk_hashes(&bytes));
         }
     }
 
@@ -1442,7 +1512,14 @@ mod spill_tests {
         let cursor: Cursor =
             serde_json::from_slice(&lz4_flex::decompress_size_prepended(&parsed.cursor).unwrap())
                 .unwrap();
-        assert_eq!(cursor.prefix_chunks, chunk_hashes(&bytes));
+        assert_eq!(
+            cursor.first_chunk,
+            chunk_digest(&bytes[..bytes.len().min(CHECKPOINT_CHUNK)])
+        );
+        assert_eq!(
+            cursor.last_chunk,
+            chunk_digest(&bytes[(bytes.len() - 1) / CHECKPOINT_CHUNK * CHECKPOINT_CHUNK..])
+        );
         assert_eq!(cursor.offset, bytes.len() as u64);
         assert_eq!(parsed.bytes_read, bytes.len());
         assert_eq!(parsed.bytes_parsed, bytes.len());
@@ -1481,7 +1558,14 @@ mod large_metadata_tests {
         let cursor: Cursor =
             serde_json::from_slice(&lz4_flex::decompress_size_prepended(&parsed.cursor).unwrap())
                 .unwrap();
-        assert_eq!(cursor.prefix_chunks, chunk_hashes(&raw));
+        assert_eq!(
+            cursor.first_chunk,
+            chunk_digest(&raw[..raw.len().min(CHECKPOINT_CHUNK)])
+        );
+        assert_eq!(
+            cursor.last_chunk,
+            chunk_digest(&raw[(raw.len() - 1) / CHECKPOINT_CHUNK * CHECKPOINT_CHUNK..])
+        );
         assert_eq!(cursor.records, 4);
     }
 
@@ -1546,7 +1630,14 @@ mod large_metadata_tests {
         let cursor: Cursor =
             serde_json::from_slice(&lz4_flex::decompress_size_prepended(&parsed.cursor).unwrap())
                 .unwrap();
-        assert_eq!(cursor.prefix_chunks, chunk_hashes(&raw));
+        assert_eq!(
+            cursor.first_chunk,
+            chunk_digest(&raw[..raw.len().min(CHECKPOINT_CHUNK)])
+        );
+        assert_eq!(
+            cursor.last_chunk,
+            chunk_digest(&raw[(raw.len() - 1) / CHECKPOINT_CHUNK * CHECKPOINT_CHUNK..])
+        );
         assert_eq!(cursor.offset, raw.len() as u64);
     }
 }

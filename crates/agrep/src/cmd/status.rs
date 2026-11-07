@@ -12,12 +12,11 @@ pub fn run(json: bool, no_auto: bool) -> Result<i32> {
     } else {
         None
     };
+    crate::finish_census(&root, census)?;
     let mut s = diagnostics::status(&root)?;
     diagnostics::verify_model(&root, &mut s);
     if root.db().exists() {
-        let pending = crate::finish_census(&root, census)?;
-        s["freshness"] = render::freshness(render::checked(no_auto), pending);
-        s["pending_sources"] = serde_json::json!(pending);
+        s["freshness"] = render::freshness(render::checked(no_auto));
     }
     if json {
         println!("{}", agrep_core::json_output::to_string(&s)?)
@@ -68,11 +67,17 @@ pub fn run(json: bool, no_auto: bool) -> Result<i32> {
             );
         } else if s["semantic"]["model_present"] == true {
             println!(
-                "semantic {}/{} rows · backlog {}",
+                "meaning index: {} of {} rows · {} remaining",
                 s["semantic"]["indexed_rows"],
                 s["semantic"]["total_rows"],
                 s["semantic"]["backlog"]
-            )
+            );
+            if s["semantic"]["state"] == "building" {
+                println!(
+                    "build runs in the background · about {}s left",
+                    s["semantic"]["progress"]["estimated_seconds"]
+                );
+            }
         } else {
             println!("semantic model not installed: run agrep setup");
         }

@@ -9,7 +9,8 @@ pub(super) fn start(port: u16, no_auto: bool, open_browser: bool) -> Result<i32>
     crate::finish_census(&root, census)?;
     let server = Explorer::bind(root, port)?.with_freshness(move || {
         let (root, census) = crate::ready(no_auto)?;
-        crate::finish_census(&root, census)
+        crate::finish_census(&root, census)?;
+        Ok(agrep_core::render::checked(no_auto))
     });
     let signals = Signals::new()?;
     let url = server.url();

@@ -1,4 +1,4 @@
-use crate::{compact, finish_census, ready, Search};
+use crate::{compact, ready, Search};
 use agrep_core::{
     caller, hybrid,
     query::Options,
@@ -56,6 +56,18 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
         eprintln!("semantic model not installed: run agrep setup");
         return Ok(2);
     }
+    let (root, census) = {
+        let _span = agrep_core::semantic_profile::span("freshness_prepare");
+        match ready(no_auto) {
+            Ok(ready) => ready,
+            Err(e) => {
+                if let Some(error) = super::usage::recorded(&e) {
+                    stop(error)?;
+                }
+                return Err(e);
+            }
+        }
+    };
     let _model_read_ahead = if s.semantic
         || (!s.lexical
             && !s.regex
@@ -74,18 +86,9 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
     } else {
         None
     };
-    let (root, census) = {
-        let _span = agrep_core::semantic_profile::span("freshness_prepare");
-        match ready(no_auto) {
-            Ok(ready) => ready,
-            Err(e) => {
-                if let Some(error) = super::usage::recorded(&e) {
-                    stop(error)?;
-                }
-                return Err(e);
-            }
-        }
-    };
+    let identity = caller::Identity::detect();
+    let config = root.config()?;
+    crate::finish_census(&root, census)?;
     let c = store::reader(&root)?;
     let coverage = agrep_core::coverage::dimensions(&c, &f)?;
     if let Some(chat) = &f.chat {
@@ -94,7 +97,6 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
         };
         f.chat = Some(session);
     }
-    let identity = caller::Identity::detect();
     if !s.json && !s.scope.include_self && (s.scope.no_self || identity.agent_context) {
         identity.disclose(s.scope.no_self, false);
     }
@@ -122,7 +124,7 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
             && !s.chats
             && (compact_page || std::io::stdout().is_terminal()),
         chats: s.chats,
-        tools: root.config()?.tools
+        tools: config.tools
             || f.who
                 .as_deref()
                 .is_some_and(|who| who.split(',').any(|w| w == "tool")),
@@ -138,7 +140,7 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
         && s.sort == "score"
         && f.who.as_deref() != Some("tool")
         && compact_page
-        && root.config()?.embeddings != "off"
+        && config.embeddings != "off"
         && semantic::eligible(&pattern);
     let automatic = wants_meaning && semantic::installed(&root);
     if timing {
@@ -214,7 +216,7 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
             Err(error) if s.semantic => {
                 // An explicit matcher failure cannot silently change matcher semantics
                 // (py/search.py:7686-7719).
-                let freshness = render::machine_freshness(no_auto, finish_census(&root, census)?);
+                let freshness = render::machine_freshness(no_auto);
                 return unavailable(
                     &s,
                     pattern.trim(),
@@ -224,7 +226,9 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
                 );
             }
             Err(error) => {
-                agrep_core::logging::semantic_failure(&root, &error);
+                if !semantic::is_building(&error) {
+                    agrep_core::logging::semantic_failure(&root, &error);
+                }
                 (keyword, None, true)
             }
         }
@@ -324,11 +328,6 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
             .map(caller::Withheld::total),
         _ => None,
     };
-    let pending_sources = {
-        let _span = agrep_core::semantic_profile::span("freshness_join");
-        finish_census(&root, census)?
-    };
-    result.pending_sources = pending_sources;
     // 0.4.9's `session_hits`: each listed chat's exact matching rows, and on a meaning page
     // the rows `_session_heads` counted per chat (py/search.py:2409-2427).
     let session_hits = if style_semantic {
@@ -383,7 +382,6 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
         caller_unknown: caller.identity.agent_context && !caller.resolved,
         self_exclusion: caller.metadata(request, excluded),
         filter_coverage: coverage.clone(),
-        pending_sources,
         session_hits,
     };
     if let Some(line) = agrep_core::query::meta_notice(result.meta_dropped, result.meta_retained) {
@@ -435,17 +433,6 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
             semantic_coverage.as_ref(),
             after_page,
         )?;
-    }
-    // 0.4.9 named a coverage gap on a miss, and on a page of hits only in its terminal
-    // footer or a compact page (py/search.py:8121-8126, 8381-8387, 8482-8485).
-    if let Some(coverage) = semantic_coverage.as_ref().filter(|c| c.gap()) {
-        if !s.json
-            && !s.count
-            && !s.count_by_tier
-            && (result.hits.is_empty() || compact_page || std::io::stderr().is_terminal())
-        {
-            eprintln!("semantic {}/{} rows", coverage.embedded, coverage.total);
-        }
     }
     // 0.4.9 let an empty filter dimension's line stand alone as the zero's explanation.
     let empty_dimension = coverage["empty_dimensions"]
@@ -544,7 +531,6 @@ fn unavailable(
     } else {
         "semantic:unavailable"
     };
-    let partial = status["partial"] == true;
     let record = serde_json::json!({
         "kind":"agrep-meta","query":query,"engine":engine,"hits":[],
         "error":{"code":"semantic-unavailable"},"semantic":status,
@@ -554,7 +540,7 @@ fn unavailable(
             "action_unavailable_reason":"the query did not produce a result set"},
         "filter_coverage":{"empty_dimensions":[],"checked":false,
             "reason":"the query returned before the index was filtered"},
-        "freshness":freshness,"semantic_coverage":null,"semantic_partial":partial,
+        "freshness":freshness,"semantic_coverage":null,
     });
     agrep_core::surface::line(&agrep_core::json_output::to_string(&record)?)?;
     Ok(2)

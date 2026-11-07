@@ -40,7 +40,7 @@ def smoke(binary, model):
         assert run('--version').stdout.strip() == f'agrep {version()}'
         indexed = run('index', '--semantic')
         assert 'indexed 3 messages across 2 sessions' in indexed.stdout, indexed.stdout
-        assert 'semantic 6/6 rows' in indexed.stderr, indexed.stderr
+        assert 'meaning index ready: 6 rows' in indexed.stderr, indexed.stderr
         keyword = list(map(json.loads, run('flaky', '--lexical', '--json', '--no-auto').stdout.splitlines()))
         assert any(row.get('session') == SESSION and row.get('snippet') == TEXT
                    for row in keyword), keyword

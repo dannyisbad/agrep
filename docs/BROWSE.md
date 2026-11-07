@@ -53,10 +53,9 @@ wrapper and descendants to a kill-on-close Job Object before spawning. A
 non-inheritable job handle stays open until process exit. No shell is used to
 assemble an argument string.
 
-`status` answers from the committed index without refreshing it inline, and with no
-index it creates neither an index nor the data root. With an index it runs the source
-census as other commands do (`--no-auto` skips it): changed sources are counted in
-`pending_sources` and start the background refresh. It reports the
+With no index, `status` creates neither an index nor the data root. With an index it
+censuses and ingests changed sources inline before reading committed counts, as other
+history commands do (`--no-auto` and read-only data roots skip ingestion). It reports the
 format marker, recursive disk bytes without following links, canonical counts,
 refresh timestamp, per-source parse errors, semantic model/coverage/backlog,
 recorded integrations, archive presence, and version. Coverage comes from the

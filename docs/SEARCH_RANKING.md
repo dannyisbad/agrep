@@ -180,10 +180,10 @@ embedding space. [SEMANTIC.md](SEMANTIC.md) describes the lane.
 
 Semantic ranking is conversation-family aware by default so one root chat and
 its side chats do not consume every slot; `--all-side-chats` ranks each session
-on its own. Partial coverage is shown as indexed/total rows. A vector belongs
-only to the exact text it embedded; changed rows are keyword-searchable until
-embedded. A completed semantic miss with partial coverage exits 1 and reports
-that coverage. See [OUTPUT_CONTRACTS.md](OUTPUT_CONTRACTS.md) for the interface
+on its own. A vector belongs only to its exact snapshot text. The lane embeds
+queued text inline before scanning, so changed rows join the next meaning answer.
+A larger build quietly leaves automatic searches on keywords; explicit `-s` exits 2
+with build progress. A completed semantic miss exits 1. See [OUTPUT_CONTRACTS.md](OUTPUT_CONTRACTS.md) for the interface
 and [PORTING.md](PORTING.md) for deliberate differences from 0.4.9.
 
 In the automatic hybrid merge, meaning rows below cosine 0.82 never appear, and

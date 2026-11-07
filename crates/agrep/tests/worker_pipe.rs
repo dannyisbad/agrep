@@ -65,17 +65,39 @@ fn a_spawned_worker_holds_no_pipe_of_the_caller() {
     use std::time::Duration;
     let t = fixture();
     let root = DataRoot(t.path().join("data"));
-    // A new source makes the search start a worker. With the writer lock held while a merge
-    // seems to run, the worker waits in its refresh until this test lets it go.
-    write_chat(
-        &t.path()
-            .join("home/.pi/agent/sessions/alpha/2026-01-04_root-alpha-0003.jsonl"),
-        "root-alpha-0003",
-        &t.path().join("project alpha"),
-        &[("2026-01-04T00:00:00Z", "add a new chat", "")],
-    );
-    let merging = root.merge_lock().unwrap().unwrap();
-    let writing = root.lock(true).unwrap().unwrap();
+    // Leave several FTS segments for the search's merger, then keep it queued.
+    let source = t
+        .path()
+        .join("home/.pi/agent/sessions/alpha/2026-01-02_root-alpha-0001.jsonl");
+    for n in 2..=3 {
+        let turns = vec![("2026-01-02T00:00:00Z", "design the cache", "Finished."); n];
+        write_chat(
+            &source,
+            "root-alpha-0001",
+            &t.path().join("project alpha"),
+            &turns,
+        );
+        let out = Command::new(support::binary())
+            .env_clear()
+            .env("HOME", t.path().join("home"))
+            .env("AGREP_HOME", t.path().join("home"))
+            .env("AGREP_DATA_DIR", t.path().join("data"))
+            .args(["__work", "refresh"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert!(agrep_core::fts_segments::pending(&agrep_core::store::reader(&root).unwrap()).unwrap());
+    let queued = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.path().join("writer.queue"))
+        .unwrap();
+    queued.lock_shared().unwrap();
     let (mut reader, writer) = std::io::pipe().unwrap();
     let extra = writer.as_raw_fd();
     let mut cmd = Command::new(support::binary());
@@ -115,7 +137,7 @@ fn a_spawned_worker_holds_no_pipe_of_the_caller() {
     // The search has exited, so only the worker can still hold the pipe open.
     let held =
         matches!(reader.read(&mut [0; 1]), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock);
-    drop((writing, merging));
+    drop(queued);
     assert!(exit::wait(worker, Duration::from_secs(30)).unwrap());
     assert!(running, "the worker exited before the pipe was checked");
     assert!(!held, "the worker inherited the caller's pipe");

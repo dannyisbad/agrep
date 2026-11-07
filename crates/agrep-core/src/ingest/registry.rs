@@ -355,22 +355,21 @@ impl WindowsFileIdentity {
 
 #[cfg(windows)]
 pub fn metadata_change_token(path: &Path, metadata: &fs::Metadata) -> std::io::Result<ChangeToken> {
-    windows_metadata_identity(path, metadata, false, false).map(|(token, _)| token)
+    windows_metadata_identity(path, metadata)
 }
 
 #[cfg(windows)]
-pub fn metadata_change_token_with_file_identity(
-    path: &Path,
-    metadata: &fs::Metadata,
-) -> std::io::Result<(ChangeToken, WindowsFileIdentity)> {
-    let (token, identity) = windows_metadata_identity(path, metadata, true, false)?;
-    let identity = identity.ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "filesystem did not provide a stable file identity",
-        )
-    })?;
-    Ok((token, identity))
+pub(crate) fn opened_file_identity(file: &fs::File) -> std::io::Result<WindowsFileIdentity> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    let state = windows_handle_state(file.as_raw_handle())?;
+    if state.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "source is a reparse point",
+        ));
+    }
+    Ok(state.identity)
 }
 
 #[cfg(windows)]
@@ -638,12 +637,7 @@ fn windows_open_file_change_token(
 }
 
 #[cfg(windows)]
-fn windows_metadata_identity(
-    path: &Path,
-    metadata: &fs::Metadata,
-    need_file_id: bool,
-    force_content_hash: bool,
-) -> std::io::Result<(ChangeToken, Option<WindowsFileIdentity>)> {
+fn windows_metadata_identity(path: &Path, metadata: &fs::Metadata) -> std::io::Result<ChangeToken> {
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -656,8 +650,7 @@ fn windows_metadata_identity(
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
-    let (token, initial_identity) =
-        windows_open_file_change_token(&file, metadata, force_content_hash)?;
+    let (token, initial_identity) = windows_open_file_change_token(&file, metadata, false)?;
     let path_after = fs::OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
@@ -674,7 +667,7 @@ fn windows_metadata_identity(
             "source was replaced while reading its freshness identity",
         ));
     }
-    Ok((token, need_file_id.then_some(initial_identity.identity)))
+    Ok(token)
 }
 
 #[cfg(not(any(unix, windows)))]

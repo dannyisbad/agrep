@@ -976,7 +976,7 @@ fn around_freshness_record_matches_0_4_9() {
     let miss = cli(&h, &d, &args, &[]);
     assert_eq!(miss.status.code(), Some(2));
     assert_eq!(values(&miss)[0]["freshness"], unchecked);
-    // 0.5 also counts changed sources awaiting refresh on that record.
+    // Checked around reads ingest the appended turn before loading the window.
     let root = agrep_core::data::DataRoot::open(&d, false).unwrap();
     let _work = root.work_lock(true).unwrap().unwrap();
     let source = h.join(".pi/agent/sessions/-work-alpha/2026-01-02T03-04-05-000Z_01930000-0000-7000-8000-000000000001.jsonl");
@@ -990,11 +990,17 @@ fn around_freshness_record_matches_0_4_9() {
         &["around", "01930000", "1", "--json"],
         &[],
     )));
-    assert_eq!(
-        rows.last().unwrap()["freshness"],
-        serde_json::json!({"state":"no-known-failure","failing":false,"checked":true,
-            "pending_sources":1})
-    );
+    assert!(rows.iter().all(|r| r.get("freshness").is_none()));
+    let out = ok(cli(
+        &h,
+        &d,
+        &["around", "01930000", "--whole", "--json"],
+        &[],
+    ));
+    assert!(String::from_utf8(out.stdout)
+        .unwrap()
+        .contains("a later turn"));
+    assert!(out.stderr.is_empty());
 }
 // Expected text is agrep 0.4.9's on this fixture: the empty-search line counts one
 // message per user-side row and names its matcher, chats lists short handles and

@@ -145,7 +145,7 @@ pub(crate) fn stopped(
         if unavailable {
             json!({"state":"unavailable","failing":false,"checked":false,"may_be_stale":true,"code":"index-unavailable"})
         } else if checked {
-            agrep_core::render::freshness(true, 0)
+            agrep_core::render::freshness(true)
         } else {
             json!({"state":"unchecked","failing":false,"checked":false,"may_be_stale":true})
         },

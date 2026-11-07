@@ -238,6 +238,7 @@ fn query_gate(
     let query = Embedder::load_query(path)?;
     let mut ids_equal = true;
     let mut identical = 0;
+    let mut singles = Vec::new();
     let mut minimum = 1f64;
     for (i, text) in texts.iter().enumerate() {
         ids_equal &= query.token_ids(text)? == ids[i];
@@ -255,14 +256,26 @@ fn query_gate(
             .sum();
         let norm = |x: &[f32]| x.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
         minimum = minimum.min(dot / (norm(&fast) * norm(&expected[i])));
+        singles.push(fast);
     }
+    let inline = query.embed_inline(texts)?;
+    let inline_identical = inline
+        .iter()
+        .zip(&singles)
+        .filter(|(a, b)| {
+            a.iter()
+                .map(|v| v.to_bits())
+                .eq(b.iter().map(|v| v.to_bits()))
+        })
+        .count();
     let passed = query.mapped()
         && parity
         && ids_equal
         && identical == texts.len()
+        && inline_identical == texts.len()
         && minimum >= 0.99999999999;
     Ok((
-        json!({"query_mapped":query.mapped(),"query_tokenizer_parity":parity,"query_tokenizer_inputs":tables,"query_ids_equal":ids_equal,"query_identical":identical,"query_texts":texts.len(),"query_minimum_cosine":minimum}),
+        json!({"query_mapped":query.mapped(),"query_tokenizer_parity":parity,"query_tokenizer_inputs":tables,"query_ids_equal":ids_equal,"query_identical":identical,"query_inline_identical":inline_identical,"query_texts":texts.len(),"query_minimum_cosine":minimum}),
         passed,
     ))
 }

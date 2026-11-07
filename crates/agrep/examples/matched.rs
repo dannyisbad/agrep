@@ -523,6 +523,14 @@ impl Bench {
                 self.diagnose(lane, &format!("{} sample {i}", case.name), &s);
             }
             if case.kind == Kind::Changed {
+                if lane.role == Role::Candidate {
+                    let count = self.probe(lane, &changed)?;
+                    s.evidence["bench_probe_count"] = json!(count);
+                    if count != Some(1) {
+                        self.diagnose(lane, &format!("{} before drain {i}", case.name), &s);
+                        verified = false;
+                    }
+                }
                 // The next sample starts from a refreshed index; a failed refresh fails the sample.
                 let drain = self.invoke(lane, &["index".into()], "classic")?;
                 if drain.exit != 0 || !drain.settled || self.probe(lane, &changed)? != Some(1) {

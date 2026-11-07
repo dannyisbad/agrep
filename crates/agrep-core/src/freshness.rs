@@ -2,7 +2,7 @@
 use crate::{
     data::DataRoot,
     ingest::registry::{self, ADAPTERS},
-    store::{self, Stamp},
+    store::{self, SourceToken, Stamp},
 };
 use anyhow::Result;
 use rayon::prelude::*;
@@ -12,7 +12,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{atomic::AtomicUsize, Arc, Mutex},
     time::Instant,
 };
 
@@ -36,8 +36,8 @@ pub(crate) struct Directory {
     path: String,
     agent: String,
     mtime: i64,
-    dirs: Arc<Vec<String>>,
-    files: Arc<Vec<String>>,
+    dirs: Arc<Names>,
+    files: Arc<Names>,
     dirty: bool,
 }
 pub(crate) struct Census {
@@ -64,25 +64,44 @@ pub struct Pending {
     /// FTS segments need a merge, for instance one a killed worker left unfinished.
     pub merge_pending: bool,
 }
-fn encode_names(names: &[String]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for name in names {
-        out.extend((name.len() as u32).to_le_bytes());
-        out.extend(name.as_bytes());
-    }
-    out
+#[derive(Clone, Default)]
+struct Names {
+    bytes: Vec<u8>,
+    offsets: Vec<usize>,
 }
-fn decode_names(mut bytes: &[u8]) -> Result<Vec<String>> {
-    let mut out = vec![];
-    while !bytes.is_empty() {
-        anyhow::ensure!(bytes.len() >= 4, "invalid cached directory listing");
-        let length = u32::from_le_bytes(bytes[..4].try_into()?) as usize;
-        bytes = &bytes[4..];
-        anyhow::ensure!(length <= bytes.len(), "invalid cached directory entry");
-        out.push(std::str::from_utf8(&bytes[..length])?.to_string());
-        bytes = &bytes[length..];
+impl Names {
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut names = Self {
+            bytes: bytes.to_vec(),
+            offsets: Vec::new(),
+        };
+        let mut at = 0;
+        while at < bytes.len() {
+            anyhow::ensure!(bytes.len() - at >= 4, "invalid cached directory listing");
+            let length = u32::from_le_bytes(bytes[at..at + 4].try_into()?) as usize;
+            at += 4;
+            anyhow::ensure!(length <= bytes.len() - at, "invalid cached directory entry");
+            std::str::from_utf8(&bytes[at..at + length])?;
+            names.offsets.push(at);
+            at += length;
+        }
+        Ok(names)
     }
-    Ok(out)
+    fn push(&mut self, name: &str) {
+        self.bytes.extend((name.len() as u32).to_le_bytes());
+        self.offsets.push(self.bytes.len());
+        self.bytes.extend_from_slice(name.as_bytes());
+    }
+    fn iter(&self) -> impl Iterator<Item = &str> {
+        self.offsets.iter().map(|&start| {
+            let length = u32::from_le_bytes(
+                self.bytes[start - 4..start]
+                    .try_into()
+                    .expect("validated name length"),
+            ) as usize;
+            std::str::from_utf8(&self.bytes[start..start + length]).expect("validated cached name")
+        })
+    }
 }
 fn mtime(m: &fs::Metadata) -> i64 {
     m.modified()
@@ -100,6 +119,7 @@ pub(crate) fn scan(c: &Connection, force: bool) -> Result<Census> {
     Ok(walk(cached, started.elapsed().as_secs_f64() * 1000.))
 }
 fn cached_directories(c: &Connection) -> Result<HashMap<String, Directory>> {
+    let _span = crate::semantic_profile::span("census_cached_listings");
     let mut cached = HashMap::new();
     let mut stmt = c.prepare("SELECT path,agent,mtime,dirs,files FROM source_directories")?;
     let mut rows = stmt.query([])?;
@@ -108,100 +128,123 @@ fn cached_directories(c: &Connection) -> Result<HashMap<String, Directory>> {
             path: row.get(0)?,
             agent: row.get(1)?,
             mtime: row.get(2)?,
-            dirs: Arc::new(decode_names(row.get_ref(3)?.as_blob()?)?),
-            files: Arc::new(decode_names(row.get_ref(4)?.as_blob()?)?),
+            dirs: Arc::new(Names::decode(row.get_ref(3)?.as_blob()?)?),
+            files: Arc::new(Names::decode(row.get_ref(4)?.as_blob()?)?),
             dirty: false,
         };
         cached.insert(d.path.clone(), d);
     }
     Ok(cached)
 }
-/// Each directory's sources are stat'ed in the same task that confirmed its listing,
-/// so the walk is one parallel pass per directory level.
-fn walk(cached: HashMap<String, Directory>, listing_ms: f64) -> Census {
-    let started = Instant::now();
-    let mut queue: Vec<_> = ADAPTERS
-        .iter()
-        .flat_map(|a| a.freshness_roots().into_iter().map(|p| (a.name(), p)))
-        .collect();
-    let mut seen = HashSet::new();
-    let mut directories = Vec::new();
-    let mut stamps = Vec::new();
-    let mut issues = Vec::new();
-    let listings = std::sync::atomic::AtomicUsize::new(0);
-    let cache_hits = std::sync::atomic::AtomicUsize::new(0);
-    let stat_files = std::sync::atomic::AtomicUsize::new(0);
-    while !queue.is_empty() {
-        queue.retain(|(_, p)| seen.insert(p.clone()));
-        let batch: Vec<_> = STAT_POOL.install(|| {
-            queue
-                .par_iter()
-                .map(|(agent, path)| -> Result<Option<(Directory, Vec<Stamp>)>> {
-                    let Some(d) = directory(&cached, agent, path, &listings, &cache_hits)? else {
-                        return Ok(None);
-                    };
-                    let owner = ADAPTERS
-                        .iter()
-                        .find(|a| a.name() == d.agent)
-                        .unwrap()
-                        .name();
-                    stat_files.fetch_add(d.files.len(), std::sync::atomic::Ordering::Relaxed);
-                    // A flat store holds thousands of sources in one directory; its stats
-                    // split across the pool, while a small directory stays one task.
-                    let files = d
-                        .files
-                        .par_iter()
-                        .with_min_len(STAT_CHUNK)
-                        .filter_map(|name| {
-                            if name.is_empty() {
-                                store::stamp_present(owner, Path::new(&d.path))
-                            } else {
-                                store::stamp_present(owner, &Path::new(&d.path).join(name))
-                            }
-                        })
-                        .collect();
-                    Ok(Some((d, files)))
-                })
-                .collect()
-        });
-        let inputs = std::mem::take(&mut queue);
-        // Each result carries its agent; failures retain a named root error below.
-        for ((agent, path), result) in inputs.into_iter().zip(batch) {
-            match result {
-                Ok(Some((d, files))) => {
-                    let a = ADAPTERS
-                        .iter()
-                        .find(|a| a.name() == d.agent)
-                        .unwrap()
-                        .name();
-                    queue.extend(d.dirs.iter().map(|p| {
-                        (
-                            a,
-                            if p.is_empty() {
-                                PathBuf::from(&d.path)
-                            } else {
-                                Path::new(&d.path).join(p)
-                            },
-                        )
-                    }));
-                    stamps.extend(files);
-                    directories.push(d);
-                }
-                Ok(None) => {}
-                Err(e) => issues.push(Stamp {
-                    path: path.to_string_lossy().into(),
+struct Walk<'a> {
+    cached: &'a HashMap<String, Directory>,
+    seen: Mutex<HashSet<PathBuf>>,
+    completed: Mutex<Vec<Directory>>,
+    issues: Mutex<Vec<Stamp>>,
+    listings: AtomicUsize,
+    cache_hits: AtomicUsize,
+}
+impl<'a> Walk<'a> {
+    fn visit<'scope>(&'scope self, scope: &rayon::Scope<'scope>, agent: &'static str, path: PathBuf)
+    where
+        'a: 'scope,
+    {
+        let result = directory(self.cached, agent, &path, &self.listings, &self.cache_hits);
+        let d = match result {
+            Ok(Some(d)) => d,
+            Ok(None) => return,
+            Err(error) => {
+                self.issues.lock().unwrap().push(Stamp {
+                    path: path.to_string_lossy().into_owned(),
                     agent: agent.into(),
                     size: 0,
                     mtime_ns: 0,
-                    token: String::new(),
-                    error: Some(e.to_string()),
-                }),
+                    token: SourceToken::default(),
+                    error: Some(error.to_string()),
+                });
+                return;
+            }
+        };
+        let owner = ADAPTERS
+            .iter()
+            .find(|a| a.name() == d.agent)
+            .unwrap()
+            .name();
+        for name in d.dirs.iter() {
+            let child = if name.is_empty() {
+                PathBuf::from(&d.path)
+            } else {
+                Path::new(&d.path).join(name)
+            };
+            if self.seen.lock().unwrap().insert(child.clone()) {
+                scope.spawn(move |scope| self.visit(scope, owner, child));
             }
         }
+        self.completed.lock().unwrap().push(d);
     }
+}
+/// Traverse directories without level barriers, then balance every source over
+/// the same stat tasks; small directories need no separate file task.
+fn walk(cached: HashMap<String, Directory>, listing_ms: f64) -> Census {
+    let started = Instant::now();
+    let mut seen = HashSet::new();
+    let roots: Vec<_> = ADAPTERS
+        .iter()
+        .flat_map(|a| a.freshness_roots().into_iter().map(|p| (a.name(), p)))
+        .filter(|(_, p)| seen.insert(p.clone()))
+        .collect();
+    let walk = Walk {
+        cached: &cached,
+        seen: Mutex::new(seen),
+        completed: Mutex::new(Vec::new()),
+        issues: Mutex::new(Vec::new()),
+        listings: AtomicUsize::new(0),
+        cache_hits: AtomicUsize::new(0),
+    };
+    {
+        let _span = crate::semantic_profile::span("census_directory_walk");
+        STAT_POOL.scope(|scope| {
+            for (agent, path) in roots {
+                let walk = &walk;
+                scope.spawn(move |scope| walk.visit(scope, agent, path));
+            }
+        });
+    }
+    let directories = walk.completed.into_inner().unwrap();
+    let files: Vec<_> = directories
+        .iter()
+        .flat_map(|d| {
+            let owner = ADAPTERS
+                .iter()
+                .find(|a| a.name() == d.agent)
+                .unwrap()
+                .name();
+            d.files
+                .iter()
+                .map(move |name| (owner, d.path.as_str(), name))
+        })
+        .collect();
+    let mut stamps: Vec<_> = {
+        let _span = crate::semantic_profile::span("census_file_stats");
+        STAT_POOL.install(|| {
+            files
+                .par_iter()
+                .with_min_len(STAT_CHUNK)
+                .filter_map(|&(owner, directory, name)| {
+                    let path = if name.is_empty() {
+                        PathBuf::from(directory)
+                    } else {
+                        Path::new(directory).join(name)
+                    };
+                    store::stamp_owned(owner, path)
+                })
+                .collect()
+        })
+    };
+    let stat_files = stamps.len();
     let stat_ms = started.elapsed().as_secs_f64() * 1000.;
     // Directory errors must not license deletion of an unseen subtree.
-    stamps.extend(issues);
+    stamps.extend(walk.issues.into_inner().unwrap());
     STAT_POOL.install(|| stamps.par_sort_unstable_by(|a, b| a.path.cmp(&b.path)));
     stamps.dedup_by(|a, b| a.path == b.path);
     let names: HashSet<_> = directories.iter().map(|d| d.path.as_str()).collect();
@@ -217,9 +260,9 @@ fn walk(cached: HashMap<String, Directory>, listing_ms: f64) -> Census {
         removed,
         listing_ms,
         stat_ms,
-        listed_directories: listings.into_inner(),
-        cached_directories: cache_hits.into_inner(),
-        stat_files: stat_files.into_inner(),
+        listed_directories: walk.listings.into_inner(),
+        cached_directories: walk.cache_hits.into_inner(),
+        stat_files,
     }
 }
 /// The current listing of one freshness root or directory: reused while its mtime
@@ -246,10 +289,12 @@ fn directory(
             agent: agent.into(),
             mtime: mtime(&meta),
             dirs: Arc::default(),
-            files: Arc::new(if a.freshness_content(path) {
-                vec![String::new()]
-            } else {
-                vec![]
+            files: Arc::new({
+                let mut files = Names::default();
+                if a.freshness_content(path) {
+                    files.push("");
+                }
+                files
             }),
             dirty: true,
         }));
@@ -278,9 +323,9 @@ fn directory(
         let ty = entry.file_type()?;
         let p = entry.path();
         if ty.is_dir() {
-            Arc::make_mut(&mut d.dirs).push(entry.file_name().to_string_lossy().into());
+            Arc::make_mut(&mut d.dirs).push(&entry.file_name().to_string_lossy());
         } else if ty.is_file() && a.freshness_content(&p) {
-            Arc::make_mut(&mut d.files).push(entry.file_name().to_string_lossy().into());
+            Arc::make_mut(&mut d.files).push(&entry.file_name().to_string_lossy());
         }
     }
     Ok(Some(d))
@@ -295,15 +340,16 @@ pub(crate) fn save(tx: &Transaction<'_>, census: &Census) -> Result<()> {
             d.path,
             d.agent,
             d.mtime,
-            encode_names(&d.dirs),
-            encode_names(&d.files)
+            &d.dirs.bytes,
+            &d.files.bytes
         ])?;
     }
     Ok(())
 }
-type Fingerprint = (String, u64, i64, String);
+pub(crate) type Fingerprint = (String, u64, i64, SourceToken);
 /// The index's fingerprint of every file source, in path order.
-fn indexed(c: &Connection) -> Result<Vec<Fingerprint>> {
+pub(crate) fn indexed(c: &Connection) -> Result<Vec<Fingerprint>> {
+    let _span = crate::semantic_profile::span("census_fingerprints");
     let mut old = c.prepare("SELECT path,size,mtime_ns,change_token FROM sources ORDER BY path")?;
     let rows = old.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
     let mut out = Vec::new();
@@ -315,7 +361,15 @@ fn indexed(c: &Connection) -> Result<Vec<Fingerprint>> {
     }
     Ok(out)
 }
+/// The source snapshot and measurements from one read-only census.
+pub struct Check {
+    pub stats: Pending,
+    pub(crate) census: Census,
+}
 pub fn pending(root: &DataRoot) -> Result<Pending> {
+    Ok(check(root)?.stats)
+}
+pub fn check(root: &DataRoot) -> Result<Check> {
     let start = Instant::now();
     let c = store::reader(root)?;
     let read_ms = start.elapsed().as_secs_f64() * 1000.;
@@ -347,7 +401,7 @@ pub fn pending(root: &DataRoot) -> Result<Pending> {
     }
     changed += census.stamps.len() - next;
     let census_ms = start.elapsed().as_secs_f64() * 1000.;
-    Ok(Pending {
+    let stats = Pending {
         changed_sources: changed,
         census_ms,
         read_ms,
@@ -358,7 +412,8 @@ pub fn pending(root: &DataRoot) -> Result<Pending> {
         cached_directories: census.cached_directories,
         stat_files: census.stat_files,
         merge_pending,
-    })
+    };
+    Ok(Check { stats, census })
 }
 /// Spawn only an eligible one-shot worker. Kernel locks arbitrate concurrent spawns.
 pub fn spawn(root: &DataRoot, binary: &Path) -> Result<bool> {

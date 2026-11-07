@@ -18,7 +18,7 @@ class Armv8SmokeTests(unittest.TestCase):
             (self.root / name).touch()
         self.outputs = [
             (f'agrep {version()}\n', ''),
-            ('indexed 3 messages across 2 sessions', 'semantic 6/6 rows'),
+            ('indexed 3 messages across 2 sessions', 'meaning index ready: 6 rows'),
             (json.dumps({'session': SESSION, 'snippet': TEXT}), ''),
             (json.dumps({'hits': [{'session': SESSION, 'window': [{'text': TEXT}]}]}), ''),
             ('\n'.join(map(json.dumps, [

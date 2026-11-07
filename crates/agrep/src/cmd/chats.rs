@@ -13,9 +13,8 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
     let mut filters = args.scope.filters()?;
     h::validate_filters(&filters)?;
     let (root, census) = ready(no_auto)?;
-    let c = store::reader(&root)?;
+    let detected = agrep_core::caller::Identity::detect();
     let tools = root.config()?.tools;
-    let all = h::sessions(&c)?;
     let pattern = args.pattern.join(" ");
     if args.pattern.len() == 1 && pattern.starts_with('@') && pattern.contains(':') {
         agrep_core::handles::parse(&pattern)?;
@@ -25,11 +24,13 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
     } else {
         None
     };
+    crate::finish_census(&root, census)?;
+    let c = store::reader(&root)?;
+    let all = h::sessions(&c)?;
     let direct = identity
         .as_ref()
         .is_some_and(|id| all.iter().any(|s| s.id.starts_with(id)));
     filters.no_side = !args.side && !direct;
-    let detected = agrep_core::caller::Identity::detect();
     if args.scope.no_self && !args.scope.include_self && !args.json {
         detected.disclose(true, false);
     }
@@ -144,7 +145,6 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
     if args.max > 0 {
         selected.truncate(args.max);
     }
-    let pending_sources = crate::finish_census(&root, census)?;
     let checked = agrep_core::render::checked(no_auto);
     let truncated = selected.len() < total || !exact;
     // 0.4.9 named a page cut by -n with its larger rerun (py/search.py:8888-8912).
@@ -196,7 +196,7 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
         if let Some(command) = &more_command {
             completeness["more_command"] = json!(command);
         }
-        let mut meta = json!({"kind":"agrep-meta","completeness":completeness,"filter_coverage":coverage,"freshness":render::machine_freshness(no_auto,pending_sources),"self_exclusion":caller.metadata(request,None),"self_excluded":excluded});
+        let mut meta = json!({"kind":"agrep-meta","completeness":completeness,"filter_coverage":coverage,"freshness":render::machine_freshness(no_auto),"self_exclusion":caller.metadata(request,None),"self_excluded":excluded});
         if selected.is_empty() {
             meta["hits"] = json!([]);
         }

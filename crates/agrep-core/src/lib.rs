@@ -27,6 +27,7 @@ pub mod freshness;
 
 pub mod incremental;
 
+mod refresh_order;
 mod row_stats;
 
 mod tool_index;
@@ -68,9 +69,12 @@ mod semantic_norm;
 mod semantic_policy;
 #[doc(hidden)]
 pub mod semantic_profile;
-mod semantic_store;
+#[doc(hidden)]
+pub mod semantic_store;
 pub mod semantic_tokenizer;
 pub mod surface;
 pub mod terminal;
 
 pub mod tool_text;
+
+mod source_token;

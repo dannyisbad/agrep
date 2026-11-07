@@ -37,7 +37,6 @@ pub struct Style {
     pub caller_unknown: bool,
     pub self_exclusion: Value,
     pub filter_coverage: Value,
-    pub pending_sources: usize,
     /// Each `--chats` hit's matching rows in its chat (0.4.9's `session_hits`).
     pub session_hits: Vec<usize>,
 }
@@ -160,26 +159,22 @@ pub fn note_no_auto(no_auto: bool) {
 }
 /// The machine freshness record; under `--no-auto` it is 0.4.9's: nothing checked the
 /// sources, so the index may be stale.
-pub fn machine_freshness(no_auto: bool, pending: usize) -> Value {
+pub fn machine_freshness(no_auto: bool) -> Value {
     if no_auto {
         json!({"state":"degraded","failing":true,"may_be_stale":true,"code":"search-index-stale","reason":"automatic freshness checks are disabled by --no-auto","checked":false})
     } else {
-        freshness(checked(no_auto), pending)
+        freshness(checked(no_auto))
     }
 }
 pub fn checked(no_auto: bool) -> bool {
     !no_auto && !crate::data::read_only()
 }
-pub fn freshness(checked: bool, pending: usize) -> Value {
-    let mut v = if checked {
+pub fn freshness(checked: bool) -> Value {
+    if checked {
         json!({"state":"no-known-failure","failing":false,"checked":true})
     } else {
         json!({"state":"unchecked","failing":false,"checked":false})
-    };
-    if pending > 0 {
-        v["pending_sources"] = json!(pending)
     }
-    v
 }
 /// A search hit's JSON row. A meaning row is 0.4.9's (py/search.py:1010-1038, py/ask.py:
 /// 2613-2624): its cosine to six places, the keyword formula as `score`, no lane or match
@@ -635,7 +630,7 @@ fn json_lines(
     now: i64,
 ) -> Result<String> {
     let exhaustible = !s.semantic && !r.hits.iter().any(|h| h.matched == "semantic");
-    let mut meta = json!({"kind":"agrep-meta","query":q,"engine":"sqlite","freshness":machine_freshness(s.no_auto,s.pending_sources),"filter_coverage":s.filter_coverage,"self_exclusion":s.self_exclusion,"completeness":{"shown":r.hits.len(),"total":r.total,"total_basis":r.total_basis,"unit":if s.chats || s.semantic{"chat"}else{"matching row"},"truncated":truncated,"tool_rows":r.tool_rows},"semantic_coverage":null});
+    let mut meta = json!({"kind":"agrep-meta","query":q,"engine":"sqlite","freshness":machine_freshness(s.no_auto),"filter_coverage":s.filter_coverage,"self_exclusion":s.self_exclusion,"completeness":{"shown":r.hits.len(),"total":r.total,"total_basis":r.total_basis,"unit":if s.chats || s.semantic{"chat"}else{"matching row"},"truncated":truncated,"tool_rows":r.tool_rows},"semantic_coverage":null});
     if s.filter_coverage.is_null() {
         meta["filter_coverage"] = json!({"checked":true,"empty_dimensions":[]})
     }
@@ -644,7 +639,6 @@ fn json_lines(
     }
     if let Some(coverage) = coverage {
         meta["semantic_coverage"] = serde_json::to_value(coverage)?;
-        meta["semantic_partial"] = json!(coverage.partial());
     }
     if let Some(coverage) = coverage.filter(|_| s.semantic) {
         // 0.4.9 named its meaning lane's engine and led with the lane's status
@@ -849,7 +843,7 @@ mod tests {
         let full = json!({"complete":true,"fraction":1.0,"indexed":24,"order":"newest-first","pending":0,"total":24});
         assert_eq!(
             lines[0],
-            json!({"completeness":{"shown":4,"tool_rows":0,"total":4,"total_basis":"exact","truncated":false,"unit":"chat"},"engine":"semantic:hybrid","filter_coverage":{"checked":true,"empty_dimensions":[]},"freshness":{"checked":true,"failing":false,"state":"no-known-failure"},"kind":"agrep-meta","query":q,"self_exclusion":{"active":false,"reason":"machine-surface"},"semantic":{"complete":true,"coverage":full,"eligible":true,"fallback_recommended":false,"min_score":0.82,"partial":false,"reason":null,"score_kind":"cosine","state":"ready"},"semantic_coverage":full,"semantic_partial":false})
+            json!({"completeness":{"shown":4,"tool_rows":0,"total":4,"total_basis":"exact","truncated":false,"unit":"chat"},"engine":"semantic:hybrid","filter_coverage":{"checked":true,"empty_dimensions":[]},"freshness":{"checked":true,"failing":false,"state":"no-known-failure"},"kind":"agrep-meta","query":q,"self_exclusion":{"active":false,"reason":"machine-surface"},"semantic":{"complete":true,"coverage":full,"eligible":true,"fallback_recommended":false,"min_score":0.82,"reason":null,"score_kind":"cosine","state":"ready"},"semantic_coverage":full})
         );
         assert_eq!(
             lines[1],
@@ -883,7 +877,7 @@ mod tests {
         assert_eq!(meta["hits"], json!([]));
         assert_eq!(
             meta["semantic"],
-            json!({"complete":true,"coverage":full,"eligible":true,"fallback_recommended":false,"min_score":0.82,"partial":false,"reason":null,"score_kind":"cosine","state":"no-confident-match"})
+            json!({"complete":true,"coverage":full,"eligible":true,"fallback_recommended":false,"min_score":0.82,"reason":null,"score_kind":"cosine","state":"no-confident-match"})
         );
     }
     // 0.4.9's real compact page for "how do we rotate secret credentials" on the six-chat

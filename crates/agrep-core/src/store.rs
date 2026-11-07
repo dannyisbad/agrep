@@ -1,4 +1,5 @@
 //! One WAL transaction is the visibility boundary for rows, indexes and fingerprints.
+pub use crate::source_token::SourceToken;
 use crate::{
     data::DataRoot,
     ingest::registry::{self, Adapter, ADAPTERS},
@@ -24,7 +25,7 @@ pub struct Stamp {
     pub agent: String,
     pub size: u64,
     pub mtime_ns: i64,
-    pub token: String,
+    pub token: SourceToken,
     pub error: Option<String>,
 }
 #[derive(Default, Debug, Serialize)]
@@ -113,10 +114,13 @@ pub fn writer(root: &DataRoot) -> Result<Connection> {
     open_writer(&root.db(), true)
 }
 fn open_writer(path: &Path, wal: bool) -> Result<Connection> {
+    let initialize = path.metadata().map_or(true, |m| m.len() == 0);
     let c = Connection::open(path)?;
     c.set_prepared_statement_cache_capacity(256);
     c.execute_batch(if wal {"PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-32000; PRAGMA wal_autocheckpoint=4096; PRAGMA journal_size_limit=0;"}else{"PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-131072;"})?;
-    schema(&c)?;
+    if initialize {
+        schema(&c)?;
+    }
     register_functions(&c)?;
     Ok(c)
 }
@@ -135,11 +139,14 @@ fn register_functions(c: &Connection) -> Result<()> {
     Ok(())
 }
 pub(crate) fn schema(c: &Connection) -> Result<()> {
-    c.execute_batch("CREATE TABLE IF NOT EXISTS sources(path TEXT PRIMARY KEY,agent TEXT NOT NULL,size INTEGER NOT NULL,mtime_ns INTEGER NOT NULL,change_token TEXT NOT NULL,last_error TEXT);
+    c.execute_batch("CREATE TABLE IF NOT EXISTS sources(path TEXT PRIMARY KEY,agent TEXT NOT NULL,size INTEGER NOT NULL,mtime_ns INTEGER NOT NULL,change_token BLOB NOT NULL,last_error TEXT);
 CREATE TABLE IF NOT EXISTS sessions(agent TEXT NOT NULL,id TEXT NOT NULL,project TEXT NOT NULL,cwd TEXT NOT NULL DEFAULT '',parent TEXT NOT NULL,family TEXT NOT NULL,side INTEGER NOT NULL,title TEXT NOT NULL,first_ts INTEGER NOT NULL,last_ts INTEGER NOT NULL,PRIMARY KEY(agent,id)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS sessions_project ON sessions(project);
 CREATE INDEX IF NOT EXISTS sessions_family ON sessions(agent,family);
 CREATE INDEX IF NOT EXISTS sessions_parent ON sessions(agent,parent);
+CREATE TABLE IF NOT EXISTS family_nodes(agent TEXT NOT NULL,id TEXT NOT NULL,parent TEXT NOT NULL,PRIMARY KEY(agent,id)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS family_alias_claims(agent TEXT NOT NULL,alias TEXT NOT NULL,session TEXT NOT NULL,PRIMARY KEY(agent,alias,session)) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS family_alias_session ON family_alias_claims(agent,session);
 CREATE TABLE IF NOT EXISTS session_sources(agent TEXT NOT NULL,session TEXT NOT NULL,source INTEGER NOT NULL,PRIMARY KEY(agent,session,source)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS session_sources_source ON session_sources(source);
 CREATE TABLE IF NOT EXISTS reply_shapes(source INTEGER NOT NULL,session TEXT NOT NULL,turn INTEGER NOT NULL,body TEXT NOT NULL,PRIMARY KEY(source,session,turn)) WITHOUT ROWID;
@@ -149,7 +156,7 @@ CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY,value TEXT NOT NULL) WITHO
 CREATE TABLE IF NOT EXISTS source_directories(path TEXT PRIMARY KEY,agent TEXT NOT NULL,mtime INTEGER NOT NULL,dirs BLOB NOT NULL,files BLOB NOT NULL) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS parser_cursors(path TEXT PRIMARY KEY REFERENCES sources(path) ON DELETE CASCADE ON UPDATE CASCADE,body BLOB NOT NULL) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS parser_graph(source INTEGER NOT NULL,bucket INTEGER NOT NULL,body BLOB NOT NULL,PRIMARY KEY(source,bucket)) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS gram_postings(lane INTEGER NOT NULL,gram INTEGER NOT NULL,body BLOB NOT NULL,PRIMARY KEY(lane,gram)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS gram_postings(lane INTEGER NOT NULL,gram INTEGER NOT NULL,chunk INTEGER NOT NULL,body BLOB NOT NULL,PRIMARY KEY(lane,gram,chunk)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS block_grams(lane INTEGER NOT NULL,block INTEGER NOT NULL,body BLOB NOT NULL,PRIMARY KEY(lane,block)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS blocks(id INTEGER PRIMARY KEY,max_ts INTEGER NOT NULL,user_ts INTEGER,weight REAL NOT NULL,min_session TEXT NOT NULL,min_turn INTEGER NOT NULL,max_gap INTEGER NOT NULL,all_ascii INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS tool_blocks(id INTEGER PRIMARY KEY,max_ts INTEGER NOT NULL,user_ts INTEGER,weight REAL NOT NULL,min_session TEXT NOT NULL,min_turn INTEGER NOT NULL,max_gap INTEGER NOT NULL,all_ascii INTEGER NOT NULL);
@@ -187,8 +194,11 @@ CREATE TRIGGER IF NOT EXISTS prose_user_count_visibility AFTER UPDATE OF visible
     }
     crate::row_stats::schema(c)?;
     c.execute_batch("CREATE TABLE IF NOT EXISTS bound_updates(id INTEGER PRIMARY KEY);
-CREATE TRIGGER IF NOT EXISTS prose_bound_update AFTER UPDATE ON prose BEGIN INSERT OR IGNORE INTO bound_updates VALUES(old.id); END;
-CREATE TRIGGER IF NOT EXISTS prose_bound_delete BEFORE DELETE ON prose BEGIN INSERT OR IGNORE INTO bound_updates VALUES(old.id); END;")?;
+CREATE TABLE IF NOT EXISTS tool_bound_updates(id INTEGER PRIMARY KEY);
+CREATE TRIGGER IF NOT EXISTS tool_bound_update AFTER UPDATE OF tool_id,blob,visible,active,ts,position,session_key ON event_rows WHEN old.active=1 AND old.blob IS NOT NULL AND (old.tool_id!=new.tool_id OR old.blob IS NOT new.blob OR old.visible!=new.visible OR old.active!=new.active OR old.ts!=new.ts OR old.position!=new.position OR old.session_key!=new.session_key) BEGIN INSERT OR IGNORE INTO tool_bound_updates VALUES(old.tool_id); END;
+CREATE TRIGGER IF NOT EXISTS tool_bound_delete BEFORE DELETE ON event_rows WHEN old.active=1 AND old.blob IS NOT NULL BEGIN INSERT OR IGNORE INTO tool_bound_updates VALUES(old.tool_id); END;
+CREATE TRIGGER IF NOT EXISTS prose_bound_update AFTER UPDATE OF text,ts,who,session,position,visible ON prose WHEN (old.visible=1 OR new.visible=1) AND (old.text IS NOT new.text OR old.ts!=new.ts OR old.who!=new.who OR old.session!=new.session OR old.position!=new.position OR old.visible!=new.visible) BEGIN INSERT OR IGNORE INTO bound_updates VALUES(old.id); END;
+CREATE TRIGGER IF NOT EXISTS prose_bound_delete BEFORE DELETE ON prose WHEN old.visible=1 BEGIN INSERT OR IGNORE INTO bound_updates VALUES(old.id); END;")?;
     c.execute_batch("CREATE TABLE IF NOT EXISTS semantic_queue(row_id INTEGER PRIMARY KEY,digest TEXT NOT NULL,ts INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS semantic_queue_time ON semantic_queue(ts DESC);
 CREATE TABLE IF NOT EXISTS semantic_refs(row_id INTEGER PRIMARY KEY,digest TEXT NOT NULL,content_key TEXT NOT NULL);
@@ -327,6 +337,16 @@ pub(crate) fn stamp_present(a: &str, p: &Path) -> Option<Stamp> {
     }
     Some(stamp_meta(a, p, meta))
 }
+pub(crate) fn stamp_owned(a: &str, path: PathBuf) -> Option<Stamp> {
+    let metadata = fs::symlink_metadata(&path);
+    if metadata
+        .as_ref()
+        .is_err_and(|error| registry::stat_proves_absent(&path, error))
+    {
+        return None;
+    }
+    Some(stamp_meta_owned(a, path, metadata))
+}
 /// Whether an indexed source the census did not stamp is gone: its stat proves it absent, or
 /// a directory stands at its path. Sources are files, so an indexed directory is stale: the
 /// error of a census that could not list it then, or a source a directory replaced.
@@ -336,28 +356,32 @@ pub(crate) fn gone(path: &Path) -> bool {
         Err(e) => registry::stat_proves_absent(path, &e),
     }
 }
-fn stamp_meta(a: &str, p: &Path, meta: std::io::Result<fs::Metadata>) -> Stamp {
-    let result = (|| -> Result<(u64, i64, String)> {
+pub(crate) fn stamp_meta(a: &str, p: &Path, meta: std::io::Result<fs::Metadata>) -> Stamp {
+    stamp_meta_owned(a, p.to_owned(), meta)
+}
+fn stamp_meta_owned(a: &str, path: PathBuf, meta: std::io::Result<fs::Metadata>) -> Stamp {
+    let p = path.as_path();
+    let result = (|| -> Result<(u64, i64, SourceToken)> {
         let m = meta?;
         if registry::metadata_is_link(&m) {
             anyhow::bail!("source is a symlink")
         }
-        let t = registry::metadata_change_token(p, &m)?;
-        let mut token = serde_json::to_string(&t)?;
+        let mut token = SourceToken::File(registry::metadata_change_token(p, &m)?);
         // A source SQLite WAL is an input too. Reading metadata never opens it writable.
-        let wal = PathBuf::from(format!("{}-wal", p.to_string_lossy()));
-        if let Some(w) = p
-            .extension()
+        if p.extension()
             .and_then(|s| s.to_str())
-            .filter(|s| matches!(*s, "db" | "sqlite" | "sqlite3" | "vscdb"))
-            .and_then(|_| fs::metadata(&wal).ok())
+            .is_some_and(|s| matches!(s, "db" | "sqlite" | "sqlite3" | "vscdb"))
         {
-            token.push_str(&format!(
-                ":{}:{:?}:{:?}",
-                w.len(),
-                w.modified()?,
-                registry::metadata_change_token(&wal, &w)?
-            ));
+            let wal = PathBuf::from(format!("{}-wal", p.to_string_lossy()));
+            if let Ok(w) = fs::metadata(&wal) {
+                token = SourceToken::Opaque(format!(
+                    "{}:{}:{:?}:{:?}",
+                    token.diagnostic(),
+                    w.len(),
+                    w.modified()?,
+                    registry::metadata_change_token(&wal, &w)?
+                ));
+            }
         }
         Ok((
             m.len(),
@@ -365,9 +389,13 @@ fn stamp_meta(a: &str, p: &Path, meta: std::io::Result<fs::Metadata>) -> Stamp {
             token,
         ))
     })();
+    let path = path
+        .into_os_string()
+        .into_string()
+        .unwrap_or_else(|s| s.to_string_lossy().into_owned());
     match result {
         Ok((size, mtime_ns, token)) => Stamp {
-            path: p.to_string_lossy().into(),
+            path,
             agent: a.into(),
             size,
             mtime_ns,
@@ -375,11 +403,11 @@ fn stamp_meta(a: &str, p: &Path, meta: std::io::Result<fs::Metadata>) -> Stamp {
             error: None,
         },
         Err(e) => Stamp {
-            path: p.to_string_lossy().into(),
+            path,
             agent: a.into(),
             size: 0,
             mtime_ns: 0,
-            token: String::new(),
+            token: SourceToken::default(),
             error: Some(e.to_string()),
         },
     }
@@ -397,7 +425,7 @@ pub fn census() -> Result<Vec<Stamp>> {
                         agent: a.name().into(),
                         size: 0,
                         mtime_ns: 0,
-                        token: String::new(),
+                        token: SourceToken::default(),
                         error: Some(e.to_string()),
                     });
                 }
@@ -421,29 +449,16 @@ pub fn census() -> Result<Vec<Stamp>> {
     out.dedup_by(|a, b| a.path == b.path);
     Ok(out)
 }
-pub(crate) fn known(c: &Connection) -> Result<HashMap<String, Stamp>> {
-    let mut q =
-        c.prepare("SELECT path,agent,size,mtime_ns,change_token,last_error FROM sources")?;
-    let rows = q
-        .query_map([], |r| {
-            let s = Stamp {
-                path: r.get(0)?,
-                agent: r.get(1)?,
-                size: r.get(2)?,
-                mtime_ns: r.get(3)?,
-                token: r.get(4)?,
-                error: r.get(5)?,
-            };
-            Ok((s.path.clone(), s))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(rows)
-}
 pub fn refresh(root: &DataRoot, explicit: bool, full: bool) -> Result<Refresh> {
-    refresh_inner(root, explicit, full, false, None)
+    refresh_inner(root, explicit, full, false, None, None)
+}
+/// Wait for preceding writers, then refresh changes from the caller's census against
+/// their committed stamps. Sources they already covered need no parsing.
+pub fn refresh_checked(root: &DataRoot, check: crate::freshness::Check) -> Result<Refresh> {
+    refresh_inner(root, true, false, false, None, Some(check.census))
 }
 pub fn reindex(root: &DataRoot) -> Result<Refresh> {
-    refresh_inner(root, true, true, true, None)
+    refresh_inner(root, true, true, true, None, None)
 }
 /// Refresh only sources already attributed to this transcript. Other changed
 /// sources remain pending and their recorded stamps are not advanced.
@@ -454,7 +469,7 @@ pub fn refresh_session(root: &DataRoot, agent: &str, session: &str) -> Result<Re
         .collect::<rusqlite::Result<HashSet<_>>>()?;
     anyhow::ensure!(!paths.is_empty(), "caller has no indexed source");
     drop(c);
-    refresh_inner(root, true, false, false, Some(&paths))
+    refresh_inner(root, true, false, false, Some(&paths), None)
 }
 fn refresh_inner(
     root: &DataRoot,
@@ -462,6 +477,7 @@ fn refresh_inner(
     full: bool,
     rebuild: bool,
     scope: Option<&HashSet<String>>,
+    census: Option<crate::freshness::Census>,
 ) -> Result<Refresh> {
     let start = Instant::now();
     WRITE_TIMES.set((0, 0));
@@ -516,6 +532,8 @@ fn refresh_inner(
             "prose_stats_delete",
             "prose_stats_update",
             "session_stats_family",
+            "tool_bound_update",
+            "tool_bound_delete",
             "tool_word_dirty_insert",
             "tool_word_dirty_update",
             "tool_word_old_update",
@@ -527,7 +545,10 @@ fn refresh_inner(
             c.execute_batch(&format!("DROP TRIGGER IF EXISTS {name}"))?;
         }
     }
-    let old = known(&c)?;
+    let old = {
+        let _span = crate::semantic_profile::span("refresh_known_sources");
+        crate::freshness::indexed(&c)?
+    };
     let harness_body = match fs::read_to_string(root.path().join("harness_prefixes.txt")) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -542,35 +563,55 @@ fn refresh_inner(
         .optional()?;
     let full = full || previous.as_deref() != Some(&policy_digest);
     let tick = Instant::now();
-    let census = crate::freshness::scan(&c, false)?;
-    let stamps: Vec<_> = census
-        .stamps
-        .iter()
-        .filter(|s| scope.is_none_or(|paths| paths.contains(&s.path)))
-        .cloned()
-        .collect();
+    let mut census = match census {
+        Some(mut census) => {
+            // A preceding writer may have ingested a newer stamp than this census saw.
+            // Recheck only differing files, so its completed work is not parsed again.
+            let mut indexed = old.iter().peekable();
+            census.stamps.retain_mut(|s| {
+                while indexed.peek().is_some_and(|old| old.0 < s.path) {
+                    indexed.next();
+                }
+                if indexed.peek().is_some_and(|(path, size, mtime, token)| {
+                    *path == s.path && s.size == *size && s.mtime_ns == *mtime && s.token == *token
+                }) {
+                    return true;
+                }
+                match stamp_present(&s.agent, Path::new(&s.path)) {
+                    Some(current) => {
+                        *s = current;
+                        true
+                    }
+                    None => false,
+                }
+            });
+            census
+        }
+        None => crate::freshness::scan(&c, false)?,
+    };
+    let mut stamps = std::mem::take(&mut census.stamps);
+    if let Some(paths) = scope {
+        stamps.retain(|source| paths.contains(&source.path));
+    }
     let census_ms = tick.elapsed().as_secs_f64() * 1000.;
-    let changed: HashSet<PathBuf> = stamps
-        .iter()
-        .filter(|s| {
-            full || old
-                .get(&s.path)
-                .is_none_or(|o| s.size != o.size || s.mtime_ns != o.mtime_ns || s.token != o.token)
-        })
-        .map(|s| PathBuf::from(&s.path))
-        .collect();
-    let discovered: HashSet<&str> = stamps.iter().map(|s| s.path.as_str()).collect();
-    let removed: Vec<_> = old
-        .values()
-        .filter(|s| {
-            scope.is_none_or(|paths| paths.contains(&s.path))
-                && !s.path.starts_with('@')
-                && !s.path.starts_with("token:")
-                && !discovered.contains(s.path.as_str())
-                && gone(Path::new(&s.path))
-        })
-        .map(|s| s.path.clone())
-        .collect();
+    let mut changed = HashSet::new();
+    let mut removed = Vec::new();
+    let mut next = 0;
+    for (path, size, mtime, token) in &old {
+        while next < stamps.len() && stamps[next].path < *path {
+            changed.insert(PathBuf::from(&stamps[next].path));
+            next += 1;
+        }
+        if let Some(stamp) = stamps.get(next).filter(|s| s.path == *path) {
+            if full || stamp.size != *size || stamp.mtime_ns != *mtime || stamp.token != *token {
+                changed.insert(PathBuf::from(path));
+            }
+            next += 1;
+        } else if scope.is_none_or(|paths| paths.contains(path)) && gone(Path::new(path)) {
+            removed.push(path.clone());
+        }
+    }
+    changed.extend(stamps[next..].iter().map(|s| PathBuf::from(&s.path)));
     let mut info = Refresh {
         sources: stamps.len(),
         census_ms,
@@ -585,16 +626,21 @@ fn refresh_inner(
         // 0.4.9's notice (py/indexd_runtime.py:944-946): the size is unknown here.
         eprintln!("building the search db (a first build can take a while on a large history) …");
     }
-    let mut active: HashSet<String> = stamps
+    let changed_stamps: Vec<_> = stamps
         .iter()
         .filter(|s| changed.contains(Path::new(&s.path)))
-        .map(|s| s.agent.clone())
         .collect();
+    let mut active: HashSet<String> = changed_stamps.iter().map(|s| s.agent.clone()).collect();
+    let mut removed_agent = c.prepare_cached("SELECT agent FROM sources WHERE path=?")?;
     for key in &removed {
-        if let Some(stamp) = old.get(key) {
-            active.insert(stamp.agent.clone());
+        if let Some(agent) = removed_agent
+            .query_row([key], |r| r.get::<_, String>(0))
+            .optional()?
+        {
+            active.insert(agent);
         }
     }
+    drop(removed_agent);
     let mut cursors = HashMap::new();
     if !full {
         let mut q = c.prepare("SELECT body FROM parser_cursors WHERE path=?")?;
@@ -629,80 +675,116 @@ fn refresh_inner(
             .expect("bulk parser thread pool")
     });
     let parsers = if first || full {
-        &*BUILD_PARSERS
+        &BUILD_PARSERS
     } else {
-        &*PARSERS
+        &PARSERS
     };
-    let batches: Vec<_> = parsers.install(|| {
-        ADAPTERS
-            .par_iter()
-            .filter(|a| active.contains(a.name()))
-            .map(|a| {
-                let adapter_start = Instant::now();
-                let mut batch = IntakeBatch {
-                    changed: if a.name() == "gemini" {
-                        stamps
-                            .iter()
-                            .filter(|s| s.agent == "gemini")
-                            .map(|s| PathBuf::from(&s.path))
-                            .collect()
-                    } else {
-                        changed.clone()
-                    },
-                    force: full,
-                    cursors: cursors.clone(),
-                    database: Some(root.db()),
-                    defer: true,
-                    source_paths: stamps
-                        .iter()
-                        .filter(|s| s.agent == a.name())
-                        .map(|s| PathBuf::from(&s.path))
-                        .collect(),
-                    tokens: old
-                        .iter()
-                        .filter(|(k, _)| k.starts_with(&format!("token:{}:", a.name())))
-                        .map(|(k, v)| (k.clone(), v.token.clone()))
-                        .collect(),
-                    ..Default::default()
-                };
-                crate::intake::take_diagnostics();
-                let (m, e, o, issues) = a.collect_checked(&mut batch);
-                for message in crate::intake::take_diagnostics() {
-                    batch.issues.push(crate::intake_batch::SourceReadIssue::new(
-                        a.name(),
-                        a.runtime_issue_root(),
-                        "source-read-failed",
-                        message,
-                    ));
-                }
-                batch.issues.extend(issues);
-                if a.fingerprint() == registry::Fingerprint::Always {
-                    batch.batches.push(SourceBatch {
-                        key: format!("@{}", a.name()),
-                        agent: a.name().into(),
-                        messages: m,
-                        events: e,
-                        error: if matches!(
-                            o,
-                            crate::intake_batch::ReadOutcome::Complete
-                                | crate::intake_batch::ReadOutcome::Undone
-                        ) && batch.issues.is_empty()
-                        {
-                            None
-                        } else {
-                            Some(format!("{} source parse incomplete", a.name()))
-                        },
-                        ..Default::default()
-                    })
-                }
-                (
-                    a.name().to_owned(),
-                    adapter_start.elapsed().as_secs_f64() * 1000.,
-                    batch,
-                )
+    let parser_width = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(if first || full { 8 } else { 4 });
+    let source_paths: HashMap<&str, Vec<PathBuf>> =
+        changed_stamps
+            .iter()
+            .fold(HashMap::new(), |mut paths, source| {
+                paths
+                    .entry(source.agent.as_str())
+                    .or_default()
+                    .push(PathBuf::from(&source.path));
+                paths
+            });
+    let mut token_cache = HashMap::new();
+    for adapter in ADAPTERS
+        .iter()
+        .filter(|a| active.contains(a.name()) && a.fingerprint() == registry::Fingerprint::Token)
+    {
+        let lower = format!("token:{}:", adapter.name());
+        let upper = format!("token:{};", adapter.name());
+        let mut query =
+            c.prepare_cached("SELECT path,change_token FROM sources WHERE path>=?1 AND path<?2")?;
+        let mut tokens = HashMap::new();
+        for row in query.query_map(params![lower, upper], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, SourceToken>(1)?))
+        })? {
+            let (path, token) = row?;
+            let SourceToken::Opaque(token) = token else {
+                anyhow::bail!("invalid adapter token")
+            };
+            tokens.insert(path, token);
+        }
+        token_cache.insert(adapter.name(), tokens);
+    }
+    let collect_adapter = |a: &&dyn Adapter| {
+        let adapter_start = Instant::now();
+        let tokens = token_cache.get(a.name()).cloned().unwrap_or_default();
+        let mut batch = IntakeBatch {
+            changed: if a.name() == "gemini" {
+                stamps
+                    .iter()
+                    .filter(|s| s.agent == "gemini")
+                    .map(|s| PathBuf::from(&s.path))
+                    .collect()
+            } else {
+                changed.clone()
+            },
+            force: full,
+            cursors: cursors.clone(),
+            database: Some(root.db()),
+            defer: true,
+            source_paths: source_paths.get(a.name()).cloned().unwrap_or_default(),
+            tokens,
+            ..Default::default()
+        };
+        crate::intake::take_diagnostics();
+        let (m, e, o, issues) = a.collect_checked(&mut batch);
+        for message in crate::intake::take_diagnostics() {
+            batch.issues.push(crate::intake_batch::SourceReadIssue::new(
+                a.name(),
+                a.runtime_issue_root(),
+                "source-read-failed",
+                message,
+            ));
+        }
+        batch.issues.extend(issues);
+        if a.fingerprint() == registry::Fingerprint::Always {
+            batch.batches.push(SourceBatch {
+                key: format!("@{}", a.name()),
+                agent: a.name().into(),
+                messages: m,
+                events: e,
+                error: if matches!(
+                    o,
+                    crate::intake_batch::ReadOutcome::Complete
+                        | crate::intake_batch::ReadOutcome::Undone
+                ) && batch.issues.is_empty()
+                {
+                    None
+                } else {
+                    Some(format!("{} source parse incomplete", a.name()))
+                },
+                ..Default::default()
             })
+        }
+        (
+            a.name().to_owned(),
+            adapter_start.elapsed().as_secs_f64() * 1000.,
+            batch,
+        )
+    };
+    let batches: Vec<_> = if active.len() <= 1 {
+        ADAPTERS
+            .iter()
+            .filter(|a| active.contains(a.name()))
+            .map(collect_adapter)
             .collect()
-    });
+    } else {
+        parsers.install(|| {
+            ADAPTERS
+                .par_iter()
+                .filter(|a| active.contains(a.name()))
+                .map(collect_adapter)
+                .collect()
+        })
+    };
     info.parse_ms = parse_start.elapsed().as_secs_f64() * 1000.;
     info.adapter_parse_ms = batches
         .iter()
@@ -714,7 +796,7 @@ fn refresh_inner(
         .collect();
     let batches = batches.into_iter().map(|(name, _, batch)| (name, batch));
     let write_start = Instant::now();
-    let tx = c.transaction()?;
+    let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     if scope.is_none() {
         crate::freshness::save(&tx, &census)?;
     }
@@ -733,6 +815,8 @@ fn refresh_inner(
         tx.execute("DELETE FROM blocks", [])?;
         tx.execute("DELETE FROM tool_blocks", [])?;
         for table in [
+            "family_nodes",
+            "family_alias_claims",
             "reply_shapes",
             "term_stats",
             "parser_cursors",
@@ -742,6 +826,7 @@ fn refresh_inner(
             "stats_dirty",
             "session_sources",
             "tool_words",
+            "tool_word_blocks",
             "tool_trigrams",
             "tool_lexicon",
             "tool_word_dirty",
@@ -759,18 +844,19 @@ fn refresh_inner(
     let append_from = if first {
         None
     } else {
-        Some(
+        Some([
             tx.query_row("SELECT coalesce(max(id),0) FROM prose", [], |r| {
                 r.get::<_, i64>(0)
             })?,
-        )
+            tx.query_row(
+                "SELECT coalesce(max(tool_id),0) FROM event_rows WHERE active=1",
+                [],
+                |r| r.get::<_, i64>(0),
+            )?,
+        ])
     };
     let mut changes = Changes::default();
-    let turnless_before = if first {
-        HashSet::new()
-    } else {
-        turnless(&tx, "event_sessions", "session")?
-    };
+    let mut turnless_before = HashSet::new();
     let mut canonical_sessions = HashSet::new();
     let mut fast_sessions = HashSet::new();
     let mut forced_sessions = HashSet::new();
@@ -785,7 +871,10 @@ fn refresh_inner(
         tx.execute("DELETE FROM sources WHERE path=?", [key])?;
     }
     let mut pages = crate::incremental::GraphPages::new(parsers);
-    let sizes: HashMap<&str, u64> = stamps.iter().map(|s| (s.path.as_str(), s.size)).collect();
+    let sizes: HashMap<&str, u64> = changed_stamps
+        .iter()
+        .map(|s| (s.path.as_str(), s.size))
+        .collect();
     let mut parse_wait = std::time::Duration::ZERO;
     for (adapter, b) in batches {
         let adapter_write_start = Instant::now();
@@ -835,7 +924,8 @@ fn refresh_inner(
             info.parsed += 1;
             if let Some(error) = s.error {
                 if s.key.starts_with('@') || s.key.starts_with("token:") {
-                    let token = tokens.get(&s.key).cloned().unwrap_or_default();
+                    let token =
+                        SourceToken::Opaque(tokens.get(&s.key).cloned().unwrap_or_default());
                     tx.execute("INSERT INTO sources VALUES(?1,?2,0,0,?3,?4) ON CONFLICT(path) DO UPDATE SET change_token=?3,last_error=?4", params![s.key,s.agent,token,error])?;
                 }
                 errors.insert(s.key.clone(), error);
@@ -855,6 +945,13 @@ fn refresh_inner(
                         .map(|e| (e.agent.to_string(), e.session.clone())),
                 )
                 .collect();
+            if !first {
+                for (agent, session) in &changed_sessions {
+                    if !tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM prose INDEXED BY prose_session WHERE agent=?1 AND session=?2)")?.query_row(params![agent,session], |r| r.get::<_,bool>(0))? {
+                        turnless_before.insert((agent.clone(),session.clone()));
+                    }
+                }
+            }
             if s.append {
                 fast_sessions.extend(changed_sessions);
             } else {
@@ -899,7 +996,7 @@ fn refresh_inner(
                 info.node_chunks_ms += phase.elapsed().as_secs_f64() * 1000.;
             }
             if s.key.starts_with('@') || s.key.starts_with("token:") {
-                let token = tokens.get(&s.key).cloned().unwrap_or_default();
+                let token = SourceToken::Opaque(tokens.get(&s.key).cloned().unwrap_or_default());
                 tx.execute("INSERT INTO sources VALUES(?1,?2,0,0,?3,NULL) ON CONFLICT(path) DO UPDATE SET change_token=?3,last_error=NULL",params![s.key,s.agent,token])?;
             }
             Ok(())
@@ -907,7 +1004,7 @@ fn refresh_inner(
         for s in b.batches {
             write((s, Vec::new()))?;
         }
-        parse_wait += parse_ahead(parsers.current_num_threads(), b.pending, &sizes, &mut write)?;
+        parse_wait += parse_ahead(parser_width, b.pending, &sizes, &mut write)?;
         info.adapter_source_parse_ms
             .insert(adapter.clone(), source_parse_ms);
         info.adapter_write_ms
@@ -917,29 +1014,20 @@ fn refresh_inner(
     pages.finish(&tx)?;
     info.node_chunks_ms += phase.elapsed().as_secs_f64() * 1000.;
     for s in stamps {
-        let error = errors
-            .get(&s.path)
-            .cloned()
-            .or(s.error)
-            .or_else(|| {
-                errors.iter().find_map(|(path, error)| {
-                    Path::new(&s.path)
-                        .starts_with(Path::new(path))
-                        .then(|| error.clone())
-                })
+        let error = errors.get(&s.path).cloned().or(s.error).or_else(|| {
+            errors.iter().find_map(|(path, error)| {
+                Path::new(&s.path)
+                    .starts_with(Path::new(path))
+                    .then(|| error.clone())
             })
-            .or_else(|| {
-                (!changed.contains(Path::new(&s.path)))
-                    .then(|| old.get(&s.path).and_then(|o| o.error.clone()))
-                    .flatten()
-            });
-        if old.get(&s.path).is_some_and(|o| {
-            o.agent == s.agent
-                && o.size == s.size
-                && o.mtime_ns == s.mtime_ns
-                && o.token == s.token
-                && o.error == error
-        }) {
+        });
+        if !changed.contains(Path::new(&s.path)) {
+            if let Some(error) = error {
+                tx.prepare_cached(
+                    "UPDATE sources SET last_error=?2 WHERE path=?1 AND last_error IS NOT ?2",
+                )?
+                .execute(params![s.path, error])?;
+            }
             continue;
         }
         tx.prepare_cached("INSERT INTO sources VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(path) DO UPDATE SET size=?3,mtime_ns=?4,change_token=?5,last_error=?6")?.execute(params![s.path,s.agent,s.size,s.mtime_ns,s.token,error])?;
@@ -965,7 +1053,13 @@ fn refresh_inner(
         &mut changes,
         first,
     )?;
-    settle_turnless(&tx, &turnless_before, &mut changes, first)?;
+    settle_turnless(
+        &tx,
+        &turnless_before,
+        &canonical_sessions,
+        &mut changes,
+        first,
+    )?;
     info.canonical_ms = phase.elapsed().as_secs_f64() * 1000.;
     changes.fts.apply(&tx)?;
     let presence = if first { build_fts(&tx)? } else { None };
@@ -983,8 +1077,17 @@ fn refresh_inner(
     let phase = Instant::now();
     update_blocks(&tx, &changes.blocks, append_from)?;
     tx.execute("DELETE FROM bound_updates", [])?;
+    tx.execute("DELETE FROM tool_bound_updates", [])?;
     info.bounds_ms = phase.elapsed().as_secs_f64() * 1000.;
     let phase = Instant::now();
+    if first {
+        tx.execute("DELETE FROM sessions WHERE NOT EXISTS(SELECT 1 FROM prose p INDEXED BY prose_session WHERE p.agent=sessions.agent AND p.session=sessions.id)",[])?;
+    } else {
+        let mut q = tx.prepare_cached("DELETE FROM sessions WHERE agent=?1 AND id=?2 AND NOT EXISTS(SELECT 1 FROM prose p INDEXED BY prose_session WHERE p.agent=?1 AND p.session=?2)")?;
+        for (agent, session) in &canonical_sessions {
+            q.execute(params![agent, session])?;
+        }
+    }
     resolve_families(&tx, &canonical_sessions)?;
     crate::prose_index::refresh(&tx, first || rebuild)?;
     if first {
@@ -1010,7 +1113,6 @@ fn refresh_inner(
     }
     info.stats_ms = phase.elapsed().as_secs_f64() * 1000.;
     // 0.4.9 listed a chat only through its turns (py/corpusdb.py:2221-2234).
-    tx.execute("DELETE FROM sessions WHERE NOT EXISTS(SELECT 1 FROM prose p INDEXED BY prose_session WHERE p.agent=sessions.agent AND p.session=sessions.id)",[])?;
     tx.execute("INSERT INTO state VALUES('refreshed',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[chrono::Utc::now().timestamp_millis().to_string()])?;
     if scope.is_none() {
         tx.execute("INSERT INTO state VALUES('harness',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[policy_digest])?;
@@ -1029,6 +1131,9 @@ fn refresh_inner(
         fs::rename(&initial, root.db())?;
         #[cfg(unix)]
         fs::File::open(root.path())?.sync_all()?;
+    } else {
+        let _span = crate::semantic_profile::span("refresh_connection_close");
+        c.close().map_err(|(_, e)| e)?;
     }
     info.commit_ms = phase.elapsed().as_secs_f64() * 1000.;
     let (row_ns, fts_ns) = WRITE_TIMES.get();
@@ -1404,10 +1509,22 @@ fn turnless(tx: &Transaction<'_>, table: &str, column: &str) -> Result<HashSet<(
 fn settle_turnless(
     tx: &Transaction<'_>,
     before: &HashSet<(String, String)>,
+    affected: &HashSet<(String, String)>,
     changes: &mut Changes,
     bulk: bool,
 ) -> Result<()> {
-    let hidden = turnless(tx, "sessions", "id")?;
+    let hidden = if bulk {
+        turnless(tx, "sessions", "id")?
+    } else {
+        let mut hidden = HashSet::new();
+        let mut q = tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM sessions WHERE agent=?1 AND id=?2) AND NOT EXISTS(SELECT 1 FROM prose INDEXED BY prose_session WHERE agent=?1 AND session=?2)")?;
+        for (agent, session) in affected {
+            if q.query_row(params![agent, session], |r| r.get::<_, bool>(0))? {
+                hidden.insert((agent.clone(), session.clone()));
+            }
+        }
+        hidden
+    };
     let turned = before
         .iter()
         .filter(|s| !hidden.contains(*s))
@@ -1452,7 +1569,14 @@ fn canonicalize(
     changes: &mut Changes,
     bulk: bool,
 ) -> Result<()> {
-    let mut pi_order = None;
+    let mut pi_order: HashMap<i64, Vec<usize>> = HashMap::new();
+    let mut native_order = crate::refresh_order::Order::new(
+        ADAPTERS
+            .iter()
+            .find(|a| a.name() == "pi")
+            .unwrap()
+            .store_roots(),
+    );
     for (agent, session) in sessions {
         if bulk {
             let copies: usize = tx.query_row(
@@ -1539,25 +1663,47 @@ fn canonicalize(
             });
         }
         // Equal-quality copies and session metadata follow 0.4.9 discovery order.
-        if agent == "pi" && pi_order.is_none() {
-            let paths = crate::ingest::pi::source_order();
-            pi_order = Some(
-                tx.prepare("SELECT rowid,path FROM sources WHERE agent='pi'")?
+        if agent == "pi" {
+            let sources: BTreeSet<_> = rows
+                .iter()
+                .map(|r| r.source)
+                .filter(|id| !pi_order.contains_key(id))
+                .collect();
+            let mut ranks = Vec::new();
+            let mut fallback = false;
+            for id in sources {
+                let path: String = tx
+                    .prepare_cached("SELECT path FROM sources WHERE rowid=?")?
+                    .query_row([id], |r| r.get(0))?;
+                if let Some(rank) = native_order.rank(Path::new(&path)) {
+                    ranks.push((id, rank));
+                } else {
+                    fallback = true;
+                    break;
+                }
+            }
+            if fallback {
+                let paths = crate::ingest::pi::source_order();
+                pi_order = tx
+                    .prepare("SELECT rowid,path FROM sources WHERE agent='pi'")?
                     .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
-                    .filter_map(|r| match r {
-                        Ok((id, path)) => paths.get(Path::new(&path)).map(|rank| Ok((id, *rank))),
-                        Err(e) => Some(Err(e)),
+                    .map(|row| {
+                        let (id, path) = row?;
+                        Ok((
+                            id,
+                            vec![paths.get(Path::new(&path)).copied().unwrap_or(usize::MAX)],
+                        ))
                     })
-                    .collect::<rusqlite::Result<HashMap<_, _>>>()?,
-            );
+                    .collect::<rusqlite::Result<_>>()?;
+            } else {
+                pi_order.extend(ranks);
+            }
         }
         let source_order = |m: &ReplayMessage| {
             (
                 pi_order
-                    .as_ref()
-                    .and_then(|ranks| ranks.get(&rows[m.row].source))
-                    .copied()
-                    .unwrap_or(usize::MAX),
+                    .get(&rows[m.row].source)
+                    .map_or(&[usize::MAX][..], |rank| rank.as_slice()),
                 m.row,
             )
         };
@@ -1946,7 +2092,7 @@ fn replace(
     bulk: bool,
 ) -> Result<usize> {
     tx.execute(
-        "INSERT OR IGNORE INTO sources(path,agent,size,mtime_ns,change_token) VALUES(?1,?2,0,0,'')",
+        "INSERT OR IGNORE INTO sources(path,agent,size,mtime_ns,change_token) VALUES(?1,?2,0,0,x'02')",
         params![s.key, s.agent],
     )?;
     let source: i64 = tx.query_row("SELECT rowid FROM sources WHERE path=?", [&s.key], |r| {
@@ -2315,7 +2461,7 @@ struct BuiltBounds {
     weight: f64,
     min_session: String,
     min_turn: i64,
-    grams: Vec<(String, GramStat)>,
+    grams: Vec<(u32, GramStat)>,
     max_gap: usize,
     all_ascii: bool,
     append: bool,
@@ -2347,14 +2493,18 @@ fn weight_code(who: &str) -> u8 {
 pub(crate) fn posting_weight(code: u8) -> f64 {
     [0.22, 0.3, 0.325, 0.5, 0.7225, 0.8, 1.][usize::from(code)]
 }
-fn gram_maxima(texts: impl Iterator<Item = (String, i64, String)>) -> HashMap<String, GramStat> {
+fn gram_maxima(texts: impl Iterator<Item = (String, i64, String)>) -> HashMap<u32, GramStat> {
     // The dense key also records only metadata of rows containing this gram.
     // A recent non-match must not raise the recency ceiling of old matches.
     let mut counts = vec![(usize::MAX, 0u32, GramStat::default()); 47988];
+    let mut touched = Vec::new();
     for (row, (text, ts, who)) in texts.enumerate() {
         let code = weight_code(&who);
         let mut observe = |key: usize| {
             let (previous, current, stat) = &mut counts[key];
+            if stat.frequency == 0 {
+                touched.push(key as u32);
+            }
             if *previous != row {
                 *previous = row;
                 *current = 0;
@@ -2386,11 +2536,9 @@ fn gram_maxima(texts: impl Iterator<Item = (String, i64, String)>) -> HashMap<St
             }
         }
     }
-    counts
+    touched
         .into_iter()
-        .enumerate()
-        .filter(|(_, (_, _, stat))| stat.frequency != 0)
-        .map(|(key, (_, _, stat))| (gram_text(key as u32).expect("dense gram key"), stat))
+        .map(|key| (key, counts[key as usize].2))
         .collect()
 }
 
@@ -2424,7 +2572,7 @@ fn build_bounds(key: i64, rows: Vec<BoundRow>) -> Result<BuiltBounds> {
         texts.push((text, ts, who));
     }
     let mut grams: Vec<_> = gram_maxima(texts.into_iter()).into_iter().collect();
-    grams.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    grams.sort_unstable_by_key(|a| a.0);
     Ok(BuiltBounds {
         key,
         max_ts,
@@ -2465,6 +2613,7 @@ fn gram_code(gram: &str) -> Option<u32> {
 pub(crate) fn indexed_gram(gram: &str) -> bool {
     gram_code(gram).is_some()
 }
+#[cfg(test)]
 fn gram_text(code: u32) -> Result<String> {
     let (mut n, len) = if code < 36 {
         (code, 1)
@@ -2505,27 +2654,32 @@ pub(crate) fn take_varint(bytes: &[u8], at: &mut usize) -> Result<u32> {
     }
     anyhow::bail!("invalid integer list")
 }
-fn pack_grams(grams: &[(String, GramStat)]) -> Vec<u8> {
-    let mut keys: Vec<_> = grams.iter().filter_map(|(s, _)| gram_code(s)).collect();
-    keys.sort_unstable();
-    keys.dedup();
-    let (mut bytes, mut last) = (Vec::new(), 0);
-    for key in keys {
-        put_varint(key - last, &mut bytes);
-        last = key;
+const GRAM_BITMAP_BYTES: usize = 47988usize.div_ceil(8);
+fn pack_grams(grams: &[(u32, GramStat)]) -> Vec<u8> {
+    let mut bits = vec![0; GRAM_BITMAP_BYTES];
+    for &(key, _) in grams {
+        bits[key as usize / 8] |= 1 << (key % 8);
     }
-    lz4_flex::compress_prepend_size(&bytes)
+    lz4_flex::compress_prepend_size(&bits)
 }
-fn unpack_grams(bytes: &[u8]) -> Result<Vec<String>> {
-    let data = lz4_flex::decompress_size_prepended(bytes)?;
-    let (mut at, mut last, mut out) = (0, 0u32, Vec::new());
-    while at < data.len() {
-        last = last
-            .checked_add(take_varint(&data, &mut at)?)
-            .ok_or_else(|| anyhow::anyhow!("gram key overflow"))?;
-        out.push(gram_text(last)?);
-    }
-    Ok(out)
+fn gram_bitmap(bytes: &[u8]) -> Result<Vec<u8>> {
+    let bits = lz4_flex::decompress_size_prepended(bytes)?;
+    anyhow::ensure!(
+        bits.len() == GRAM_BITMAP_BYTES && bits[GRAM_BITMAP_BYTES - 1] & 0xf0 == 0,
+        "invalid gram bitmap"
+    );
+    Ok(bits)
+}
+fn bitmap_grams(bits: &[u8]) -> impl Iterator<Item = u32> + '_ {
+    bits.iter().enumerate().flat_map(|(index, &byte)| {
+        (0..8)
+            .filter(move |bit| byte & (1 << bit) != 0)
+            .map(move |bit| (index * 8 + bit) as u32)
+    })
+}
+#[cfg(test)]
+fn unpack_grams(bytes: &[u8]) -> Result<Vec<u32>> {
+    Ok(bitmap_grams(&gram_bitmap(bytes)?).collect())
 }
 fn put_wide(mut n: u64, out: &mut Vec<u8>) {
     while n >= 128 {
@@ -2549,21 +2703,30 @@ fn take_wide(bytes: &[u8], at: &mut usize) -> Result<u64> {
     }
     anyhow::bail!("invalid timestamp")
 }
+const POSTING_CHUNK: u32 = 64;
 pub(crate) fn posting_list(c: &Connection, lane: i64, gram: &str) -> Result<Vec<Posting>> {
     let Some(key) = gram_code(gram) else {
         return Ok(vec![]);
     };
+    let mut q = c.prepare_cached(
+        "SELECT body FROM gram_postings WHERE lane=?1 AND gram=?2 ORDER BY chunk",
+    )?;
+    let mut rows = q.query(params![lane, key])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.extend(decode_posting(row.get_ref(0)?.as_blob()?)?);
+    }
+    Ok(out)
+}
+fn posting_chunk(c: &Connection, lane: i64, key: u32, chunk: u32) -> Result<Vec<Posting>> {
     let bytes: Option<Vec<u8>> = c
-        .query_row(
-            "SELECT body FROM gram_postings WHERE lane=?1 AND gram=?2",
-            params![lane, key],
-            |r| r.get(0),
-        )
+        .prepare_cached("SELECT body FROM gram_postings WHERE lane=?1 AND gram=?2 AND chunk=?3")?
+        .query_row(params![lane, key, chunk], |r| r.get(0))
         .optional()?;
-    let Some(bytes) = bytes else {
-        return Ok(vec![]);
-    };
-    let packed = lz4_flex::decompress_size_prepended(&bytes)?;
+    bytes.map_or_else(|| Ok(vec![]), |bytes| decode_posting(&bytes))
+}
+fn decode_posting(bytes: &[u8]) -> Result<Vec<Posting>> {
+    let packed = lz4_flex::decompress_size_prepended(bytes)?;
     let data = packed
         .strip_prefix(b"R1")
         .ok_or_else(|| anyhow::anyhow!("invalid posting format"))?;
@@ -2594,12 +2757,34 @@ pub(crate) fn posting_list(c: &Connection, lane: i64, gram: &str) -> Result<Vec<
     }
     Ok(rows)
 }
+#[cfg(test)]
 fn write_posting(tx: &Transaction<'_>, lane: i64, gram: &str, rows: &[Posting]) -> Result<()> {
-    let key = gram_code(gram).ok_or_else(|| anyhow::anyhow!("unsupported gram key"))?;
+    let mut at = 0;
+    while at < rows.len() {
+        let chunk = rows[at].block / POSTING_CHUNK;
+        let end = at + rows[at..].partition_point(|r| r.block / POSTING_CHUNK == chunk);
+        write_posting_chunk(
+            tx,
+            lane,
+            gram_code(gram).expect("test gram"),
+            chunk,
+            &rows[at..end],
+        )?;
+        at = end;
+    }
+    Ok(())
+}
+fn write_posting_chunk(
+    tx: &Transaction<'_>,
+    lane: i64,
+    key: u32,
+    chunk: u32,
+    rows: &[Posting],
+) -> Result<()> {
     if rows.is_empty() {
         tx.execute(
-            "DELETE FROM gram_postings WHERE lane=?1 AND gram=?2",
-            params![lane, key],
+            "DELETE FROM gram_postings WHERE lane=?1 AND gram=?2 AND chunk=?3",
+            params![lane, key, chunk],
         )?;
         return Ok(());
     }
@@ -2616,21 +2801,21 @@ fn write_posting(tx: &Transaction<'_>, lane: i64, gram: &str, rows: &[Posting]) 
         last = row.block;
         timestamp = row.max_ts;
     }
-    tx.prepare_cached("INSERT INTO gram_postings VALUES(?1,?2,?3) ON CONFLICT(lane,gram) DO UPDATE SET body=excluded.body")?.execute(params![lane,key,lz4_flex::compress_prepend_size(&body)])?;
+    tx.prepare_cached("INSERT INTO gram_postings VALUES(?1,?2,?3,?4) ON CONFLICT(lane,gram,chunk) DO UPDATE SET body=excluded.body")?.execute(params![lane,key,chunk,lz4_flex::compress_prepend_size(&body)])?;
     Ok(())
 }
 
 fn update_blocks(
     tx: &Transaction<'_>,
     blocks: &BTreeSet<i64>,
-    append_from: Option<i64>,
+    append_from: Option<[i64; 2]>,
 ) -> Result<()> {
     let first: bool = !tx.query_row("SELECT EXISTS(SELECT 1 FROM gram_postings)", [], |r| {
         r.get::<_, bool>(0)
     })?;
-    let mut changed: HashMap<(i64, String), Vec<Posting>> = HashMap::new();
+    let mut changed: HashMap<(i64, u32, u32), Vec<Posting>> = HashMap::new();
     let keys: Vec<_> = blocks.iter().copied().collect();
-    for chunk in keys.chunks(rayon::current_num_threads().max(1) * 2) {
+    for chunk in keys.chunks(32) {
         let mut input = vec![];
         for &key in chunk {
             let (table, block) = if key < 0 {
@@ -2638,27 +2823,37 @@ fn update_blocks(
             } else {
                 ("prose", key)
             };
-            let append = if let Some(floor) = append_from.filter(|_| key >= 0 && !first) {
-                tx.query_row("SELECT EXISTS(SELECT 1 FROM blocks WHERE id=?1) AND NOT EXISTS(SELECT 1 FROM bound_updates WHERE id>=?2 AND id<?3 AND id<=?4)",params![block,block*BLOCK,(block+1)*BLOCK,floor],|r|r.get::<_,bool>(0))?
+            let (metadata, dirty, lane) = if key < 0 {
+                ("tool_blocks", "tool_bound_updates", 1)
+            } else {
+                ("blocks", "bound_updates", 0)
+            };
+            let floor = append_from.map(|f| f[lane]);
+            let append = if let Some(floor) = floor.filter(|_| !first) {
+                tx.prepare_cached(&format!("SELECT EXISTS(SELECT 1 FROM {metadata} WHERE id=?1) AND NOT EXISTS(SELECT 1 FROM {dirty} WHERE id>=?2 AND id<?3 AND id<=?4)"))?.query_row(params![block,block*BLOCK,(block+1)*BLOCK,floor],|r|r.get::<_,bool>(0))?
             } else {
                 false
             };
             let lo = if append {
-                (block * BLOCK).max(append_from.unwrap() + 1)
+                (block * BLOCK).max(floor.unwrap() + 1)
             } else {
                 block * BLOCK
             };
             let rows=tx.prepare_cached(&format!("SELECT text,ts,who,session,position FROM {table} WHERE visible=1 AND id>=?1 AND id<?2"))?.query_map(params![lo,(block+1)*BLOCK],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?.collect::<rusqlite::Result<Vec<BoundRow>>>()?;
             input.push((key, rows, append));
         }
-        let built: Vec<_> = input
-            .into_par_iter()
-            .map(|(key, rows, append)| {
-                let mut b = build_bounds(key, rows)?;
-                b.append = append;
-                Ok::<_, anyhow::Error>(b)
-            })
-            .collect();
+        let small =
+            input.len() <= 1 || input.iter().map(|(_, rows, _)| rows.len()).sum::<usize>() <= 16;
+        let build = |(key, rows, append)| {
+            let mut bounds = build_bounds(key, rows)?;
+            bounds.append = append;
+            Ok::<_, anyhow::Error>(bounds)
+        };
+        let built: Vec<_> = if small {
+            input.into_iter().map(build).collect()
+        } else {
+            input.into_par_iter().map(build).collect()
+        };
         for b in built {
             let mut b = b?;
             if b.append && b.min_turn == i64::MAX {
@@ -2676,10 +2871,12 @@ fn update_blocks(
                     |r| r.get(0),
                 )
                 .optional()?;
-            let old: Vec<String> = if let Some(old) = old {
-                unpack_grams(&old)?
+            let mut presence =
+                old.map_or_else(|| Ok(vec![0; GRAM_BITMAP_BYTES]), |body| gram_bitmap(&body))?;
+            let old: Vec<_> = if b.append {
+                Vec::new()
             } else {
-                vec![]
+                bitmap_grams(&presence).collect()
             };
             let new: HashMap<_, _> = b.grams.iter().cloned().collect();
             let grams: HashSet<_> = if b.append {
@@ -2688,16 +2885,18 @@ fn update_blocks(
                 old.iter().cloned().chain(new.keys().cloned()).collect()
             };
             for gram in grams {
-                let key = (lane, gram);
-                if !changed.contains_key(&key) {
-                    let rows = if first {
-                        vec![]
-                    } else {
-                        posting_list(tx, lane, &key.1)?
-                    };
-                    changed.insert(key.clone(), rows);
-                }
-                let rows = changed.get_mut(&key).unwrap();
+                let key = (lane, gram, id as u32 / POSTING_CHUNK);
+                let rows = match changed.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let rows = if first {
+                            Vec::new()
+                        } else {
+                            posting_chunk(tx, lane, key.1, key.2)?
+                        };
+                        entry.insert(rows)
+                    }
+                };
                 if first {
                     if let Some(tf) = new.get(&key.1) {
                         rows.push(Posting {
@@ -2751,12 +2950,7 @@ fn update_blocks(
                 }
             }
             if b.append {
-                for gram in old {
-                    if !new.contains_key(&gram) {
-                        b.grams.push((gram, GramStat::default()));
-                    }
-                }
-                let (ts,user_ts,weight,session,turn,gap,ascii): (i64,Option<i64>,f64,String,i64,i64,bool) = tx.query_row("SELECT max_ts,user_ts,weight,min_session,min_turn,max_gap,all_ascii FROM blocks WHERE id=?",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)))?;
+                let (ts,user_ts,weight,session,turn,gap,ascii): (i64,Option<i64>,f64,String,i64,i64,bool) = tx.query_row(&format!("SELECT max_ts,user_ts,weight,min_session,min_turn,max_gap,all_ascii FROM {metadata} WHERE id=?"),[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)))?;
                 b.max_ts = b.max_ts.max(ts);
                 b.user_ts = b.user_ts.max(user_ts);
                 b.weight = b.weight.max(weight);
@@ -2769,7 +2963,15 @@ fn update_blocks(
                     b.min_turn = b.min_turn.min(turn);
                 }
             }
-            tx.prepare_cached("INSERT INTO block_grams VALUES(?1,?2,?3) ON CONFLICT(lane,block) DO UPDATE SET body=excluded.body")?.execute(params![lane,id,pack_grams(&b.grams)])?;
+            let packed = if b.append {
+                for &(key, _) in &b.grams {
+                    presence[key as usize / 8] |= 1 << (key % 8);
+                }
+                lz4_flex::compress_prepend_size(&presence)
+            } else {
+                pack_grams(&b.grams)
+            };
+            tx.prepare_cached("INSERT INTO block_grams VALUES(?1,?2,?3) ON CONFLICT(lane,block) DO UPDATE SET body=excluded.body")?.execute(params![lane,id,packed])?;
             tx.execute(&format!("DELETE FROM {metadata} WHERE id=?"), [id])?;
             if b.min_turn != i64::MAX {
                 tx.prepare_cached(&format!(
@@ -2789,12 +2991,12 @@ fn update_blocks(
         }
     }
     let mut changed: Vec<_> = changed.into_iter().collect();
-    changed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    for ((lane, gram), mut rows) in changed {
+    changed.sort_unstable_by_key(|a| a.0);
+    for ((lane, gram, chunk), mut rows) in changed {
         if first {
             rows.sort_unstable_by_key(|r| r.block);
         }
-        write_posting(tx, lane, &gram, &rows)?;
+        write_posting_chunk(tx, lane, gram, chunk, &rows)?;
     }
     Ok(())
 }
@@ -2805,65 +3007,94 @@ pub fn counts(c: &Connection) -> Result<serde_json::Value> {
     )
 }
 
-fn family_aliases(tx: &Transaction<'_>) -> Result<HashMap<(String, String), String>> {
-    let indexed = tx
-        .prepare("SELECT agent,id FROM sessions s WHERE EXISTS(SELECT 1 FROM prose p INDEXED BY prose_session WHERE p.agent=s.agent AND p.session=s.id)")?
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-        .collect::<rusqlite::Result<HashSet<_>>>()?;
-    let mut claims = BTreeMap::<(String, String), Option<String>>::new();
-    let mut q = tx.prepare("SELECT ss.agent,ss.session,s.path FROM session_sources ss JOIN sources s ON s.rowid=ss.source JOIN sessions c ON c.agent=ss.agent AND c.id=ss.session")?;
-    for row in q.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-        ))
-    })? {
-        let (agent, session, path) = row?;
-        if !indexed.contains(&(agent.clone(), session.clone())) {
-            continue;
-        }
-        let Some(alias) = registry::session_alias(&agent, Path::new(&path), &session) else {
-            continue;
-        };
-        let key = (agent, alias);
-        if indexed.contains(&key) {
-            claims.insert(key, None);
-        } else {
-            claims
-                .entry(key)
-                .and_modify(|prior| {
-                    if prior.as_ref() != Some(&session) {
-                        *prior = None;
-                    }
-                })
-                .or_insert(Some(session));
-        }
-    }
-    let mut seen = HashSet::new();
-    Ok(claims
-        .into_iter()
-        .filter_map(|((agent, alias), session)| {
-            let session = session?;
-            seen.insert((agent.clone(), session.clone()))
-                .then_some(((agent, alias), session))
-        })
-        .collect())
+fn family_alias(tx: &Transaction<'_>, agent: &str, alias: &str) -> Result<Option<String>> {
+    if tx.query_row("SELECT EXISTS(SELECT 1 FROM sessions s WHERE s.agent=?1 AND s.id=?2 AND EXISTS(SELECT 1 FROM prose p INDEXED BY prose_session WHERE p.agent=s.agent AND p.session=s.id))", params![agent,alias], |r| r.get::<_,bool>(0))? { return Ok(None); }
+    let mut q = tx.prepare_cached(
+        "SELECT session FROM family_alias_claims WHERE agent=?1 AND alias=?2 LIMIT 2",
+    )?;
+    let claims: Vec<String> = q
+        .query_map(params![agent, alias], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let [session] = claims.as_slice() else {
+        return Ok(None);
+    };
+    // The original alias pass chose the first unambiguous filename per session.
+    let first: Option<String> = tx.query_row("SELECT min(c.alias) FROM family_alias_claims c WHERE c.agent=?1 AND c.session=?2 AND NOT EXISTS(SELECT 1 FROM family_alias_claims d WHERE d.agent=c.agent AND d.alias=c.alias AND d.session!=c.session) AND NOT EXISTS(SELECT 1 FROM sessions s WHERE s.agent=c.agent AND s.id=c.alias AND EXISTS(SELECT 1 FROM prose p INDEXED BY prose_session WHERE p.agent=s.agent AND p.session=s.id))", params![agent,session], |r| r.get(0))?;
+    Ok((first.as_deref() == Some(alias)).then(|| session.clone()))
 }
-
 fn resolve_families(tx: &Transaction<'_>, changed: &HashSet<(String, String)>) -> Result<()> {
-    if changed.is_empty() {
-        return Ok(());
+    let mut affected = HashSet::new();
+    for (agent, id) in changed {
+        let parent: Option<String> = tx.query_row("SELECT parent FROM sessions WHERE agent=?1 AND id=?2 AND EXISTS(SELECT 1 FROM prose p INDEXED BY prose_session WHERE p.agent=sessions.agent AND p.session=sessions.id)", params![agent,id], |r| r.get(0)).optional()?;
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT parent FROM family_nodes WHERE agent=?1 AND id=?2",
+                params![agent, id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let old_aliases: BTreeSet<String> = tx
+            .prepare_cached("SELECT alias FROM family_alias_claims WHERE agent=?1 AND session=?2")?
+            .query_map(params![agent, id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut aliases = BTreeSet::new();
+        if parent.is_some() {
+            let mut q = tx.prepare_cached("SELECT s.path FROM session_sources ss JOIN sources s ON s.rowid=ss.source WHERE ss.agent=?1 AND ss.session=?2")?;
+            for path in q.query_map(params![agent, id], |r| r.get::<_, String>(0))? {
+                if let Some(alias) = registry::session_alias(agent, Path::new(&path?), id) {
+                    aliases.insert(alias);
+                }
+            }
+        }
+        if parent == previous && aliases == old_aliases {
+            continue;
+        }
+        affected.insert((agent.clone(), id.clone()));
+        affected.extend(
+            aliases
+                .iter()
+                .chain(&old_aliases)
+                .map(|alias| (agent.clone(), alias.clone())),
+        );
+        // Another claim can change which alias is the first for its target.
+        for alias in aliases
+            .iter()
+            .chain(&old_aliases)
+            .chain(std::iter::once(id))
+        {
+            let targets: Vec<String> = tx
+                .prepare_cached(
+                    "SELECT session FROM family_alias_claims WHERE agent=?1 AND alias=?2",
+                )?
+                .query_map(params![agent, alias], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            for target in targets {
+                let names: Vec<String> = tx
+                    .prepare_cached(
+                        "SELECT alias FROM family_alias_claims WHERE agent=?1 AND session=?2",
+                    )?
+                    .query_map(params![agent, target], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                affected.extend(names.into_iter().map(|name| (agent.clone(), name)));
+            }
+        }
+        tx.execute(
+            "DELETE FROM family_alias_claims WHERE agent=?1 AND session=?2",
+            params![agent, id],
+        )?;
+        for alias in aliases {
+            tx.prepare_cached("INSERT INTO family_alias_claims VALUES(?1,?2,?3)")?
+                .execute(params![agent, alias, id])?;
+        }
+        if let Some(parent) = parent {
+            tx.prepare_cached("INSERT INTO family_nodes VALUES(?1,?2,?3) ON CONFLICT(agent,id) DO UPDATE SET parent=excluded.parent")?.execute(params![agent,id,parent])?;
+        } else {
+            tx.execute(
+                "DELETE FROM family_nodes WHERE agent=?1 AND id=?2",
+                params![agent, id],
+            )?;
+        }
     }
-    let aliases = family_aliases(tx)?;
-    let mut affected = changed.clone();
-    // A filename alias can appear, disappear or become ambiguous without its
-    // children's files changing. Their raw parent names stay available to resolve again.
-    affected.extend(
-        tx.prepare("SELECT s.agent,s.id FROM sessions s WHERE s.parent!='' AND NOT EXISTS(SELECT 1 FROM sessions p WHERE p.agent=s.agent AND p.id=s.parent)")?
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?,
-    );
     let mut queue: Vec<_> = affected.iter().cloned().collect();
     while let Some((agent, id)) = queue.pop() {
         let children: Vec<String> = tx
@@ -2897,12 +3128,7 @@ fn resolve_families(tx: &Transaction<'_>, changed: &HashSet<(String, String)>) -
                 )
                 .optional()?;
             match parent.filter(|s| !s.is_empty()) {
-                Some(p) => {
-                    cur = aliases
-                        .get(&(agent.clone(), p.clone()))
-                        .cloned()
-                        .unwrap_or(p)
-                }
+                Some(p) => cur = family_alias(tx, &agent, &p)?.unwrap_or(p),
                 None => break cur,
             }
         };
@@ -2913,6 +3139,51 @@ fn resolve_families(tx: &Transaction<'_>, changed: &HashSet<(String, String)>) -
             .execute(params![agent, id, root])?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod family_delta_tests {
+    use super::*;
+    #[test]
+    fn canonical_names_reconsider_other_aliases_of_the_masked_target() {
+        let mut c = Connection::open_in_memory().unwrap();
+        schema(&c).unwrap();
+        let tx = c.transaction().unwrap();
+        for (id, parent, family) in [
+            ("root", "", "root"),
+            ("child", "zzz", "zzz"),
+            ("aaa", "", "aaa"),
+        ] {
+            tx.execute(
+                "INSERT INTO sessions VALUES('pi',?1,'p','',?2,?3,0,'title',0,0)",
+                params![id, parent, family],
+            )
+            .unwrap();
+            tx.execute("INSERT INTO prose(source,agent,session,project,turn,who,model,model_source,ts,text,digest,extra) VALUES(0,'pi',?1,'p',0,'user','m',0,1,x'78','digest','')",[id]).unwrap();
+        }
+        tx.execute_batch("INSERT INTO family_nodes VALUES('pi','root',''),('pi','child','zzz'); INSERT INTO family_alias_claims VALUES('pi','aaa','root'),('pi','zzz','root');").unwrap();
+        let changed = HashSet::from([("pi".into(), "aaa".into())]);
+        resolve_families(&tx, &changed).unwrap();
+        assert_eq!(
+            tx.query_row("SELECT family FROM sessions WHERE id='child'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+            "root"
+        );
+        tx.execute("DELETE FROM prose WHERE session='aaa'", [])
+            .unwrap();
+        tx.execute("DELETE FROM sessions WHERE id='aaa'", [])
+            .unwrap();
+        resolve_families(&tx, &changed).unwrap();
+        assert_eq!(
+            tx.query_row("SELECT family FROM sessions WHERE id='child'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+            "zzz"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2947,7 +3218,7 @@ mod bound_tests {
         let grams = ["a", "00", "zzz"]
             .map(|s| {
                 (
-                    s.to_string(),
+                    super::gram_code(s).unwrap(),
                     super::GramStat {
                         frequency: 1,
                         ..Default::default()
@@ -2955,7 +3226,11 @@ mod bound_tests {
                 )
             })
             .to_vec();
-        let mut got = super::unpack_grams(&super::pack_grams(&grams)).unwrap();
+        let mut got: Vec<_> = super::unpack_grams(&super::pack_grams(&grams))
+            .unwrap()
+            .into_iter()
+            .map(|code| super::gram_text(code).unwrap())
+            .collect();
         got.sort();
         assert_eq!(got, vec!["00", "a", "zzz"]);
     }
@@ -2966,12 +3241,10 @@ mod bound_tests {
                 .into_iter()
                 .map(|s| (s.to_owned(), 1, "user".to_owned())),
         );
-        assert_eq!(got["a"].frequency, 4);
-        assert_eq!(got["aa"].frequency, 3);
-        assert_eq!(got["aaa"].frequency, 2);
-        assert!(!got.contains_key("é"));
-        assert!(!got.contains_key("éé"));
-        assert!(!got.contains_key("ééé"));
+        assert_eq!(got[&super::gram_code("a").unwrap()].frequency, 4);
+        assert_eq!(got[&super::gram_code("aa").unwrap()].frequency, 3);
+        assert_eq!(got[&super::gram_code("aaa").unwrap()].frequency, 2);
+        assert_eq!(got.len(), 3);
     }
     #[test]
     fn dense_counts_match_literal_grams_across_unicode_and_punctuation() {
@@ -2998,7 +3271,7 @@ mod bound_tests {
                     .map(|s| (s.to_owned(), 1, "user".to_owned()))
             )
             .into_iter()
-            .map(|(s, v)| (s, v.frequency))
+            .map(|(code, v)| (super::gram_text(code).unwrap(), v.frequency))
             .collect::<std::collections::HashMap<_, _>>(),
             expected
         );

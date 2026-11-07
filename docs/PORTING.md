@@ -40,8 +40,7 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
 - `--more` serves a page's frozen rows until its TTL, as 0.4.9 did, without 0.4.9's
   `corpus changed since this page was frozen; newer results may exist - rerun the search
   to refresh` line when the index changed meanwhile: a 0.5 page keeps its rows, query and
-  totals but not the state of the index it came from, which the background refresh
-  changes between almost any two pages while an agent works.
+  totals across later source ingestion: a continuation belongs to its original answer.
 - Recall's structured hit also carries its verified handle and `self` bit, and source reply
   truncation is known from retained reply metadata where 0.4.9 reported it as unknown: 0.5
   keeps that metadata.
@@ -51,6 +50,15 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   counting the rows below it, keeps one vector store whose coverage is `semantic_coverage`,
   and probes the scope for the query's words only when the keyword lane found nothing,
   since a keyword row already proves one occurs.
+- Meaning search answers only from a complete snapshot. 0.4.9 searched the vectors
+  already published, even with unembedded rows, and disclosed that gap through
+  coverage numbers, partial flags and lines such as `catching up; retry shortly`.
+  0.5 embeds a small queued tail inline with the query model. During a larger build,
+  automatic hybrid silently uses keywords; explicit `-s` exits 2 with build progress.
+  `semantic_partial` and the semantic status's `partial` field are removed;
+  `semantic_coverage` is complete or null; `index --semantic` names a ready index
+  instead of printing a coverage ratio. This prevents newly indexed prose from
+  being silently absent from a meaning answer. `status` and setup explain the build.
 - An explicit `-s` whose lane failed gives the failure's cause as its reason, and a pack
   whose lanes failed for different causes says `semantic search unavailable: the meaning
   lane did not answer` without 0.4.9's `; it retries automatically`: 0.5 has no daemon to
@@ -121,19 +129,21 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   `freshness` keep their names; 0.4.9's data-dir, index, semantic and instruction keys
   become `data_root`, `format`, `index`, `semantic` and `integrations`, `messages` and
   `per_agent` become `prose`, `tools` and `sources`, and 0.5 adds `disk_bytes`,
-  `disk_files`, `archive`, `permissions`, `source_errors` and `pending_sources`. The
+  `disk_files`, `archive`, `permissions` and `source_errors`. The
   daemon, diagnostics-tier, warning and build-identity keys are gone with that machinery.
 - A bare `agrep` runs `status` rather than 0.4.9's welcome page of recent chats and example
   commands: one status page serves both, and `agrep chats` lists the recent chats.
 
 ## Around, summary and usage errors
 
-- Sources changed since the last refresh appear as `pending_sources` on around's trailing
-  freshness record, with no stderr line, where 0.4.9 printed an `index-behind` record with
-  `changed_stores` and `serving the last-good index (N stores changed)`: 0.5 refreshes
-  them in the background as it answers, so the count is the whole story, as in search,
-  recall and chats. Under `AGREP_DATA_READONLY` the record says `unchecked`: 0.5 skips
-  the source check when it may not write.
+- 0.4.9 served the last-good index and said it was behind when transcripts had changed.
+  0.5 indexes those changes before answering: search in every form, recall, pack, around,
+  chats, summary (including pending), resume, status, postcompact and each explorer
+  request use the completed source census and foreground refresh. This makes a transcript
+  change visible to the next command. There is no behind notice or changed-source count
+  in an answer's freshness record or status. `--more` continues its first frozen page.
+  `--no-auto` keeps 0.4.9's unchecked record; a read-only data root also says `unchecked`
+  because 0.5 skips ingestion when it may not write.
 
 ## Command line and help
 

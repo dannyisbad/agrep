@@ -38,13 +38,30 @@ fn missing_model_is_one_line_exit_two_and_hybrid_stays_lexical() {
     assert!(!t.path().join("model").exists());
 }
 #[test]
-fn partial_semantic_zero_exits_one_and_reports_numbers() {
+fn a_building_meaning_index_never_answers_partially() {
     let t = tempfile::tempdir().unwrap();
-    let r = DataRoot::open(t.path().join("data"), true).unwrap();
-    let c = store::writer(&r).unwrap();
-    c.execute("INSERT INTO prose(source,agent,session,project,turn,who,model,model_source,ts,text,digest,extra) VALUES(1,'codex','session','p',1,'user','',0,0,'text','digest','')",[]).unwrap();
-    // Empty coverage never loads weights. Sparse file sizes exercise that path
-    // without network, model initialization or embedding fabricated evidence.
+    let dir = t.path().join(".pi/agent/sessions/fixture");
+    fs::create_dir_all(&dir).unwrap();
+    let mut source = String::from("{\"type\":\"session\",\"id\":\"semantic-build-fixture\",\"version\":3,\"cwd\":\"/fixture\",\"timestamp\":\"2026-10-29T10:00:00Z\"}\n");
+    for n in 0..1024 {
+        source.push_str(&format!("{}\n", serde_json::json!({"type":"message","id":format!("m{n}"),"parentId":if n==0 {None} else {Some(format!("m{}",n-1))},"timestamp":"2026-10-29T10:01:00Z","message":{"role":"user","content":[{"type":"text","text":format!("database migration failure number {n}")}]}})));
+    }
+    fs::write(dir.join("case.jsonl"), source).unwrap();
+    let indexed = agrep(&t).arg("index").output().unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let root = DataRoot::open(t.path().join("data"), false).unwrap();
+    assert_eq!(
+        semantic::coverage(&store::reader(&root).unwrap())
+            .unwrap()
+            .total,
+        1024
+    );
+    // A large build must be refused before loading weights. These sparse files
+    // satisfy discovery; verification would fail if the lane tried to answer.
     fs::create_dir(t.path().join("model")).unwrap();
     for (name, size, _) in agrep_core::semantic_model::FILES {
         fs::File::create(t.path().join("model").join(name))
@@ -52,31 +69,52 @@ fn partial_semantic_zero_exits_one_and_reports_numbers() {
             .set_len(size)
             .unwrap();
     }
-    let out = run(
-        &t,
-        &[
-            "search",
-            "--no-auto",
-            "-s",
-            "--json",
-            "database migration failure",
-        ],
-    );
-    assert_eq!(
-        out.status.code(),
-        Some(1),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let meta: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(meta["semantic_coverage"]["indexed"], 0);
-    assert_eq!(meta["semantic_coverage"]["total"], 1);
-    let out = run(
-        &t,
-        &["search", "--no-auto", "-s", "database migration failure"],
-    );
-    assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("semantic 0/1 rows"));
+    for command in ["search", "recall", "pack"] {
+        let out = run(&t, &[command, "database migration failure"]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{command}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!out.stdout.is_empty(), "{command}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        for notice in [
+            "semantic",
+            "meaning",
+            "building",
+            "catching up",
+            "may not show",
+        ] {
+            assert!(!stderr.contains(notice), "{command}: {stderr}");
+        }
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("meaning match"));
+        let out = run(&t, &[command, "-s", "database migration failure"]);
+        assert_eq!(out.status.code(), Some(2), "{command}");
+        assert!(out.stdout.is_empty());
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "semantic search unavailable: the meaning index is still building (0 of 1024 rows, about 18s left)\n");
+        let out = run(&t, &[command, "-s", "--json", "database migration failure"]);
+        assert_eq!(out.status.code(), Some(2), "{command}");
+        assert!(out.stderr.is_empty());
+        let meta: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(meta["error"]["code"], "semantic-unavailable");
+        let status = if command == "search" {
+            &meta["semantic"]
+        } else {
+            &meta["semantic_status"]
+        };
+        assert_eq!(
+            status["progress"],
+            serde_json::json!({"indexed_rows":0,"total_rows":1024,"remaining_rows":1024,"estimated_seconds":18})
+        );
+        assert!(meta["semantic_coverage"].is_null());
+        assert!(meta.get("semantic_partial").is_none());
+        assert!(status.get("partial").is_none());
+    }
+    let out = run(&t, &["status", "--json"]);
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(status["semantic"]["state"], "building");
+    assert_eq!(status["semantic"]["progress"]["remaining_rows"], 1024);
 }
 // Expected lines and fields are agrep 0.4.9's for `-s foo_bar` (py/search.py:7686-7719,
 // py/recall.py:2717-2747).
@@ -115,13 +153,13 @@ fn explicit_semantic_refuses_an_identifier_query_as_0_4_9() {
     );
     assert_eq!(record["semantic"], refused);
     assert_eq!(record["semantic_coverage"], serde_json::Value::Null);
-    assert_eq!(record["semantic_partial"], false);
+    assert!(record.get("semantic_partial").is_none());
     let out = run(&t, &["recall", "--no-auto", "-s", "--json", "foo_bar"]);
     assert_eq!(out.status.code(), Some(2));
     let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(record["engine"], "semantic:policy");
     assert_eq!(record["score_kind"], "cosine");
-    assert_eq!(record["partial"], false);
+    assert!(record.get("partial").is_none());
     assert_eq!(record["semantic_status"], refused);
     assert_eq!(
         record["error"],

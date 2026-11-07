@@ -10,7 +10,7 @@ use std::sync::Mutex;
 
 pub(crate) fn schema(c: &Connection) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS row_stats(id INTEGER PRIMARY KEY,agent TEXT NOT NULL,family TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS family_token_counts(agent TEXT NOT NULL,family TEXT NOT NULL,body BLOB NOT NULL,PRIMARY KEY(agent,family)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS family_token_counts(agent TEXT NOT NULL,family TEXT NOT NULL,start TEXT NOT NULL,body BLOB NOT NULL,PRIMARY KEY(agent,family,start)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS stats_dirty(id INTEGER PRIMARY KEY,old_text BLOB,old_agent TEXT,old_family TEXT);
 CREATE TRIGGER IF NOT EXISTS prose_stats_insert AFTER INSERT ON prose BEGIN INSERT OR IGNORE INTO stats_dirty(id) VALUES(new.id); END;
 CREATE TRIGGER IF NOT EXISTS prose_stats_delete BEFORE DELETE ON prose BEGIN INSERT OR IGNORE INTO stats_dirty SELECT old.id,CASE WHEN r.id IS NOT NULL THEN old.text END,r.agent,r.family FROM (SELECT 1) LEFT JOIN row_stats r ON r.id=old.id; END;
@@ -18,26 +18,76 @@ CREATE TRIGGER IF NOT EXISTS prose_stats_update BEFORE UPDATE OF text,visible,ag
 CREATE TRIGGER IF NOT EXISTS session_stats_family BEFORE UPDATE OF family ON sessions WHEN old.family!=new.family BEGIN INSERT OR IGNORE INTO stats_dirty SELECT p.id,CASE WHEN r.id IS NOT NULL THEN p.text END,r.agent,r.family FROM prose p LEFT JOIN row_stats r ON r.id=p.id WHERE p.agent=old.agent AND p.session=old.id; END;")?;
     Ok(())
 }
+const FAMILY_PAGE: usize = 256;
 #[derive(Default)]
 struct Family {
     key: Option<(String, String)>,
-    counts: HashMap<String, [u32; 2]>,
+    counts: HashMap<String, [i64; 2]>,
     delta: HashMap<String, [i64; 2]>,
+}
+fn write_family_page(
+    tx: &Transaction<'_>,
+    agent: &str,
+    family: &str,
+    start: &str,
+    counts: &HashMap<String, [u32; 2]>,
+) -> Result<()> {
+    let body = lz4_flex::compress_prepend_size(&serde_json::to_vec(counts)?);
+    tx.prepare_cached("INSERT INTO family_token_counts VALUES(?1,?2,?3,?4) ON CONFLICT(agent,family,start) DO UPDATE SET body=excluded.body")?.execute(params![agent,family,start,body])?;
+    Ok(())
 }
 impl Family {
     fn flush(&mut self, tx: &Transaction<'_>) -> Result<()> {
         let Some((agent, family)) = &self.key else {
             return Ok(());
         };
-        self.counts.retain(|_, v| *v != [0, 0]);
-        if self.counts.is_empty() {
-            tx.execute(
-                "DELETE FROM family_token_counts WHERE agent=?1 AND family=?2",
-                params![agent, family],
-            )?;
-        } else {
-            let body = lz4_flex::compress_prepend_size(&serde_json::to_vec(&self.counts)?);
-            tx.execute("INSERT INTO family_token_counts VALUES(?1,?2,?3) ON CONFLICT(agent,family) DO UPDATE SET body=excluded.body",params![agent,family,body])?;
+        let mut pages: HashMap<String, HashMap<String, [u32; 2]>> = HashMap::new();
+        let mut locate = tx.prepare_cached("SELECT start FROM family_token_counts WHERE agent=?1 AND family=?2 AND start<=?3 ORDER BY start DESC LIMIT 1")?;
+        for (token, change) in std::mem::take(&mut self.counts) {
+            if change == [0, 0] {
+                continue;
+            }
+            let page: Option<String> = locate
+                .query_row(params![agent, family, token], |r| r.get(0))
+                .optional()?;
+            let start = page.as_deref().unwrap_or("").to_owned();
+            if !pages.contains_key(&start) {
+                let counts = if page.is_some() {
+                    let body: Vec<u8> = tx.prepare_cached("SELECT body FROM family_token_counts WHERE agent=?1 AND family=?2 AND start=?3")?.query_row(params![agent,family,start], |r| r.get(0))?;
+                    serde_json::from_slice(&lz4_flex::decompress_size_prepended(&body)?)?
+                } else {
+                    HashMap::new()
+                };
+                pages.insert(start.clone(), counts);
+            }
+            let counts = pages.get_mut(&start).expect("loaded family page");
+            let n = counts.entry(token.clone()).or_default();
+            for column in 0..2 {
+                let before = n[column] > 0;
+                n[column] = u32::try_from(i64::from(n[column]) + change[column])
+                    .context("family token count overflow or underflow")?;
+                self.delta.entry(token.clone()).or_default()[column] +=
+                    i64::from(n[column] > 0) - i64::from(before);
+            }
+            if *n == [0, 0] {
+                counts.remove(&token);
+            }
+        }
+        for (start, counts) in pages {
+            if counts.len() <= FAMILY_PAGE {
+                write_family_page(tx, agent, family, &start, &counts)?;
+            } else {
+                let mut items: Vec<_> = counts.into_iter().collect();
+                items.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                for (index, chunk) in items.chunks(FAMILY_PAGE).enumerate() {
+                    let lower = if index == 0 {
+                        start.as_str()
+                    } else {
+                        &chunk[0].0
+                    };
+                    write_family_page(tx, agent, family, lower, &chunk.iter().cloned().collect())?;
+                }
+            }
         }
         Ok(())
     }
@@ -49,8 +99,13 @@ impl Family {
         text: &str,
         sign: i64,
     ) -> Result<()> {
-        let tokens = crate::boundary_stats::text_tokens(std::iter::once(text));
-        self.apply_tokens(tx, agent, family, tokens, sign)
+        self.apply_tokens(
+            tx,
+            agent,
+            family,
+            crate::boundary_stats::text_tokens(std::iter::once(text)),
+            sign,
+        )
     }
     fn apply_tokens(
         &mut self,
@@ -66,33 +121,11 @@ impl Family {
             .is_some_and(|(a, f)| a == &agent && f == &family)
         {
             self.flush(tx)?;
-            let body: Option<Vec<u8>> = tx
-                .query_row(
-                    "SELECT body FROM family_token_counts WHERE agent=?1 AND family=?2",
-                    params![agent, family],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            self.counts = if let Some(body) = body {
-                serde_json::from_slice(&lz4_flex::decompress_size_prepended(&body)?)?
-            } else {
-                HashMap::new()
-            };
             self.key = Some((agent, family));
         }
         for (column, tokens) in [(0, any), (1, aligned)] {
             for token in tokens {
-                let n = &mut self.counts.entry(token.clone()).or_default()[column];
-                let before = *n > 0;
-                *n = if sign > 0 {
-                    n.checked_add(1).context("family token count overflow")?
-                } else {
-                    n.checked_sub(1).context("family token count underflow")?
-                };
-                if (*n > 0) != before {
-                    self.delta.entry(token).or_default()[column] +=
-                        i64::from(*n > 0) - i64::from(before);
-                }
+                self.counts.entry(token).or_default()[column] += sign;
             }
         }
         Ok(())
@@ -338,11 +371,17 @@ fn build_in_chunks(tx: &Transaction<'_>, chunk_rows: usize) -> Result<()> {
                 }
             }
         });
-        let mut insert = tx.prepare("INSERT INTO family_token_counts VALUES(?1,?2,?3)")?;
-        let mut store = |done: Result<Vec<(u32, Vec<u8>)>>| -> Result<()> {
+        let store = |done: Result<Vec<(u32, Vec<u8>)>>| -> Result<()> {
             for (family, body) in done? {
                 let (agent, name) = &families[family as usize];
-                insert.execute(params![agent, name, body])?;
+                let counts: HashMap<String, [u32; 2]> =
+                    serde_json::from_slice(&lz4_flex::decompress_size_prepended(&body)?)?;
+                let mut items: Vec<_> = counts.into_iter().collect();
+                items.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                for (index, chunk) in items.chunks(FAMILY_PAGE).enumerate() {
+                    let lower = if index == 0 { "" } else { &chunk[0].0 };
+                    write_family_page(tx, agent, name, lower, &chunk.iter().cloned().collect())?;
+                }
             }
             Ok(())
         };
@@ -570,10 +609,15 @@ CREATE TABLE term_stats(token TEXT PRIMARY KEY,n INTEGER NOT NULL,s INTEGER NOT 
         let mut rows = q.query([]).unwrap();
         while let Some(row) = rows.next().unwrap() {
             let body: Vec<u8> = row.get(2).unwrap();
-            let counts =
+            let counts: HashMap<String, [u32; 2]> =
                 serde_json::from_slice(&lz4_flex::decompress_size_prepended(&body).unwrap())
                     .unwrap();
-            bodies.insert((row.get(0).unwrap(), row.get(1).unwrap()), counts);
+            if !counts.is_empty() {
+                bodies
+                    .entry((row.get(0).unwrap(), row.get(1).unwrap()))
+                    .or_default()
+                    .extend(counts);
+            }
         }
         let terms = c
             .prepare("SELECT token,n,s FROM term_stats")

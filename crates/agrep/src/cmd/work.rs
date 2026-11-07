@@ -55,7 +55,7 @@ fn execute(
         }
     }
     let selected = |task: &str| requested.is_empty() || requested.iter().any(|t| t == task);
-    if selected("refresh") {
+    if requested.iter().any(|task| task == "refresh") {
         let Some(_lock) = root.work_lock(blocking)? else {
             return Ok(0);
         };

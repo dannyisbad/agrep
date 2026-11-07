@@ -590,6 +590,38 @@ impl Embedder {
         self.max_padding = percent;
         Ok(self)
     }
+    /// Two CPU streams retain single-chunk arithmetic while overlapping serial
+    /// projections with attention work in the same bounded Rayon pool.
+    pub fn embed_inline(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        if !self.device.is_cpu() {
+            bail!("inline semantic embedding requires the CPU");
+        }
+        if texts.len() < 2 {
+            return self.embed(texts);
+        }
+        let stream = |offset| {
+            texts
+                .iter()
+                .skip(offset)
+                .step_by(2)
+                .map(|text| {
+                    self.embed(std::slice::from_ref(text))
+                        .map(|mut v| v.remove(0))
+                })
+                .collect::<Result<Vec<_>>>()
+        };
+        let (a, b) = rayon::join(|| stream(0), || stream(1));
+        let (mut a, mut b) = (a?.into_iter(), b?.into_iter());
+        Ok((0..texts.len())
+            .map(|i| {
+                if i % 2 == 0 {
+                    a.next().unwrap()
+                } else {
+                    b.next().unwrap()
+                }
+            })
+            .collect())
+    }
     pub fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         if self.device.is_cpu() && texts.len() >= 32 {
             // Both streams use the same bounded Rayon pool. While one reaches

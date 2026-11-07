@@ -111,6 +111,8 @@ pub fn run(o: Options) -> Result<i32> {
         if o.yes || consent("download the semantic model?")? {
             if let Err(e) = agrep_core::semantic::provision(&root) {
                 errors.push(format!("semantic model: {e:#}"));
+            } else {
+                println!("The meaning index builds in the background. Meaning results join searches once the queued rows fit within about one second of CPU embedding; keywords are ready now.");
             }
         } else {
             println!("semantic download skipped; `agrep setup --yes` opts in");

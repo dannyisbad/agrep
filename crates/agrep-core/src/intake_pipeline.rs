@@ -195,14 +195,42 @@ fn retained_bytes((source, prepared): &Parsed, input: u64) -> u64 {
     (bytes as u64).saturating_mul(3).div_ceil(2).min(input)
 }
 
+fn prepare(source: SourceBatch) -> Parsed {
+    let event = |event: &crate::model::Event| {
+        (source.error.is_none() && event.kind != "control")
+            .then(|| tool_store::prepare(event).ok())
+            .flatten()
+    };
+    let small = source.events.len() <= 1
+        || source
+            .events
+            .iter()
+            .map(|e| e.input.len() + e.output.len())
+            .sum::<usize>()
+            <= 64 << 10;
+    let prepared = if small {
+        source.events.iter().map(event).collect()
+    } else {
+        source.events.par_iter().map(event).collect()
+    };
+    (source, prepared)
+}
+
 /// Keep active input and completed output inside one byte window, through the write.
 /// A feeder can reuse compaction credit while the writer is occupied with earlier rows.
 pub(crate) fn parse_ahead(
     parsers: usize,
     pending: Vec<crate::intake_batch::Pending>,
     sizes: &HashMap<&str, u64>,
-    write: impl FnMut(Parsed) -> Result<()>,
+    mut write: impl FnMut(Parsed) -> Result<()>,
 ) -> Result<Duration> {
+    if pending.len() == 1 {
+        let started = Instant::now();
+        let parsed = prepare(pending.into_iter().next().expect("one source").parse());
+        let waited = started.elapsed();
+        write(parsed)?;
+        return Ok(waited);
+    }
     run(
         parsers,
         pending,
@@ -261,17 +289,7 @@ fn run(
                 else {
                     break;
                 };
-                let source = source.parse();
-                let prepared = source
-                    .events
-                    .par_iter()
-                    .map(|event| {
-                        (source.error.is_none() && event.kind != "control")
-                            .then(|| tool_store::prepare(event).ok())
-                            .flatten()
-                    })
-                    .collect();
-                let parsed = (source, prepared);
+                let parsed = prepare(source.parse());
                 let input = reservation.bytes;
                 let retained = retained_bytes(&parsed, input);
                 reservation.retain(retained);

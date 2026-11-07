@@ -621,8 +621,7 @@ fn semantic_meta(
         return meta;
     };
     let all = |key: &str| runs.iter().all(|(_, s, _)| s[key] == true);
-    // A refused query's lane keeps its cosine kind; it never ran to be partial
-    // (py/recall.py:2283-2291).
+    // A refused query retains its cosine score kind (py/recall.py:2283-2291).
     let kind = |s: &Value| s["score_kind"].as_str().unwrap_or("cosine").to_owned();
     let kinds: BTreeSet<_> = runs.iter().map(|(_, s, _)| kind(s)).collect();
     let coverage = runs.iter().rev().find_map(|(_, _, c)| c.as_ref());
@@ -639,10 +638,6 @@ fn semantic_meta(
     if let Some(coverage) = coverage {
         meta.insert("semantic_coverage".into(), json!(coverage));
     }
-    meta.insert(
-        "partial".into(),
-        json!(coverage.map_or(first["partial"] == true, |c| c.partial())),
-    );
     let status = if runs.len() == 1 {
         first.clone()
     } else {
@@ -655,6 +650,13 @@ fn semantic_meta(
             .collect();
         if reasons.len() == 1 {
             status["reason"] = json!(reasons.first());
+        }
+        if !first["progress"].is_null()
+            && runs
+                .iter()
+                .all(|(_, s, _)| s["progress"] == first["progress"])
+        {
+            status["progress"] = first["progress"].clone();
         }
         status
     };
@@ -750,6 +752,18 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
         eprintln!("semantic model not installed: run agrep setup");
         return Ok(2);
     }
+    let (root, census) = {
+        let _span = agrep_core::semantic_profile::span("freshness_prepare");
+        match ready(no_auto) {
+            Ok(ready) => ready,
+            Err(e) => {
+                if let Some(error) = super::usage::recorded(&e) {
+                    stop("query:error", error)?;
+                }
+                return Err(e);
+            }
+        }
+    };
     let target = if a.probe {
         1
     } else {
@@ -778,21 +792,12 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
     // How deep 0.4.9 read each query's lanes (py/recall.py:2000-2001, 2255-2259).
     let query_target = target.max(if a.scope.no_meta { 40 } else { 8 });
     let mut meanings: Vec<Vec<Hit>> = Vec::new();
-    let (root, census) = {
-        let _span = agrep_core::semantic_profile::span("freshness_prepare");
-        match ready(no_auto) {
-            Ok(ready) => ready,
-            Err(e) => {
-                if let Some(error) = super::usage::recorded(&e) {
-                    stop("query:error", error)?;
-                }
-                return Err(e);
-            }
-        }
-    };
+    let identity = Identity::detect();
+    crate::finish_census(&root, census)?;
     let c = store::reader(&root)?;
     let mut semantic_ran = false;
     let mut semantic_failed = false;
+    let mut semantic_building = false;
     // An automatic meaning lane a query wanted with no model installed to run it.
     let mut model_missing = false;
     // An explicit `-s` lane that did not answer, and whether one failed rather than
@@ -801,7 +806,6 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
     let mut hybrid_used = false;
     let mut lane_runs: Vec<(String, Value, Option<semantic::Coverage>)> = Vec::new();
     let include_self = a.scope.include_self || (a.scope.chat.is_some() && !a.scope.no_self);
-    let identity = Identity::detect();
     if !a.json && !a.scope.include_self && (a.scope.no_self || identity.agent_context) {
         identity.disclose(a.scope.no_self, true);
     }
@@ -1072,6 +1076,10 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
                     lane_runs.push((query.clone(), status, None));
                     Results::default()
                 }
+                Err(error) if semantic::is_building(&error) => {
+                    semantic_building = true;
+                    keyword
+                }
                 Err(error) => {
                     agrep_core::logging::semantic_failure(&root, &error);
                     semantic_failed = true;
@@ -1134,7 +1142,6 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
             let meta = semantic_meta(&lane_runs, queries.len() > 1, false, false);
             eprintln!("{}", semantic::unavailable_notice(&meta["semantic_status"]));
             if !a.probe {
-                crate::finish_census(&root, census)?;
                 return Ok(2);
             }
         }
@@ -1253,10 +1260,6 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
     if a.probe {
         disclose();
     }
-    let pending_sources = {
-        let _span = agrep_core::semantic_profile::span("freshness_join");
-        crate::finish_census(&root, census)?
-    };
     let _render_span = agrep_core::semantic_profile::span("render");
     let checked = agrep_core::render::checked(no_auto);
     // 0.4.9's `meaning_lane_down` (py/recall.py:2353-2357, 2766-2769): a meaning lane that
@@ -1389,6 +1392,8 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
                 "model-not-installed"
             } else if !meaning_room {
                 "no-meaning-room"
+            } else if semantic_building {
+                "keyword-only"
             } else {
                 "query-not-language-shaped"
             };
@@ -1399,7 +1404,7 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
             Some(note) => json!({"empty_dimensions":[],"checked":false,"reason":note}),
             None => json!(coverage),
         };
-        value["freshness"] = render::machine_freshness(no_auto, pending_sources);
+        value["freshness"] = render::machine_freshness(no_auto);
         value["semantic_coverage"] = lane_coverage;
         if unanswered {
             value["error"] = json!({"code":"semantic-unavailable"});
@@ -1498,9 +1503,9 @@ mod tests {
     #[test]
     fn semantic_envelope_matches_0_4_9() {
         let full = json!({"indexed":24,"total":24,"pending":0,"fraction":1.0,"complete":true,"order":"newest-first"});
-        let ready = json!({"state":"ready","eligible":true,"reason":null,"min_score":0.82,"score_kind":"cosine","coverage":full,"partial":false,"complete":true,"fallback_recommended":false});
+        let ready = json!({"state":"ready","eligible":true,"reason":null,"min_score":0.82,"score_kind":"cosine","coverage":full,"complete":true,"fallback_recommended":false});
         assert_eq!(semantic::status(&coverage(), true), ready);
-        let none = json!({"state":"no-confident-match","eligible":true,"reason":null,"min_score":0.82,"score_kind":"cosine","coverage":full,"partial":false,"complete":true,"fallback_recommended":false});
+        let none = json!({"state":"no-confident-match","eligible":true,"reason":null,"min_score":0.82,"score_kind":"cosine","coverage":full,"complete":true,"fallback_recommended":false});
         let runs = vec![(
             "zebra quantum lighthouse marmalade".to_owned(),
             semantic::status(&coverage(), false),
@@ -1508,7 +1513,7 @@ mod tests {
         )];
         assert_eq!(
             Value::Object(semantic_meta(&runs, false, false, false)),
-            json!({"score_kind":"cosine","semantic_coverage":full,"partial":false,"semantic_status":none})
+            json!({"score_kind":"cosine","semantic_coverage":full,"semantic_status":none})
         );
         let runs = vec![
             (
@@ -1520,7 +1525,7 @@ mod tests {
         ];
         assert_eq!(
             Value::Object(semantic_meta(&runs, true, true, false)),
-            json!({"score_kind":"cosine","semantic_coverage":full,"partial":false,
+            json!({"score_kind":"cosine","semantic_coverage":full,
                 "semantic_status":{"state":"ready","complete":true,"fallback_recommended":false},
                 "semantic_queries":[
                     {"query":"how do we rotate secret credentials","status":ready,"coverage":full},
@@ -1532,24 +1537,24 @@ mod tests {
             Value::Object(semantic_meta(&runs[..1], false, false, true)),
             json!({"semantic_status":ready})
         );
-        // py/search.py:581-610: a failed lane reports unavailable, partial and its cause.
+        // A failed lane reports unavailable and its cause; PORTING.md lists removed fields.
         let error = anyhow::anyhow!("model SHA-256 mismatch: model.safetensors");
         let failed = vec![("q".to_owned(), semantic::failed(&error), None)];
         assert_eq!(
             Value::Object(semantic_meta(&failed, false, false, false)),
-            json!({"score_kind":"unavailable","partial":true,"semantic_status":{
+            json!({"score_kind":"unavailable","semantic_status":{
                 "state":"unavailable","eligible":true,
                 "reason":"model SHA-256 mismatch: model.safetensors","min_score":0.82,
-                "score_kind":"unavailable","coverage":null,"partial":true,"complete":false,
+                "score_kind":"unavailable","coverage":null,"complete":false,
                 "fallback_recommended":true}})
         );
         // agrep 0.4.9's `recall -s --json foo_bar`: a refused query keeps the cosine kind
-        // and is not partial.
+        // without a result set.
         let error = anyhow::Error::new(semantic::Rejected("identifier-query"));
         let refused = vec![("foo_bar".to_owned(), semantic::failed(&error), None)];
         assert_eq!(
             Value::Object(semantic_meta(&refused, false, false, false)),
-            json!({"score_kind":"cosine","partial":false,"semantic_status":{
+            json!({"score_kind":"cosine","semantic_status":{
                 "state":"query-rejected","complete":false,"fallback_recommended":true,
                 "eligible":false,"reason":"identifier-query","min_score":0.82,"coverage":null}})
         );

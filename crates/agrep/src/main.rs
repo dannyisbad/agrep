@@ -932,7 +932,7 @@ fn compact(classic: bool) -> bool {
             .any(|k| std::env::var(k).is_ok_and(|v| !v.is_empty())),
     }
 }
-type CensusTask = std::thread::JoinHandle<Result<agrep_core::freshness::Pending>>;
+type CensusTask = std::thread::JoinHandle<Result<agrep_core::freshness::Check>>;
 fn ready(no_auto: bool) -> Result<(DataRoot, Option<CensusTask>)> {
     let root = DataRoot::discover()?;
     if no_auto && !root.db().exists() {
@@ -948,31 +948,36 @@ fn ready(no_auto: bool) -> Result<(DataRoot, Option<CensusTask>)> {
         let copy = root.clone();
         std::thread::spawn(move || {
             let _span = agrep_core::semantic_profile::span("freshness");
-            let pending = agrep_core::freshness::pending(&copy)?;
-            agrep_core::semantic_profile::event(serde_json::json!({"freshness":pending}));
+            let pending = agrep_core::freshness::check(&copy)?;
+            agrep_core::semantic_profile::event(serde_json::json!({"freshness":pending.stats}));
             Ok(pending)
         })
     });
     Ok((root, census))
 }
-/// Joins the census and starts the background work it found. A command without one
-/// (`--no-auto`, or a read-only data root) starts none.
-fn finish_census(root: &DataRoot, census: Option<CensusTask>) -> Result<usize> {
+/// Complete source ingestion before the first index read. Opt-outs start no work.
+fn finish_census(root: &DataRoot, census: Option<CensusTask>) -> Result<()> {
     let Some(task) = census else {
-        return Ok(0);
+        return Ok(());
     };
-    let census = task
+    let _span = agrep_core::semantic_profile::span("freshness_join");
+    let check = task
         .join()
         .map_err(|_| anyhow::anyhow!("source census failed"))??;
-    if census.changed_sources > 0 {
-        agrep_core::freshness::spawn(root, &std::env::current_exe()?)?;
-    } else {
-        if census.merge_pending {
-            agrep_core::freshness::spawn_merge(root, &std::env::current_exe()?)?;
+    let mut merge_pending = check.stats.merge_pending;
+    if check.stats.changed_sources > 0 {
+        let refresh = store::refresh_checked(root, check)?;
+        if refresh.changed_rows > 0 {
+            semantic::mark_index_changed(root)?;
         }
-        semantic::schedule(root)?;
+        merge_pending = agrep_core::fts_segments::pending(&store::reader(root)?)?;
+        agrep_core::semantic_profile::event(serde_json::json!({"auto_refresh":refresh}));
     }
-    Ok(census.changed_sources)
+    if merge_pending {
+        agrep_core::freshness::spawn_merge(root, &std::env::current_exe()?)?;
+    }
+    semantic::schedule(root)?;
+    Ok(())
 }
 
 fn run(cli: Cli, invocation: &cmd::usage::Invocation) -> Result<i32> {

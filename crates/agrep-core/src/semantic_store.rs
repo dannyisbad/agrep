@@ -19,24 +19,17 @@ pub struct Coverage {
 }
 impl Serialize for Coverage {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        // 0.4.9 rounded the fraction to six places (py/semantic.py:341).
-        let fraction = if self.total == 0 {
-            1.0
-        } else {
-            crate::window::round6(self.embedded as f64 / self.total as f64)
-        };
-        serde_json::json!({"indexed":self.embedded,"total":self.total,"pending":self.total.saturating_sub(self.embedded),"fraction":fraction,"complete":!self.partial(),"order":"newest-first"}).serialize(serializer)
+        if self.embedded != self.total {
+            return Err(serde::ser::Error::custom(
+                "semantic lane has not covered its snapshot",
+            ));
+        }
+        serde_json::json!({"indexed":self.total,"total":self.total,"pending":0,"fraction":1.0,"complete":true,"order":"newest-first"}).serialize(serializer)
     }
 }
 impl Coverage {
-    pub fn partial(&self) -> bool {
+    pub fn building(&self) -> bool {
         self.embedded < self.total
-    }
-    /// 0.4.9's `semantic_coverage_notice(.., suppress_trivial=True)` firing
-    /// (py/surface_policy.py:2835-2872): partial past the live-update tail, under 99% of
-    /// the rows embedded.
-    pub fn gap(&self) -> bool {
-        self.partial() && (self.embedded as f64) < self.total as f64 * 0.99
     }
 }
 /// Invalidate all derived vectors after an explicitly requested full rebuild.
@@ -139,6 +132,18 @@ pub fn quantize(vector: &[f32]) -> Result<(Vec<i8>, f32)> {
         scale,
     ))
 }
+fn encode(vectors: &[Vec<f32>]) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(vectors.len() * RECORD);
+    for v in vectors {
+        let (q, scale) = quantize(v)?;
+        bytes.extend_from_slice(&scale.to_le_bytes());
+        bytes.extend(q.into_iter().map(|x| x as u8));
+        for x in v {
+            bytes.extend_from_slice(&half::f16::from_f32(*x).to_le_bytes());
+        }
+    }
+    Ok(bytes)
+}
 pub fn publish(
     root: &DataRoot,
     pending: &[Pending],
@@ -149,15 +154,7 @@ pub fn publish(
         bail!("semantic batch length mismatch");
     }
     // File name derives from its exact bytes; a crash can only leave an unreferenced block.
-    let mut bytes = Vec::with_capacity(vectors.len() * (DIM * 3 + 4));
-    for v in vectors {
-        let (q, scale) = quantize(v)?;
-        bytes.extend_from_slice(&scale.to_le_bytes());
-        bytes.extend(q.into_iter().map(|x| x as u8));
-        for x in v {
-            bytes.extend_from_slice(&half::f16::from_f32(*x).to_le_bytes());
-        }
-    }
+    let bytes = encode(vectors)?;
     use sha2::{Digest, Sha256};
     let name = format!("{}.q8f16", crate::store::hex_digest(Sha256::digest(&bytes)));
     if !new.is_empty() {
@@ -214,6 +211,16 @@ pub struct Block {
 }
 const RECORD: usize = DIM * 3 + 4;
 impl Block {
+    pub fn memory(vectors: &[Vec<f32>]) -> Result<Self> {
+        let bytes = encode(vectors)?;
+        let mut map = memmap2::MmapMut::map_anon(bytes.len())?;
+        map.copy_from_slice(&bytes);
+        Ok(Self {
+            name: String::new(),
+            map: map.make_read_only()?,
+            rows: vectors.len(),
+        })
+    }
     /// Rows whose quantized upper bound reaches `floor`, with that bound and the
     /// exact F16 cosine.
     pub fn candidates(
@@ -311,19 +318,6 @@ pub fn blocks(root: &DataRoot, c: &Connection) -> Result<Vec<Block>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Cases are 0.4.9's own (py/test_surface_policy.py:807-821) and its silent `-s` on the
-    // 24-row meaning fixture: complete coverage and a churn-sized lag say nothing; a
-    // rebuild or a small corpus missing over a quarter of its rows is a gap.
-    #[test]
-    fn coverage_names_a_gap_as_0_4_9() {
-        let gap = |embedded, total| Coverage { embedded, total }.gap();
-        assert!(!gap(24, 24));
-        assert!(!gap(0, 0));
-        assert!(!gap(46358, 46421));
-        assert!(gap(4, 7200));
-        assert!(gap(20, 28));
-        assert!(gap(0, 1));
-    }
     #[test]
     fn parallel_block_mapping_preserves_order_and_validates_paths() {
         let (_t, r) = root();
@@ -403,17 +397,22 @@ mod tests {
         c.execute("INSERT INTO prose(id,source,agent,session,project,turn,who,model,model_source,ts,text,digest,extra) VALUES(1,1,'codex','abc','project',1,'user','',0,5,?,?,'')",params![text.as_bytes(),store::digest(text)]).unwrap();
     }
     #[test]
-    fn coverage_preserves_numeric_output_contract() {
+    fn coverage_serializes_only_complete_lanes() {
         let value = serde_json::to_value(Coverage {
             embedded: 3,
-            total: 4,
+            total: 3,
         })
         .unwrap();
         assert_eq!(value["indexed"], 3);
-        assert_eq!(value["pending"], 1);
-        assert_eq!(value["fraction"], 0.75);
-        assert_eq!(value["complete"], false);
+        assert_eq!(value["pending"], 0);
+        assert_eq!(value["fraction"], 1.0);
+        assert_eq!(value["complete"], true);
         assert_eq!(value["order"], "newest-first");
+        assert!(serde_json::to_value(Coverage {
+            embedded: 3,
+            total: 4
+        })
+        .is_err());
     }
     #[test]
     fn inference_cannot_attach_to_edited_text() {

@@ -166,7 +166,6 @@ fn installed_corruption_is_disclosed_and_reported_by_diagnostics() {
             "filter_coverage",
             "freshness",
             "semantic_coverage",
-            "semantic_partial"
         ]
     );
     let reason = record["semantic"]["reason"].as_str().unwrap().to_owned();
@@ -177,7 +176,7 @@ fn installed_corruption_is_disclosed_and_reported_by_diagnostics() {
         json!({"kind":"agrep-meta","query":"database migration failure",
             "engine":"semantic:unavailable","hits":[],"error":{"code":"semantic-unavailable"},
             "semantic":{"state":"unavailable","eligible":true,"reason":reason,"min_score":0.82,
-                "score_kind":"unavailable","coverage":null,"partial":true,"complete":false,
+                "score_kind":"unavailable","coverage":null,"complete":false,
                 "fallback_recommended":true},
             "self_exclusion":{"active":false,"reason":"machine-surface"},
             "completeness":{"shown":0,"total":0,"total_basis":"floor","unit":"row",
@@ -185,19 +184,12 @@ fn installed_corruption_is_disclosed_and_reported_by_diagnostics() {
                 "action_unavailable_reason":"the query did not produce a result set"},
             "filter_coverage":{"empty_dimensions":[],"checked":false,
                 "reason":"the query returned before the index was filtered"},
-            "freshness":record["freshness"],"semantic_coverage":null,"semantic_partial":true})
+            "freshness":record["freshness"],"semantic_coverage":null})
     );
     for (args, mut expected) in [
         (
             vec!["recall", "-s", "--json", "database migration failure"],
-            vec![
-                "query",
-                "engine",
-                "hits",
-                "score_kind",
-                "partial",
-                "semantic_status",
-            ],
+            vec!["query", "engine", "hits", "score_kind", "semantic_status"],
         ),
         (
             vec![
@@ -212,7 +204,6 @@ fn installed_corruption_is_disclosed_and_reported_by_diagnostics() {
                 "engine",
                 "hits",
                 "score_kind",
-                "partial",
                 "semantic_status",
                 "semantic_queries",
             ],
@@ -233,7 +224,7 @@ fn installed_corruption_is_disclosed_and_reported_by_diagnostics() {
         assert_eq!(value["engine"], "semantic:unavailable");
         assert_eq!(value["hits"], json!([]));
         assert_eq!(value["score_kind"], "unavailable");
-        assert_eq!(value["partial"], true);
+        assert!(value.get("partial").is_none());
         assert_eq!(value["semantic_status"]["state"], "unavailable");
         assert_eq!(value["semantic_status"]["reason"], json!(reason));
         assert_eq!(value["semantic_coverage"], Value::Null);

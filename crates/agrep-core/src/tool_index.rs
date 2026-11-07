@@ -20,13 +20,14 @@ pub(crate) fn schema(c: &Connection) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS tool_words(id INTEGER PRIMARY KEY,term TEXT NOT NULL UNIQUE,doc INTEGER NOT NULL,blocks BLOB NOT NULL DEFAULT x'');
 CREATE VIRTUAL TABLE IF NOT EXISTS tool_lexicon USING fts5(term,content='',contentless_delete=1,tokenize='trigram case_sensitive 1',detail=none);")?;
     c.execute_batch(WORD_INSERT)?;
-    c.execute_batch("CREATE TABLE IF NOT EXISTS tool_word_dirty(id INTEGER PRIMARY KEY);
+    c.execute_batch("CREATE TABLE IF NOT EXISTS tool_word_blocks(word INTEGER NOT NULL,block INTEGER NOT NULL,PRIMARY KEY(word,block)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS tool_word_dirty(id INTEGER PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS tool_word_old(id INTEGER PRIMARY KEY,text BLOB NOT NULL);
 CREATE VIRTUAL TABLE IF NOT EXISTS tool_word_batch USING fts5(text,content='',contentless_delete=1,tokenize='unicode61 remove_diacritics 0',detail=none);
 CREATE VIRTUAL TABLE IF NOT EXISTS tool_word_batch_vocab USING fts5vocab(tool_word_batch,row);
 CREATE TABLE IF NOT EXISTS tool_trigrams(gram INTEGER PRIMARY KEY,doc INTEGER NOT NULL);
-CREATE TRIGGER IF NOT EXISTS tool_word_old_update BEFORE UPDATE OF blob,visible,active ON event_rows WHEN old.blob IS NOT NULL AND old.visible=1 AND old.active=1 AND (old.blob IS NOT new.blob OR old.visible!=new.visible OR old.active!=new.active) BEGIN INSERT OR IGNORE INTO tool_word_old SELECT old.tool_id,body FROM tool_blobs WHERE id=old.blob; END;
-CREATE TRIGGER IF NOT EXISTS tool_word_old_delete BEFORE DELETE ON event_rows WHEN old.blob IS NOT NULL AND old.visible=1 AND old.active=1 BEGIN INSERT OR IGNORE INTO tool_word_old SELECT old.tool_id,body FROM tool_blobs WHERE id=old.blob; END;
+CREATE TRIGGER IF NOT EXISTS tool_word_old_update BEFORE UPDATE OF blob,visible,active ON event_rows WHEN old.blob IS NOT NULL AND old.visible=1 AND old.active=1 AND NOT EXISTS(SELECT 1 FROM tool_word_dirty WHERE id=old.tool_id) AND (old.blob IS NOT new.blob OR old.visible!=new.visible OR old.active!=new.active) BEGIN INSERT OR IGNORE INTO tool_word_old SELECT old.tool_id,body FROM tool_blobs WHERE id=old.blob; END;
+CREATE TRIGGER IF NOT EXISTS tool_word_old_delete BEFORE DELETE ON event_rows WHEN old.blob IS NOT NULL AND old.visible=1 AND old.active=1 AND NOT EXISTS(SELECT 1 FROM tool_word_dirty WHERE id=old.tool_id) BEGIN INSERT OR IGNORE INTO tool_word_old SELECT old.tool_id,body FROM tool_blobs WHERE id=old.blob; END;
 CREATE TRIGGER IF NOT EXISTS tool_word_dirty_insert AFTER INSERT ON event_rows WHEN new.blob IS NOT NULL AND new.visible=1 AND new.active=1 BEGIN INSERT OR IGNORE INTO tool_word_dirty VALUES(new.tool_id); END;
 CREATE TRIGGER IF NOT EXISTS tool_word_dirty_update AFTER UPDATE OF blob,visible,active ON event_rows WHEN new.blob IS NOT NULL AND new.visible=1 AND new.active=1 AND (old.blob IS NOT new.blob OR old.visible!=new.visible OR old.active!=new.active) BEGIN INSERT OR IGNORE INTO tool_word_dirty VALUES(new.tool_id); END;")?;
     Ok(())
@@ -414,113 +415,83 @@ pub(crate) fn refresh(
         let tokenizers = Tokenizers::new(tx)?;
         let mut tokenizer = tokenizers.tokenizer()?;
         let mut added: HashMap<Box<[u8]>, Vec<u32>> = HashMap::new();
-        {
-            let mut insert = tx.prepare("INSERT INTO tool_word_batch(text) VALUES(?)")?;
-            let mut q = tx.prepare(
-                "SELECT p.id,p.text FROM tool_word_dirty d JOIN tools p ON p.id=d.id WHERE p.visible=1",
-            )?;
+        let mut frequencies: HashMap<Box<[u8]>, i64> = HashMap::new();
+        for (sql, sign) in [
+            ("SELECT p.id,p.text FROM tool_word_dirty d CROSS JOIN tools p ON p.id=d.id WHERE p.visible=1", 1),
+            ("SELECT id,text FROM tool_word_old", -1),
+        ] {
+            let mut q = tx.prepare(sql)?;
             let mut rows = q.query([])?;
             while let Some(row) = rows.next()? {
                 let block = u32::try_from(row.get::<_, i64>(0)? / store::BLOCK)?;
                 let text = store::search_fold(&store::decode("tools", row.get(1)?)?);
-                let text = index_text(&text);
-                tokenizer.tokens(&text, |token| {
-                    if dictionary_word(token) {
-                        match added.get_mut(token) {
-                            Some(blocks) => blocks.push(block),
-                            None => {
-                                added.insert(token.into(), vec![block]);
-                            }
-                        }
+                for word in row_words(&mut tokenizer, &index_text(&text))? {
+                    *frequencies.entry(word.clone()).or_default() += sign;
+                    if sign > 0 {
+                        added.entry(word).or_default().push(block);
                     }
-                })?;
-                insert.execute([text.as_ref()])?;
-            }
-            let mut q = tx.prepare("SELECT text FROM tool_word_old")?;
-            let mut rows = q.query([])?;
-            while let Some(row) = rows.next()? {
-                let text = store::search_fold(&store::decode("tools", row.get(0)?)?);
-                insert.execute([index_text(&text).as_ref()])?;
-            }
-        }
-        {
-            // Frequencies come from the index itself; their deltas keep each
-            // trigram's sum equal to the total its expansion would compute.
-            let mut deltas: HashMap<u32, i64> = HashMap::new();
-            let mut vocabulary = tx.prepare("SELECT b.term,coalesce((SELECT doc FROM tools_vocab WHERE term=b.term),0) FROM tool_word_batch_vocab b WHERE length(b.term)>=3")?;
-            let mut select = tx.prepare("SELECT id,doc FROM tool_words WHERE term=?")?;
-            let mut update = tx.prepare("UPDATE tool_words SET doc=?2 WHERE id=?1")?;
-            let mut new_words = Vec::new();
-            let mut rows = vocabulary.query([])?;
-            while let Some(row) = rows.next()? {
-                let term: String = row.get(0)?;
-                let doc: i64 = row.get(1)?;
-                let old = select
-                    .query_row([&term], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
-                    .optional()?;
-                let delta = match old {
-                    None => doc,
-                    Some((id, before)) => {
-                        if before != doc {
-                            update.execute(params![id, doc])?;
-                        }
-                        doc - before
-                    }
-                };
-                if delta != 0 {
-                    for code in trigrams(term.as_bytes()) {
-                        *deltas.entry(code).or_default() += delta;
-                    }
-                }
-                if old.is_none() {
-                    new_words.push((term, doc));
-                }
-            }
-            drop(rows);
-            // The batch is discarded before any statement opens a savepoint, so its
-            // pending terms never become a segment.
-            tx.execute(
-                "INSERT INTO tool_word_batch(tool_word_batch) VALUES('delete-all')",
-                [],
-            )?;
-            // One statement: the lexicon rows its trigger writes join a single segment.
-            tx.execute(
-                "INSERT INTO tool_words(term,doc) SELECT value->>0,value->>1 FROM json_each(?1)",
-                [serde_json::to_string(&new_words)?],
-            )?;
-            let mut apply = tx.prepare("INSERT INTO tool_trigrams(gram,doc) VALUES(?1,?2) ON CONFLICT(gram) DO UPDATE SET doc=doc+excluded.doc")?;
-            for (code, delta) in deltas {
-                if delta != 0 {
-                    apply.execute(params![code, delta])?;
                 }
             }
         }
-        // Removed rows leave their blocks listed: presence may only overstate.
-        let mut select = tx.prepare_cached("SELECT id,blocks FROM tool_words WHERE term=?")?;
-        let mut update = tx.prepare_cached("UPDATE tool_words SET blocks=?2 WHERE id=?1")?;
-        for (token, mut blocks) in added {
-            let term = std::str::from_utf8(&token)?;
-            let Some((id, old)) = select
-                .query_row([term], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
-                })
+        let mut deltas: HashMap<u32, i64> = HashMap::new();
+        let mut new_words = Vec::new();
+        let mut select = tx.prepare("SELECT id FROM tool_words WHERE term=?")?;
+        let mut update = tx.prepare("UPDATE tool_words SET doc=doc+?2 WHERE id=?1")?;
+        for (word, delta) in frequencies {
+            let term = std::str::from_utf8(&word)?;
+            if let Some(id) = select
+                .query_row([term], |r| r.get::<_, i64>(0))
                 .optional()?
-            else {
-                bail!("tool word presence is incomplete");
-            };
-            let mut merged = decode_blocks(&old)?;
-            let before = merged.len();
-            merged.append(&mut blocks);
-            merged.sort_unstable();
-            merged.dedup();
-            if merged.len() != before {
-                update.execute(params![id, encode_blocks(&merged)])?;
+            {
+                if delta != 0 {
+                    update.execute(params![id, delta])?;
+                }
+            } else {
+                ensure!(delta >= 0, "negative new word frequency");
+                new_words.push((term.to_owned(), delta));
+            }
+            for code in trigrams(&word) {
+                *deltas.entry(code).or_default() += delta;
+            }
+        }
+        // One statement keeps the lexicon trigger's additions in one FTS segment.
+        tx.execute(
+            "INSERT INTO tool_words(term,doc) SELECT value->>0,value->>1 FROM json_each(?1)",
+            [serde_json::to_string(&new_words)?],
+        )?;
+        let mut apply = tx.prepare("INSERT INTO tool_trigrams(gram,doc) VALUES(?1,?2) ON CONFLICT(gram) DO UPDATE SET doc=doc+excluded.doc")?;
+        for (code, delta) in deltas {
+            if delta != 0 {
+                apply.execute(params![code, delta])?;
+            }
+        }
+        // The first build's compressed presence is immutable. Each added block is
+        // a keyed delta, so a common word never reads or rewrites its whole list.
+        let mut insert = tx.prepare(
+            "INSERT OR IGNORE INTO tool_word_blocks SELECT id,?2 FROM tool_words WHERE term=?1",
+        )?;
+        for (word, mut blocks) in added {
+            blocks.sort_unstable();
+            blocks.dedup();
+            let term = std::str::from_utf8(&word)?;
+            for block in blocks {
+                insert.execute(params![term, block])?;
             }
         }
     }
     tx.execute("DELETE FROM tool_word_dirty", [])?;
     tx.execute("DELETE FROM tool_word_old", [])?;
     Ok(())
+}
+fn word_blocks(c: &Connection, id: i64, base: &[u8]) -> Result<Vec<u32>> {
+    let mut blocks = decode_blocks(base)?;
+    let mut q = c.prepare_cached("SELECT block FROM tool_word_blocks WHERE word=?")?;
+    for row in q.query_map([id], |r| r.get::<_, u32>(0))? {
+        blocks.push(row?);
+    }
+    blocks.sort_unstable();
+    blocks.dedup();
+    Ok(blocks)
 }
 pub(crate) struct Word {
     pub term: String,
@@ -538,14 +509,14 @@ pub(crate) fn expand(c: &Connection, term: &str) -> Result<Option<Vec<Word>>> {
         .map(|g| format!("\"{}\"", std::str::from_utf8(g).unwrap()))
         .collect::<Vec<_>>()
         .join(" AND ");
-    let mut q=c.prepare("SELECT w.term,w.doc,w.blocks FROM tool_lexicon l CROSS JOIN tool_words w ON w.id=l.rowid WHERE tool_lexicon MATCH ?1 AND instr(w.term,?2)>0 AND w.doc>0")?;
+    let mut q=c.prepare("SELECT w.term,w.doc,w.blocks,w.id FROM tool_lexicon l CROSS JOIN tool_words w ON w.id=l.rowid WHERE tool_lexicon MATCH ?1 AND instr(w.term,?2)>0 AND w.doc>0")?;
     let mut rows = q.query([&expression, term])?;
     let mut words = Vec::new();
     while let Some(row) = rows.next()? {
         words.push(Word {
             term: row.get(0)?,
             doc: row.get(1)?,
-            blocks: decode_blocks(row.get_ref(2)?.as_blob()?)?,
+            blocks: word_blocks(c, row.get(3)?, row.get_ref(2)?.as_blob()?)?,
         });
     }
     Ok(Some(words))
@@ -704,16 +675,16 @@ mod presence_tests {
             .collect()
     }
     fn stored(c: &Connection, word: &str) -> BTreeSet<u32> {
-        decode_blocks(
-            &c.query_row("SELECT blocks FROM tool_words WHERE term=?", [word], |r| {
-                r.get::<_, Vec<u8>>(0)
-            })
-            .unwrap(),
-        )
-        .unwrap()
-        .into_iter()
-        .collect()
+        let (id, base): (i64, Vec<u8>) = c
+            .query_row(
+                "SELECT id,blocks FROM tool_words WHERE term=?",
+                [word],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        word_blocks(c, id, &base).unwrap().into_iter().collect()
     }
+
     #[test]
     fn block_lists_round_trip_both_encodings() {
         let dense: Vec<u32> = (40..2000).filter(|n| n % 3 != 0).collect();

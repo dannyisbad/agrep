@@ -44,7 +44,7 @@ pub fn source_rows(c: &Connection) -> Result<Vec<Value>> {
     )?;
     let result=q.query_map([],|r| {
         let path:String=r.get(0)?;let agent:String=r.get(1)?;
-        Ok(json!({"path":source_path(&path,&agent),"derived":path.starts_with('@')||path.starts_with("token:"),"agent":agent,"bytes":r.get::<_,i64>(2)?,"mtime_ns":r.get::<_,i64>(3)?,"last_error":r.get::<_,Option<String>>(4)?,"change_token":r.get::<_,String>(5)?}))
+        Ok(json!({"path":source_path(&path,&agent),"derived":path.starts_with('@')||path.starts_with("token:"),"agent":agent,"bytes":r.get::<_,i64>(2)?,"mtime_ns":r.get::<_,i64>(3)?,"last_error":r.get::<_,Option<String>>(4)?,"change_token":r.get::<_,crate::store::SourceToken>(5)?.diagnostic()}))
     })?.collect::<rusqlite::Result<_>>()?;
     Ok(result)
 }
@@ -132,7 +132,8 @@ pub fn status(root: &DataRoot) -> Result<Value> {
     out["sources"] = json!(sources);
     let coverage = crate::semantic::coverage(&c)?;
     let installed = crate::semantic::installed(root);
-    out["semantic"] = json!({"model_present":false,"model_installed":installed,"integrity_error":null,"model_path":crate::semantic_model::directory(root),"indexed_rows":coverage.embedded,"total_rows":coverage.total,"backlog":coverage.total.saturating_sub(coverage.embedded)});
+    let progress = crate::semantic::build_progress(&c, &coverage)?;
+    out["semantic"] = json!({"model_present":false,"model_installed":installed,"integrity_error":null,"model_path":crate::semantic_model::directory(root),"indexed_rows":coverage.embedded,"total_rows":coverage.total,"backlog":coverage.total.saturating_sub(coverage.embedded),"state":if !installed {"unavailable"} else if coverage.building() {"building"} else {"ready"},"progress":progress});
     let (bytes, files) = disk_usage(&root.0)?;
     out["disk_bytes"] = json!(bytes);
     out["disk_files"] = json!(files);

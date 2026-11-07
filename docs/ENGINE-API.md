@@ -52,8 +52,8 @@ visible prose, visible tool and source-error counts.
   hit's `handle` and `self` marker.
 - `Filters.session_rows` restricts a scope to one session from a position on, and
   `Filters.sessions` to a list of sessions; both read through the session indexes.
-- `Results.total_basis` is `exact` or `floor`. `Results.pending_sources` is filled by
-  the binary from its census. `Results.timings` has `plan_ms`, `sqlite_ms`,
+- `Results.total_basis` is `exact` or `floor`. The binary completes source ingestion
+  before opening the reader. `Results.timings` has `plan_ms`, `sqlite_ms`,
   `hydrate_ms`, `score_ms` and `total_ms`, without text or identifiers.
 - `Hit.meta_marker` serializes as `meta`, only when true: the row is the sole proven
   `~meta` evidence `--no-meta` retained.
@@ -64,15 +64,18 @@ visible prose, visible tool and source-error counts.
 
 ## Freshness and refresh
 
-- `freshness::pending(&DataRoot) -> Result<Pending>` runs the stat-only census without a
-  lock. `Pending` has `changed_sources` and `merge_pending`, plus diagnostic timings and
+- `freshness::check(&DataRoot) -> Result<Check>` runs a stat-only census without a
+  writer lock, retaining the source snapshot and `stats: Pending` for ingestion.
+  `freshness::pending` returns only those measurements. `Pending` has `changed_sources` and `merge_pending`, plus diagnostic timings and
   counts: `census_ms`, `read_ms`, `listing_ms`, `stat_ms`, `comparison_ms`,
   `listed_directories`, `cached_directories` and `stat_files`. `agrep __census` prints
   it as JSON without scheduling anything.
 - `freshness::spawn(&DataRoot, binary)` starts a detached `__work` when `work.lock` is
   free; `freshness::spawn_merge` starts `__work merge` when `merge.lock` is free.
   Callers spawn a merger only when `fts_segments::pending` reports merge work.
-- `store::refresh(&DataRoot, explicit, full)` and `store::reindex` refresh the index;
+- `store::refresh_checked(&DataRoot, Check)` waits for `writer.lock` and refreshes from
+  that census, comparing against the preceding writer's committed source stamps.
+  `store::refresh(&DataRoot, explicit, full)` and `store::reindex` take their own census;
   `store::refresh_session(&DataRoot, agent, session)` refreshes only the sources already
   attributed to that session, leaving other sources' fingerprints alone.
 - `Refresh` reports `sources`, `parsed`, `changed_rows`, `errors`, `resumed_sources`,
@@ -81,9 +84,9 @@ visible prose, visible tool and source-error counts.
   `commit_ms`, `total_ms`, and per-adapter maps). File sources parse while earlier ones
   are written, so `parse_ms` is discovery plus the writer's waits for a parse and
   `write_ms` excludes those waits.
-- `Explorer::with_freshness` takes a closure that runs the census and returns the
-  pending-source count; `agrep serve` and `agrep ui` pass the command line's own, so the
-  explorer reports the same count as the terminal.
+- `Explorer::with_freshness` takes a closure that completes ingestion before each
+  index-reading request and returns whether sources were checked; `agrep serve` and
+  `agrep ui` pass the command line's own freshness path.
 
 ## Profiling
 

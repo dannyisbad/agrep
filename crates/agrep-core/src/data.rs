@@ -5,7 +5,7 @@ use std::{
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
 };
-pub const FORMAT: &[u8] = b"agrep-data 2\n";
+pub const FORMAT: &[u8] = b"agrep-data 6\n";
 #[derive(Debug, Clone)]
 pub struct DataRoot(pub PathBuf);
 #[derive(Debug, Clone, Serialize, Deserialize)]

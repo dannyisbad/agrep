@@ -195,7 +195,7 @@
         "cfg(unix)",
         "cfg(windows)"
       ],
-      "reason": "Uses each platform\u2019s symlink API; the same source, restore, and instruction assertions run on both."
+      "reason": "Uses each platform’s symlink API; the same source, restore, and instruction assertions run on both."
     },
     {
       "test": "crates/agrep/tests/review_fixes.rs::post_index_hook_runs_after_changed_rows_and_only_once",

@@ -14,7 +14,7 @@ The root is `AGREP_DATA_DIR` if set, otherwise `~/Library/Application Support/ag
 on macOS, `$XDG_DATA_HOME/agrep/0.5` (or `~/.local/share/agrep/0.5`) on Linux and
 `%LOCALAPPDATA%\agrep\0.5` on Windows.
 
-`FORMAT` holds exactly `agrep-data 2\n`. An absent or empty root is initialized; the
+`FORMAT` holds exactly `agrep-data 6\n`. An absent or empty root is initialized; the
 marker is created with `create_new`, so racing initializers agree. Other marker bytes,
 or a non-empty root without a marker, are refused with one line naming the path. On Unix
 the root and its `archive`, `model` and `log` directories are created with mode 0700,
@@ -57,7 +57,7 @@ never deleted. Readers take no lock.
   while a writer waits: the step is interrupted and rolled back, its writer lock is free
   at once, and it runs again once no writer waits. A writer therefore never waits for
   merge work, however long the step a common trigram's doclist forces.
-- `work.lock`: one background worker for refresh and the queue tasks. A command spawns a
+- `work.lock`: one background worker for embeddings, hooks and archives. A command spawns a
   worker only while the lock is free; the worker takes it itself and exits if another
   process got there first.
 - `merge.lock`: the one process merging FTS segments. It holds no `work.lock`, so
@@ -74,13 +74,16 @@ can leave only an unreferenced file, which reclamation deletes.
 
 ## Census and freshness
 
-`freshness::pending` decides whether anything changed, without parsing:
+`freshness::check` decides whether anything changed, without parsing, and retains the
+source snapshot for the refresh (`pending` exposes only its measurements):
 
-- Each adapter's freshness roots are walked one directory level at a time on a pool of
-  at most eight threads. A directory's listing is cached by name in `source_directories`
-  and reused while its mtime is unchanged. Sources are stat'ed in the task that
-  confirmed their directory, split across the pool in chunks of 64. The index's
-  fingerprints are read from `sources` meanwhile.
+- Each adapter's freshness roots are walked on a pool of at most eight threads.
+  Directory traversal has no level barriers; after it confirms the reachable tree,
+  source files share stat tasks of at least 64 files across directory boundaries.
+  Cached listings stay packed while their directory mtime is unchanged, so each
+  filename needs no separate allocation. The index's fingerprints are read meanwhile.
+  File change tokens stay numeric in memory and use compact binary storage; JSON
+  encoding is reserved for diagnostics.
 - A fingerprint is size, modification time in nanoseconds and a change token (on Unix,
   the inode change time). SQLite stores (`.db`, `.sqlite`, `.sqlite3`, `.vscdb`) include
   their `-wal` file's size, time and token.
@@ -95,16 +98,25 @@ How commands use it (`ready` and `finish_census` in `crates/agrep/src/main.rs`):
 
 - Without `index.db` the command builds the index inline, printing `building the search
   db (a first build can take a while on a large history) …` on stderr, then answers.
-- Otherwise the census runs on its own thread while the command queries its snapshot.
-  Afterwards, if sources changed, the command spawns `agrep __work`. If none changed, it
-  spawns `agrep __work merge` when segments need merging, and `semantic::schedule`
-  spawns `agrep __work` for pending embeddings (model installed, `embeddings` not off),
-  a pending post-index hook, or an enabled archive.
-- The answer comes from the snapshot. The number of changed sources is part of the
-  result (`freshness.pending_sources` in JSON); the changes become visible once the
-  worker commits. `--no-auto` skips the census and marks freshness unchecked.
-- `postcompact` refreshes only the sources already attributed to the caller's session
-  (`store::refresh_session`); other changed sources stay pending.
+- Otherwise the census runs on its own thread alongside index-independent preparation:
+  search model read-ahead, caller detection, recall budgeting, and configuration reads.
+  Every reader joins it before its first index read. If sources changed, the command
+  waits for `writer.lock` and calls `store::refresh_checked` with that same census;
+  it does not walk the sources again or run the query twice. It compares the census
+  against the stamps committed by any preceding writer, rechecking only differing files
+  so a newer version that writer ingested also counts. It parses only uncovered changes.
+  A parse failure retains that source's last-good rows.
+- After ingestion, the command schedules `agrep __work merge` if FTS segments need
+  merging, and `semantic::schedule` schedules embeddings, the post-index hook and
+  archives. Scheduled workers do not refresh sources.
+- Every index answer includes source changes present when its command, request or redraw
+  began. A record still being written at that instant can be absent. `--no-auto` and a
+  read-only data root skip automatic ingestion and mark freshness unchecked. Continuation
+  pages (`--more`) retain the first page's frozen results.
+- `postcompact` uses the same full freshness path: although recovered rows belong to the
+  caller, its displayed family root is resolved through other indexed sessions.
+- The explorer runs this path before each index-reading HTTP request. Board and the
+  explorer's live view read native stores through the live service, without the index.
 
 ## Refresh pipeline
 
@@ -113,15 +125,19 @@ How commands use it (`ready` and `finish_census` in `crates/agrep/src/main.rs`):
 1. Takes `writer.lock` as described above.
 2. Reads `harness_prefixes.txt`; a digest different from the last refresh's re-parses
    every source.
-3. Censuses the sources and compares them with `sources`. With nothing new, changed or
+3. Uses the caller's census, or takes one for an explicit refresh, and compares it with
+   `sources`. With nothing new, changed or
    removed, it returns without a transaction.
 4. Parses the changed sources, adapters in parallel (up to four threads; eight for the
-   first build or a full refresh). pi, Claude and Codex `.jsonl` sources resume from a
+   first build or a full refresh). One-source updates parse inline; small record, event,
+   graph and bound batches stay serial so they do not create idle worker pools. pi, Claude and Codex `.jsonl` sources resume from a
    cursor in `parser_cursors`: byte offset, record count, file identity, parser state, a
-   SHA-256 digest of each 1 MiB chunk of the parsed prefix, and pi's header and current
-   leaf. A resume needs the same file identity, a length of at least the offset, and
-   every prior chunk's digest to match; otherwise the source is parsed from the start. A
-   torn final record waits for the next refresh. A pi append whose parent is not the
+   SHA-256 digest of the first and last parsed 64 KiB chunks, and pi's header and
+   current leaf. Claude, Codex and pi transcripts are append-only logs, so resume
+   verifies file identity, length at least the saved offset, and these two digests;
+   a mismatch re-parses from the start. This reads appended bytes plus at most two
+   chunks on every platform. `index --full` always re-parses every source.
+   A torn final record waits for the next refresh. A pi append whose parent is not the
    previous leaf is a branch: the active branch is rebuilt from the stored entry graph
    (`parser_graph`) instead of rereading the file. Other formats re-parse the changed
    source.
@@ -178,7 +194,8 @@ How commands use it (`ready` and `finish_census` in `crates/agrep/src/main.rs`):
   `tool_blob_sources` records which sources reference a blob. `tools` and `events` are
   views with the public columns.
 - Parser cursors and family token counts are LZ4-compressed JSON, pi graph pages zlib,
-  gram postings LZ4.
+  gram postings LZ4. Family token counts occupy ordered pages of at most 256 tokens;
+  refreshes locate and update only pages holding changed tokens.
 - `state` keeps trigger-maintained counts of visible prose, user prose and tool rows, so
   status and empty-result messages need no row scan.
 
@@ -197,9 +214,20 @@ block can reach, using the score formula in [SEARCH_RANKING.md](SEARCH_RANKING.m
 the boundary factor at its maximum of 1. Other text gets a conservative universal
 ceiling.
 
-A refresh recomputes bounds only for changed blocks. A prose block that only gained rows
-(none updated or deleted, which `bound_updates` records) merges the new rows' maxima
-without reading its old rows.
+A refresh recomputes bounds only for changed blocks. Posting lists are partitioned into
+64-block chunks, so changing one block never decodes or rewrites a gram's whole list.
+Each block's gram presence is a fixed 5,999-byte bitmap; an append ORs its new grams
+into that bitmap instead of materializing the block's previous vocabulary. Metadata
+updates that cannot change bounds do not dirty them.
+A block that only gained rows (none updated or deleted, recorded by `bound_updates`
+and `tool_bound_updates`) merges the new rows' maxima without reading its old rows.
+
+Family parent and filename-alias claims are persisted. An append with unchanged claims
+needs no family traversal; changes revisit the affected names and their descendants.
+Turnless-session cleanup likewise visits only sessions touched by the refresh.
+Copied pi replays derive discovery keys from their sources' ancestor listings, using
+files before child directories below each store root. Unavailable paths retain the
+native discovery fallback.
 
 ## FTS indexes
 
@@ -223,7 +251,11 @@ without reading its old rows.
 - Tool dictionary: `tool_words` holds each indexed word of three or more characters with
   its document frequency and the tool blocks containing it, `tool_lexicon` is a trigram
   FTS5 index of those words (`detail=none`), and `tool_trigrams` holds the summed
-  frequency of the words containing each trigram. A term of 3 to 4,096 ASCII letters and
+  frequency of the words containing each trigram. Frequencies use per-row additions and
+  removals tokenized exactly as FTS5, without traversing existing term postings. Initial
+  block-presence blobs are immutable; keyed `tool_word_blocks` additions extend them
+  without decoding the base lists. Presence may conservatively retain removed blocks.
+  A term of 3 to 4,096 ASCII letters and
   digits expands through the lexicon to the indexed words containing it; the tool lane
   searches for any of them. Other tool terms are verified on decoded text.
 - `prose_terms` holds the exact document frequency of each prose trigram, and
@@ -333,7 +365,7 @@ A ranked page reports `total_basis` `exact` when every candidate was examined, a
 `floor` when it stopped early: phrase rows filled the page and the lower tiers went
 uncounted, a block ceiling ended a pass, or the tool lane was skipped because a tool row
 (scoring at most 0.22) cannot outscore the page's last phrase row. A `--no-meta` page
-whose matches did not fit the fetched rows, partial semantic coverage, a meaning scan
+whose matches did not fit the fetched rows, a meaning scan
 stopped at its bound and a hybrid merge that added meaning rows also give floors.
 Classic output prints a floor on stderr as `showing N of M+ … (a floor, not the total;
 -c counts exactly)`. A compact page prints `N+ matches (floor; -c exact)`, or `N+ matches
@@ -412,9 +444,9 @@ only while the lock is free, and leaves the queue to a background worker.
 
 - The census stats every source and directory on each command that runs it, so its cost
   grows with the number of source files.
-- Resuming a JSONL source hashes its whole parsed prefix, so an append to a large
-  transcript costs time in proportion to the file, not the append. Other formats are
-  re-parsed whole when they change.
+- JSONL resume checks the first and last parsed chunks under the append-only log
+  assumption; use `index --full` after an in-place edit confined to the middle of a
+  parsed prefix. Other formats are re-parsed whole when they change.
 - A source that fails to parse keeps its last good rows and is parsed again only when
   its file changes or on a full rebuild.
 - Terms shorter than three characters, and tool terms that are not ASCII letters and

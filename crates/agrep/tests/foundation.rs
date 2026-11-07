@@ -1,5 +1,3 @@
-#[path = "../examples/support/exit.rs"]
-mod exit;
 mod support;
 use agrep_core::{data::DataRoot, store};
 use rusqlite::{Connection, OpenFlags};
@@ -238,6 +236,20 @@ fn incremental_changes_and_last_good() {
     );
     let unchanged_error = indexed(&h, &d);
     assert_eq!(unchanged_error["parsed"], 0);
+    let other = path.parent().unwrap().join("other.jsonl");
+    fs::write(&other, format!("{}\n{}\n", serde_json::json!({"type":"session","id":"other","version":3,"cwd":"/work/project"}), serde_json::json!({"type":"message","id":"m0","parentId":null,"message":{"role":"user","content":"unrelated prompt"}}))).unwrap();
+    let other_refresh = indexed(&h, &d);
+    assert_eq!(other_refresh["parsed"], 1);
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM sources WHERE last_error IS NOT NULL",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    ok(cli(&h, &d, &["gamma", "-c"]));
     fs::remove_file(path).unwrap();
     ok(cli(&h, &d, &["index"]));
     assert_eq!(cli(&h, &d, &["gamma", "-c"]).status.code(), Some(1));
@@ -482,7 +494,7 @@ fn gemini_recorded_flows_keep_roles_replies_and_parents() {
     }
 }
 #[test]
-fn opportunistic_second_writer_reads_old_complete_state() {
+fn no_auto_reads_the_committed_state_while_another_writer_holds_the_lock() {
     let t = TempDir::new().unwrap();
     let h = t.path().join("h");
     let d = t.path().join("d");
@@ -492,13 +504,14 @@ fn opportunistic_second_writer_reads_old_complete_state() {
     let lock = root.lock(true).unwrap().unwrap();
     let work = root.work_lock(true).unwrap().unwrap();
     transcript(&h, &["new marker"]);
-    let out = cli(&h, &d, &["new", "--json"]);
-    assert_eq!(out.status.code(), Some(1));
-    assert!(out.stderr.is_empty());
+    let out = cli(&h, &d, &["new", "--json", "--no-auto"]);
+    assert_eq!(out.status.code(), Some(2));
+    let meta: Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).lines().next().unwrap()).unwrap();
+    assert_eq!(meta["freshness"]["checked"], false);
     assert_eq!(pending_sources(&h, &d), 1);
     drop(work);
     drop(lock);
-    ok(cli(&h, &d, &["index"]));
     ok(cli(&h, &d, &["new", "-c"]));
 }
 #[test]
@@ -615,7 +628,7 @@ fn a_directory_error_clears_once_the_directory_reads_again() {
     store::writer(&DataRoot(d.clone()))
         .unwrap()
         .execute(
-            "INSERT INTO sources VALUES(?1,'pi',0,0,'',?2)",
+            "INSERT INTO sources VALUES(?1,'pi',0,0,x'02',?2)",
             rusqlite::params![
                 dir.to_string_lossy(),
                 format!("source parse incomplete: {}", dir.display())
@@ -1423,7 +1436,7 @@ fn tool_block_word_plans_keep_exhaustive_pages() {
 }
 
 #[test]
-fn reader_does_not_parse_changed_sources_and_work_lock_arbitrates_refresh() {
+fn reader_refreshes_sources_without_waiting_for_the_maintenance_worker() {
     let t = TempDir::new().unwrap();
     let h = t.path().join("h");
     let d = t.path().join("d");
@@ -1431,21 +1444,24 @@ fn reader_does_not_parse_changed_sources_and_work_lock_arbitrates_refresh() {
     ok(cli(&h, &d, &["index"]));
     let root = DataRoot::open(&d, false).unwrap();
     let guard = root.work_lock(true).unwrap().unwrap();
-    transcript(&h, &["pending new text"]);
-    ok(cli(&h, &d, &["committed", "--json"]));
+    transcript(&h, &["replacement new text"]);
+    ok(cli(&h, &d, &["committed", "--json", "--no-auto"]));
     assert_eq!(pending_sources(&h, &d), 1);
-    ok(cli(&h, &d, &["__work", "refresh"]));
-    assert_eq!(
-        cli(&h, &d, &["pending", "-c", "--no-auto"]).status.code(),
-        Some(2)
-    );
+    ok(cli(&h, &d, &["replacement", "--json"]));
+    assert_eq!(pending_sources(&h, &d), 0);
     drop(guard);
-    ok(cli(&h, &d, &["__work", "refresh"]));
-    ok(cli(&h, &d, &["pending", "-c", "--no-auto"]));
+    transcript(&h, &["subsequent new text"]);
+    ok(cli(&h, &d, &["__work"]));
+    assert_eq!(
+        pending_sources(&h, &d),
+        1,
+        "maintenance never ingests sources"
+    );
+    ok(cli(&h, &d, &["subsequent", "-c"]));
     assert_eq!(pending_sources(&h, &d), 0);
 }
 /// The index's fingerprint of every file source, by path.
-fn source_fingerprints(data: &Path) -> std::collections::BTreeMap<String, (i64, i64, String)> {
+fn source_fingerprints(data: &Path) -> std::collections::BTreeMap<String, (i64, i64, Vec<u8>)> {
     let c = Connection::open_with_flags(data.join("index.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)
         .unwrap();
     let mut q = c
@@ -2299,7 +2315,7 @@ fn abandoned_tool_text_is_shared_and_restored_without_source_reparse() {
 }
 
 #[test]
-fn append_parsing_is_bounded_and_rewrites_are_detected() {
+fn append_parsing_is_bounded_and_boundary_rewrites_are_detected() {
     use serde_json::json;
     let t = TempDir::new().unwrap();
     let h = t.path().join("h");
@@ -2326,17 +2342,21 @@ fn append_parsing_is_bounded_and_rewrites_are_detected() {
     let info = indexed(&h, &d);
     assert_eq!(info["resumed_sources"], 1);
     assert!(info["bytes_parsed"].as_u64().unwrap() < 20_000, "{info}");
+    assert!(
+        info["bytes_read"].as_u64().unwrap()
+            <= info["bytes_parsed"].as_u64().unwrap() + 2 * 64 * 1024,
+        "{info}"
+    );
     let mut bytes = fs::read(&path).unwrap();
-    let middle = bytes.len() / 2;
-    let at = bytes[middle..].iter().position(|b| *b == b'x').unwrap() + middle;
+    let at = bytes[..64 * 1024].iter().position(|b| *b == b'x').unwrap();
     bytes[at] = b'y';
     fs::write(&path, &bytes).unwrap();
     let info = indexed(&h, &d);
     assert_eq!(info["resumed_sources"], 0);
     assert!(info["bytes_read"].as_u64().unwrap() >= bytes.len() as u64);
     let mut bytes = fs::read(&path).unwrap();
-    let middle = bytes.len() / 2;
-    let at = bytes[middle..].iter().position(|b| *b == b'x').unwrap() + middle;
+    let last = (bytes.len() - 1) / (64 * 1024) * (64 * 1024);
+    let at = bytes[last..].iter().position(|b| *b == b'x').unwrap() + last;
     bytes[at] = b'z';
     fs::write(&path, &bytes).unwrap();
     write_records(
@@ -2349,7 +2369,7 @@ fn append_parsing_is_bounded_and_rewrites_are_detected() {
     let info = indexed(&h, &d);
     assert_eq!(
         info["resumed_sources"], 0,
-        "interior rewrite plus append must not pass edge guards"
+        "last-chunk rewrite plus append must not pass edge guards"
     );
     transcript(&h, &["rewritten prompt"]);
     let info = indexed(&h, &d);
@@ -3389,10 +3409,9 @@ fn index_output_closes_while_the_merger_it_started_waits() {
     queued.unlock().unwrap();
 }
 
-/// The automatic refresh end to end: a plain query that finds a changed source answers
-/// from the committed index and starts the detached `__work` that commits the change.
+/// The automatic refresh commits the appended source before the query reads its snapshot.
 #[test]
-fn a_query_that_finds_a_changed_source_starts_the_refresh_that_commits_it() {
+fn a_query_commits_a_changed_source_before_answering() {
     use serde_json::json;
     let t = TempDir::new().unwrap();
     let h = t.path().join("h");
@@ -3417,17 +3436,15 @@ fn a_query_that_finds_a_changed_source_starts_the_refresh_that_commits_it() {
         .args(["cobalt", "-c"])
         .output()
         .unwrap();
-    // The answer is the committed index's; the refresh runs after it.
-    assert_eq!(String::from_utf8_lossy(&query.stdout).trim(), "0");
-    let stderr = String::from_utf8_lossy(&query.stderr);
-    let pid = stderr
+    assert!(query.status.success());
+    assert_eq!(String::from_utf8_lossy(&query.stdout).trim(), "1");
+    let events: Vec<Value> = String::from_utf8_lossy(&query.stderr)
         .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .find_map(|event| event["worker_started"]["pid"].as_u64())
-        .unwrap_or_else(|| panic!("no refresh worker started: {stderr}"));
-    assert!(
-        exit::wait(pid as u32, std::time::Duration::from_secs(300)).unwrap(),
-        "refresh worker {pid} did not exit"
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    assert_eq!(
+        events.iter().find_map(|e| e.get("auto_refresh")).unwrap()["parsed"],
+        1
     );
     let found = ok(cli(&h, &d, &["cobalt", "-c", "--no-auto"]));
     assert_eq!(String::from_utf8_lossy(&found.stdout).trim(), "1");

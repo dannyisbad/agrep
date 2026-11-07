@@ -80,7 +80,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let root = DataRoot::open(t.path(), true).unwrap();
         let c = store::writer(&root).unwrap();
-        c.execute_batch("INSERT INTO sources VALUES('fixture','pi',0,0,'',NULL); INSERT INTO sessions VALUES('pi','root-long','demo','','','root-long',0,'title',0,99); INSERT INTO prose(source,agent,session,project,turn,who,model,model_source,ts,text,digest,extra,position,visible) VALUES(1,'pi','root-long','demo',0,'user','','',1,X'6869','','',0,1); INSERT INTO event_sessions VALUES(1,'pi','root-long'); INSERT INTO symbols(id,value) VALUES(1,'tool'),(2,'shell'); INSERT INTO event_rows(id,tool_id,source,session_key,call_id,kind_key,name_key,ts,native_turn,position,input_chars,output_chars,output_bytes,child_session,meta,state,input_end,project_key) VALUES(1,1,1,1,'call',1,2,99,0,0,4,0,0,'','','',11,0);").unwrap();
+        c.execute_batch("INSERT INTO sources VALUES('fixture','pi',0,0,x'02',NULL); INSERT INTO sessions VALUES('pi','root-long','demo','','','root-long',0,'title',0,99); INSERT INTO prose(source,agent,session,project,turn,who,model,model_source,ts,text,digest,extra,position,visible) VALUES(1,'pi','root-long','demo',0,'user','','',1,X'6869','','',0,1); INSERT INTO event_sessions VALUES(1,'pi','root-long'); INSERT INTO symbols(id,value) VALUES(1,'tool'),(2,'shell'); INSERT INTO event_rows(id,tool_id,source,session_key,call_id,kind_key,name_key,ts,native_turn,position,input_chars,output_chars,output_bytes,child_session,meta,state,input_end,project_key) VALUES(1,1,1,1,'call',1,2,99,0,0,4,0,0,'','','',11,0);").unwrap();
         c.execute(
             "INSERT INTO tool_blobs(id,digest,body) VALUES(1,X'01',?)",
             [store::encode_tool("shell: test").unwrap()],

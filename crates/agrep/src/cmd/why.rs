@@ -86,6 +86,10 @@ fn explain(reference: String, json_output: bool) -> Result<i32> {
             Some("agrep doctor"),
         ));
     }
+    if root.db().exists() {
+        let (_, census) = crate::ready(false)?;
+        crate::finish_census(&root, census)?;
+    }
     let c = match store::reader(&root) {
         Ok(c) => c,
         Err(e) => {
@@ -171,27 +175,6 @@ fn explain(reference: String, json_output: bool) -> Result<i32> {
             candidates,
             json!({"index":root.db(),"sources":sources}),
             Some("agrep doctor"),
-        ));
-    }
-    let live = store::census()?;
-    let stale = live.iter().any(|s| {
-        sources
-            .iter()
-            .find(|v| v["path"] == s.path)
-            .is_none_or(|v| {
-                v["bytes"].as_u64() != Some(s.size)
-                    || v["mtime_ns"].as_i64() != Some(s.mtime_ns)
-                    || v["change_token"].as_str() != Some(s.token.as_str())
-            })
-    });
-    if stale {
-        return Ok(out.emit(
-            "unprovable",
-            2,
-            "source files changed since the last refresh",
-            candidates,
-            evidence,
-            Some("agrep index"),
         ));
     }
     Ok(out.emit(

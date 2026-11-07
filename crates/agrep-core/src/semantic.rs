@@ -6,12 +6,12 @@ use crate::{
     semantic_policy, semantic_store, store,
 };
 use anyhow::{bail, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 pub use semantic_model::{installed, provision};
 pub use semantic_policy::{eligible, FLOOR, STRONG};
 pub use semantic_store::{coverage, reclaim, reset, Coverage};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -21,6 +21,114 @@ use std::{
 pub struct SearchResults {
     pub result: Results,
     pub coverage: Coverage,
+}
+
+// Measured with the query CPU F32 path and 200-token chunks. Long chunks cost
+// more than a typical row; this budget is inference work, not a row-count cutoff.
+const INLINE_CHUNKS_PER_SECOND: f64 = 20.;
+const DEFAULT_BUILD_ROWS_PER_SECOND: f64 = 60.;
+const INLINE_SECONDS: f64 = 1.;
+const MIN_INLINE_UNITS: f64 = 0.25;
+
+#[derive(Debug, serde::Serialize)]
+pub struct BuildProgress {
+    pub indexed_rows: usize,
+    pub total_rows: usize,
+    pub remaining_rows: usize,
+    pub estimated_seconds: u64,
+}
+pub fn build_progress(c: &Connection, coverage: &Coverage) -> Result<BuildProgress> {
+    let rate = c
+        .query_row(
+            "SELECT value FROM state WHERE key='semantic_rows_per_second'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.)
+        .unwrap_or(DEFAULT_BUILD_ROWS_PER_SECOND);
+    let remaining = coverage.total.saturating_sub(coverage.embedded);
+    Ok(BuildProgress {
+        indexed_rows: coverage.embedded,
+        total_rows: coverage.total,
+        remaining_rows: remaining,
+        estimated_seconds: (remaining as f64 / rate).ceil() as u64,
+    })
+}
+impl std::fmt::Display for BuildProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let seconds = self.estimated_seconds;
+        let left = if seconds >= 3600 {
+            format!("{}h {}m", seconds / 3600, seconds % 3600 / 60)
+        } else if seconds >= 60 {
+            format!("{}m {}s", seconds / 60, seconds % 60)
+        } else {
+            format!("{seconds}s")
+        };
+        write!(
+            f,
+            "the meaning index is still building ({} of {} rows, about {left} left)",
+            self.indexed_rows, self.total_rows
+        )
+    }
+}
+impl std::error::Error for BuildProgress {}
+pub fn is_building(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<BuildProgress>().is_some()
+}
+
+#[derive(Default)]
+struct Overlay {
+    texts: Vec<String>,
+    // Each vector can serve several identical rows, including rows whose vector
+    // was published before their reference was queued in this snapshot.
+    rows: HashMap<(String, usize), Vec<i64>>,
+}
+impl Overlay {
+    fn snapshot(c: &Connection, coverage: &Coverage) -> Result<Self> {
+        let pending = coverage.total.saturating_sub(coverage.embedded);
+        if pending == 0 {
+            return Ok(Self::default());
+        }
+        if pending as f64 > INLINE_CHUNKS_PER_SECOND * INLINE_SECONDS / MIN_INLINE_UNITS {
+            return Err(build_progress(c, coverage)?.into());
+        }
+        let mut out = Self::default();
+        let mut seen = HashMap::<String, Vec<(String, usize)>>::new();
+        let mut known = c.prepare(
+            "SELECT block,slot FROM semantic_chunks WHERE content_key=? ORDER BY ordinal",
+        )?;
+        let queued = semantic_store::batch(c, pending)?;
+        if queued.len() != pending {
+            bail!("meaning snapshot has unqueued rows without vectors");
+        }
+        for p in queued {
+            let slots = if let Some(slots) = seen.get(&p.key) {
+                slots.clone()
+            } else {
+                let mut slots = known
+                    .query_map([&p.key], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<(String, usize)>>>()?;
+                if slots.is_empty() {
+                    for text in p.chunks {
+                        slots.push((String::new(), out.texts.len()));
+                        out.texts.push(text);
+                    }
+                }
+                seen.insert(p.key, slots.clone());
+                slots
+            };
+            for slot in slots {
+                out.rows.entry(slot).or_default().push(p.id);
+            }
+        }
+        // Bound preparation as well as inference, even for a few very long rows.
+        if out.texts.len() as f64 > INLINE_CHUNKS_PER_SECOND * INLINE_SECONDS / MIN_INLINE_UNITS {
+            return Err(build_progress(c, coverage)?.into());
+        }
+        Ok(out)
+    }
 }
 
 fn background_thread_count(logical: usize, requested: Option<usize>) -> usize {
@@ -146,12 +254,21 @@ fn drain_with(
             }
         }
         drop(c);
+        let started = std::time::Instant::now();
         let vectors = if texts.is_empty() {
             Vec::new()
         } else {
             embed(&texts)?
         };
         semantic_store::publish(root, &pending, &refs, &vectors)?;
+        if !texts.is_empty() {
+            let rate = pending.len() as f64 / started.elapsed().as_secs_f64();
+            let _lock = root.lock(true)?;
+            store::writer(root)?.execute(
+                "INSERT INTO state VALUES('semantic_rows_per_second',?1) ON CONFLICT(key) DO UPDATE SET value=0.75*CAST(value AS REAL)+0.25*?1",
+                [rate],
+            )?;
+        }
         if let Some(n) = left.as_mut() {
             *n -= pending.len();
         }
@@ -167,8 +284,36 @@ struct VectorScan {
     /// (block, slot, upper bound, exact cosine) in descending bound order.
     candidates: Vec<(usize, usize, f32, f32)>,
     total_rows: usize,
+    overlay: HashMap<(usize, usize), Vec<i64>>,
 }
 impl VectorScan {
+    fn with_overlay(
+        mut blocks: Vec<semantic_store::Block>,
+        vector: &[f32],
+        overlay: Overlay,
+        extra: &[Vec<f32>],
+    ) -> Result<Self> {
+        if overlay.rows.is_empty() && extra.is_empty() {
+            return Self::new(blocks, vector);
+        }
+        if !extra.is_empty() {
+            blocks.push(semantic_store::Block::memory(extra)?);
+        }
+        let mut scan = Self::new(blocks, vector)?;
+        let names: HashMap<_, _> = scan
+            .names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.as_str(), i))
+            .collect();
+        for ((name, slot), rows) in overlay.rows {
+            let block = *names
+                .get(name.as_str())
+                .ok_or_else(|| anyhow::anyhow!("missing semantic overlay block"))?;
+            scan.overlay.insert((block, slot), rows);
+        }
+        Ok(scan)
+    }
     fn new(blocks: Vec<semantic_store::Block>, vector: &[f32]) -> Result<Self> {
         let _span = crate::semantic_profile::span("vector_scan_and_sort");
         use rayon::prelude::*;
@@ -213,6 +358,7 @@ impl VectorScan {
             names: blocks.into_iter().map(|b| b.name).collect(),
             candidates,
             total_rows,
+            overlay: HashMap::new(),
         })
     }
 }
@@ -240,11 +386,13 @@ pub fn begin(
     }
     // This first read pins the same WAL snapshot used by the lexical query.
     let coverage = {
-        let _span = crate::semantic_profile::span("semantic_coverage");
+        let _span = crate::semantic_profile::span("meaning_snapshot");
         coverage(c)?
     };
+    let overlay = Overlay::snapshot(c, &coverage)?;
+    let progress = build_progress(c, &coverage)?;
     let joined = Arc::new(AtomicBool::new(false));
-    let lane = if coverage.embedded == 0 {
+    let lane = if coverage.total == 0 {
         None
     } else {
         let listed = {
@@ -267,12 +415,35 @@ pub fn begin(
                             semantic_store::open_blocks(root, listed)
                         })?
                 };
-                let vector =
-                    Embedder::query(&root).and_then(|model| Ok(model.embed(&[pattern])?.remove(0)));
+                let vector = Embedder::query(&root).and_then(|model| {
+                    let units = overlay
+                        .texts
+                        .iter()
+                        .map(|text| {
+                            let tokens = model.token_ids(text)?.len() as f64;
+                            Ok(
+                                ((tokens / 200.) * (1. + tokens / 1024.) / (1. + 200. / 1024.))
+                                    .max(MIN_INLINE_UNITS),
+                            )
+                        })
+                        .sum::<Result<f64>>()?;
+                    if units / INLINE_CHUNKS_PER_SECOND > INLINE_SECONDS {
+                        return Err(progress.into());
+                    }
+                    let vector = model.embed(&[pattern])?.remove(0);
+                    let extra = if overlay.texts.is_empty() {
+                        vec![]
+                    } else {
+                        let _span = crate::semantic_profile::span("inline_embedding");
+                        model.embed_inline(&overlay.texts)?
+                    };
+                    Ok((vector, extra))
+                });
                 let blocks = opened.join().map_err(crate::logging::panic_error)?;
                 Ok((blocks, vector))
             })?;
-            let scan = VectorScan::new(blocks?, &vector?)?;
+            let (vector, extra) = vector?;
+            let scan = VectorScan::with_overlay(blocks?, &vector, overlay, &extra)?;
             // While the keyword lane still runs, the same resolution on this thread's
             // own snapshot pages in the rows `finish` reads; its result is discarded.
             if !waiting.load(Ordering::Relaxed) {
@@ -285,7 +456,10 @@ pub fn begin(
         })?)
     };
     Ok(QueryWork {
-        coverage,
+        coverage: Coverage {
+            embedded: coverage.total,
+            total: coverage.total,
+        },
         options: o.clone(),
         family_diverse,
         lane,
@@ -293,7 +467,7 @@ pub fn begin(
     })
 }
 pub fn finish(c: &Connection, work: QueryWork) -> Result<SearchResults> {
-    let mut result = if let Some(lane) = work.lane {
+    let result = if let Some(lane) = work.lane {
         work.joined.store(true, Ordering::Relaxed);
         let scan = lane.join().map_err(crate::logging::panic_error)??;
         let _span = crate::semantic_profile::span("vector_refine");
@@ -303,9 +477,6 @@ pub fn finish(c: &Connection, work: QueryWork) -> Result<SearchResults> {
         r.total_basis = "exact".into();
         r
     };
-    if work.coverage.partial() {
-        result.total_basis = "floor".into();
-    }
     Ok(SearchResults {
         result,
         coverage: work.coverage,
@@ -318,11 +489,8 @@ pub fn search(root: &DataRoot, o: &Options, family_diverse: bool) -> Result<Sear
 /// 0.4.9's `semantic_status` for one meaning lane that answered: `found` is whether a row
 /// cleared the floor (py/search.py:510-578).
 pub fn status(coverage: &Coverage, found: bool) -> serde_json::Value {
-    let partial = coverage.partial();
-    // py/surface_policy.py:2839-2852: complete, or within the 1% live-update tail.
-    let usable = !partial
-        || (coverage.total > 0 && coverage.embedded as f64 >= coverage.total as f64 * 0.99);
-    serde_json::json!({"state":if found {"ready"} else {"no-confident-match"},"eligible":true,"reason":null,"min_score":FLOOR,"score_kind":"cosine","coverage":coverage,"partial":partial,"complete":!partial,"fallback_recommended":!found && !usable})
+    debug_assert!(!coverage.building());
+    serde_json::json!({"state":if found {"ready"} else {"no-confident-match"},"eligible":true,"reason":null,"min_score":FLOOR,"score_kind":"cosine","coverage":coverage,"complete":true,"fallback_recommended":false})
 }
 /// A query 0.4.9's meaning policy refuses, with its reason code.
 #[derive(Debug)]
@@ -340,11 +508,14 @@ pub fn failed(error: &anyhow::Error) -> serde_json::Value {
     if let Some(Rejected(reason)) = error.downcast_ref() {
         return serde_json::json!({"state":"query-rejected","complete":false,"fallback_recommended":true,"eligible":false,"reason":reason,"min_score":FLOOR,"coverage":null});
     }
+    if let Some(progress) = error.downcast_ref::<BuildProgress>() {
+        return serde_json::json!({"state":"unavailable","eligible":true,"reason":progress.to_string(),"min_score":FLOOR,"score_kind":"unavailable","complete":false,"fallback_recommended":true,"progress":progress});
+    }
     let cause: String = crate::surface::safe(&format!("{error:#}"), false)
         .chars()
         .take(140)
         .collect();
-    serde_json::json!({"state":"unavailable","eligible":true,"reason":cause.trim(),"min_score":FLOOR,"score_kind":"unavailable","coverage":null,"partial":true,"complete":false,"fallback_recommended":true})
+    serde_json::json!({"state":"unavailable","eligible":true,"reason":cause.trim(),"min_score":FLOOR,"score_kind":"unavailable","coverage":null,"complete":false,"fallback_recommended":true})
 }
 /// 0.4.9's `semantic_unavailable_notice`, the one line an explicit `-s` prints when its
 /// lane did not answer (py/surface_policy.py:2749-2761).
@@ -416,6 +587,31 @@ pub fn search_vector(
         None,
     )
 }
+fn read_hit(r: &rusqlite::Row<'_>) -> rusqlite::Result<Hit> {
+    Ok(Hit {
+        rowid: r.get(0)?,
+        session: r.get(1)?,
+        agent: r.get(2)?,
+        project: r.get(3)?,
+        turn: r.get(4)?,
+        who: r.get(5)?,
+        model: r.get(6)?,
+        model_source: r.get(7)?,
+        ts: r.get(8)?,
+        text: store::decode("prose", r.get::<_, Vec<u8>>(9)?).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                9,
+                rusqlite::types::Type::Blob,
+                e.into_boxed_dyn_error(),
+            )
+        })?,
+        family: r.get(10)?,
+        side: r.get(11)?,
+        score: 0.,
+        matched: "semantic".into(),
+        ..Default::default()
+    })
+}
 /// `stop` ends a speculative resolution before its next row lookup.
 fn resolve_scan(
     c: &Connection,
@@ -430,10 +626,16 @@ fn resolve_scan(
         names,
         candidates,
         total_rows,
+        overlay,
     } = scan;
     let want = if o.limit == 0 { 200 } else { o.limit.min(200) };
     let mut result = Results::default();
     let mut resolve=c.prepare("SELECT p.id,p.session,p.agent,p.project,p.position,p.who,p.model,p.model_source,p.ts,p.text,s.family,s.side FROM semantic_chunks v JOIN semantic_refs r ON r.content_key=v.content_key JOIN prose p ON p.id=r.row_id AND p.digest=r.digest JOIN sessions s ON s.id=p.session AND s.agent=p.agent WHERE v.block=? AND v.slot=? AND p.visible=1")?;
+    let mut resolve_overlay = if overlay.is_empty() {
+        None
+    } else {
+        Some(c.prepare("SELECT p.id,p.session,p.agent,p.project,p.position,p.who,p.model,p.model_source,p.ts,p.text,s.family,s.side FROM prose p JOIN sessions s ON s.id=p.session AND s.agent=p.agent WHERE p.id=? AND p.visible=1")?)
+    };
     let mut hits = Vec::<Hit>::new();
     let mut matched_groups = HashSet::new();
     let compare = |a: &Hit, b: &Hit| {
@@ -478,33 +680,17 @@ fn resolve_scan(
             break;
         }
         resolved += 1;
-        let rows = resolve.query_map(params![names[block], slot], |r| {
-            Ok(Hit {
-                rowid: r.get(0)?,
-                session: r.get(1)?,
-                agent: r.get(2)?,
-                project: r.get(3)?,
-                turn: r.get(4)?,
-                who: r.get(5)?,
-                model: r.get(6)?,
-                model_source: r.get(7)?,
-                ts: r.get(8)?,
-                text: store::decode("prose", r.get::<_, Vec<u8>>(9)?).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        9,
-                        rusqlite::types::Type::Blob,
-                        e.into_boxed_dyn_error(),
-                    )
-                })?,
-                family: r.get(10)?,
-                side: r.get(11)?,
-                score: score as f64,
-                matched: "semantic".into(),
-                ..Default::default()
-            })
-        })?;
-        for row in rows {
+        let rows = resolve.query_map(params![names[block], slot], read_hit)?;
+        let mut extra = Vec::new();
+        if let Some(ids) = overlay.get(&(block, slot)) {
+            let resolve_overlay = resolve_overlay.as_mut().unwrap();
+            for id in ids {
+                extra.push(resolve_overlay.query_row([id], read_hit));
+            }
+        }
+        for row in rows.chain(extra) {
             let mut h = row?;
+            h.score = score as f64;
             h.meta_marker = crate::query::meta_role(&h.who, h.turn);
             if !matches_filters(&h, o)
                 || (o.filters.no_meta && crate::history_meta::is_meta(c, &h, &o.pattern)?)
@@ -879,7 +1065,51 @@ mod tests {
         q[0] = 1.;
         let c = store::reader(&r).unwrap();
         assert!(search_vector(&r, &c, &o, true, &q).unwrap().hits.is_empty());
-        assert!(coverage(&c).unwrap().partial());
+        assert!(coverage(&c).unwrap().building());
+    }
+    #[test]
+    fn queued_overlay_reuses_vectors_and_keeps_the_commands_snapshot() {
+        let (_t, r, o) = setup();
+        insert(&r, 1, "first", "alpha");
+        embed(&r);
+        insert(&r, 2, "second", "alpha");
+        insert(&r, 3, "third", "alpha");
+        let text = "connection timeout row 1";
+        store::writer(&r)
+            .unwrap()
+            .execute(
+                "UPDATE prose SET text=?,digest=? WHERE id=3",
+                params![text.as_bytes(), store::digest(text)],
+            )
+            .unwrap();
+        let c = store::reader(&r).unwrap();
+        let overlay = Overlay::snapshot(&c, &coverage(&c).unwrap()).unwrap();
+        assert_eq!(overlay.texts, ["connection timeout row 2"]);
+        let mut vector = vec![0.; semantic_model::DIM];
+        vector[0] = 1.;
+        let scan = VectorScan::with_overlay(
+            semantic_store::blocks(&r, &c).unwrap(),
+            &vector,
+            overlay,
+            std::slice::from_ref(&vector),
+        )
+        .unwrap();
+        store::writer(&r)
+            .unwrap()
+            .execute(
+                "UPDATE prose SET text='edited',digest=? WHERE id=2",
+                [store::digest("edited")],
+            )
+            .unwrap();
+        let found = resolve_scan(&c, &o, false, &scan, None).unwrap();
+        assert_eq!(found.hits.len(), 3);
+        assert!(found
+            .hits
+            .iter()
+            .any(|h| h.rowid == 2 && h.text == "connection timeout row 2"));
+        assert!(found.hits.iter().any(|h| h.rowid == 3));
+        assert_eq!(coverage(&store::reader(&r).unwrap()).unwrap().embedded, 1);
+        assert_eq!(semantic_store::block_list(&c).unwrap().len(), 1);
     }
     #[test]
     fn semantic_snippet_is_the_rows_first_240_characters() {

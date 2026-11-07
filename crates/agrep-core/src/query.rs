@@ -104,7 +104,6 @@ pub struct Hit {
 }
 #[derive(Default, Serialize, Deserialize, Debug)]
 pub struct Results {
-    pub pending_sources: usize,
     pub hits: Vec<Hit>,
     pub total: usize,
     pub total_basis: String,

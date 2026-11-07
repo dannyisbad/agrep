@@ -42,7 +42,15 @@ pages do not suggest more results. `--more` reads frozen rows, rather than silen
 rerunning a query against a changed corpus.
 
 Normal commands check source files and answer from a committed snapshot.
-`--no-auto` suppresses automatic freshness work and marks freshness unchecked.
+Index-reading commands finish their source census and ingest its changes before querying.
+This includes each explorer request; `postcompact` also refreshes the sessions used to
+resolve its displayed family root. Changes present when a command or request began are
+included; a record still being written at that instant can be absent. Freshness records
+and status contain no pending-source count or behind notice. Background maintenance does
+not ingest source changes. `--more` reads the first page's frozen results.
+
+`--no-auto` and a read-only data root suppress automatic freshness work and mark freshness
+unchecked. `--no-auto` retains its existing unchecked notices and machine records.
 A parse failure keeps the last-good rows and is reported with its source by
 status/doctor.
 
@@ -60,11 +68,19 @@ hybrid search uses keywords; status reports the missing model. Explicit `-s`
 prints `semantic model not installed: run agrep setup` and exits 2. It must not
 report that as a verified zero match.
 
-Only vectors belonging to the exact current text can supply a meaning hit.
-Coverage is a number, such as `semantic 164499/173524 rows`. A completed
-semantic-only search miss with partial coverage exits 1 and states the coverage.
-An empty `recall` or `pack` exits 2, as 0.4.9's did, when a meaning lane failed or
-missed while more than 1% of the rows were unembedded: that answer is unverified.
+Only vectors belonging to the exact snapshot text can supply a meaning hit. Before
+scanning, the lane embeds queued text with its CPU query model and includes those
+vectors with the published blocks. A lane that answers covers every visible prose
+row in that snapshot; `semantic_coverage`, when non-null, is always complete.
+There is no `semantic_partial` field or coverage notice.
+
+When the queue exceeds about one second of estimated CPU embedding, automatic
+hybrid quietly returns keyword results. Explicit `-s` exits 2 with
+`semantic search unavailable: the meaning index is still building (N of M rows, about T left)`.
+Under `--json`, it returns `error.code: "semantic-unavailable"`, no hits, and
+`progress` in its semantic status: `indexed_rows`, `total_rows`, `remaining_rows`,
+`estimated_seconds`. A build is not a verified zero match. `status` shows this
+progress; setup says the build runs in the background and when meaning joins searches.
 
 ## Handles and around
 

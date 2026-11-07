@@ -60,7 +60,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          nice -n 10 cargo build --locked --release --workspace --bin agrep --example matched --example semantic_eval --example semantic_scale
+          nice -n 10 cargo build --locked --release --workspace --bin agrep --example matched --example semantic_eval --example semantic_scale --example semantic_inline
           suffix=""
           if [ "$RUNNER_OS" = Windows ]; then suffix=.exe; fi
           model="$RUNNER_TEMP/agrep-model"
@@ -68,6 +68,7 @@ jobs:
           performance_status=0
           nice -n 10 "target/release/examples/semantic_eval$suffix" "$model" provision || performance_status=1
           nice -n 10 "target/release/examples/semantic_eval$suffix" "$model" cpu || performance_status=1
+          nice -n 10 "target/release/examples/semantic_inline$suffix" "$model" "target/release/agrep$suffix" > semantic-inline.json || performance_status=1
           "${matched[@]}" --workload mixed --output matched-mixed.json || performance_status=1
           "${matched[@]}" --workload semantic --model-dir "$model" --output matched-semantic.json || performance_status=1
           nice -n 10 python bench/semantic_owner.py --binary "target/release/agrep$suffix" --builder "target/release/examples/semantic_scale$suffix" --evaluator "target/release/examples/semantic_eval$suffix" --model "$model" --runs 20 --output semantic-owner.json || performance_status=1
@@ -88,6 +89,7 @@ jobs:
             *-tests.log
             matched-*.json*
             semantic-owner.json
+            semantic-inline.json
   # The dense 2,000,000-row comparison is most of the performance gate's time; its own
   # job keeps each job's wall time bounded.
   dense:

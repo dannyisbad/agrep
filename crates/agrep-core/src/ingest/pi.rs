@@ -1287,7 +1287,7 @@ fn slug_files(agent: &str, slug: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
-fn session_files(agent: &str, root: &Path) -> Vec<PathBuf> {
+pub(crate) fn session_files(agent: &str, root: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = Vec::new();
     if !plain_dir(agent, root) {
         return files;

@@ -169,6 +169,14 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
         usage::window(since_arg, since, until_arg, until)?;
     }
     let (root, census) = ready(no_auto)?;
+    let identity = agrep_core::caller::Identity::detect();
+    let filters = Filters {
+        project: args.project.clone(),
+        agent: args.agent.clone(),
+        ..Default::default()
+    };
+    h::validate_filters(&filters)?;
+    crate::finish_census(&root, census)?;
     let c = store::reader(&root)?;
     // Under AGREP_QUERY_TIMING the briefing reports the SQLite work it did, which its window
     // must bound however much history lies outside it.
@@ -186,13 +194,6 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
     });
     let all = h::sessions(&c)?;
     let symbols = b::Symbols::load(&c)?;
-    let filters = Filters {
-        project: args.project.clone(),
-        agent: args.agent.clone(),
-        ..Default::default()
-    };
-    h::validate_filters(&filters)?;
-    let identity = agrep_core::caller::Identity::detect();
     if args.no_self && !args.include_self && !args.json {
         identity.disclose(true, false);
     }
@@ -477,11 +478,10 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
         }}));
     }
     let timezone = render::timezone_label();
-    let pending_sources = crate::finish_census(&root, census)?;
     let checked = agrep_core::render::checked(no_auto);
     if args.json {
         // 0.5 never skips index rows or loses a chat's events, so its totals are exact.
-        let mut meta = json!({"kind":"agrep-meta","mode":mode,"window":{"since":since_text,"since_ts":since,"until":args.until,"until_ts":until_arg},"timezone":timezone,"idle_cap":args.idle_cap,"idle_cap_ms":cap,"metric":METRIC,"chats":families.len(),"side_chats":side_count,"unknown_timestamp_rows":unknown,"family_dedup_ms":dedup,"self_excluded":excluded,"self_exclusion":caller.metadata(request,None),"totals_exact":true,"events_unavailable_chats":0,"caveats":caveats,"freshness":render::machine_freshness(no_auto,pending_sources)});
+        let mut meta = json!({"kind":"agrep-meta","mode":mode,"window":{"since":since_text,"since_ts":since,"until":args.until,"until_ts":until_arg},"timezone":timezone,"idle_cap":args.idle_cap,"idle_cap_ms":cap,"metric":METRIC,"chats":families.len(),"side_chats":side_count,"unknown_timestamp_rows":unknown,"family_dedup_ms":dedup,"self_excluded":excluded,"self_exclusion":caller.metadata(request,None),"totals_exact":true,"events_unavailable_chats":0,"caveats":caveats,"freshness":render::machine_freshness(no_auto)});
         if mode == "time" {
             meta["group"] = json!(group);
             meta["total_estimated_active_ms"] = json!(total);

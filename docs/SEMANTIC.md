@@ -81,8 +81,7 @@ hybrid, a failure of an installed model prints one stderr line, logs the cause t
 keeps the keyword results. An explicit `-s` never answers with keyword
 rows: a failed lane, or a query the meaning policy refuses, prints `semantic search
 unavailable: <reason>` (under `--json`, a record with `error.code` `semantic-unavailable`)
-and exits 2. A semantic-only search that finds nothing exits 1, also when coverage is
-partial.
+and exits 2. A complete semantic-only search that finds nothing exits 1.
 
 ## Vector storage and scan
 
@@ -101,12 +100,33 @@ partial.
   directory fsynced on Unix) before one transaction under `writer.lock` records the
   block and attaches the batch's rows. A row attaches only if its id and digest are
   unchanged and it is still visible; otherwise it stays queued.
-- Coverage is the trigger-maintained `semantic_ref_count` over the visible prose rows. A
-  row counts once every chunk is published. Partial coverage is a number
-  (`semantic N/M rows` on stderr; `semantic_coverage` with `indexed`, `total`,
-  `pending`, `fraction`, `complete` and `order` in JSON), never an error. As in 0.4.9,
-  stderr names it only below 99% of the rows embedded, and on a page of hits only on a
-  terminal or a compact page; a miss always names it.
+- Before scanning, the lane pins the keyword query's SQLite snapshot and captures its
+  queued rows. It embeds every missing chunk with the already loaded CPU F32 query
+  model in two CPU streams sharing the bounded Rayon pool, and scans a command-local
+  q8/F16 block alongside the published blocks. Single-chunk arithmetic is retained. The
+  encoding and cosine calculation are identical to published vectors. Identical text
+  reuses published chunks or a single inline embedding. Resolution uses the original
+  snapshot, including edits and deletions committed after the query started.
+- Inline vectors remain in memory for the command. They do not acquire the writer lock,
+  publish references, or create small block files. The background worker continues to
+  drain the queue into ordinary 128-row blocks.
+- A lane answers only with all the snapshot's visible prose covered. Its
+  `semantic_coverage`, when present, has `indexed == total`, `pending: 0`,
+  `fraction: 1.0` and `complete: true`. Search totals can still be score floors or
+  bounded pages; those describe ranking and pagination, not missing embeddings.
+- If the estimated CPU embedding work exceeds about one second, automatic hybrid
+  quietly uses its complete keyword lane. Explicit `-s` exits 2 and prints
+  `semantic search unavailable: the meaning index is still building (N of M rows, about T left)`.
+  JSON carries `error.code: "semantic-unavailable"` and a status `progress` object
+  with `indexed_rows`, `total_rows`, `remaining_rows`, and `estimated_seconds`.
+  It returns no meaning hits and no incomplete `semantic_coverage`. The work estimate
+  accounts for actual token lengths, attention work and per-chunk overhead; a bounded
+  preflight avoids loading large rebuild queues.
+- `status` reports the build counts and remaining time. The worker records its
+  throughput and smooths it across batches, using an initial estimate until its first
+  completed batch. This build estimate is separate from the inline CPU budget. Setup
+  explains that the build runs in the background and meaning results join searches
+  when the remaining work fits the inline budget.
 - The scan quantizes the query to int8 and takes int8 dot products with SIMD (AVX2 on
   x86_64, NEON with or without the dot-product extension on aarch64). A Cauchy-Schwarz
   bound covers both quantization errors; each row whose bound reaches the floor gets its
@@ -136,16 +156,19 @@ partial.
   queries, recall@5 of 1.0, rank one on the four tasks in
   `semantic-recall-reference.json`, and ten of ten long-document cases. It also checks
   that the query path maps its weights, that its tokenizer tables agree with the
-  library, and that its vectors equal the bulk model's bit for bit. CI runs it on every
+  library, that its vectors equal the bulk model's bit for bit, and that both inline
+  CPU streams reproduce all 40 single-query vectors bit for bit. CI runs it on every
   target and it blocks.
 - `semantic_eval MODEL_DIR metal` checks the F16 Metal path with a minimum cosine of
   0.9999 and the same recall checks. `semantic_eval MODEL_DIR cpu batch` measures bulk
   throughput on `fixtures/semantic-batch.json`; it is not a gate.
-- `bench/semantic_owner.py` builds a store of at least 200,000 vector references with
-  `semantic_scale` (synthetic vectors derived from the oracle) and runs 20 fresh
-  semantic and hybrid queries with the real query model. Every query must return meaning
-  rows; latency is printed against `docs/perf-budgets.json` and does not fail the check.
-  Speed is gated by the matched comparison in [DISTRIBUTION.md](DISTRIBUTION.md).
+- `semantic_inline` proves that a normal meaning query ingests and finds appended
+  prose without a background drain or query publication, and that parallel and serial
+  inference produce identical vectors. CI records its samples as `semantic-inline.json`.
+- `bench/semantic_owner.py` exercises a native-source store with synthetic vectors
+  derived from the oracle and the real query model. Every query must return meaning
+  rows; latency is reported against `docs/perf-budgets.json`. Speed is gated by the
+  matched comparison in [DISTRIBUTION.md](DISTRIBUTION.md).
 - The Metal kernels have GPU-only tests; see the release check in
   [DISTRIBUTION.md](DISTRIBUTION.md).
 
@@ -153,8 +176,8 @@ partial.
 
 - English model; the query window is 1,024 tokens and a long row is represented by at
   most 32 windows.
-- Coverage grows in the background, newest rows first; until a row is embedded it is
-  found only by keywords.
+- During a large initial build or rebuild, only keyword search answers automatically;
+  explicit meaning search waits for the build to fit the inline budget.
 - Tool output is not embedded.
 - Background embedding uses Metal only on Apple GPUs that support every kernel the lane
   needs; other machines embed on the CPU.

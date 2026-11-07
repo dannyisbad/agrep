@@ -21,7 +21,7 @@ pub(crate) fn run(full: bool, with_semantic: bool) -> Result<i32> {
         };
         super::work::after_index(&root, Some(drain))?;
         let coverage = semantic::coverage(&store::reader(&root)?)?;
-        eprintln!("semantic {}/{} rows", coverage.embedded, coverage.total);
+        eprintln!("meaning index ready: {} rows", coverage.total);
     } else {
         super::work::after_index(&root, None)?;
     }

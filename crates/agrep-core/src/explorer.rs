@@ -193,7 +193,7 @@ struct State {
     auth: String,
     bootstrap: Mutex<String>,
     live: Mutex<Option<Service>>,
-    freshen: Option<Arc<dyn Fn() -> Result<usize> + Send + Sync>>,
+    freshen: Option<Arc<dyn Fn() -> Result<bool> + Send + Sync>>,
 }
 impl Explorer {
     pub fn bind(root: DataRoot, port: u16) -> Result<Self> {
@@ -217,7 +217,7 @@ impl Explorer {
     /// same census and query APIs as command-line history.
     pub fn with_freshness(
         mut self,
-        freshen: impl Fn() -> Result<usize> + Send + Sync + 'static,
+        freshen: impl Fn() -> Result<bool> + Send + Sync + 'static,
     ) -> Self {
         Arc::get_mut(&mut self.state)
             .expect("server not yet shared")
@@ -427,7 +427,7 @@ impl State {
         if !["/api/status", "/api/chats", "/api/around", "/api/search"].contains(&r.path.as_str()) {
             return Ok(Response::error(404, "not found"));
         }
-        let pending = self.freshen.as_ref().map(|f| f()).transpose()?;
+        let checked = self.freshen.as_ref().map(|f| f()).transpose()?;
         let c = store::reader(&self.root)?;
         match r.path.as_str() {
             "/api/status" => {
@@ -440,7 +440,7 @@ impl State {
                 )?;
                 Ok(Response::json(
                     200,
-                    json!({"messages":messages,"sessions":sessions,"indexed":true,"freshness":crate::render::freshness(pending.is_some(),pending.unwrap_or(0))}),
+                    json!({"messages":messages,"sessions":sessions,"indexed":true,"freshness":crate::render::freshness(checked.unwrap_or(false))}),
                 ))
             }
             "/api/chats" => {
@@ -545,9 +545,8 @@ impl State {
                                 &mut found.result.hits,
                                 !keyword.hits.is_empty(),
                             )?;
-                            // Semantic mode always names its coverage, as 0.4.9's explorer
-                            // did; automatic hybrid only a gap the CLI would also name.
-                            if mode == "semantic" || found.coverage.gap() {
+                            // An answered meaning lane always covers its snapshot.
+                            if mode == "semantic" {
                                 semantic = Some(json!(found.coverage));
                             }
                             if mode == "semantic" {
@@ -562,11 +561,14 @@ impl State {
                         // (py/server.py:142-159, 513-515; py/search.py:581-599).
                         Err(error) if mode == "semantic" => {
                             let status = crate::semantic::failed(&error);
-                            semantic = Some(
-                                json!({"state":status["state"],"complete":false,"partial":status["partial"]==true,"indexed":0,"total":0,"pending":0,"fallback_recommended":true,"truncated":false}),
-                            );
+                            let mut unavailable = json!({"state":status["state"],"complete":false,"fallback_recommended":true});
+                            if let Some(progress) = status.get("progress") {
+                                unavailable["progress"] = progress.clone();
+                            }
+                            semantic = Some(unavailable);
                             query::Results::default()
                         }
+                        Err(error) if crate::semantic::is_building(&error) => keyword,
                         Err(error) => {
                             crate::logging::semantic_failure(&self.root, &error);
                             fallback = Some("meaning search unavailable; showing keyword matches");
@@ -578,7 +580,7 @@ impl State {
                 };
                 Ok(Response::json(
                     200,
-                    json!({"query":q,"mode":mode,"sort":sort,"engine":if result.hits.iter().any(|h| h.matched=="semantic"){"keyword+semantic"}else{"keyword"},"notice":fallback,"semantic":semantic,"freshness":crate::render::freshness(pending.is_some(),pending.unwrap_or(0)),"total":result.total,"totals_exact":result.total_basis=="exact","hits":result.hits}),
+                    json!({"query":q,"mode":mode,"sort":sort,"engine":if result.hits.iter().any(|h| h.matched=="semantic"){"keyword+semantic"}else{"keyword"},"notice":fallback,"semantic":semantic,"freshness":crate::render::freshness(checked.unwrap_or(false)),"total":result.total,"totals_exact":result.total_basis=="exact","hits":result.hits}),
                 ))
             }
             _ => Ok(Response::error(404, "not found")),
@@ -693,13 +695,13 @@ mod tests {
         assert!(body.contains("\"messages\":1"));
     }
     #[test]
-    fn search_names_partial_semantic_coverage() {
+    fn a_building_meaning_lane_never_answers_from_published_vectors() {
         let t = tempfile::tempdir().unwrap();
         let root = DataRoot::open(t.path().join("data"), true).unwrap();
         let c = store::writer(&root).unwrap();
         c.execute_batch("INSERT INTO sessions VALUES('pi','session-one','demo','/work/demo','','session-one',0,'Title',1,100);INSERT INTO prose(source,agent,session,project,turn,who,model,model_source,ts,text,digest,extra,position,visible) VALUES(1,'pi','session-one','demo',0,'user','model','',1,'database migration failure','x','',0,1);").unwrap();
-        // With no row embedded the lane loads no weights, so files of the right sizes
-        // stand in for an installed model.
+        c.execute_batch("WITH RECURSIVE rows(n) AS (VALUES(2) UNION ALL SELECT n+1 FROM rows WHERE n<1024) INSERT INTO prose(source,agent,session,project,turn,who,model,model_source,ts,text,digest,extra) SELECT 1,'pi','session-one','demo',n,'user','',0,0,'database migration failure','x','' FROM rows;").unwrap();
+        // A build is refused before model loading, even when no vectors are published.
         let model = crate::semantic_model::directory(&root);
         std::fs::create_dir_all(&model).unwrap();
         for (name, size, _) in crate::semantic_model::FILES {
@@ -717,9 +719,14 @@ mod tests {
             assert_eq!(r.code, 200, "{mode}");
             let body: Value = serde_json::from_slice(&r.body).unwrap();
             let semantic = &body["semantic"];
-            assert_eq!(semantic["indexed"], 0, "{mode}: {body}");
-            assert_eq!(semantic["total"], 1, "{mode}");
-            assert_eq!(semantic["complete"], false, "{mode}");
+            if mode == "semantic" {
+                assert_eq!(semantic["complete"], false);
+                assert_eq!(semantic["progress"]["total_rows"], 1024);
+                assert_eq!(body["hits"], json!([]));
+            } else {
+                assert!(semantic.is_null(), "{body}");
+                assert!(body["notice"].is_null(), "{body}");
+            }
         }
     }
     #[test]
@@ -750,13 +757,9 @@ mod tests {
             ));
             (r.code, serde_json::from_slice::<Value>(&r.body).unwrap())
         };
-        for (query, state, partial) in [
-            (
-                "q=database+migration+failure&mode=semantic",
-                "unavailable",
-                true,
-            ),
-            ("q=!!&mode=semantic", "query-rejected", false),
+        for (query, state) in [
+            ("q=database+migration+failure&mode=semantic", "unavailable"),
+            ("q=!!&mode=semantic", "query-rejected"),
         ] {
             let (code, body) = search(query);
             assert_eq!(code, 200, "{query}");
@@ -766,7 +769,7 @@ mod tests {
             assert_eq!(body["notice"], Value::Null, "{query}");
             assert_eq!(
                 body["semantic"],
-                json!({"state":state,"complete":false,"partial":partial,"indexed":0,"total":0,"pending":0,"fallback_recommended":true,"truncated":false}),
+                json!({"state":state,"complete":false,"fallback_recommended":true}),
                 "{query}"
             );
         }
@@ -810,7 +813,7 @@ mod freshness_tests {
         let count = calls.clone();
         let server = Explorer::bind(root, 0).unwrap().with_freshness(move || {
             count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(0)
+            Ok(true)
         });
         let s = &server.state;
         let r = request(&format!(
@@ -875,7 +878,7 @@ mod boundary_tests {
         let seen = calls.clone();
         let server = Explorer::bind(root, 0).unwrap().with_freshness(move || {
             seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(0)
+            Ok(true)
         });
         let s = &server.state;
         let legacy = format!(
