@@ -419,6 +419,43 @@ pub struct Embedder {
     max_padding: usize,
     mapped: bool,
 }
+#[derive(Default)]
+pub(crate) struct InlineBatch {
+    pub vectors: Vec<Vec<f32>>,
+    pub cpu_unit: f64,
+    pub span_unit: f64,
+}
+fn cpu_seconds() -> Option<f64> {
+    #[cfg(unix)]
+    unsafe {
+        let mut usage: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut usage) == 0 {
+            return Some(
+                usage.ru_utime.tv_sec as f64
+                    + usage.ru_utime.tv_usec as f64 / 1e6
+                    + usage.ru_stime.tv_sec as f64
+                    + usage.ru_stime.tv_usec as f64 / 1e6,
+            );
+        }
+    }
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::{
+            Foundation::FILETIME,
+            System::Threading::{GetCurrentProcess, GetProcessTimes},
+        };
+        let mut times = [FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        }; 4];
+        let [created, exited, kernel, user] = &mut times;
+        if GetProcessTimes(GetCurrentProcess(), created, exited, kernel, user) != 0 {
+            let ticks = |t: &FILETIME| ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64;
+            return Some((ticks(kernel) + ticks(user)) as f64 / 1e7);
+        }
+    }
+    None
+}
 fn batch_end(
     ids: &[Vec<u32>],
     order: &[usize],
@@ -443,12 +480,6 @@ fn batch_end(
 impl Embedder {
     /// Bulk embedding: every weight is copied into tensors once per process.
     pub fn load(path: &Path, device: Device) -> Result<Self> {
-        #[cfg(target_os = "macos")]
-        if device.is_cpu() {
-            // Rayon already parallelizes attention. Nested BLAS threads make small
-            // publication batches slower and differ from the worker's allowance.
-            std::env::set_var("VECLIB_MAXIMUM_THREADS", "1");
-        }
         Self::open(path, device, false)
     }
     /// The query path's F32 CPU model. Converted projection and embedding weights
@@ -559,9 +590,6 @@ impl Embedder {
     pub fn mapped(&self) -> bool {
         self.mapped
     }
-    pub fn is_cpu(&self) -> bool {
-        self.device.is_cpu()
-    }
     pub fn query(root: &DataRoot) -> Result<Self> {
         Self::load_query(&directory(root))
     }
@@ -599,12 +627,59 @@ impl Embedder {
         self.max_padding = percent;
         Ok(self)
     }
-    /// The same batching, padding and arithmetic as a CPU publication batch.
+    /// Parallel single-sequence inference retains the query model's arithmetic.
     pub fn embed_inline(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        if self.mapped || !self.device.is_cpu() {
-            bail!("inline semantic embedding requires the bulk CPU model");
+        Ok(self.inline_batch(texts)?.vectors)
+    }
+    pub fn inline_streams() -> usize {
+        rayon::current_num_threads()
+            .min(std::thread::available_parallelism().map_or(1, usize::from))
+            .max(1)
+    }
+    pub(crate) fn inline_batch(&self, texts: &[String]) -> Result<InlineBatch> {
+        use rayon::prelude::*;
+        if !self.mapped || !self.device.is_cpu() {
+            bail!("inline semantic embedding requires the mapped query model");
         }
-        self.embed(texts)
+        let streams = Self::inline_streams().min(texts.len());
+        if streams == 0 {
+            return Ok(InlineBatch::default());
+        }
+        let cpu = cpu_seconds();
+        let started = std::time::Instant::now();
+        let parts = (0..streams)
+            .into_par_iter()
+            .map(|offset| {
+                texts
+                    .iter()
+                    .enumerate()
+                    .skip(offset)
+                    .step_by(streams)
+                    .map(|(i, text)| {
+                        let units = self.work_units(std::slice::from_ref(text))?;
+                        let tick = std::time::Instant::now();
+                        let vector = self.embed(std::slice::from_ref(text))?.remove(0);
+                        Ok((i, vector, units, tick.elapsed().as_secs_f64() / units))
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let elapsed = started.elapsed().as_secs_f64();
+        let used = cpu
+            .zip(cpu_seconds())
+            .map_or(elapsed * streams as f64, |(a, b)| (b - a).max(elapsed));
+        let mut out = InlineBatch {
+            vectors: vec![vec![]; texts.len()],
+            ..InlineBatch::default()
+        };
+        let mut units = 0.;
+        for (i, vector, weight, span) in parts.into_iter().flatten() {
+            out.vectors[i] = vector;
+            units += weight;
+            out.span_unit = out.span_unit.max(span);
+        }
+        out.cpu_unit = used / units;
+        Ok(out)
     }
     pub fn work_units(&self, texts: &[String]) -> Result<f64> {
         texts
@@ -616,7 +691,7 @@ impl Embedder {
             .sum()
     }
     pub fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        if self.device.is_cpu() && texts.len() >= 2 {
+        if self.device.is_cpu() && texts.len() >= 32 {
             // Both streams use the same bounded Rayon pool. While one reaches
             // a serial operation, the other can occupy an otherwise idle core.
             // Stripe rows so a length-ordered source cannot leave one stream

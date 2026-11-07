@@ -28,18 +28,19 @@ const INLINE_SECONDS: f64 = 1.;
 const MIN_INLINE_UNITS: f64 = 0.25;
 
 #[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
-struct CpuCost {
+struct QueryCost {
     load: f64,
-    unit: f64,
+    cpu_unit: f64,
+    span_unit: f64,
     updated: u64,
 }
-impl CpuCost {
+impl QueryCost {
     fn key() -> String {
         format!(
-            "semantic_cpu_cost_v1_{}_{}_{}",
+            "semantic_query_cost_v2_{}_{}_{}",
             std::env::consts::OS,
             std::env::consts::ARCH,
-            rayon::current_num_threads()
+            Embedder::inline_streams()
         )
     }
     fn now() -> u64 {
@@ -57,23 +58,39 @@ impl CpuCost {
         let cost: Self = serde_json::from_str(&raw).ok()?;
         (cost.load.is_finite()
             && cost.load >= 0.
-            && cost.unit.is_finite()
-            && cost.unit > 0.
+            && cost.cpu_unit.is_finite()
+            && cost.cpu_unit > 0.
+            && cost.span_unit.is_finite()
+            && cost.span_unit > 0.
             && Self::now().saturating_sub(cost.updated) < 60)
             .then_some(cost)
     }
-    fn fits(self, units: f64, elapsed: f64) -> bool {
-        // Leave room for variable scheduling and the vector scan.
-        elapsed + units * self.unit <= INLINE_SECONDS * 0.85
+    fn seconds(self, units: f64, largest: f64) -> f64 {
+        // CPU work accounts for the core allowance; the longest sequence still
+        // has a serial critical path. Headroom covers contention and scheduling.
+        (units * self.cpu_unit / Embedder::inline_streams() as f64).max(largest * self.span_unit)
+            * 1.5
+    }
+    fn fits(self, units: f64, largest: f64, elapsed: f64) -> bool {
+        elapsed + self.seconds(units, largest) <= INLINE_SECONDS * 0.85
     }
     fn preparation_limit(cost: Option<Self>) -> usize {
         cost.map_or(32, |c| {
-            (((INLINE_SECONDS * 0.85 - c.load).max(0.) / c.unit / MIN_INLINE_UNITS) as usize)
+            (((INLINE_SECONDS * 0.85 - c.load).max(0.) * Embedder::inline_streams() as f64
+                / c.cpu_unit
+                / MIN_INLINE_UNITS
+                / 1.5) as usize)
                 .min(4096)
         })
     }
-    fn observe(root: &DataRoot, load: f64, unit: f64) {
-        if crate::data::read_only() || !load.is_finite() || !unit.is_finite() || unit <= 0. {
+    fn observe(root: &DataRoot, load: f64, batch: &semantic_model::InlineBatch) {
+        if crate::data::read_only()
+            || !load.is_finite()
+            || !batch.cpu_unit.is_finite()
+            || batch.cpu_unit <= 0.
+            || !batch.span_unit.is_finite()
+            || batch.span_unit <= 0.
+        {
             return;
         }
         let save = || -> Result<()> {
@@ -86,7 +103,14 @@ impl CpuCost {
             let old = Self::read(&c);
             let cost = Self {
                 load: old.map_or(load, |v| blend(v.load, load)),
-                unit: old.map_or(unit, |v| blend(v.unit, unit)),
+                cpu_unit: old.map_or(batch.cpu_unit, |v| blend(v.cpu_unit, batch.cpu_unit)),
+                span_unit: old.map_or(batch.span_unit, |v| {
+                    if batch.vectors.len() == 1 {
+                        blend(v.span_unit, batch.span_unit)
+                    } else {
+                        v.span_unit
+                    }
+                }),
                 updated: Self::now(),
             };
             c.execute("INSERT INTO state VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -158,7 +182,7 @@ impl Overlay {
         if pending == 0 {
             return Ok(Self::default());
         }
-        let limit = CpuCost::preparation_limit(CpuCost::read(c));
+        let limit = QueryCost::preparation_limit(QueryCost::read(c));
         if pending > limit {
             return Err(build_progress(c, coverage)?.into());
         }
@@ -272,23 +296,12 @@ pub fn drain(root: &DataRoot, how: Drain) -> Result<bool> {
         return Ok(false);
     }
     let mut model = None;
-    let mut load_seconds = 0.;
     drain_with(root, how, |texts| {
         let loaded = match model.take() {
             Some(loaded) => loaded,
-            None => {
-                let started = std::time::Instant::now();
-                let loaded = Embedder::background(root)?;
-                load_seconds = started.elapsed().as_secs_f64();
-                loaded
-            }
+            None => Embedder::background(root)?,
         };
-        let units = loaded.work_units(texts)?;
-        let started = std::time::Instant::now();
         let vectors = loaded.embed(texts);
-        if vectors.is_ok() && loaded.is_cpu() {
-            CpuCost::observe(root, load_seconds, started.elapsed().as_secs_f64() / units);
-        }
         model = Some(loaded);
         vectors
     })
@@ -469,7 +482,7 @@ pub fn begin(
         coverage(c)?
     };
     let overlay = Overlay::snapshot(c, &coverage)?;
-    let cost = CpuCost::read(c);
+    let cost = QueryCost::read(c);
     let progress = build_progress(c, &coverage)?;
     let joined = Arc::new(AtomicBool::new(false));
     let lane = if coverage.total == 0 {
@@ -496,52 +509,44 @@ pub fn begin(
                         })?
                 };
                 let started = std::time::Instant::now();
-                let model = if overlay.texts.is_empty() {
-                    Embedder::query(&root)
-                } else {
-                    Embedder::load(&semantic_model::directory(&root), candle_core::Device::Cpu)
-                };
+                let model = Embedder::query(&root);
                 let load_seconds = started.elapsed().as_secs_f64();
                 let vector = model.and_then(|model| {
-                    let extra = if overlay.texts.is_empty() {
-                        vec![]
-                    } else {
+                    let mut extra = Vec::new();
+                    if !overlay.texts.is_empty() {
                         let _span = crate::semantic_profile::span("inline_embedding");
-                        let units = model.work_units(&overlay.texts)?;
-                        let mut probe = None;
                         let measured = if let Some(cost) = cost {
                             cost
                         } else {
-                            // Bootstrap on real work on this CPU, without publishing
-                            // a probe whose batch shape differs from the final batch.
-                            let tick = std::time::Instant::now();
-                            let first = &overlay.texts[..1];
-                            let vectors = model.embed_inline(first)?;
-                            let unit = tick.elapsed().as_secs_f64() / model.work_units(first)?;
-                            CpuCost::observe(&root, load_seconds, unit);
-                            probe = Some(vectors);
-                            CpuCost {
+                            let batch = model.inline_batch(&overlay.texts[..1])?;
+                            QueryCost::observe(&root, load_seconds, &batch);
+                            let measured = QueryCost {
                                 load: load_seconds,
-                                unit,
-                                updated: CpuCost::now(),
-                            }
+                                cpu_unit: batch.cpu_unit,
+                                span_unit: batch.span_unit,
+                                updated: QueryCost::now(),
+                            };
+                            extra = batch.vectors;
+                            measured
                         };
-                        if let Some(vectors) = probe.filter(|_| overlay.texts.len() == 1) {
-                            vectors
-                        } else {
-                            if !measured.fits(units, started.elapsed().as_secs_f64()) {
+                        let remaining = &overlay.texts[extra.len()..];
+                        if !remaining.is_empty() {
+                            let weights = remaining
+                                .iter()
+                                .map(|text| model.work_units(std::slice::from_ref(text)))
+                                .collect::<Result<Vec<_>>>()?;
+                            if !measured.fits(
+                                weights.iter().sum(),
+                                weights.iter().copied().fold(0., f64::max),
+                                started.elapsed().as_secs_f64(),
+                            ) {
                                 return Err(progress.into());
                             }
-                            let tick = std::time::Instant::now();
-                            let vectors = model.embed_inline(&overlay.texts)?;
-                            CpuCost::observe(
-                                &root,
-                                load_seconds,
-                                tick.elapsed().as_secs_f64() / units,
-                            );
-                            vectors
+                            let batch = model.inline_batch(remaining)?;
+                            QueryCost::observe(&root, load_seconds, &batch);
+                            extra.extend(batch.vectors);
                         }
-                    };
+                    }
                     let vector = model.embed(&[pattern])?.remove(0);
                     Ok((vector, extra))
                 });
@@ -1003,40 +1008,61 @@ pub fn post_index(root: &DataRoot) -> Result<()> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn inline_budget_uses_measured_cpu_cost_and_load() {
-        let slow = super::CpuCost {
-            load: 0.1,
-            unit: 0.1,
-            updated: super::CpuCost::now(),
+    fn inline_budget_uses_query_cpu_work_and_serial_critical_path() {
+        let cores = Embedder::inline_streams() as f64;
+        let slow = QueryCost {
+            load: 0.01,
+            cpu_unit: cores * 0.2,
+            span_unit: 0.2,
+            updated: QueryCost::now(),
         };
-        let fast = super::CpuCost { unit: 0.01, ..slow };
-        assert!(slow.fits(5., 0.1));
-        assert!(!slow.fits(10., 0.1));
-        assert!(fast.fits(20., 0.1));
-        assert!(!fast.fits(20., 0.7));
+        let fast = QueryCost {
+            cpu_unit: cores * 0.01,
+            span_unit: 0.01,
+            ..slow
+        };
+        assert!(slow.fits(2., 1., 0.01));
+        assert!(!slow.fits(5., 1., 0.01));
+        assert!(fast.fits(20., 1., 0.01));
+        assert!(!fast.fits(20., 1., 0.7));
+        let long = QueryCost {
+            span_unit: 0.6,
+            ..fast
+        };
+        assert!(!long.fits(1., 1., 0.01));
         assert!(
-            super::CpuCost::preparation_limit(Some(slow))
-                < super::CpuCost::preparation_limit(Some(fast))
+            QueryCost::preparation_limit(Some(slow)) < QueryCost::preparation_limit(Some(fast))
         );
-        assert_eq!(super::CpuCost::preparation_limit(None), 32);
+        assert_eq!(QueryCost::preparation_limit(None), 32);
     }
     #[test]
-    fn cpu_calibration_records_slowdowns_without_using_build_eta() {
+    fn query_calibration_records_slowdowns_without_using_bulk_rates() {
         let (_temp, root, _) = setup();
-        super::CpuCost::observe(&root, 0.1, 0.01);
+        let batch = |unit| semantic_model::InlineBatch {
+            cpu_unit: unit,
+            span_unit: unit,
+            ..Default::default()
+        };
+        QueryCost::observe(&root, 0.1, &batch(0.01));
         let c = store::reader(&root).unwrap();
-        let initial = super::CpuCost::read(&c).unwrap();
-        assert_eq!(initial.unit, 0.01);
-        super::CpuCost::observe(&root, 0.2, 0.1);
-        let slow = super::CpuCost::read(&store::reader(&root).unwrap()).unwrap();
-        assert_eq!(slow.unit, 0.1);
+        assert_eq!(QueryCost::read(&c).unwrap().cpu_unit, 0.01);
+        QueryCost::observe(&root, 0.2, &batch(0.1));
+        let slow = QueryCost::read(&store::reader(&root).unwrap()).unwrap();
+        assert_eq!(slow.cpu_unit, 0.1);
         assert_eq!(slow.load, 0.2);
-        super::CpuCost::observe(&root, 0.1, 0.01);
-        let decayed = super::CpuCost::read(&store::reader(&root).unwrap()).unwrap();
-        assert!(decayed.unit > 0.01 && decayed.unit < slow.unit);
+        QueryCost::observe(&root, 0.1, &batch(0.01));
+        let decayed = QueryCost::read(&store::reader(&root).unwrap()).unwrap();
+        assert!(decayed.cpu_unit > 0.01 && decayed.cpu_unit < slow.cpu_unit);
         assert!(c
             .query_row(
                 "SELECT value FROM state WHERE key='semantic_rows_per_second'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .is_err());
+        assert!(c
+            .query_row(
+                "SELECT value FROM state WHERE key LIKE 'semantic_cpu_cost_v1_%'",
                 [],
                 |r| r.get::<_, String>(0)
             )

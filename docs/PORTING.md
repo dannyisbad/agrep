@@ -53,7 +53,7 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
 - Meaning search answers only from a complete snapshot. 0.4.9 searched the vectors
   already published, even with unembedded rows, and disclosed that gap through
   coverage numbers, partial flags and lines such as `catching up; retry shortly`.
-  0.5 embeds a small queued tail inline with the bulk CPU model. During a larger build,
+  0.5 embeds a small queued tail inline with the mapped CPU query model. During a larger build,
   automatic hybrid silently uses keywords; explicit `-s` exits 2 with build progress.
   `semantic_partial` and the semantic status's `partial` field are removed;
   `semantic_coverage` is complete or null; `index --semantic` names a ready index

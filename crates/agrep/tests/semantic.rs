@@ -38,6 +38,63 @@ fn missing_model_is_one_line_exit_two_and_hybrid_stays_lexical() {
     assert!(!t.path().join("model").exists());
 }
 #[test]
+fn measured_query_cost_can_refuse_one_queued_row_before_loading_weights() {
+    let t = tempfile::tempdir().unwrap();
+    transcript(&t);
+    assert!(agrep(&t).arg("index").output().unwrap().status.success());
+    let root = DataRoot::open(t.path().join("data"), false).unwrap();
+    let key = format!(
+        "semantic_query_cost_v2_{}_{}_1",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    let updated = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    store::writer(&root)
+        .unwrap()
+        .execute(
+            "INSERT INTO state VALUES(?1,?2)",
+            rusqlite::params![
+                key,
+                serde_json::json!({"load":0.01,"cpu_unit":100.,"span_unit":100.,"updated":updated})
+                    .to_string()
+            ],
+        )
+        .unwrap();
+    fs::create_dir(t.path().join("model")).unwrap();
+    for (name, size, _) in agrep_core::semantic_model::FILES {
+        fs::File::create(t.path().join("model").join(name))
+            .unwrap()
+            .set_len(size)
+            .unwrap();
+    }
+    let command = || {
+        let mut cmd = agrep(&t);
+        cmd.env("RAYON_NUM_THREADS", "1")
+            .env("AGREP_DATA_READONLY", "1")
+            .env("AGREP_PROFILE", "compact");
+        cmd
+    };
+    let out = command()
+        .args(["search", "-s", "--json", "database migration failure"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stderr.is_empty());
+    let meta: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(meta["error"]["code"], "semantic-unavailable");
+    assert_eq!(meta["semantic"]["progress"]["remaining_rows"], 1);
+    let out = command()
+        .args(["search", "database migration failure"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stderr.is_empty());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("database migration failure"));
+}
+#[test]
 fn a_building_meaning_index_never_answers_partially() {
     let t = tempfile::tempdir().unwrap();
     let dir = t.path().join(".pi/agent/sessions/fixture");

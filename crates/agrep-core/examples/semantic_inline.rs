@@ -97,6 +97,34 @@ fn previous(model: &Embedder, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         })
         .collect())
 }
+fn bulk_previous(model: &Embedder, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    if texts.len() < 2 {
+        return model.embed(texts);
+    }
+    let a = texts.iter().step_by(2).cloned().collect::<Vec<_>>();
+    let b = texts.iter().skip(1).step_by(2).cloned().collect::<Vec<_>>();
+    let (a, b) = rayon::join(|| model.embed(&a), || model.embed(&b));
+    let (mut a, mut b) = (a?.into_iter(), b?.into_iter());
+    Ok((0..texts.len())
+        .map(|i| {
+            if i % 2 == 0 {
+                a.next().unwrap()
+            } else {
+                b.next().unwrap()
+            }
+        })
+        .collect())
+}
+fn serial(model: &Embedder, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    texts
+        .iter()
+        .map(|text| {
+            model
+                .embed(std::slice::from_ref(text))
+                .map(|mut v| v.remove(0))
+        })
+        .collect()
+}
 fn chunks() -> Result<Vec<String>> {
     let batch: Vec<String> =
         serde_json::from_str(include_str!("../../../fixtures/semantic-batch.json"))?;
@@ -113,49 +141,33 @@ fn vector_digest(vectors: &[Vec<f32>]) -> String {
     hash.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 fn fresh(model_dir: &Path, backend: &str, n: usize, sample: usize) -> Result<()> {
-    if backend == "worker" {
-        agrep_core::semantic::configure_background()?;
-    }
     let chunks = chunks()?;
     let start = sample % (chunks.len() - 20);
     let texts = &chunks[start..start + n];
     let tick = Instant::now();
-    let device = if backend == "metal" {
-        let Some(device) = agrep_core::semantic_device::metal_device() else {
-            println!("{}", json!({"available":false}));
-            return Ok(());
-        };
-        device
+    // Reproduce the rejected bulk implementation only in this child process.
+    let model = if backend == "bulk" {
+        std::env::set_var("VECLIB_MAXIMUM_THREADS", "1");
+        Embedder::load(model_dir, candle_core::Device::Cpu)?
     } else {
-        candle_core::Device::Cpu
-    };
-    let model = if backend == "previous" {
         Embedder::load_query(model_dir)?
-    } else {
-        Embedder::load(model_dir, device)?
     };
     let setup_ms = tick.elapsed().as_secs_f64() * 1000.;
-    let (vectors, embed_ms) = timed(|| {
-        if backend == "previous" {
-            previous(&model, texts)
-        } else {
-            model.embed(texts)
-        }
+    let (vectors, embed_ms) = timed(|| match backend {
+        "bulk" => bulk_previous(&model, texts),
+        "two" => previous(&model, texts),
+        "mapped" => model.embed_inline(texts),
+        _ => bail!("unknown sample mode"),
     })?;
     let (_, query_ms) = timed(|| model.embed(&["connection pool timeout".into()]))?;
     println!(
         "{}",
-        json!({"available":true,"setup_ms":setup_ms,"embed_ms":embed_ms,"query_ms":query_ms,"total_ms":tick.elapsed().as_secs_f64()*1000.,"vector_sha256":vector_digest(&vectors)})
+        json!({"streams":if backend == "mapped" {Embedder::inline_streams()} else {2},"setup_ms":setup_ms,"embed_ms":embed_ms,"query_ms":query_ms,"total_ms":tick.elapsed().as_secs_f64()*1000.,"vector_sha256":vector_digest(&vectors)})
     );
     Ok(())
 }
 fn child(model_dir: &Path, backend: &str, n: usize, sample: usize) -> Result<Value> {
-    let mut cmd = Command::new(std::env::current_exe()?);
-    // Reproduce the old default, before the CPU bulk loader bounds BLAS.
-    if backend == "previous" {
-        cmd.env_remove("VECLIB_MAXIMUM_THREADS");
-    }
-    let out = cmd
+    let out = Command::new(std::env::current_exe()?)
         .arg(model_dir)
         .args(["__sample", backend, &n.to_string(), &sample.to_string()])
         .output()?;
@@ -189,7 +201,7 @@ fn main() -> Result<()> {
         .map(|s| Path::new(s).canonicalize())
         .transpose()?;
     let started = Instant::now();
-    let model = Embedder::load(&model_dir, candle_core::Device::Cpu)?;
+    let model = Embedder::load_query(&model_dir)?;
     let load_ms = started.elapsed().as_secs_f64() * 1000.;
     let data: Value = serde_json::from_str(include_str!("../tests/fixtures/semantic-eval.json"))?;
     let texts: Vec<String> = serde_json::from_value(data["texts"].clone())?;
@@ -243,6 +255,8 @@ fn main() -> Result<()> {
         bail!("query published command-local vectors");
     }
     drop(snapshot);
+    let block_root = DataRoot::open(temp.path().join("blocks"), true)?;
+    store::writer(&block_root)?;
     let mut samples = Vec::new();
     let mut command_samples = Vec::new();
     for sample in 0..20 {
@@ -259,46 +273,32 @@ fn main() -> Result<()> {
                 .map(|s| model.token_ids(s).map(|v| v.len()))
                 .sum::<Result<_>>()?;
             let uptime = load();
-            let (old_fresh, cpu_fresh, metal_fresh) = if sample % 2 == 0 {
-                let old = child(&model_dir, "previous", n, sample)?;
-                let cpu = child(&model_dir, "cpu", n, sample)?;
-                let metal = if sample < 3 {
-                    child(&model_dir, "metal", n, sample)?
-                } else {
-                    json!({"measured":false})
-                };
-                (old, cpu, metal)
+            let order = if sample % 2 == 0 {
+                ["bulk", "two", "mapped"]
             } else {
-                let metal = if sample < 3 {
-                    child(&model_dir, "metal", n, sample)?
-                } else {
-                    json!({"measured":false})
-                };
-                let cpu = child(&model_dir, "cpu", n, sample)?;
-                (child(&model_dir, "previous", n, sample)?, cpu, metal)
+                ["mapped", "two", "bulk"]
             };
-            let before_ms = old_fresh["embed_ms"]
+            let mut measured = serde_json::Map::new();
+            for mode in order {
+                measured.insert(mode.into(), child(&model_dir, mode, n, sample)?);
+            }
+            let vectors = model.embed_inline(texts)?;
+            let digest = vector_digest(&vectors);
+            if measured["mapped"]["vector_sha256"] != digest
+                || measured["two"]["vector_sha256"] != digest
+            {
+                bail!("parallel inline vectors differ from the query model");
+            }
+            if sample == 0 && vector_digest(&serial(&model, texts)?) != digest {
+                bail!("inline vectors differ from serial query inference");
+            }
+            let embed_ms = measured["mapped"]["embed_ms"]
                 .as_f64()
-                .context("previous embedding time")?;
-            let (vectors, embed_ms) = timed(|| model.embed_inline(texts))?;
-            let published = model.embed(texts)?;
-            if !vectors
-                .iter()
-                .flatten()
-                .map(|v| v.to_bits())
-                .eq(published.iter().flatten().map(|v| v.to_bits()))
-            {
-                bail!("inline CPU batching differs from publication batching");
-            }
-            if cpu_fresh["vector_sha256"] != vector_digest(&vectors) {
-                bail!("inline vectors differ from a fresh CPU publication model");
-            }
-            if sample == 0
-                && child(&model_dir, "worker", n, sample)?["vector_sha256"]
-                    != vector_digest(&vectors)
-            {
-                bail!("inline vectors differ with the worker's CPU allowance");
-            }
+                .context("inline time")?;
+            let before_ms = measured["bulk"]["embed_ms"].as_f64().context("bulk time")?;
+            let two_ms = measured["two"]["embed_ms"]
+                .as_f64()
+                .context("two-stream time")?;
             let tick = Instant::now();
             let memory = Block::memory(&vectors)?;
             let memory_ms = tick.elapsed().as_secs_f64() * 1000.;
@@ -307,16 +307,16 @@ fn main() -> Result<()> {
             let refs: Vec<_> = (0..vectors.len())
                 .map(|i| (format!("benchmark-{sample}-{n}"), i))
                 .collect();
-            semantic_store::publish(&root, &[], &refs, &vectors)?;
+            semantic_store::publish(&block_root, &[], &refs, &vectors)?;
             let publish_ms = tick.elapsed().as_secs_f64() * 1000.;
             let blocks = semantic_store::open_blocks(
-                &root,
-                semantic_store::block_list(&store::reader(&root)?)?,
+                &block_root,
+                semantic_store::block_list(&store::reader(&block_root)?)?,
             )?;
             if !blocks.iter().any(|b| b.map[..] == memory.map[..]) {
                 bail!("inline block bytes differ from publication");
             }
-            samples.push(json!({"sample":sample,"rows":n,"tokens":tokens,"embed_ms":embed_ms,"before_ms":before_ms,"old_fresh":old_fresh,"cpu_fresh":cpu_fresh,"metal_fresh":metal_fresh,"memory_ms":memory_ms,"publish_ms":publish_ms,"uptime":uptime}));
+            samples.push(json!({"sample":sample,"rows":n,"tokens":tokens,"embed_ms":embed_ms,"before_ms":before_ms,"two_ms":two_ms,"fresh":measured,"memory_ms":memory_ms,"publish_ms":publish_ms,"uptime":uptime}));
             eprintln!("{}", samples.last().unwrap());
         }
         let bins: Vec<_> = if sample % 2 == 0 {
@@ -335,7 +335,7 @@ fn main() -> Result<()> {
                 let out = cli(bin, &model_dir, temp.path(), &root, &command)?;
                 let found = String::from_utf8_lossy(&out.stdout).contains("inline-2");
                 let wall_ms = tick.elapsed().as_secs_f64() * 1000.;
-                command_samples.push(json!({"sample":sample,"candidate":bin==&binary,"semantic_only":semantic_only,"wall_ms":wall_ms,"exit":out.status.code(),"found_new":found,"uptime":uptime}));
+                command_samples.push(json!({"sample":sample,"candidate":bin==&binary,"semantic_only":semantic_only,"covered":false,"wall_ms":wall_ms,"exit":out.status.code(),"found_new":found,"uptime":uptime}));
                 eprintln!("{}", command_samples.last().unwrap());
                 if bin == &binary && (!out.status.success() || !found) {
                     bail!(
@@ -346,9 +346,36 @@ fn main() -> Result<()> {
             }
         }
     }
+    let pending = semantic_store::batch(&store::reader(&root)?, 128)?;
+    let mut vectors = Vec::new();
+    let mut refs = Vec::new();
+    for row in &pending {
+        for (i, vector) in model.embed_inline(&row.chunks)?.into_iter().enumerate() {
+            refs.push((row.key.clone(), i));
+            vectors.push(vector);
+        }
+    }
+    semantic_store::publish(&root, &pending, &refs, &vectors)?;
+    for sample in 0..20 {
+        for semantic_only in [sample % 2 == 0, sample % 2 != 0] {
+            let uptime = load();
+            let tick = Instant::now();
+            let mut command = vec!["search", data["texts"][0].as_str().unwrap()];
+            if semantic_only {
+                command.extend(["-s", "--json"]);
+            }
+            let out = cli(&binary, &model_dir, temp.path(), &root, &command)?;
+            let found = String::from_utf8_lossy(&out.stdout).contains("inline-2");
+            command_samples.push(json!({"sample":sample,"candidate":true,"semantic_only":semantic_only,"covered":true,"wall_ms":tick.elapsed().as_secs_f64()*1000.,"exit":out.status.code(),"found_new":found,"uptime":uptime}));
+            eprintln!("{}", command_samples.last().unwrap());
+            if !out.status.success() || !found {
+                bail!("covered query proof failed");
+            }
+        }
+    }
     println!(
         "{}",
-        json!({"cpu":"F32 bulk CPU batching; previous query two-stream comparator","model_load_ms":load_ms,"next_query_proof":proof,"query_vectors_published":false,"samples":samples,"command_samples":command_samples})
+        json!({"cpu":"mapped F32 query path; bounded streams of singleton inference","streams":Embedder::inline_streams(),"model_load_ms":load_ms,"next_query_proof":proof,"query_vectors_published":false,"samples":samples,"command_samples":command_samples})
     );
     Ok(())
 }

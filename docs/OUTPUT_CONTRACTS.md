@@ -69,7 +69,7 @@ prints `semantic model not installed: run agrep setup` and exits 2. It must not
 report that as a verified zero match.
 
 Only vectors belonging to the exact snapshot text can supply a meaning hit. Before
-scanning, the lane embeds queued text with the bulk CPU model and includes those
+scanning, the lane embeds queued text with the mapped CPU query model and includes those
 vectors with the published blocks. A lane that answers covers every visible prose
 row in that snapshot; `semantic_coverage`, when non-null, is always complete.
 There is no `semantic_partial` field or coverage notice.

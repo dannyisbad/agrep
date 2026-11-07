@@ -8,14 +8,17 @@
   agrep formats. There is no migration: build a fresh index and run `agrep setup`
   again. Before upgrading, run `agrep remove` with 0.4 to remove its blocks,
   hooks and uninstall sentinel. Save old archives before deleting old data.
-- Index reads census native transcripts and ingest changes before answering.
-  The command reuses its census and waits for preceding writers; the first index is built inline,
-  parsing sources while it writes earlier ones, so it holds a bounded share of
-  the history in memory whatever the history's size.
+- Every command checks the agent transcripts and indexes what changed before it
+  answers, so an answer includes everything written before the command started,
+  with no "behind" notice. The first index is built inline, parsing sources
+  while it writes earlier ones, so it holds a bounded share of the history in
+  memory whatever the history's size.
 - Meaning search runs in process with Candle and a pinned model; a missing model
   leaves automatic hybrid search on keywords and is shown by status. Explicit
-  `-s` requires the model. Coverage is reported as indexed/total rows. The verified
-  model occupies about 194 MB installed.
+  `-s` requires the model. A meaning search embeds rows that arrived since the
+  last background pass before it answers. While the meaning index is first being
+  built, automatic hybrid search answers on keywords and `-s` reports the build's
+  progress. The verified model occupies about 194 MB installed.
 - Six platform wheels bundle the executable. npm verifies package-pinned hashes
   before caching and executing the matching GitHub release binary.
 - CI runs tests and a blocking full-process performance comparison with agrep
