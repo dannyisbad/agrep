@@ -18,6 +18,10 @@ fn command(t: &Path) -> Command {
         .env("AGREP_HOME", t.join("home"))
         .env("AGREP_DATA_DIR", t.join("data"))
         .env("AGREP_PROFILE", "classic");
+    // Winsock cannot load its providers on Windows without SystemRoot.
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        c.env("SystemRoot", root);
+    }
     c
 }
 fn chat(t: &Path, id: &str) -> std::path::PathBuf {
@@ -327,7 +331,17 @@ fn explorer_refreshes_each_index_request() {
     );
     let mut output = BufReader::new(server.0.stdout.take().unwrap());
     let mut line = String::new();
-    assert!(output.read_line(&mut line).unwrap() > 0);
+    if output.read_line(&mut line).unwrap() == 0 {
+        let mut stderr = String::new();
+        server
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        panic!("the explorer exited before printing its URL: {stderr}");
+    }
     let (address, bootstrap) = line
         .trim()
         .strip_prefix("agrep explorer: http://")
