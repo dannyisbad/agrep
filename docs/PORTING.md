@@ -53,7 +53,7 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
 - Meaning search answers only from a complete snapshot. 0.4.9 searched the vectors
   already published, even with unembedded rows, and disclosed that gap through
   coverage numbers, partial flags and lines such as `catching up; retry shortly`.
-  0.5 embeds a small queued tail inline with the query model. During a larger build,
+  0.5 embeds a small queued tail inline with the bulk CPU model. During a larger build,
   automatic hybrid silently uses keywords; explicit `-s` exits 2 with build progress.
   `semantic_partial` and the semantic status's `partial` field are removed;
   `semantic_coverage` is complete or null; `index --semantic` names a ready index
@@ -74,11 +74,11 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
 - A meaning row counts as weak when it holds fewer than half of the query's words, each
   word weighing the same, where 0.4.9 weighted the words by how many chats hold each once
   a row held some but not all of them: counting a word's chats scans its whole posting
-  list on every hybrid search (half a second for a common word on a real history).
+  list on every hybrid search.
 - When the content fallback searches tool output too, a word's weight counts its tool rows
   by the tool word dictionary's frequency total, where 0.4.9 counted them exactly: an
-  exact count reads the word's whole tool posting list (three seconds for "error" on a
-  real history). Prose rows are counted exactly, so recall's prose lane matches 0.4.9.
+  exact count reads the word’s whole tool posting list. Prose rows are counted exactly,
+  so recall’s prose lane matches 0.4.9.
 - A lane skipped for a missing model says `model-not-installed` where 0.4.9 said
   `runtime-not-installed`: the model is the only piece 0.5 installs.
 - Digestless `@session:turn` handles are refused as malformed (exit 2) where 0.4.9 served

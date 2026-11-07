@@ -443,6 +443,12 @@ fn batch_end(
 impl Embedder {
     /// Bulk embedding: every weight is copied into tensors once per process.
     pub fn load(path: &Path, device: Device) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        if device.is_cpu() {
+            // Rayon already parallelizes attention. Nested BLAS threads make small
+            // publication batches slower and differ from the worker's allowance.
+            std::env::set_var("VECLIB_MAXIMUM_THREADS", "1");
+        }
         Self::open(path, device, false)
     }
     /// The query path's F32 CPU model. Converted projection and embedding weights
@@ -553,6 +559,9 @@ impl Embedder {
     pub fn mapped(&self) -> bool {
         self.mapped
     }
+    pub fn is_cpu(&self) -> bool {
+        self.device.is_cpu()
+    }
     pub fn query(root: &DataRoot) -> Result<Self> {
         Self::load_query(&directory(root))
     }
@@ -590,40 +599,24 @@ impl Embedder {
         self.max_padding = percent;
         Ok(self)
     }
-    /// Two CPU streams retain single-chunk arithmetic while overlapping serial
-    /// projections with attention work in the same bounded Rayon pool.
+    /// The same batching, padding and arithmetic as a CPU publication batch.
     pub fn embed_inline(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        if !self.device.is_cpu() {
-            bail!("inline semantic embedding requires the CPU");
+        if self.mapped || !self.device.is_cpu() {
+            bail!("inline semantic embedding requires the bulk CPU model");
         }
-        if texts.len() < 2 {
-            return self.embed(texts);
-        }
-        let stream = |offset| {
-            texts
-                .iter()
-                .skip(offset)
-                .step_by(2)
-                .map(|text| {
-                    self.embed(std::slice::from_ref(text))
-                        .map(|mut v| v.remove(0))
-                })
-                .collect::<Result<Vec<_>>>()
-        };
-        let (a, b) = rayon::join(|| stream(0), || stream(1));
-        let (mut a, mut b) = (a?.into_iter(), b?.into_iter());
-        Ok((0..texts.len())
-            .map(|i| {
-                if i % 2 == 0 {
-                    a.next().unwrap()
-                } else {
-                    b.next().unwrap()
-                }
+        self.embed(texts)
+    }
+    pub fn work_units(&self, texts: &[String]) -> Result<f64> {
+        texts
+            .iter()
+            .map(|text| {
+                let tokens = self.token_ids(text)?.len() as f64;
+                Ok(((tokens / 200.) * (1. + tokens / 1024.) / (1. + 200. / 1024.)).max(0.25))
             })
-            .collect())
+            .sum()
     }
     pub fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        if self.device.is_cpu() && texts.len() >= 32 {
+        if self.device.is_cpu() && texts.len() >= 2 {
             // Both streams use the same bounded Rayon pool. While one reaches
             // a serial operation, the other can occupy an otherwise idle core.
             // Stripe rows so a length-ordered source cannot leave one stream

@@ -101,15 +101,16 @@ and exits 2. A complete semantic-only search that finds nothing exits 1.
   block and attaches the batch's rows. A row attaches only if its id and digest are
   unchanged and it is still visible; otherwise it stays queued.
 - Before scanning, the lane pins the keyword query's SQLite snapshot and captures its
-  queued rows. It embeds every missing chunk with the already loaded CPU F32 query
-  model in two CPU streams sharing the bounded Rayon pool, and scans a command-local
-  q8/F16 block alongside the published blocks. Single-chunk arithmetic is retained. The
-  encoding and cosine calculation are identical to published vectors. Identical text
-  reuses published chunks or a single inline embedding. Resolution uses the original
+  queued rows. It embeds every missing chunk with the bulk CPU F32 model using the
+  publication path’s batching, padding and single-threaded BLAS, and scans a
+  command-local q8/F16 block alongside the published blocks. The encoding and cosine
+  calculation are identical to published vectors. Two length-bucketed CPU batches
+  share the bounded Rayon pool. Identical text reuses published chunks or a single
+  inline embedding. Resolution uses the original
   snapshot, including edits and deletions committed after the query started.
-- Inline vectors remain in memory for the command. They do not acquire the writer lock,
-  publish references, or create small block files. The background worker continues to
-  drain the queue into ordinary 128-row blocks.
+- Inline vectors remain in memory for the command. They do not publish references
+  or create small block files. A nonblocking writer lock records CPU calibration.
+  The background worker continues to drain the queue into ordinary 128-row blocks.
 - A lane answers only with all the snapshot's visible prose covered. Its
   `semantic_coverage`, when present, has `indexed == total`, `pending: 0`,
   `fraction: 1.0` and `complete: true`. Search totals can still be score floors or
@@ -120,8 +121,11 @@ and exits 2. A complete semantic-only search that finds nothing exits 1.
   JSON carries `error.code: "semantic-unavailable"` and a status `progress` object
   with `indexed_rows`, `total_rows`, `remaining_rows`, and `estimated_seconds`.
   It returns no meaning hits and no incomplete `semantic_coverage`. The work estimate
-  accounts for actual token lengths, attention work and per-chunk overhead; a bounded
-  preflight avoids loading large rebuild queues.
+  uses measured CPU costs for loading and embedding, token lengths and attention work.
+  Costs are stored per platform and thread count; slowdowns apply immediately and
+  speedups decay across observations. An uncalibrated CPU probes one real chunk
+  before admitting a batch; a bounded preflight avoids loading large rebuild queues.
+  Background CPU batches also update calibration; Metal rates never set a CPU limit.
 - `status` reports the build counts and remaining time. The worker records its
   throughput and smooths it across batches, using an initial estimate until its first
   completed batch. This build estimate is separate from the inline CPU budget. Setup
@@ -156,15 +160,16 @@ and exits 2. A complete semantic-only search that finds nothing exits 1.
   queries, recall@5 of 1.0, rank one on the four tasks in
   `semantic-recall-reference.json`, and ten of ten long-document cases. It also checks
   that the query path maps its weights, that its tokenizer tables agree with the
-  library, that its vectors equal the bulk model's bit for bit, and that both inline
-  CPU streams reproduce all 40 single-query vectors bit for bit. CI runs it on every
+  library, that its single-query vectors equal the bulk model’s bit for bit, and that
+  inline bulk batching reproduces publication batching bit for bit. CI runs it on every
   target and it blocks.
 - `semantic_eval MODEL_DIR metal` checks the F16 Metal path with a minimum cosine of
   0.9999 and the same recall checks. `semantic_eval MODEL_DIR cpu batch` measures bulk
   throughput on `fixtures/semantic-batch.json`; it is not a gate.
 - `semantic_inline` proves that a normal meaning query ingests and finds appended
-  prose without a background drain or query publication, and that parallel and serial
-  inference produce identical vectors. CI records its samples as `semantic-inline.json`.
+  prose without a background drain or query publication, with vectors and encoded
+  blocks identical to CPU publication. CI records its CPU and fresh-process Metal
+  comparison samples as `semantic-inline.json`.
 - `bench/semantic_owner.py` exercises a native-source store with synthetic vectors
   derived from the oracle and the real query model. Every query must return meaning
   rows; latency is reported against `docs/perf-budgets.json`. Speed is gated by the

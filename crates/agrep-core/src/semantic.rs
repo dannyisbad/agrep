@@ -23,12 +23,79 @@ pub struct SearchResults {
     pub coverage: Coverage,
 }
 
-// Measured with the query CPU F32 path and 200-token chunks. Long chunks cost
-// more than a typical row; this budget is inference work, not a row-count cutoff.
-const INLINE_CHUNKS_PER_SECOND: f64 = 20.;
 const DEFAULT_BUILD_ROWS_PER_SECOND: f64 = 60.;
 const INLINE_SECONDS: f64 = 1.;
 const MIN_INLINE_UNITS: f64 = 0.25;
+
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+struct CpuCost {
+    load: f64,
+    unit: f64,
+    updated: u64,
+}
+impl CpuCost {
+    fn key() -> String {
+        format!(
+            "semantic_cpu_cost_v1_{}_{}_{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            rayon::current_num_threads()
+        )
+    }
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+    fn read(c: &Connection) -> Option<Self> {
+        let raw: String = c
+            .query_row("SELECT value FROM state WHERE key=?", [Self::key()], |r| {
+                r.get(0)
+            })
+            .ok()?;
+        let cost: Self = serde_json::from_str(&raw).ok()?;
+        (cost.load.is_finite()
+            && cost.load >= 0.
+            && cost.unit.is_finite()
+            && cost.unit > 0.
+            && Self::now().saturating_sub(cost.updated) < 60)
+            .then_some(cost)
+    }
+    fn fits(self, units: f64, elapsed: f64) -> bool {
+        // Leave room for variable scheduling and the vector scan.
+        elapsed + units * self.unit <= INLINE_SECONDS * 0.85
+    }
+    fn preparation_limit(cost: Option<Self>) -> usize {
+        cost.map_or(32, |c| {
+            (((INLINE_SECONDS * 0.85 - c.load).max(0.) / c.unit / MIN_INLINE_UNITS) as usize)
+                .min(4096)
+        })
+    }
+    fn observe(root: &DataRoot, load: f64, unit: f64) {
+        if crate::data::read_only() || !load.is_finite() || !unit.is_finite() || unit <= 0. {
+            return;
+        }
+        let save = || -> Result<()> {
+            // Calibration must never add a wait behind an index writer.
+            let Some(_lock) = root.lock(false)? else {
+                return Ok(());
+            };
+            let c = store::writer(root)?;
+            let blend = |old: f64, new: f64| new.max(old * 0.75 + new * 0.25);
+            let old = Self::read(&c);
+            let cost = Self {
+                load: old.map_or(load, |v| blend(v.load, load)),
+                unit: old.map_or(unit, |v| blend(v.unit, unit)),
+                updated: Self::now(),
+            };
+            c.execute("INSERT INTO state VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![Self::key(), serde_json::to_string(&cost)?])?;
+            Ok(())
+        };
+        let _ = save();
+    }
+}
 
 #[derive(Debug, serde::Serialize)]
 pub struct BuildProgress {
@@ -91,7 +158,8 @@ impl Overlay {
         if pending == 0 {
             return Ok(Self::default());
         }
-        if pending as f64 > INLINE_CHUNKS_PER_SECOND * INLINE_SECONDS / MIN_INLINE_UNITS {
+        let limit = CpuCost::preparation_limit(CpuCost::read(c));
+        if pending > limit {
             return Err(build_progress(c, coverage)?.into());
         }
         let mut out = Self::default();
@@ -124,7 +192,7 @@ impl Overlay {
             }
         }
         // Bound preparation as well as inference, even for a few very long rows.
-        if out.texts.len() as f64 > INLINE_CHUNKS_PER_SECOND * INLINE_SECONDS / MIN_INLINE_UNITS {
+        if out.texts.len() > limit {
             return Err(build_progress(c, coverage)?.into());
         }
         Ok(out)
@@ -204,12 +272,23 @@ pub fn drain(root: &DataRoot, how: Drain) -> Result<bool> {
         return Ok(false);
     }
     let mut model = None;
+    let mut load_seconds = 0.;
     drain_with(root, how, |texts| {
         let loaded = match model.take() {
             Some(loaded) => loaded,
-            None => Embedder::background(root)?,
+            None => {
+                let started = std::time::Instant::now();
+                let loaded = Embedder::background(root)?;
+                load_seconds = started.elapsed().as_secs_f64();
+                loaded
+            }
         };
+        let units = loaded.work_units(texts)?;
+        let started = std::time::Instant::now();
         let vectors = loaded.embed(texts);
+        if vectors.is_ok() && loaded.is_cpu() {
+            CpuCost::observe(root, load_seconds, started.elapsed().as_secs_f64() / units);
+        }
         model = Some(loaded);
         vectors
     })
@@ -390,6 +469,7 @@ pub fn begin(
         coverage(c)?
     };
     let overlay = Overlay::snapshot(c, &coverage)?;
+    let cost = CpuCost::read(c);
     let progress = build_progress(c, &coverage)?;
     let joined = Arc::new(AtomicBool::new(false));
     let lane = if coverage.total == 0 {
@@ -415,28 +495,54 @@ pub fn begin(
                             semantic_store::open_blocks(root, listed)
                         })?
                 };
-                let vector = Embedder::query(&root).and_then(|model| {
-                    let units = overlay
-                        .texts
-                        .iter()
-                        .map(|text| {
-                            let tokens = model.token_ids(text)?.len() as f64;
-                            Ok(
-                                ((tokens / 200.) * (1. + tokens / 1024.) / (1. + 200. / 1024.))
-                                    .max(MIN_INLINE_UNITS),
-                            )
-                        })
-                        .sum::<Result<f64>>()?;
-                    if units / INLINE_CHUNKS_PER_SECOND > INLINE_SECONDS {
-                        return Err(progress.into());
-                    }
-                    let vector = model.embed(&[pattern])?.remove(0);
+                let started = std::time::Instant::now();
+                let model = if overlay.texts.is_empty() {
+                    Embedder::query(&root)
+                } else {
+                    Embedder::load(&semantic_model::directory(&root), candle_core::Device::Cpu)
+                };
+                let load_seconds = started.elapsed().as_secs_f64();
+                let vector = model.and_then(|model| {
                     let extra = if overlay.texts.is_empty() {
                         vec![]
                     } else {
                         let _span = crate::semantic_profile::span("inline_embedding");
-                        model.embed_inline(&overlay.texts)?
+                        let units = model.work_units(&overlay.texts)?;
+                        let mut probe = None;
+                        let measured = if let Some(cost) = cost {
+                            cost
+                        } else {
+                            // Bootstrap on real work on this CPU, without publishing
+                            // a probe whose batch shape differs from the final batch.
+                            let tick = std::time::Instant::now();
+                            let first = &overlay.texts[..1];
+                            let vectors = model.embed_inline(first)?;
+                            let unit = tick.elapsed().as_secs_f64() / model.work_units(first)?;
+                            CpuCost::observe(&root, load_seconds, unit);
+                            probe = Some(vectors);
+                            CpuCost {
+                                load: load_seconds,
+                                unit,
+                                updated: CpuCost::now(),
+                            }
+                        };
+                        if let Some(vectors) = probe.filter(|_| overlay.texts.len() == 1) {
+                            vectors
+                        } else {
+                            if !measured.fits(units, started.elapsed().as_secs_f64()) {
+                                return Err(progress.into());
+                            }
+                            let tick = std::time::Instant::now();
+                            let vectors = model.embed_inline(&overlay.texts)?;
+                            CpuCost::observe(
+                                &root,
+                                load_seconds,
+                                tick.elapsed().as_secs_f64() / units,
+                            );
+                            vectors
+                        }
                     };
+                    let vector = model.embed(&[pattern])?.remove(0);
                     Ok((vector, extra))
                 });
                 let blocks = opened.join().map_err(crate::logging::panic_error)?;
@@ -896,6 +1002,46 @@ pub fn post_index(root: &DataRoot) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inline_budget_uses_measured_cpu_cost_and_load() {
+        let slow = super::CpuCost {
+            load: 0.1,
+            unit: 0.1,
+            updated: super::CpuCost::now(),
+        };
+        let fast = super::CpuCost { unit: 0.01, ..slow };
+        assert!(slow.fits(5., 0.1));
+        assert!(!slow.fits(10., 0.1));
+        assert!(fast.fits(20., 0.1));
+        assert!(!fast.fits(20., 0.7));
+        assert!(
+            super::CpuCost::preparation_limit(Some(slow))
+                < super::CpuCost::preparation_limit(Some(fast))
+        );
+        assert_eq!(super::CpuCost::preparation_limit(None), 32);
+    }
+    #[test]
+    fn cpu_calibration_records_slowdowns_without_using_build_eta() {
+        let (_temp, root, _) = setup();
+        super::CpuCost::observe(&root, 0.1, 0.01);
+        let c = store::reader(&root).unwrap();
+        let initial = super::CpuCost::read(&c).unwrap();
+        assert_eq!(initial.unit, 0.01);
+        super::CpuCost::observe(&root, 0.2, 0.1);
+        let slow = super::CpuCost::read(&store::reader(&root).unwrap()).unwrap();
+        assert_eq!(slow.unit, 0.1);
+        assert_eq!(slow.load, 0.2);
+        super::CpuCost::observe(&root, 0.1, 0.01);
+        let decayed = super::CpuCost::read(&store::reader(&root).unwrap()).unwrap();
+        assert!(decayed.unit > 0.01 && decayed.unit < slow.unit);
+        assert!(c
+            .query_row(
+                "SELECT value FROM state WHERE key='semantic_rows_per_second'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .is_err());
+    }
     #[test]
     fn background_cpu_allowance_never_exceeds_half_the_machine() {
         for logical in [1, 2, 3, 6, 12, 64] {
