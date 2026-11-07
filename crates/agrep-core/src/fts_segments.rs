@@ -1,4 +1,4 @@
-//! FTS5 segment upkeep. A refresh adds at most one segment to each FTS table and never
+//! FTS5 segment upkeep and deferred retrieval-bound tightening. A refresh adds at most one segment to each FTS table and never
 //! merges; a detached worker merges them in bounded steps, so lookups, which seek
 //! every segment for every term, stay on few segments, and no foreground writer
 //! waits for more than one step.
@@ -91,7 +91,7 @@ pub fn segments(levels: &[Level]) -> usize {
 }
 
 /// Whether [`upkeep`] has work: an unfinished merge, a level holding two segments, or
-/// more than [`CAP`] segments in a table.
+/// more than [`CAP`] segments in a table, or retrieval bounds awaiting tightening.
 pub fn pending(c: &Connection) -> Result<bool> {
     for table in TABLES {
         let levels = levels(c, table)?;
@@ -99,7 +99,11 @@ pub fn pending(c: &Connection) -> Result<bool> {
             return Ok(true);
         }
     }
-    Ok(false)
+    Ok(
+        c.query_row("SELECT EXISTS(SELECT 1 FROM bound_rebuild)", [], |r| {
+            r.get(0)
+        })?,
+    )
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -159,7 +163,7 @@ fn upkeep_with(root: &DataRoot, cap: usize, step_pages: i64) -> Result<Upkeep> {
             out.skipped_lock = out.tables.is_empty();
             break;
         };
-        let c = {
+        let mut c = {
             let _lock = root.lock_behind_writers()?;
             store::writer(root)?
         };
@@ -183,6 +187,16 @@ fn upkeep_with(root: &DataRoot, cap: usize, step_pages: i64) -> Result<Upkeep> {
             report.ms = table_start.elapsed().as_secs_f64() * 1000.;
             worked |= report.merge_steps + report.optimize_steps > 0;
             out.tables.push(report);
+        }
+        let mut wal = root.db().into_os_string();
+        wal.push("-wal");
+        while store::tighten_bounds_step(root, &mut c)? {
+            worked = true;
+            if std::fs::metadata(&wal).is_ok_and(|m| m.len() >= CHECKPOINT_BYTES) {
+                let started = Instant::now();
+                c.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))?;
+                out.checkpoint_ms += started.elapsed().as_secs_f64() * 1000.;
+            }
         }
         drop(merging);
         // A writer that found merge.lock held while this process finished its last step

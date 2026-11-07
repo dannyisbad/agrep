@@ -14,7 +14,7 @@ The root is `AGREP_DATA_DIR` if set, otherwise `~/Library/Application Support/ag
 on macOS, `$XDG_DATA_HOME/agrep/0.5` (or `~/.local/share/agrep/0.5`) on Linux and
 `%LOCALAPPDATA%\agrep\0.5` on Windows.
 
-`FORMAT` holds exactly `agrep-data 6\n`. An absent or empty root is initialized; the
+`FORMAT` holds exactly `agrep-data 8\n`. An absent or empty root is initialized; the
 marker is created with `create_new`, so racing initializers agree. Other marker bytes,
 or a non-empty root without a marker, are refused with one line naming the path. On Unix
 the root and its `archive`, `model` and `log` directories are created with mode 0700,
@@ -91,8 +91,8 @@ source snapshot for the refresh (`pending` exposes only its measurements):
   or a directory now stands at its path; the refresh removes a source on the same test.
   Symbolic links are not followed. An unreadable directory yields an error record rather
   than the deletion of its unseen subtree, and the record goes once the directory lists.
-- The census also reports whether FTS segments need merging. It writes nothing; the
-  refresh saves the listings it used.
+- The census also reports whether FTS segments need merging or retrieval bounds need
+  tightening. It writes nothing; the refresh saves the listings it used.
 
 How commands use it (`ready` and `finish_census` in `crates/agrep/src/main.rs`):
 
@@ -214,13 +214,18 @@ block can reach, using the score formula in [SEARCH_RANKING.md](SEARCH_RANKING.m
 the boundary factor at its maximum of 1. Other text gets a conservative universal
 ceiling.
 
-A refresh recomputes bounds only for changed blocks. Posting lists are partitioned into
-64-block chunks, so changing one block never decodes or rewrites a gram's whole list.
-Each block's gram presence is a fixed 5,999-byte bitmap; an append ORs its new grams
-into that bitmap instead of materializing the block's previous vocabulary. Metadata
-updates that cannot change bounds do not dirty them.
-A block that only gained rows (none updated or deleted, recorded by `bound_updates`
-and `tool_bound_updates`) merges the new rows' maxima without reading its old rows.
+A refresh raises bounds using only changed visible rows. A removal, rewrite or
+visibility change can leave older maxima in place: these are upper bounds, so they
+admit extra candidates without hiding matches or changing scores. Such blocks enter
+`bound_rebuild`; the merge worker recomputes one block per transaction, yielding to
+queued writers, to tighten them later. First builds and explicit bound rebuilds compute
+exact bounds. Base postings are partitioned into 64-block chunks. A refresh writes
+per-block term raises without reading the old chunks; queries merge both halves in
+one SQLite snapshot. The worker folds raises into exact base postings and clears them
+in the same transaction, so concurrent readers cannot lose a term during that move.
+Each block's gram presence is a fixed 5,999-byte bitmap, merged with new grams without
+materializing its previous vocabulary. Metadata updates that cannot change bounds do
+not dirty them.
 
 Family parent and filename-alias claims are persisted. An append with unchanged claims
 needs no family traversal; changes revisit the affected names and their descendants.
@@ -325,7 +330,8 @@ matching allows, and a match stands where neither neighbor is `\w` (`str.isalnum
   groups and verifies the rest. Tool phrase passes check the indexed positions of up
   to three groups before decoding text. Common questions of at most sixteen terms
   prefer three consecutive groups that each expand to one literal word; other plans
-  use the rarest groups. Distinct single-word expansions with no extra token gaps
+  use the rarest groups. Phrase anchors use literal spellings rather than inflections.
+  Distinct single-word expansions with no extra token gaps
   first use FTS5's native phrase check for consecutive groups, or its proximity check
   for spaced groups, then the same ordered-position verifier.
 - Terms shorter than three characters stay out of the FTS expression and are verified on
@@ -334,6 +340,17 @@ matching allows, and a match stands where neither neighbor is `\w` (`str.isalnum
   the snippet's repetition score. A positive literal occurrence count proves the match;
   when its score ceiling loses to the page, it is counted without decoding or scoring.
   Other query forms and rows that can enter the page retain canonical text verification.
+  ASCII tool blocks also bound snippet repetition directly from FTS token positions.
+  Matched tokens supply their exact word widths; unmatched tokens need at least one
+  character and a separator. These minimum distances can only overestimate how many
+  occurrences fit in a snippet. Windows no wider than the long-token chunk overlap
+  retain a complete posting copy. Other text keeps the global occurrence bound.
+  Unscoped tool-only searches read a block's ranking metadata once through the existing
+  tool-ID index. The FTS cursor retains possible page winners and counts the rest only
+  when a strict bound proves that the original uncapped row ceilings remain above every
+  possible page cutoff; otherwise the original cursor runs. Retained candidates carry
+  their occurrence ceilings forward as the page improves. Broad expansions walk each
+  word's postings separately and union IDs and capped counts.
 - Outside a selective scope, with more than 128 estimated matches, a page limit and
   score or time order, a pass visits blocks in descending ceiling order (newest first
   for time order) and stops once the page is full and the next block cannot beat the
@@ -350,6 +367,11 @@ Scores, snippets, boundary grading and tie order follow
 the proven `~meta` rows from that page; counts with `--no-meta` are refused.
 Row and chat pages fetch display metadata and build handles only for candidates that
 can enter the page or improve an existing chat head; matching rows are still counted.
+Tool candidates defer session and symbol names until a filter, an equal-time tie, or a
+surviving row needs them. On ASCII all-terms rows, first fully aligned term spans can
+supply snippet boundary spans without regrading. Doubled spelling edges retain the
+original path because a cut can duplicate its neighbour. A contiguous window cannot
+introduce an absent alphanumeric phrase, so it needs no second phrase scan.
 
 ## Counts
 

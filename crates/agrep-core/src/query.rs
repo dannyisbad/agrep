@@ -1130,19 +1130,25 @@ impl Matcher {
         }
         let mut found = Vec::new();
         let mut found_weight = 0.;
-        for i in 0..self.terms.len() {
-            let present = self.term_present(&row, i);
-            if !present {
-                if self.partial {
-                    continue;
-                } else {
-                    return Ok(None);
+        // A literal phrase or the selected term spans already prove membership on
+        // ASCII rows. Case-alias and content lanes keep their separate eligibility.
+        let verify_terms =
+            self.partial || !text.is_ascii() || self.lowercase_terms.iter().any(|t| t.special);
+        if verify_terms {
+            for i in 0..self.terms.len() {
+                let present = self.term_present(&row, i);
+                if !present {
+                    if self.partial {
+                        continue;
+                    } else {
+                        return Ok(None);
+                    }
                 }
+                found_weight += self.idf.get(i).copied().unwrap_or(1.);
+                found.push(i);
             }
-            found_weight += self.idf.get(i).copied().unwrap_or(1.);
-            found.push(i);
         }
-        if found.is_empty() {
+        if verify_terms && found.is_empty() {
             return Ok(None);
         }
         let first = if self.partial {
@@ -1189,21 +1195,50 @@ impl Matcher {
                 return Ok(None);
             };
             let snip = Snip::new(text, &spans);
-            let view = View::new(&row, &snip);
-            let phrase = self.phrase_strength(&row, &snip, &view)?;
-            let graded = boundary_rank::decut_text(&snip.text, true);
-            let b = self.boundary.evaluate(&graded, None, true)?;
-            let shift = i64::from(snip.text.starts_with(window::CUT));
-            let selected: Vec<_> = b
-                .spans
-                .iter()
-                .map(|span| span.map(|[start, end]| [start - shift, end - shift]))
-                .collect();
-            let near = window::proximity(&snip.text, &selected, &b.qualities, self.query_chars);
+            // A contiguous window cannot introduce a phrase absent from the row.
+            // Disjoint windows can join terms across their cut markers.
+            let phrase = if snip.contiguous()
+                && self
+                    .terms
+                    .iter()
+                    .flatten()
+                    .all(|t| t.bytes().all(|b| b.is_ascii_alphanumeric()))
+            {
+                0.
+            } else {
+                self.phrase_strength(&row, &snip, &View::new(&row, &snip))?
+            };
+            // First aligned spans already maximize every boundary factor. A cut
+            // duplicates its neighbour, so doubled spelling edges need regrading.
+            let reusable = text.is_ascii()
+                && self.lowercase_terms.iter().all(|t| !t.special)
+                && self.terms.iter().flatten().all(|t| {
+                    let b = t.as_bytes();
+                    b.len() >= 2
+                        && b.iter().all(u8::is_ascii_alphanumeric)
+                        && b[0] != b[1]
+                        && b[b.len() - 1] != b[b.len() - 2]
+                })
+                && spans.iter().all(|s| window::aligned(text, s));
+            let (factor, class, selected, qualities) =
+                if let Some(selected) = reusable.then(|| snip.selected(&spans)).flatten() {
+                    (1., "aligned", selected, vec![1.; spans.len()])
+                } else {
+                    let graded = boundary_rank::decut_text(&snip.text, true);
+                    let b = self.boundary.evaluate(&graded, None, true)?;
+                    let shift = i64::from(snip.text.starts_with(window::CUT));
+                    let selected = b
+                        .spans
+                        .iter()
+                        .map(|span| span.map(|[start, end]| [start - shift, end - shift]))
+                        .collect();
+                    (b.factor, b.match_class, selected, b.qualities)
+                };
+            let near = window::proximity(&snip.text, &selected, &qualities, self.query_chars);
             return Ok(Some(Scored {
                 tier: 1,
-                score: score(phrase.max(near), rec, who, b.factor, meta),
-                class: b.match_class,
+                score: score(phrase.max(near), rec, who, factor, meta),
+                class,
                 span: spans
                     .iter()
                     .min_by_key(|span| (span.start, span.end))
@@ -1533,9 +1568,21 @@ impl Matcher {
         }
         let mut clauses = vec![];
         let mut ordinals = vec![];
+        let literal = !self.lowercase_terms.iter().any(|t| t.special)
+            && self
+                .terms
+                .iter()
+                .all(|group| group[0].bytes().all(|b| b.is_ascii_alphanumeric()));
         let mut groups: Vec<_> = self
             .terms
             .iter()
+            .map(|group| {
+                if literal {
+                    &group[..1]
+                } else {
+                    group.as_slice()
+                }
+            })
             .enumerate()
             .filter(|(_, group)| group.iter().all(|v| self.tool_supported.contains(v)))
             .collect();
@@ -1564,7 +1611,7 @@ impl Matcher {
                     (
                         self.ordered_terms
                             .iter()
-                            .position(|ordered| ordered == *group)
+                            .position(|ordered| ordered.first() == group.first())
                             .unwrap_or(usize::MAX),
                         *i,
                     )
@@ -2440,9 +2487,8 @@ const RUN_BLOCKS: usize = 64;
 /// Consecutive blocks a run may step over: ones without a ceiling, already read, or
 /// below the page's cutoff.
 const RUN_GAP: usize = 8;
-/// A cheap necessary condition for the ordered span check. Keep the original
-/// clauses first: their phrase numbers are the span function's ordinals.
-fn tool_near(expression: &str, ordinals: &[u8]) -> Option<String> {
+/// A necessary token proximity condition, verified against canonical text later.
+fn tool_near(expression: &str, ordinals: &[u8], gap: i64) -> Option<String> {
     let words: Vec<_> = expression.split('"').skip(1).step_by(2).collect();
     let positions: Vec<_> = ordinals
         .chunks_exact(4)
@@ -2458,12 +2504,14 @@ fn tool_near(expression: &str, ordinals: &[u8]) -> Option<String> {
     {
         return None;
     }
-    let distance = positions.last()? - positions.first()?;
-    if positions.windows(2).all(|pair| pair[1] == pair[0] + 1) {
-        return Some(format!("{expression} AND \"{}\"", words.join(" ")));
+    let distance = i64::from(positions.last()? - positions.first()?)
+        .saturating_mul(gap.saturating_add(1))
+        .min(i64::from(i32::MAX));
+    if gap == 0 && positions.windows(2).all(|pair| pair[1] == pair[0] + 1) {
+        return Some(format!("\"{}\"", words.join(" ")));
     }
     Some(format!(
-        "{expression} AND NEAR({}, {distance})",
+        "NEAR({}, {distance})",
         words
             .iter()
             .map(|word| format!("\"{word}\""))
@@ -2548,10 +2596,23 @@ fn admit_run(
     let (expression, ordinals) = own.as_ref().map_or((expression, span), |(e, o)| {
         (e.as_str(), Some(o.as_slice()))
     });
-    let near = (table == "tools" && span.is_some() && max_gap == Some(0))
-        .then(|| ordinals.and_then(|o| tool_near(expression, o)))
+    let near = (table == "tools" && span.is_some())
+        .then(|| {
+            ordinals.and_then(|o| {
+                max_gap
+                    .and_then(|gap| tool_near(expression, o, gap))
+                    .map(|e| (e, o.to_vec()))
+            })
+        })
         .flatten();
-    let expression = near.as_deref().unwrap_or(expression);
+    let (expression, ordinals) = near.as_ref().map_or((expression, ordinals), |(e, o)| {
+        (e.as_str(), Some(o.as_slice()))
+    });
+    let span = if table == "tools" && near.as_ref().is_some_and(|(e, _)| e.starts_with('"')) {
+        None
+    } else {
+        span
+    };
     let mut sql = match (table, span) {
         ("tools", Some(_)) => "SELECT f.rowid FROM tools_fts f LEFT JOIN event_rows e INDEXED BY event_tool_id ON e.tool_id=f.rowid AND e.active=1 LEFT JOIN tool_blobs t ON t.id=e.blob WHERE tools_fts MATCH ?1 AND f.rowid>=?2 AND f.rowid<?3 AND agrep_word_span(tools_fts,?4,CASE WHEN t.ascii THEN 0 ELSE ?5 END)".to_owned(),
         (_, Some(_)) => format!("SELECT rowid FROM {table}_fts WHERE {table}_fts MATCH ?1 AND rowid>=?2 AND rowid<?3 AND agrep_word_span({table}_fts,?4,?5)"),
@@ -2563,11 +2624,32 @@ fn admit_run(
         Value::Integer((last + 1) * BLOCK),
     ];
     if occurrences.is_some() {
-        let weights: Vec<u8> = m
-            .group_words(&m.ordered_terms[0], Some(blocks))
+        let words = m.group_words(&m.ordered_terms[0], Some(blocks));
+        // Separate posting walks avoid merging hundreds of OR position lists
+        // for every row. The union retains every ID and the same occurrence cap.
+        if words.len() >= 32 {
+            let counts =
+                tool_rank::word_rows(c, &words, &m.terms[0][0], first * BLOCK, (last + 1) * BLOCK)?;
+            let mut rows: HashMap<i64, Vec<i64>> =
+                blocks.iter().map(|&b| (b, Vec::new())).collect();
+            for (id, count) in counts {
+                if let Some(ids) = rows.get_mut(&(id / BLOCK)) {
+                    ids.push(id);
+                    if let Some(occurrences) = occurrences.as_deref_mut() {
+                        occurrences.insert(id, count);
+                    }
+                }
+            }
+            for ids in rows.values_mut() {
+                ids.sort_unstable();
+            }
+            admitted.extend(rows);
+            return Ok(());
+        }
+        let weights = words
             .iter()
-            .flat_map(|word| (word.matches(m.terms[0][0].as_str()).count() as u32).to_le_bytes())
-            .collect();
+            .flat_map(|w| (w.matches(m.terms[0][0].as_str()).count() as u32).to_le_bytes())
+            .collect::<Vec<_>>();
         sql = "SELECT rowid,agrep_tool_occurrences(tools_fts,?4) FROM tools_fts WHERE tools_fts MATCH ?1 AND rowid>=?2 AND rowid<?3".into();
         bind.push(Value::Blob(weights));
     }
@@ -3029,6 +3111,11 @@ fn search_pass(
             && m.terms.len() == 1
             && m.estimated != usize::MAX
             && m.estimated.saturating_mul(4) >= lane_total;
+        let fts_table = if table == "tools" {
+            "tools_fts"
+        } else {
+            "prose_fts"
+        };
         let span_plan = if table == "tools" {
             m.word_positions(None)
         } else {
@@ -3199,14 +3286,17 @@ fn search_pass(
             && ids.is_none()
             && !selective
             && fts.as_ref().is_some_and(|f| f.matches('"').count() <= 16))
-        .then(|| {
-            m.group_words(&m.ordered_terms[0], None)
-                .iter()
-                .flat_map(|word| {
-                    (word.matches(m.terms[0][0].as_str()).count() as u32).to_le_bytes()
-                })
-                .collect::<Vec<_>>()
-        });
+        .then(|| tool_rank::window_plan(&m.group_words(&m.ordered_terms[0], None), &m.terms[0][0]));
+        let frontier = (occurrence_weights.is_some()
+            && o.sort == "score"
+            && o.filters.who.as_deref() == Some("tool")
+            && !has_scope
+            && o.filters.exclude_project.is_none()
+            && o.filters.no_who.is_none()
+            && !o.filters.no_side
+            && o.filters.caller.is_none())
+        .then(|| tool_rank::frontier(c))
+        .transpose()?;
         let mut visited = HashSet::new();
         let mut coverage_tried = false;
         while let Some((block, bound, max_ts, min_session, min_turn, max_gap)) =
@@ -3257,7 +3347,7 @@ fn search_pass(
             }
             if adaptive_prose && block_index > 0 {
                 adaptive_prose = false;
-                if let Some(expression) = &fts {
+                if let Some(expression) = fts.as_ref().filter(|_| span_plan.is_none()) {
                     let tick = Instant::now();
                     ids = cache.candidate_rows(
                         c,
@@ -3288,7 +3378,7 @@ fn search_pass(
                         }
                     })
                 };
-                // The adaptive prose plan reads one candidate stream after this block.
+                // Probe one block before committing to a longer posting read.
                 let limit = if adaptive_prose { 1 } else { RUN_BLOCKS };
                 let mut run = vec![block];
                 for step in [1, -1] {
@@ -3326,19 +3416,95 @@ fn search_pass(
                 )?;
                 result.timings.sqlite_ms += tick.elapsed().as_secs_f64() * 1000.;
             }
-            let block_ids = match &ids {
-                Some(map) => map.get(&block),
-                None => runs.get(&block),
+            let ascii = if occurrence_weights.is_some() {
+                c.query_row(
+                    "SELECT all_ascii FROM tool_blocks WHERE id=?",
+                    [block],
+                    |r| r.get::<_, bool>(0),
+                )
+                .optional()?
+                .unwrap_or(false)
+            } else {
+                false
             };
-            if (ids.is_some() || spanned) && block_ids.is_none_or(Vec::is_empty) {
+            let prefetched = if let (Some(frontier), Some(plan), Some(expression)) =
+                (&frontier, &occurrence_weights, &fts)
+            {
+                if ascii
+                    && result.hits.len() >= o.limit
+                    && result.hits[o.limit - 1].tier == 0
+                    && result.hits[o.limit - 1].score > 0.
+                    && result.hits[o.limit - 1].score < ranked(bound)
+                {
+                    let tick = Instant::now();
+                    let cutoff = result.hits[o.limit - 1].score;
+                    let prefetched = tool_rank::competitive_rows(
+                        c,
+                        frontier,
+                        expression,
+                        plan,
+                        block * BLOCK..(block + 1) * BLOCK,
+                        (now, cutoff, ascii),
+                    )?
+                    .filter(|p| p.complete(cutoff, bound));
+                    result.timings.sqlite_ms += tick.elapsed().as_secs_f64() * 1000.;
+                    prefetched
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(prefetched) = &prefetched {
+                // The strict frontier proves the old uncapped row ceiling never
+                // skips these matches, even after every possible page improvement.
+                let counted = prefetched.total - prefetched.ids.len();
+                result.total += counted;
+                result.rows += counted;
+                result.tool_rows += counted;
+                if let Some(occurrences) = &mut occurrences {
+                    occurrences.extend(
+                        prefetched
+                            .ids
+                            .iter()
+                            .copied()
+                            .zip(prefetched.counts.iter().copied()),
+                    );
+                }
+            }
+            let block_ids = if let Some(prefetched) = &prefetched {
+                Some(&prefetched.ids)
+            } else {
+                match &ids {
+                    Some(map) => map.get(&block),
+                    None => runs.get(&block),
+                }
+            };
+            if (prefetched.is_some() || ids.is_some() || spanned)
+                && block_ids.is_none_or(Vec::is_empty)
+            {
                 continue;
             }
             result.blocks += 1;
             let mut bind = vec![];
-            if let Some(weights) = &occurrence_weights {
+            let occurrence_weights = occurrence_weights.as_ref().filter(|_| prefetched.is_none());
+            if let Some(weights) = occurrence_weights {
                 bind.push(Value::Blob(weights.clone()));
+                bind.push(Value::Integer(now));
+                bind.push(Value::Real(
+                    if o.limit > 0
+                        && result.hits.len() >= o.limit
+                        && result.hits[o.limit - 1].tier == 0
+                    {
+                        result.hits[o.limit - 1].score
+                    } else {
+                        -1.
+                    },
+                ));
+                bind.push(Value::Integer(i64::from(ascii)));
             }
-            let uses_fts = !selective && fts.is_some() && ids.is_none() && !spanned;
+            let uses_fts =
+                !selective && fts.is_some() && ids.is_none() && !spanned && prefetched.is_none();
             let candidate_table = if table == "tools" && (uses_fts || ids.is_some() || bounded) {
                 crate::tool_store::CANDIDATES_BY_ID
             } else {
@@ -3347,7 +3513,7 @@ fn search_pass(
             let from = if uses_fts {
                 bind.push(Value::Text(fts.clone().unwrap()));
                 format!(
-                    "{table}_fts f CROSS JOIN {candidate_table} p ON f.rowid=p.id WHERE {table}_fts MATCH ?"
+                    "{fts_table} f CROSS JOIN {candidate_table} p ON f.rowid=p.id WHERE {fts_table} MATCH ?"
                 )
             } else if table == "prose" && (ids.is_some() || bounded) {
                 // The candidate IDs already establish the selective access path.
@@ -3362,6 +3528,12 @@ fn search_pass(
             } else {
                 "NULL"
             };
+            let lazy_identity = candidate_table == crate::tool_store::CANDIDATES_BY_ID;
+            let identity_columns = if lazy_identity {
+                "NULL,NULL"
+            } else {
+                "p.session,p.agent"
+            };
             let eager_prose = table == "prose"
                 && !selective
                 && !partial
@@ -3370,11 +3542,11 @@ fn search_pass(
             let body = if eager_prose {
                 "p.text"
             } else if occurrence_weights.is_some() {
-                "agrep_tool_occurrences(tools_fts,?)"
+                "agrep_tool_window_occurrences(tools_fts,?,p.id,p.ts,?,?,?)"
             } else {
                 "NULL"
             };
-            let mut sql=format!("SELECT p.id,p.session,p.agent,{blob},p.position,p.who,{body},NULL,p.ts,NULL,NULL,NULL FROM {from}{scope}");
+            let mut sql=format!("SELECT p.id,{identity_columns},{blob},p.position,p.who,{body},NULL,p.ts,NULL,NULL,NULL FROM {from}{scope}");
             bind.extend(values.clone());
             if uses_fts {
                 if let Some((_, ordinals)) = &span_plan {
@@ -3429,16 +3601,33 @@ fn search_pass(
                 let row = rows.next()?;
                 result.timings.sqlite_ms += sql_started.elapsed().as_secs_f64() * 1000.;
                 let Some(r) = row else { break };
+                let identity_cache = std::cell::OnceCell::new();
+                let identity = || -> Result<&(String, String)> {
+                    if identity_cache.get().is_none() {
+                        let value = if lazy_identity {
+                            c.prepare_cached("SELECT s.session,s.agent FROM event_rows e INDEXED BY event_tool_id JOIN event_sessions s ON s.id=e.session_key WHERE e.active=1 AND e.blob IS NOT NULL AND e.tool_id=?")?
+                                .query_row([r.get::<_,i64>(0)?], |r|Ok((r.get(0)?,r.get(1)?)))?
+                        } else {
+                            (r.get(1)?, r.get(2)?)
+                        };
+                        let _ = identity_cache.set(value);
+                    }
+                    Ok(identity_cache.get().expect("loaded above"))
+                };
                 let who: String = r.get(5)?;
                 let ts: i64 = r.get(8)?;
                 let turn: i64 = r.get(4)?;
                 let cutoff = if o.sort == "score" && o.limit > 0 && result.hits.len() >= o.limit {
-                    let session: String = r.get(1)?;
+                    let session = if ts == result.hits[o.limit - 1].ts {
+                        identity()?.0.as_str()
+                    } else {
+                        ""
+                    };
                     Some(Cutoff::of(
                         &result.hits[o.limit - 1],
                         o.chats,
                         ts,
-                        &session,
+                        session,
                         turn,
                     ))
                 } else {
@@ -3501,7 +3690,10 @@ fn search_pass(
                     result.rows += 1;
                     result.tool_rows += 1;
                     if o.filters.sessions.is_some() {
-                        *result.session_counts.entry(r.get(1)?).or_default() += 1;
+                        *result
+                            .session_counts
+                            .entry(identity()?.0.clone())
+                            .or_default() += 1;
                     }
                     continue;
                 }
@@ -3531,10 +3723,13 @@ fn search_pass(
                 result.total += 1;
                 result.rows += 1;
                 if o.filters.sessions.is_some() {
-                    *result.session_counts.entry(r.get(1)?).or_default() += 1;
+                    *result
+                        .session_counts
+                        .entry(identity()?.0.clone())
+                        .or_default() += 1;
                 }
                 if o.chats {
-                    sessions.insert((r.get::<_, String>(2)?, r.get::<_, String>(1)?));
+                    sessions.insert((identity()?.1.clone(), identity()?.0.clone()));
                 }
                 if table == "tools" {
                     result.tool_rows += 1;
@@ -3559,7 +3754,7 @@ fn search_pass(
                 if o.count_only {
                     continue;
                 }
-                let session: String = r.get(1)?;
+                let session = identity()?.0.clone();
                 if o.chats || (o.limit > 0 && result.hits.len() >= o.limit) {
                     let ranked = Hit {
                         session: session.clone(),
@@ -3575,9 +3770,9 @@ fn search_pass(
                         && result.hits.len() >= o.limit
                         && compare(&ranked, &result.hits[o.limit - 1], &o.sort, o.chats).is_ge();
                     let below_head = if o.chats && !below_page {
-                        let agent: String = r.get(2)?;
+                        let agent = &identity()?.1;
                         result.hits.iter().any(|old| {
-                            old.agent == agent
+                            &old.agent == agent
                                 && old.session == session
                                 && compare(&ranked, old, &o.sort, true).is_ge()
                         })
@@ -3620,13 +3815,13 @@ fn search_pass(
                     )
                 };
                 let self_marker = o.filters.caller.as_ref().is_some_and(|caller| {
-                    caller.agent == r.get::<_, String>(2).unwrap_or_default()
+                    caller.agent == identity().map(|i| i.1.as_str()).unwrap_or_default()
                         && caller.session == session
                 });
                 let meta_marker = meta_role(&who, turn);
                 let h = Hit {
                     session,
-                    agent: r.get(2)?,
+                    agent: identity()?.1.clone(),
                     project,
                     family: String::new(),
                     side: false,
@@ -3982,6 +4177,79 @@ mod chat_scope_tests {
 mod matcher_cache_tests {
     use super::*;
     #[test]
+    fn reused_all_terms_spans_match_snippet_regrading() {
+        let c = Connection::open_in_memory().unwrap();
+        store::schema(&c).unwrap();
+        for pattern in [
+            "flaky windows cache",
+            "how did the drafting go last run",
+            "caches window flaky",
+            "oo book",
+            "cache cache",
+        ] {
+            let o = Options {
+                pattern: pattern.into(),
+                regex: false,
+                word: false,
+                sort: "score".into(),
+                limit: 40,
+                exact: false,
+                count_only: false,
+                count_by_tier: false,
+                content: false,
+                chats: false,
+                tools: false,
+                filters: Default::default(),
+            };
+            let mut matcher = Matcher::new(&o, &c).unwrap();
+            matcher.phase = 2;
+            for gap in [
+                " ".into(),
+                "\n\t ".into(),
+                "x".repeat(79),
+                "x".repeat(160),
+                "x ".repeat(200),
+            ] {
+                let tokens = boundary_rank::query_tokens(pattern);
+                let text = format!(
+                    "prefix {} suffix",
+                    tokens.iter().rev().copied().collect::<Vec<_>>().join(&gap)
+                );
+                let Some(actual) = matcher.evaluate(&text, "user", 1, 0, 0, None).unwrap() else {
+                    continue;
+                };
+                let row = Folded::new(&text);
+                let spans = matcher
+                    .terms
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| matcher.term_span(&row, i).unwrap().unwrap())
+                    .collect::<Vec<_>>();
+                let snip = Snip::new(&text, &spans);
+                let phrase = matcher
+                    .phrase_strength(&row, &snip, &View::new(&row, &snip))
+                    .unwrap();
+                let graded = boundary_rank::decut_text(&snip.text, true);
+                let b = matcher.boundary.evaluate(&graded, None, true).unwrap();
+                let shift = i64::from(snip.text.starts_with(window::CUT));
+                let selected = b
+                    .spans
+                    .iter()
+                    .map(|s| s.map(|[a, b]| [a - shift, b - shift]))
+                    .collect::<Vec<_>>();
+                let near =
+                    window::proximity(&snip.text, &selected, &b.qualities, matcher.query_chars);
+                assert_eq!(
+                    actual.score,
+                    score(phrase.max(near), 1., "user", b.factor, false),
+                    "{pattern:?}"
+                );
+                assert_eq!(actual.class, b.match_class);
+                assert_eq!(actual.snippet, snip.text);
+            }
+        }
+    }
+    #[test]
     fn native_tool_proximity_keeps_every_ordered_span() {
         let c = Connection::open_in_memory().unwrap();
         c.execute_batch("CREATE VIRTUAL TABLE f USING fts5(text,content='',tokenize='unicode61 remove_diacritics 0');
@@ -3994,7 +4262,7 @@ mod matcher_cache_tests {
             .into_iter()
             .flat_map(u32::to_le_bytes)
             .collect();
-        let near = tool_near(expression, &ordinals).unwrap();
+        let near = tool_near(expression, &ordinals, 0).unwrap();
         let query = |expression: &str| {
             c.prepare("SELECT rowid FROM f WHERE f MATCH ?1 AND agrep_word_span(f,?2,0)")
                 .unwrap()
@@ -4006,8 +4274,15 @@ mod matcher_cache_tests {
                 .unwrap()
         };
         assert_eq!(query(expression), [1, 4, 5]);
-        assert_eq!(query(&near), [1, 4, 5]);
-        assert!(tool_near("(\"foobar\") AND (\"foobar\")", &ordinals[..8]).is_none());
+        let candidates = c
+            .prepare("SELECT rowid FROM f WHERE f MATCH ? ORDER BY rowid")
+            .unwrap()
+            .query_map([near], |r| r.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(candidates, [1, 4, 5]);
+        assert!(tool_near("(\"foobar\") AND (\"foobar\")", &ordinals[..8], 0).is_none());
     }
 
     #[test]
@@ -4053,6 +4328,22 @@ mod matcher_cache_tests {
                 .into_iter()
                 .flat_map(u32::to_le_bytes)
                 .collect::<Vec<_>>()
+        );
+        for term in ["windows", "window"] {
+            c.execute(
+                "INSERT INTO tool_words(term,doc,blocks) VALUES(?1,200,?2)",
+                rusqlite::params![term, blocks],
+            )
+            .unwrap();
+        }
+        let mut o = o;
+        o.pattern = "one windows six".into();
+        let mut matcher = cache.matcher(&o, &c).unwrap();
+        matcher.phase = 1;
+        matcher.order_for(&c, "tools", &mut cache).unwrap();
+        assert_eq!(
+            matcher.word_positions(None).unwrap().0,
+            "(\"one\") AND (\"windows\") AND (\"six\")"
         );
     }
     #[test]
@@ -4101,8 +4392,8 @@ mod matcher_cache_tests {
         let (expression, ordinals) = matcher.word_positions(None).unwrap();
         assert_eq!(expression, "(\"one\") AND (\"two\") AND (\"six\")");
         assert_eq!(
-            tool_near(&expression, &ordinals).unwrap(),
-            "(\"one\") AND (\"two\") AND (\"six\") AND \"one two six\""
+            tool_near(&expression, &ordinals, 0).unwrap(),
+            "\"one two six\""
         );
     }
     // Every pass of a search clones one compiled matcher: a pass adjusts only its copy,

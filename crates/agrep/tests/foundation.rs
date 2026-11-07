@@ -3209,7 +3209,7 @@ fn coverage_bounds_use_terms_in_the_same_row_and_preserve_unicode() {
 }
 
 #[test]
-fn appended_block_bounds_equal_a_complete_rebuild() {
+fn appended_bounds_tighten_to_a_complete_rebuild() {
     fn bounds(root: &DataRoot) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
         let c = store::reader(root).unwrap();
         [
@@ -3228,10 +3228,26 @@ fn appended_block_bounds_equal_a_complete_rebuild() {
         })
         .collect()
     }
+    fn check_search(root: &DataRoot) {
+        let c = store::reader(root).unwrap();
+        for pattern in ["needle", "old marker", "βeta"] {
+            let mut options = retrieval_options(pattern);
+            options.limit = 20;
+            let fast = agrep_core::query::search(&c, &options).unwrap();
+            options.exact = true;
+            let exact = agrep_core::query::search(&c, &options).unwrap();
+            assert_eq!(
+                fast.hits.iter().map(|h| &h.handle).collect::<Vec<_>>(),
+                exact.hits.iter().map(|h| &h.handle).collect::<Vec<_>>()
+            );
+        }
+    }
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
     let data = temp.path().join("data");
     let path = transcript(&home, &vec!["old marker"; 600]);
+    let root = DataRoot::open(&data, true).unwrap();
+    let merge = root.merge_lock().unwrap().unwrap();
     ok(cli(&home, &data, &["index"]));
     write_records(
         &path,
@@ -3241,16 +3257,30 @@ fn appended_block_bounds_equal_a_complete_rebuild() {
         true,
     );
     ok(cli(&home, &data, &["index"]));
-    let root = DataRoot::open(&data, false).unwrap();
+    check_search(&root);
+    drop(merge);
+    agrep_core::fts_segments::upkeep(&root).unwrap();
     let incremental = bounds(&root);
     store::rebuild_bounds(&root).unwrap();
     assert_eq!(incremental, bounds(&root));
-    // A metadata-only edit of an old row must invalidate the append merge too.
+    // Metadata-only edits must raise ceilings before the worker tightens them too.
     let text = fs::read_to_string(&path)
         .unwrap()
         .replace("2026-10-29T12:00:01Z", "2099-02-01T00:00:00Z");
     fs::write(&path, text).unwrap();
+    let merge = root.merge_lock().unwrap().unwrap();
     ok(cli(&home, &data, &["index"]));
+    check_search(&root);
+    drop(merge);
+    agrep_core::fts_segments::upkeep(&root).unwrap();
+    assert_eq!(
+        store::reader(&root)
+            .unwrap()
+            .query_row("SELECT count(*) FROM gram_raises", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
     let incremental = bounds(&root);
     store::rebuild_bounds(&root).unwrap();
     assert_eq!(incremental, bounds(&root));

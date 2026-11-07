@@ -219,6 +219,9 @@ fn boundary(text: &str, at: usize) -> bool {
     }
     (alpha(left) && unicode_v16::is_digit(right)) || (unicode_v16::is_digit(left) && alpha(right))
 }
+pub(crate) fn aligned(text: &str, span: &Range<usize>) -> bool {
+    boundary(text, span.start) && boundary(text, span.end)
+}
 
 /// 0.4.9's `insensitive_span` over folded text: of the occurrences of each spelling in
 /// turn, the first aligned at both ends, else the first of the best quality, as an
@@ -283,6 +286,24 @@ pub(crate) struct Snip {
 }
 
 impl Snip {
+    pub fn contiguous(&self) -> bool {
+        self.pieces.len() <= 1
+    }
+    pub fn selected(&self, spans: &[Range<usize>]) -> Option<Vec<Option<[i64; 2]>>> {
+        spans
+            .iter()
+            .map(|span| {
+                let piece = self
+                    .pieces
+                    .iter()
+                    .position(|p| p.body.start <= span.start && span.end <= p.body.end)?;
+                Some(Some([
+                    self.index(piece, span.start) as i64,
+                    self.index(piece, span.end) as i64,
+                ]))
+            })
+            .collect()
+    }
     pub fn new(text: &str, spans: &[Range<usize>]) -> Self {
         Self::padded(text, spans, PAD)
     }

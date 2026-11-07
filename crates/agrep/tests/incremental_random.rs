@@ -124,11 +124,17 @@ fn logical(data: &Path) -> Vec<Vec<String>> {
     }
     out
 }
-fn search(home: &Path, data: &Path, pattern: &str, who: &str) -> (Option<i32>, Vec<String>) {
+fn search(
+    home: &Path,
+    data: &Path,
+    pattern: &str,
+    who: &str,
+    limit: &str,
+) -> (Option<i32>, Vec<String>) {
     let out = run(
         home,
         data,
-        &[pattern, "--who", who, "--json", "--no-auto", "-n", "0"],
+        &[pattern, "--who", who, "--json", "--no-auto", "-n", limit],
     );
     let rows: Vec<_> = String::from_utf8_lossy(&out.stdout)
         .lines()
@@ -169,6 +175,9 @@ fn randomized_refreshes_equal_fresh_builds_across_adapters() {
         let temp = TempDir::new().unwrap();
         let home = temp.path().join("home");
         let data = temp.path().join("data");
+        let root = DataRoot::open(&data, true).unwrap();
+        // Keep the ceilings loose across the whole mutation sequence.
+        let _bounds_worker = root.merge_lock().unwrap().unwrap();
         let mut sources = Vec::new();
         let mut serial = 0;
         for agent in 0..3 {
@@ -243,11 +252,13 @@ fn randomized_refreshes_equal_fresh_builds_across_adapters() {
                 ("kit", "tool"),
                 ("rewritten", "user"),
             ] {
-                assert_eq!(
-                    search(&home, &data, pattern, who),
-                    search(&home, &fresh_data, pattern, who),
-                    "seed {seed} step {step} {pattern} {who}"
-                );
+                for limit in ["0", "3"] {
+                    assert_eq!(
+                        search(&home, &data, pattern, who, limit),
+                        search(&home, &fresh_data, pattern, who, limit),
+                        "seed {seed} step {step} {pattern} {who} limit {limit}"
+                    );
+                }
             }
             let c = Connection::open(data.join("index.db")).unwrap();
             let mismatches:i64=c.query_row("SELECT count(*) FROM tool_words w WHERE w.doc!=coalesce((SELECT doc FROM tools_vocab v WHERE v.term=w.term),0)",[],|r|r.get(0)).unwrap();

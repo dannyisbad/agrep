@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 // Candidate streams already carry IDs or a block range. Keep that access path
 // ahead of broad agent/session predicates, and do not join stored text here.
-pub(crate) const CANDIDATES_BY_ID: &str = "(SELECT e.tool_id AS id,s.agent,s.session,p.value AS project,'tool' AS who,m.value AS model,e.ts,e.position,e.visible,e.blob FROM event_rows e INDEXED BY event_tool_id CROSS JOIN event_sessions s ON s.id=e.session_key LEFT JOIN symbols p ON p.id=e.project_key LEFT JOIN symbols m ON m.id=e.model_key WHERE e.active=1 AND e.blob IS NOT NULL)";
+pub(crate) const CANDIDATES_BY_ID: &str = "(SELECT e.tool_id AS id,(SELECT agent FROM event_sessions WHERE id=e.session_key) AS agent,(SELECT session FROM event_sessions WHERE id=e.session_key) AS session,(SELECT value FROM symbols WHERE id=e.project_key) AS project,'tool' AS who,(SELECT value FROM symbols WHERE id=e.model_key) AS model,e.ts,e.position,e.visible,e.blob FROM event_rows e INDEXED BY event_tool_id WHERE e.active=1 AND e.blob IS NOT NULL)";
 
 pub(crate) fn schema(c: &Connection) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS event_sessions(id INTEGER PRIMARY KEY,agent TEXT NOT NULL,session TEXT NOT NULL,UNIQUE(agent,session));

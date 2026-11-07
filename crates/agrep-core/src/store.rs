@@ -157,6 +157,9 @@ CREATE TABLE IF NOT EXISTS source_directories(path TEXT PRIMARY KEY,agent TEXT N
 CREATE TABLE IF NOT EXISTS parser_cursors(path TEXT PRIMARY KEY REFERENCES sources(path) ON DELETE CASCADE ON UPDATE CASCADE,body BLOB NOT NULL) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS parser_graph(source INTEGER NOT NULL,bucket INTEGER NOT NULL,body BLOB NOT NULL,PRIMARY KEY(source,bucket)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS gram_postings(lane INTEGER NOT NULL,gram INTEGER NOT NULL,chunk INTEGER NOT NULL,body BLOB NOT NULL,PRIMARY KEY(lane,gram,chunk)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS bound_rebuild(block INTEGER PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS gram_raises(lane INTEGER NOT NULL,gram INTEGER NOT NULL,block INTEGER NOT NULL,frequency INTEGER NOT NULL,max_ts INTEGER NOT NULL,weight INTEGER NOT NULL,PRIMARY KEY(lane,gram,block)) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS gram_raises_block ON gram_raises(lane,block);
 CREATE TABLE IF NOT EXISTS block_grams(lane INTEGER NOT NULL,block INTEGER NOT NULL,body BLOB NOT NULL,PRIMARY KEY(lane,block)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS blocks(id INTEGER PRIMARY KEY,max_ts INTEGER NOT NULL,user_ts INTEGER,weight REAL NOT NULL,min_session TEXT NOT NULL,min_turn INTEGER NOT NULL,max_gap INTEGER NOT NULL,all_ascii INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS tool_blocks(id INTEGER PRIMARY KEY,max_ts INTEGER NOT NULL,user_ts INTEGER,weight REAL NOT NULL,min_session TEXT NOT NULL,min_turn INTEGER NOT NULL,max_gap INTEGER NOT NULL,all_ascii INTEGER NOT NULL);
@@ -828,6 +831,8 @@ fn refresh_inner(
             "tool_words",
             "tool_word_blocks",
             "tool_trigrams",
+            "bound_rebuild",
+            "gram_raises",
             "tool_lexicon",
             "tool_word_dirty",
             "tool_word_batch",
@@ -841,21 +846,10 @@ fn refresh_inner(
             tx.execute(&format!("DELETE FROM {table}"), [])?;
         }
     }
-    let append_from = if first {
-        None
-    } else {
-        Some([
-            tx.query_row("SELECT coalesce(max(id),0) FROM prose", [], |r| {
-                r.get::<_, i64>(0)
-            })?,
-            tx.query_row(
-                "SELECT coalesce(max(tool_id),0) FROM event_rows WHERE active=1",
-                [],
-                |r| r.get::<_, i64>(0),
-            )?,
-        ])
+    let mut changes = Changes {
+        bulk: first || rebuild,
+        ..Default::default()
     };
-    let mut changes = Changes::default();
     let mut turnless_before = HashSet::new();
     let mut canonical_sessions = HashSet::new();
     let mut fast_sessions = HashSet::new();
@@ -1075,7 +1069,11 @@ fn refresh_inner(
         .as_secs_f64()
         * 1000.;
     let phase = Instant::now();
-    update_blocks(&tx, &changes.blocks, append_from)?;
+    if first || rebuild {
+        update_blocks(&tx, &changes.blocks, None)?;
+    } else {
+        raise_changed_bounds(&tx, &mut changes)?;
+    }
     tx.execute("DELETE FROM bound_updates", [])?;
     tx.execute("DELETE FROM tool_bound_updates", [])?;
     info.bounds_ms = phase.elapsed().as_secs_f64() * 1000.;
@@ -1300,9 +1298,25 @@ fn build_fts(tx: &Transaction<'_>) -> Result<Option<crate::tool_index::Presence>
 /// What one transaction's row writes leave for derived structures to catch up on.
 #[derive(Default)]
 struct Changes {
-    /// Blocks whose bounds are recomputed: prose block ids, tool blocks as `-1 - id`.
+    /// Prose block ids, tool blocks as `-1 - id`.
     blocks: BTreeSet<i64>,
+    bounds: [BTreeSet<i64>; 2],
+    // A first build summarizes whole blocks and needs no per-row delta set.
+    bulk: bool,
     fts: FtsWrites,
+}
+impl Changes {
+    fn touch(&mut self, table: &str, id: i64) {
+        let lane = usize::from(table == "tools");
+        if !self.bulk {
+            self.bounds[lane].insert(id);
+        }
+        self.blocks.insert(if lane == 1 {
+            -1 - id / BLOCK
+        } else {
+            id / BLOCK
+        });
+    }
 }
 /// The FTS rows a transaction touched, per lane: whether each was indexed when the
 /// transaction began and whether it is indexed at its end.
@@ -1470,11 +1484,7 @@ fn set_visibility(
     };
     tx.prepare_cached(sql)?
         .execute(params![id, visible, position])?;
-    changes.blocks.insert(if table == "tools" {
-        -1 - id / BLOCK
-    } else {
-        id / BLOCK
-    });
+    changes.touch(table, id);
     Ok(())
 }
 fn session_title(text: &str) -> String {
@@ -1879,11 +1889,7 @@ fn remove_source(
 fn erase(tx: &Transaction<'_>, t: &str, id: i64, changes: &mut Changes) -> Result<()> {
     changes.fts.delete(t, id);
     tx.execute(&format!("DELETE FROM {t} WHERE id=?"), [id])?;
-    changes.blocks.insert(if t == "tools" {
-        -1 - id / BLOCK
-    } else {
-        id / BLOCK
-    });
+    changes.touch(t, id);
     Ok(())
 }
 struct NewRow<'a> {
@@ -1917,11 +1923,7 @@ impl BulkRows {
             r.get::<_, i64>(0)
         })? {
             let id = id?;
-            changes.blocks.insert(if lane == 0 {
-                id / BLOCK
-            } else {
-                -1 - id / BLOCK
-            });
+            changes.touch(table, id);
         }
         rows.clear();
         Ok(())
@@ -1995,7 +1997,7 @@ fn store_event(
         }
     }
     if changed.dirty {
-        changes.blocks.insert(-1 - changed.id / BLOCK);
+        changes.touch("tools", changed.id);
     }
     Ok(usize::from(changed.text_changed))
 }
@@ -2015,11 +2017,7 @@ fn upsert(
             r.text.as_bytes().to_vec()
         };
         let id=tx.prepare_cached(&format!("INSERT INTO {table}(source,agent,session,project,turn,who,model,model_source,ts,text,digest,extra,position) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?5) ON CONFLICT(source,session,turn,who,extra) DO UPDATE SET project=excluded.project,model=excluded.model,model_source=excluded.model_source,ts=excluded.ts,text=excluded.text,digest=excluded.digest RETURNING id"))?.query_row(params![source,r.agent,r.session,r.project,r.turn,r.who,r.model,r.model_source,r.ts,encoded,dg,r.extra],|row|row.get::<_,i64>(0))?;
-        changes.blocks.insert(if table == "tools" {
-            -1 - id / BLOCK
-        } else {
-            id / BLOCK
-        });
+        changes.touch(table, id);
         return Ok(1);
     }
     type StoredRow = (i64, String, i64, String, String, String, bool);
@@ -2034,11 +2032,7 @@ fn upsert(
                 return Ok(0);
             }
             if old_ts != r.ts {
-                changes.blocks.insert(if table == "tools" {
-                    -1 - id / BLOCK
-                } else {
-                    id / BLOCK
-                });
+                changes.touch(table, id);
             }
             tx.execute(
                 &format!(
@@ -2060,11 +2054,7 @@ fn upsert(
         if visible {
             changes.fts.insert(table, id);
         }
-        changes.blocks.insert(if table == "tools" {
-            -1 - id / BLOCK
-        } else {
-            id / BLOCK
-        });
+        changes.touch(table, id);
         return Ok(1);
     }
     let encoded = if table == "tools" {
@@ -2075,11 +2065,7 @@ fn upsert(
     tx.prepare_cached(&format!("INSERT INTO {table}(source,agent,session,project,turn,who,model,model_source,ts,text,digest,extra,position) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?5)"))?.execute(params![source,r.agent,r.session,r.project,r.turn,r.who,r.model,r.model_source,r.ts,encoded,dg,r.extra])?;
     let id = tx.last_insert_rowid();
     changes.fts.insert(table, id);
-    changes.blocks.insert(if table == "tools" {
-        -1 - id / BLOCK
-    } else {
-        id / BLOCK
-    });
+    changes.touch(table, id);
     Ok(1)
 }
 /// `prepared` holds the texts of `s.events` by index, where they were prepared off the
@@ -2708,16 +2694,53 @@ pub(crate) fn posting_list(c: &Connection, lane: i64, gram: &str) -> Result<Vec<
     let Some(key) = gram_code(gram) else {
         return Ok(vec![]);
     };
-    let mut q = c.prepare_cached(
-        "SELECT body FROM gram_postings WHERE lane=?1 AND gram=?2 ORDER BY chunk",
-    )?;
+    // One statement keeps both halves on the same snapshot while a worker folds raises.
+    let mut q = c.prepare_cached("SELECT 0,chunk,body,NULL,NULL,NULL FROM gram_postings WHERE lane=?1 AND gram=?2 UNION ALL SELECT 1,block,NULL,frequency,max_ts,weight FROM gram_raises WHERE lane=?1 AND gram=?2")?;
     let mut rows = q.query(params![lane, key])?;
-    let mut out = Vec::new();
+    let mut base = Vec::new();
+    let mut raises = Vec::new();
     while let Some(row) = rows.next()? {
-        out.extend(decode_posting(row.get_ref(0)?.as_blob()?)?);
+        if row.get::<_, i64>(0)? == 0 {
+            base.extend(decode_posting(row.get_ref(2)?.as_blob()?)?);
+        } else {
+            let posting = Posting {
+                block: row.get(1)?,
+                frequency: row.get(3)?,
+                max_ts: row.get(4)?,
+                weight: row.get(5)?,
+            };
+            anyhow::ensure!(
+                posting.frequency > 0 && posting.max_ts >= 0 && posting.weight <= 6,
+                "invalid gram raise"
+            );
+            raises.push(posting);
+        }
     }
+    if base.windows(2).any(|p| p[0].block > p[1].block) {
+        base.sort_unstable_by_key(|p| p.block);
+    }
+    if raises.is_empty() {
+        return Ok(base);
+    }
+    raises.sort_unstable_by_key(|p| p.block);
+    let mut out = Vec::with_capacity(base.len() + raises.len());
+    let mut base = base.into_iter().peekable();
+    for mut raised in raises {
+        while base.peek().is_some_and(|p| p.block < raised.block) {
+            out.push(base.next().expect("posting before raise"));
+        }
+        if base.peek().is_some_and(|p| p.block == raised.block) {
+            let prior = base.next().expect("same posting");
+            raised.frequency = raised.frequency.max(prior.frequency);
+            raised.max_ts = raised.max_ts.max(prior.max_ts);
+            raised.weight = raised.weight.max(prior.weight);
+        }
+        out.push(raised);
+    }
+    out.extend(base);
     Ok(out)
 }
+
 fn posting_chunk(c: &Connection, lane: i64, key: u32, chunk: u32) -> Result<Vec<Posting>> {
     let bytes: Option<Vec<u8>> = c
         .prepare_cached("SELECT body FROM gram_postings WHERE lane=?1 AND gram=?2 AND chunk=?3")?
@@ -2805,15 +2828,66 @@ fn write_posting_chunk(
     Ok(())
 }
 
+fn raise_changed_bounds(tx: &Transaction<'_>, changes: &mut Changes) -> Result<()> {
+    for (table, dirty) in [("prose", "bound_updates"), ("tools", "tool_bound_updates")] {
+        let mut query = tx.prepare_cached(&format!("SELECT id FROM {dirty}"))?;
+        for id in query.query_map([], |r| r.get::<_, i64>(0))? {
+            changes.touch(table, id?);
+        }
+    }
+    let mut enqueue = tx.prepare_cached("INSERT OR IGNORE INTO bound_rebuild VALUES(?)")?;
+    for block in &changes.blocks {
+        enqueue.execute([block])?;
+    }
+    // Old contributions may disappear, but keeping their maxima cannot hide a hit.
+    update_blocks(tx, &changes.blocks, Some(&changes.bounds))
+}
+
+pub(crate) fn tighten_bounds_step(root: &DataRoot, c: &mut Connection) -> Result<bool> {
+    let _lock = root.lock_behind_writers()?;
+    let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let block: Option<i64> = tx
+        .query_row("SELECT block FROM bound_rebuild LIMIT 1", [], |r| r.get(0))
+        .optional()?;
+    let Some(block) = block else { return Ok(false) };
+    let watch = root.clone();
+    tx.progress_handler(1000, Some(move || watch.writer_queued().unwrap_or(true)));
+    let result = update_blocks(&tx, &BTreeSet::from([block]), None);
+    tx.progress_handler(0, None::<fn() -> bool>);
+    if let Err(error) = result {
+        if error.downcast_ref::<rusqlite::Error>().is_some_and(|e| matches!(e, rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::OperationInterrupted)) {
+            return Ok(true);
+        }
+        return Err(error);
+    }
+    let (lane, id) = if block < 0 {
+        (1, -1 - block)
+    } else {
+        (0, block)
+    };
+    tx.execute(
+        "DELETE FROM gram_raises WHERE lane=?1 AND block=?2",
+        params![lane, id],
+    )?;
+    tx.execute("DELETE FROM bound_rebuild WHERE block=?", [block])?;
+    tx.commit()?;
+    Ok(true)
+}
+
+struct PostingChange {
+    rows: Vec<Posting>,
+    dirty: bool,
+}
+
 fn update_blocks(
     tx: &Transaction<'_>,
     blocks: &BTreeSet<i64>,
-    append_from: Option<[i64; 2]>,
+    delta: Option<&[BTreeSet<i64>; 2]>,
 ) -> Result<()> {
     let first: bool = !tx.query_row("SELECT EXISTS(SELECT 1 FROM gram_postings)", [], |r| {
         r.get::<_, bool>(0)
     })?;
-    let mut changed: HashMap<(i64, u32, u32), Vec<Posting>> = HashMap::new();
+    let mut changed: HashMap<(i64, u32, u32), PostingChange> = HashMap::new();
     let keys: Vec<_> = blocks.iter().copied().collect();
     for chunk in keys.chunks(32) {
         let mut input = vec![];
@@ -2823,23 +2897,41 @@ fn update_blocks(
             } else {
                 ("prose", key)
             };
-            let (metadata, dirty, lane) = if key < 0 {
-                ("tool_blocks", "tool_bound_updates", 1)
+            let lane = usize::from(key < 0);
+            let rows = if let Some(delta) = delta {
+                let mut query = tx.prepare_cached(&format!(
+                    "SELECT text,ts,who,session,position FROM {table} WHERE visible=1 AND id>=?1 AND id<?2"
+                ))?;
+                let mut rows = Vec::new();
+                let mut ids = delta[lane]
+                    .range(block * BLOCK..(block + 1) * BLOCK)
+                    .copied()
+                    .peekable();
+                while let Some(lo) = ids.next() {
+                    let mut end = lo + 1;
+                    while ids.peek() == Some(&end) {
+                        ids.next();
+                        end += 1;
+                    }
+                    let mut selected = query.query(params![lo, end])?;
+                    while let Some(row) = selected.next()? {
+                        rows.push((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ));
+                    }
+                }
+                rows
             } else {
-                ("blocks", "bound_updates", 0)
+                tx.prepare_cached(&format!("SELECT text,ts,who,session,position FROM {table} WHERE visible=1 AND id>=?1 AND id<?2"))?.query_map(params![block*BLOCK,(block+1)*BLOCK],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?.collect::<rusqlite::Result<Vec<BoundRow>>>()?
             };
-            let floor = append_from.map(|f| f[lane]);
-            let append = if let Some(floor) = floor.filter(|_| !first) {
-                tx.prepare_cached(&format!("SELECT EXISTS(SELECT 1 FROM {metadata} WHERE id=?1) AND NOT EXISTS(SELECT 1 FROM {dirty} WHERE id>=?2 AND id<?3 AND id<=?4)"))?.query_row(params![block,block*BLOCK,(block+1)*BLOCK,floor],|r|r.get::<_,bool>(0))?
-            } else {
-                false
-            };
-            let lo = if append {
-                (block * BLOCK).max(floor.unwrap() + 1)
-            } else {
-                block * BLOCK
-            };
-            let rows=tx.prepare_cached(&format!("SELECT text,ts,who,session,position FROM {table} WHERE visible=1 AND id>=?1 AND id<?2"))?.query_map(params![lo,(block+1)*BLOCK],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?.collect::<rusqlite::Result<Vec<BoundRow>>>()?;
+            if delta.is_some() && rows.is_empty() {
+                continue;
+            }
+            let append = delta.is_some();
             input.push((key, rows, append));
         }
         let small =
@@ -2885,8 +2977,15 @@ fn update_blocks(
                 old.iter().cloned().chain(new.keys().cloned()).collect()
             };
             for gram in grams {
+                if b.append {
+                    if let Some(tf) = new.get(&gram) {
+                        tx.prepare_cached("INSERT INTO gram_raises VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(lane,gram,block) DO UPDATE SET frequency=max(frequency,excluded.frequency),max_ts=max(max_ts,excluded.max_ts),weight=max(weight,excluded.weight) WHERE frequency<excluded.frequency OR max_ts<excluded.max_ts OR weight<excluded.weight")?.execute(params![lane,gram,id,tf.frequency,tf.max_ts,tf.weight])?;
+                    }
+                    continue;
+                }
+
                 let key = (lane, gram, id as u32 / POSTING_CHUNK);
-                let rows = match changed.entry(key) {
+                let PostingChange { rows, dirty } = match changed.entry(key) {
                     std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                     std::collections::hash_map::Entry::Vacant(entry) => {
                         let rows = if first {
@@ -2894,11 +2993,12 @@ fn update_blocks(
                         } else {
                             posting_chunk(tx, lane, key.1, key.2)?
                         };
-                        entry.insert(rows)
+                        entry.insert(PostingChange { rows, dirty: false })
                     }
                 };
                 if first {
                     if let Some(tf) = new.get(&key.1) {
+                        *dirty = true;
                         rows.push(Posting {
                             block: id as u32,
                             frequency: tf.frequency,
@@ -2912,7 +3012,7 @@ fn update_blocks(
                     Ok(i) => {
                         if let Some(tf) = new.get(&key.1) {
                             let prior = rows[i];
-                            rows[i] = Posting {
+                            let next = Posting {
                                 block: id as u32,
                                 frequency: if b.append {
                                     prior.frequency.max(tf.frequency)
@@ -2929,13 +3029,17 @@ fn update_blocks(
                                 } else {
                                     tf.weight
                                 },
-                            }
+                            };
+                            *dirty |= next != prior;
+                            rows[i] = next;
                         } else {
+                            *dirty = true;
                             rows.remove(i);
                         }
                     }
                     Err(i) => {
                         if let Some(tf) = new.get(&key.1) {
+                            *dirty = true;
                             rows.insert(
                                 i,
                                 Posting {
@@ -2950,17 +3054,20 @@ fn update_blocks(
                 }
             }
             if b.append {
-                let (ts,user_ts,weight,session,turn,gap,ascii): (i64,Option<i64>,f64,String,i64,i64,bool) = tx.query_row(&format!("SELECT max_ts,user_ts,weight,min_session,min_turn,max_gap,all_ascii FROM {metadata} WHERE id=?"),[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)))?;
-                b.max_ts = b.max_ts.max(ts);
-                b.user_ts = b.user_ts.max(user_ts);
-                b.weight = b.weight.max(weight);
-                b.max_gap = b.max_gap.max(gap as usize);
-                b.all_ascii &= ascii;
-                if session < b.min_session {
-                    b.min_session = session;
-                    b.min_turn = turn;
-                } else if session == b.min_session {
-                    b.min_turn = b.min_turn.min(turn);
+                type PriorBound = (i64, Option<i64>, f64, String, i64, i64, bool);
+                let prior: Option<PriorBound> = tx.query_row(&format!("SELECT max_ts,user_ts,weight,min_session,min_turn,max_gap,all_ascii FROM {metadata} WHERE id=?"),[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional()?;
+                if let Some((ts, user_ts, weight, session, turn, gap, ascii)) = prior {
+                    b.max_ts = b.max_ts.max(ts);
+                    b.user_ts = b.user_ts.max(user_ts);
+                    b.weight = b.weight.max(weight);
+                    b.max_gap = b.max_gap.max(gap as usize);
+                    b.all_ascii &= ascii;
+                    if session < b.min_session {
+                        b.min_session = session;
+                        b.min_turn = turn;
+                    } else if session == b.min_session {
+                        b.min_turn = b.min_turn.min(turn);
+                    }
                 }
             }
             let packed = if b.append {
@@ -2992,7 +3099,10 @@ fn update_blocks(
     }
     let mut changed: Vec<_> = changed.into_iter().collect();
     changed.sort_unstable_by_key(|a| a.0);
-    for ((lane, gram, chunk), mut rows) in changed {
+    for ((lane, gram, chunk), PostingChange { mut rows, dirty }) in changed {
+        if !dirty {
+            continue;
+        }
         if first {
             rows.sort_unstable_by_key(|r| r.block);
         }
@@ -3234,6 +3344,159 @@ mod bound_tests {
         got.sort();
         assert_eq!(got, vec!["00", "a", "zzz"]);
     }
+    #[test]
+    fn raised_postings_merge_in_block_order_and_keep_each_maximum() {
+        let mut c = rusqlite::Connection::open_in_memory().unwrap();
+        super::schema(&c).unwrap();
+        let tx = c.transaction().unwrap();
+        let base = [
+            super::Posting {
+                block: 0,
+                frequency: 4,
+                max_ts: 200,
+                weight: 3,
+            },
+            super::Posting {
+                block: 128,
+                frequency: 1,
+                max_ts: 500,
+                weight: 6,
+            },
+        ];
+        super::write_posting(&tx, 0, "a", &base).unwrap();
+        let gram = super::gram_code("a").unwrap();
+        for (block, frequency, ts, weight) in [(0, 3, 300, 6), (1, 2, 600, 0)] {
+            tx.execute(
+                "INSERT INTO gram_raises VALUES(0,?1,?2,?3,?4,?5)",
+                rusqlite::params![gram, block, frequency, ts, weight],
+            )
+            .unwrap();
+        }
+        tx.execute_batch("PRAGMA reverse_unordered_selects=ON")
+            .unwrap();
+        assert_eq!(
+            super::posting_list(&tx, 0, "a").unwrap(),
+            vec![
+                super::Posting {
+                    block: 0,
+                    frequency: 4,
+                    max_ts: 300,
+                    weight: 6
+                },
+                super::Posting {
+                    block: 1,
+                    frequency: 2,
+                    max_ts: 600,
+                    weight: 0
+                },
+                base[1],
+            ]
+        );
+        tx.execute("INSERT INTO gram_raises VALUES(1,?1,8,2,100,0)", [gram])
+            .unwrap();
+        assert_eq!(
+            super::posting_list(&tx, 1, "a").unwrap(),
+            vec![super::Posting {
+                block: 8,
+                frequency: 2,
+                max_ts: 100,
+                weight: 0
+            }]
+        );
+    }
+
+    fn bound_row(text: &str, turn: i64, ts: i64) -> super::NewRow<'_> {
+        super::NewRow {
+            agent: "pi",
+            session: "s",
+            project: "p",
+            turn,
+            who: "user",
+            model: "",
+            model_source: "unknown",
+            ts,
+            text,
+            extra: String::new(),
+            bulk: false,
+        }
+    }
+
+    #[test]
+    fn raising_bounds_reads_only_changed_rows_without_rewriting_base_postings() {
+        let mut c = rusqlite::Connection::open_in_memory().unwrap();
+        super::schema(&c).unwrap();
+        let tx = c.transaction().unwrap();
+        let mut changes = super::Changes::default();
+        super::upsert(&tx, "prose", 1, bound_row("aaaa", 0, 200), &mut changes).unwrap();
+        super::upsert(&tx, "prose", 1, bound_row("old", 1, 100), &mut changes).unwrap();
+        super::upsert(&tx, "prose", 1, bound_row("ccc", 2, 200), &mut changes).unwrap();
+        super::update_blocks(&tx, &changes.blocks, None).unwrap();
+        tx.commit().unwrap();
+        // An unrelated row must never be decoded to raise one changed row's bounds.
+        c.execute("UPDATE prose SET text=x'ff' WHERE turn=1", [])
+            .unwrap();
+        c.execute("DELETE FROM bound_updates", []).unwrap();
+        c.execute_batch("CREATE TRIGGER reject_unchanged_posting BEFORE INSERT ON gram_postings BEGIN SELECT RAISE(FAIL,'unchanged posting write'); END;").unwrap();
+        let tx = c.transaction().unwrap();
+        let mut changes = super::Changes::default();
+        super::upsert(&tx, "prose", 1, bound_row("aaa", 0, 100), &mut changes).unwrap();
+        super::upsert(&tx, "prose", 1, bound_row("c", 2, 100), &mut changes).unwrap();
+        super::raise_changed_bounds(&tx, &mut changes).unwrap();
+        let a = super::posting_list(&tx, 0, "a").unwrap();
+        assert_eq!((a[0].frequency, a[0].max_ts), (4, 200));
+        tx.execute_batch("DROP TRIGGER reject_unchanged_posting")
+            .unwrap();
+        assert_eq!(
+            tx.query_row("SELECT count(*) FROM bound_rebuild", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        super::upsert(&tx, "prose", 1, bound_row("bbbb Ω", 0, 300), &mut changes).unwrap();
+        super::raise_changed_bounds(&tx, &mut changes).unwrap();
+        let b = super::posting_list(&tx, 0, "b").unwrap();
+        assert_eq!((b[0].frequency, b[0].max_ts), (4, 300));
+        assert_eq!(super::posting_list(&tx, 0, "a").unwrap(), a);
+        assert!(!tx
+            .query_row("SELECT all_ascii FROM blocks WHERE id=0", [], |r| r
+                .get::<_, bool>(0))
+            .unwrap());
+    }
+
+    #[test]
+    fn background_tightening_removes_deleted_contributions() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::data::DataRoot::open(temp.path().join("data"), true).unwrap();
+        let mut c = super::writer(&root).unwrap();
+        let tx = c.transaction().unwrap();
+        let mut changes = super::Changes::default();
+        super::upsert(&tx, "prose", 1, bound_row("aaaa", 0, 200), &mut changes).unwrap();
+        super::upsert(&tx, "prose", 1, bound_row("bbb", 1, 100), &mut changes).unwrap();
+        super::update_blocks(&tx, &changes.blocks, None).unwrap();
+        let mut changes = super::Changes::default();
+        super::erase(&tx, "prose", 1, &mut changes).unwrap();
+        super::upsert(&tx, "prose", 1, bound_row("bbbb", 1, 300), &mut changes).unwrap();
+        super::raise_changed_bounds(&tx, &mut changes).unwrap();
+        assert_eq!(super::posting_list(&tx, 0, "a").unwrap()[0].frequency, 4);
+        tx.commit().unwrap();
+        assert!(super::tighten_bounds_step(&root, &mut c).unwrap());
+        assert!(!super::tighten_bounds_step(&root, &mut c).unwrap());
+        assert!(super::posting_list(&c, 0, "a").unwrap().is_empty());
+        assert_eq!(super::posting_list(&c, 0, "b").unwrap()[0].frequency, 4);
+        assert_eq!(
+            c.query_row("SELECT count(*) FROM gram_raises", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            c.query_row("SELECT max_ts FROM blocks WHERE id=0", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            300
+        );
+    }
+
     #[test]
     fn counts_are_per_row_not_summed_across_a_block() {
         let got = super::gram_maxima(
@@ -3558,7 +3821,7 @@ pub fn rebuild_bounds(root: &DataRoot) -> Result<usize> {
             blocks.insert(if tools { -1 - block } else { block });
         }
     }
-    tx.execute_batch("DELETE FROM gram_postings; DELETE FROM block_grams; DELETE FROM blocks; DELETE FROM tool_blocks;")?;
+    tx.execute_batch("DELETE FROM gram_postings; DELETE FROM block_grams; DELETE FROM blocks; DELETE FROM tool_blocks; DELETE FROM bound_rebuild; DELETE FROM gram_raises;")?;
     update_blocks(&tx, &blocks, None)?;
     tx.commit()?;
     Ok(blocks.len())
