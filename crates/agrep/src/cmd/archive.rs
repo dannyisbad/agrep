@@ -86,56 +86,7 @@ pub fn run(o: Options) -> Result<i32> {
         return Ok(0);
     }
     if o.status {
-        // 0.4.9's sentences (py/archive.py:3222-3260): a measurement it lacks is omitted.
-        let s = archive::status(&root)?;
-        let stored = s["stored_bytes"].as_u64().unwrap_or(0);
-        if s["enabled"] == false {
-            println!("archive retention is off (`agrep archive --on` turns it on)");
-            if stored > 0 {
-                println!("earlier captures still stored: {} in {dir}; `agrep archive --purge` deletes them", human(stored));
-            }
-            return Ok(0);
-        }
-        let mut parts = vec![
-            format!(
-                "{} files",
-                agrep_core::surface::number(s["files"].as_u64().unwrap_or(0) as usize)
-            ),
-            format!("{} stored", human(stored)),
-        ];
-        if stored > 0 {
-            let ratio = s["raw_bytes"].as_u64().unwrap_or(0) as f64 / stored as f64;
-            // Python printed round(ratio, 2) as its shortest float.
-            let mut ratio = format!("{ratio:.2}");
-            while ratio.ends_with('0') && !ratio.ends_with(".0") {
-                ratio.pop();
-            }
-            if ratio != "0.0" {
-                parts.push(format!("{ratio}x smaller than the originals"));
-            }
-        }
-        parts.push(match s["last_capture"].as_i64() {
-            Some(at) => format!(
-                "last capture {} ago",
-                brief((chrono::Utc::now().timestamp_millis() - at) as f64 / 1000.)
-            ),
-            None => "never captured yet".into(),
-        });
-        let retention = match s["keep"].as_u64().unwrap_or(0) {
-            0 => "keeps every version (never prunes)".to_string(),
-            keep => format!("keeps the last {keep} version(s)"),
-        };
-        println!("archive {retention} per source file: {}", parts.join(", "));
-        let failed = s["failures"].as_array().map_or(0, Vec::len);
-        if failed > 0 {
-            println!("archive partial: {failed} source path(s) failed");
-            return Ok(1);
-        }
-        if s["last_capture"].is_null() {
-            println!("archive freshness-unknown: no capture pass has completed");
-            return Ok(1);
-        }
-        return Ok(0);
+        return status(&root, &dir);
     }
     if o.purge {
         let status = archive::status(&root)?;
@@ -198,4 +149,60 @@ pub fn run(o: Options) -> Result<i32> {
         println!("  {}", safe(failure));
     }
     Ok(1)
+}
+
+fn status(root: &DataRoot, dir: &str) -> Result<i32> {
+    // 0.4.9's sentences (py/archive.py:3222-3260): a measurement it lacks is omitted.
+    let s = archive::status(root)?;
+    let stored = s["stored_bytes"].as_u64().unwrap_or(0);
+    if s["enabled"] == false {
+        println!("archive retention is off (`agrep archive --on` turns it on)");
+        if stored > 0 {
+            println!(
+                "earlier captures still stored: {} in {dir}; `agrep archive --purge` deletes them",
+                human(stored)
+            );
+        }
+        return Ok(0);
+    }
+    let mut parts = vec![
+        format!(
+            "{} files",
+            agrep_core::surface::number(s["files"].as_u64().unwrap_or(0) as usize)
+        ),
+        format!("{} stored", human(stored)),
+    ];
+    if stored > 0 {
+        let ratio = s["raw_bytes"].as_u64().unwrap_or(0) as f64 / stored as f64;
+        // Python printed round(ratio, 2) as its shortest float.
+        let mut ratio = format!("{ratio:.2}");
+        while ratio.ends_with('0') && !ratio.ends_with(".0") {
+            ratio.pop();
+        }
+        if ratio != "0.0" {
+            parts.push(format!("{ratio}x smaller than the originals"));
+        }
+    }
+    parts.push(match s["last_capture"].as_i64() {
+        Some(at) => format!(
+            "last capture {} ago",
+            brief((chrono::Utc::now().timestamp_millis() - at) as f64 / 1000.)
+        ),
+        None => "never captured yet".into(),
+    });
+    let retention = match s["keep"].as_u64().unwrap_or(0) {
+        0 => "keeps every version (never prunes)".to_string(),
+        keep => format!("keeps the last {keep} version(s)"),
+    };
+    println!("archive {retention} per source file: {}", parts.join(", "));
+    let failed = s["failures"].as_array().map_or(0, Vec::len);
+    if failed > 0 {
+        println!("archive partial: {failed} source path(s) failed");
+        return Ok(1);
+    }
+    if s["last_capture"].is_null() {
+        println!("archive freshness-unknown: no capture pass has completed");
+        return Ok(1);
+    }
+    Ok(0)
 }

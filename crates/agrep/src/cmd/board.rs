@@ -45,23 +45,7 @@ fn board(a: crate::Board) -> Result<i32> {
     let signals = Signals::board()?;
     let watcher = Service::new();
     if once {
-        let snap = watcher.snapshot(Duration::from_secs_f64(o.wait));
-        let (value, rc) = board::machine(&snap, &o);
-        if o.json {
-            agrep_core::json_output::to_writer(io::stdout().lock(), &value)?;
-            writeln!(io::stdout().lock())?;
-        } else {
-            let (w, h) = Screen::size();
-            writeln!(
-                io::stdout().lock(),
-                "{}",
-                board::frame(&snap, &o, usize::MAX, o.session.as_deref(), 0, w, h)
-            )?;
-            if snap.booting {
-                eprintln!("initial live scan is still running; rerun with --wait 5");
-            }
-        }
-        return Ok(rc);
+        return snapshot(&watcher, &o);
     }
     let preferences = agrep_core::data::DataRoot::discover()
         .ok()
@@ -178,4 +162,24 @@ fn board(a: crate::Board) -> Result<i32> {
         )?;
         io::stdout().flush()?;
     }
+}
+
+fn snapshot(watcher: &Service, o: &Options) -> Result<i32> {
+    let snap = watcher.snapshot(Duration::from_secs_f64(o.wait));
+    let (value, rc) = board::machine(&snap, o);
+    if o.json {
+        agrep_core::json_output::to_writer(io::stdout().lock(), &value)?;
+        writeln!(io::stdout().lock())?;
+    } else {
+        let (w, h) = Screen::size();
+        writeln!(
+            io::stdout().lock(),
+            "{}",
+            board::frame(&snap, o, usize::MAX, o.session.as_deref(), 0, w, h)
+        )?;
+        if snap.booting {
+            eprintln!("initial live scan is still running; rerun with --wait 5");
+        }
+    }
+    Ok(rc)
 }

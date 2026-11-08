@@ -1,16 +1,17 @@
 //! Small authenticated loopback HTTP server. All history comes from shared core APIs.
 mod api;
+mod endpoints;
+mod http;
 use crate::{
     data::DataRoot,
     live::{self, Service},
-    query::{self, Filters, Options},
     store,
 };
 use anyhow::{Context, Result};
-use serde_json::{json, Value};
+use http::{read_headers, request, Request, Response, HEADER_LIMIT, HEADER_TIMEOUT};
+use serde_json::json;
 use std::{
-    collections::HashMap,
-    io::{Read, Write},
+    io::Read,
     net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream},
     sync::{Arc, Mutex},
     time::Duration,
@@ -28,161 +29,6 @@ fn equal(a: &str, b: &str) -> bool {
             .fold(0u8, |diff, (a, b)| diff | (a ^ b))
             == 0
 }
-#[derive(Clone, Debug)]
-struct Request {
-    method: String,
-    path: String,
-    params: HashMap<String, String>,
-    headers: HashMap<String, String>,
-}
-fn decode(s: &str) -> Result<String> {
-    let mut b = vec![];
-    let raw = s.as_bytes();
-    let mut i = 0;
-    while i < raw.len() {
-        match raw[i] {
-            b'+' => b.push(b' '),
-            b'%' => {
-                anyhow::ensure!(i + 2 < raw.len(), "invalid URL escape");
-                let hex = std::str::from_utf8(&raw[i + 1..i + 3])?;
-                b.push(u8::from_str_radix(hex, 16)?);
-                i += 2
-            }
-            c => b.push(c),
-        }
-        i += 1
-    }
-    Ok(String::from_utf8(b)?)
-}
-fn request(raw: &str) -> Result<Request> {
-    let mut lines = raw.split("\r\n");
-    let words: Vec<_> = lines.next().unwrap_or("").split_whitespace().collect();
-    anyhow::ensure!(words.len() == 3, "invalid HTTP request");
-    let (path, query) = words[1].split_once('?').unwrap_or((words[1], ""));
-    let mut params = HashMap::new();
-    for pair in query.split('&').filter(|p| !p.is_empty()) {
-        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        params.entry(decode(k)?).or_insert(decode(v)?);
-    }
-    let mut headers = HashMap::new();
-    for line in lines.take_while(|s| !s.is_empty()) {
-        let (k, v) = line.split_once(':').context("invalid HTTP header")?;
-        let k = k.to_ascii_lowercase();
-        anyhow::ensure!(!headers.contains_key(&k), "duplicate header");
-        headers.insert(k, v.trim().into());
-    }
-    Ok(Request {
-        method: words[0].into(),
-        path: path.into(),
-        params,
-        headers,
-    })
-}
-struct Response {
-    code: u16,
-    body: Vec<u8>,
-    headers: Vec<(String, String)>,
-}
-impl Response {
-    fn json(code: u16, body: Value) -> Self {
-        Self {
-            code,
-            body: crate::json_output::to_string(&body)
-                .expect("serializing JSON value")
-                .into_bytes(),
-            headers: vec![(
-                "Content-Type".into(),
-                "application/json; charset=utf-8".into(),
-            )],
-        }
-    }
-    fn error(code: u16, msg: &str) -> Self {
-        Self::json(code, json!({"error":msg}))
-    }
-    fn from_error(error: &anyhow::Error) -> Self {
-        use rusqlite::ErrorCode;
-        let (code, kind, message) = if let Some(rusqlite::Error::SqliteFailure(e, _)) =
-            error.downcast_ref::<rusqlite::Error>()
-        {
-            match e.code {
-                ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => (
-                    503,
-                    "storage-unavailable",
-                    "database temporarily unavailable".to_owned(),
-                ),
-                ErrorCode::PermissionDenied | ErrorCode::ReadOnly => {
-                    (403, "permission-denied", format!("{error:#}"))
-                }
-                ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase => {
-                    (500, "invalid-database", format!("{error:#}"))
-                }
-                ErrorCode::CannotOpen => (503, "database-open", format!("{error:#}")),
-                _ => (500, "database-error", format!("{error:#}")),
-            }
-        } else if let Some(e) = error.downcast_ref::<std::io::Error>() {
-            match e.kind() {
-                std::io::ErrorKind::NotFound => (404, "not-found", format!("{error:#}")),
-                std::io::ErrorKind::PermissionDenied => {
-                    (403, "permission-denied", format!("{error:#}"))
-                }
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => (
-                    503,
-                    "source-unavailable",
-                    "source temporarily unavailable".to_owned(),
-                ),
-                _ => (500, "io-error", format!("{error:#}")),
-            }
-        } else {
-            (500, "request-failed", format!("{error:#}"))
-        };
-        Self::json(code, json!({"error":message,"error_kind":kind}))
-    }
-    fn write(&self, stream: &mut TcpStream) -> std::io::Result<()> {
-        let status = match self.code {
-            200 => "OK",
-            204 => "No Content",
-            400 => "Bad Request",
-            401 => "Unauthorized",
-            403 => "Forbidden",
-            404 => "Not Found",
-            405 => "Method Not Allowed",
-            408 => "Request Timeout",
-            413 => "Payload Too Large",
-            500 => "Internal Server Error",
-            _ => "Service Unavailable",
-        };
-        write!(stream,"HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nCross-Origin-Resource-Policy: same-origin\r\nCross-Origin-Opener-Policy: same-origin\r\nPermissions-Policy: camera=(), microphone=(), geolocation=()\r\n",self.code,status,self.body.len())?;
-        for (k, v) in &self.headers {
-            write!(stream, "{k}: {v}\r\n")?
-        }
-        stream.write_all(b"\r\n")?;
-        stream.write_all(&self.body)
-    }
-}
-const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
-const HEADER_LIMIT: usize = 16_384;
-fn read_headers(
-    mut read: impl FnMut(&mut [u8], Duration) -> std::io::Result<usize>,
-    mut remaining: impl FnMut() -> Duration,
-) -> std::io::Result<Vec<u8>> {
-    let mut raw = Vec::new();
-    let mut byte = [0; 1];
-    while raw.len() < HEADER_LIMIT {
-        let budget = remaining();
-        if budget.is_zero() {
-            return Err(std::io::ErrorKind::TimedOut.into());
-        }
-        if read(&mut byte, budget)? == 0 {
-            break;
-        }
-        raw.push(byte[0]);
-        if raw.ends_with(b"\r\n\r\n") {
-            break;
-        }
-    }
-    Ok(raw)
-}
-
 pub struct Explorer {
     listener: TcpListener,
     state: Arc<State>,
@@ -355,52 +201,13 @@ impl State {
             return Response::error(403, "invalid host");
         }
         if r.method == "POST" {
-            if !r
-                .headers
-                .get("origin")
-                .is_some_and(|o| hosts.iter().any(|h| o == &format!("http://{h}")))
-            {
-                return Response::error(403, "invalid browser origin");
-            }
-            if r.path != "/auth" {
-                return Response::error(405, "the explorer is read-only");
-            }
-            let length = match r
-                .headers
-                .get("content-length")
-                .map(|s| s.parse::<i64>())
-                .transpose()
-            {
-                Ok(n) => n.unwrap_or(0),
-                Err(_) => return Response::error(400, "invalid request length"),
-            };
-            if length != 0 || r.headers.contains_key("transfer-encoding") {
-                return Response::error(413, "authentication requests have no body");
-            }
-            let mut expected = self.bootstrap.lock().unwrap();
-            let supplied = r
-                .headers
-                .get("x-agrep-bootstrap")
-                .map(String::as_str)
-                .unwrap_or("");
-            if expected.is_empty() || !equal(supplied, &expected) {
-                return Response::error(403, "explorer link is invalid or already used");
-            }
-            expected.clear();
-            return Response::json(200, json!({"token":self.auth}));
+            return self.authenticate(r, &hosts);
         }
         if r.method != "GET" {
             return Response::error(405, "the explorer is read-only");
         }
         if r.path == "/" {
-            let nonce = match token() {
-                Ok(t) => t,
-                Err(_) => return Response::error(503, "random token unavailable"),
-            };
-            let html = APP
-                .replacen("<style>", &format!("<style nonce=\"{nonce}\">"), 1)
-                .replacen("<script>", &format!("<script nonce=\"{nonce}\">"), 1);
-            return Response{code:200,body:html.into_bytes(),headers:vec![("Content-Type".into(),"text/html; charset=utf-8".into()),("Content-Security-Policy".into(),format!("default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'"))]};
+            return app();
         }
         let authorized = r
             .headers
@@ -415,9 +222,43 @@ impl State {
             Err(error) => Response::from_error(&error),
         }
     }
+    /// Exchanges the one-use bootstrap secret from the explorer link for the API token.
+    fn authenticate(&self, r: &Request, hosts: &[String]) -> Response {
+        if !r
+            .headers
+            .get("origin")
+            .is_some_and(|o| hosts.iter().any(|h| o == &format!("http://{h}")))
+        {
+            return Response::error(403, "invalid browser origin");
+        }
+        if r.path != "/auth" {
+            return Response::error(405, "the explorer is read-only");
+        }
+        let length = match r
+            .headers
+            .get("content-length")
+            .map(|s| s.parse::<i64>())
+            .transpose()
+        {
+            Ok(n) => n.unwrap_or(0),
+            Err(_) => return Response::error(400, "invalid request length"),
+        };
+        if length != 0 || r.headers.contains_key("transfer-encoding") {
+            return Response::error(413, "authentication requests have no body");
+        }
+        let mut expected = self.bootstrap.lock().unwrap();
+        let supplied = r
+            .headers
+            .get("x-agrep-bootstrap")
+            .map(String::as_str)
+            .unwrap_or("");
+        if expected.is_empty() || !equal(supplied, &expected) {
+            return Response::error(403, "explorer link is invalid or already used");
+        }
+        expected.clear();
+        Response::json(200, json!({"token":self.auth}))
+    }
     fn api(&self, r: &Request) -> Result<Response> {
-        let param =
-            |key: &str, default: &str| r.params.get(key).cloned().unwrap_or_else(|| default.into());
         if r.path == "/api/board" {
             let mut live = self.live.lock().unwrap();
             let watcher = live.get_or_insert_with(Service::new);
@@ -428,169 +269,35 @@ impl State {
             return Ok(Response::error(404, "not found"));
         }
         let checked = self.freshen.as_ref().map(|f| f()).transpose()?;
+        let checked = checked.unwrap_or(false);
         let c = store::reader(&self.root)?;
         match r.path.as_str() {
-            "/api/status" => {
-                let sessions: i64 =
-                    c.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
-                let messages: i64 = c.query_row(
-                    "SELECT COUNT(*) FROM prose WHERE visible=1 AND who!='agent'",
-                    [],
-                    |r| r.get(0),
-                )?;
-                Ok(Response::json(
-                    200,
-                    json!({"messages":messages,"sessions":sessions,"indexed":true,"freshness":crate::render::freshness(checked.unwrap_or(false))}),
-                ))
-            }
-            "/api/chats" => {
-                let n = match param("n", "80").parse::<i64>() {
-                    Ok(n) => n.clamp(1, 200) as usize,
-                    Err(_) => return Ok(Response::error(400, "n must be an integer")),
-                };
-                let side = param("side", "0");
-                if !["0", "1"].contains(&side.as_str()) {
-                    return Ok(Response::error(400, "side must be 0 or 1"));
-                }
-                Ok(Response::json(200, api::chats(&c, n, side == "1")?))
-            }
-            "/api/around" => {
-                let id = param("session", "");
-                if id.trim().is_empty() || id.len() > 4096 {
-                    return Ok(Response::error(400, "session is required"));
-                }
-                let (turn, radius) = match (
-                    param("turn", "0").parse::<i64>(),
-                    param("radius", "4").parse::<i64>(),
-                ) {
-                    (Ok(t), Ok(r)) => (t, r.clamp(0, 12)),
-                    _ => return Ok(Response::error(400, "turn and radius must be integers")),
-                };
-                let window = match api::window(&c, &id, turn, radius) {
-                    Ok(w) => w,
-                    Err(e) if e.downcast_ref::<rusqlite::Error>().is_none() => {
-                        return Ok(Response::error(400, &e.to_string()))
-                    }
-                    Err(e) => return Err(e),
-                };
-                Ok(match window {
-                    Some(v) => Response::json(200, v),
-                    None => Response::error(404, "chat is no longer indexed"),
-                })
-            }
-            "/api/search" => {
-                let q = param("q", "").trim().to_owned();
-                if q.is_empty() {
-                    return Ok(Response::error(400, "enter a search query"));
-                }
-                if q.len() > 4096 {
-                    return Ok(Response::error(413, "search query is too large"));
-                }
-                let mode = param("mode", "keyword");
-                if !["keyword", "semantic"].contains(&mode.as_str()) {
-                    return Ok(Response::error(400, "mode must be keyword or semantic"));
-                }
-                let sort = param("sort", "score");
-                if !["score", "time"].contains(&sort.as_str()) {
-                    return Ok(Response::error(400, "sort must be score or time"));
-                }
-                if mode == "semantic" && sort != "score" {
-                    return Ok(Response::error(
-                        400,
-                        "meaning search is relevance-ordered; use sort=score",
-                    ));
-                }
-                if mode == "semantic" && !crate::semantic::installed(&self.root) {
-                    return Ok(Response::error(
-                        400,
-                        "semantic model not installed: run agrep setup",
-                    ));
-                }
-
-                let n = match param("n", "40").parse::<i64>() {
-                    Ok(n) => n.clamp(1, 100) as usize,
-                    Err(_) => return Ok(Response::error(400, "n must be an integer")),
-                };
-                let options = Options {
-                    pattern: q.clone(),
-                    regex: false,
-                    word: false,
-                    sort: sort.clone(),
-                    limit: n,
-                    exact: false,
-                    count_only: false,
-                    count_by_tier: false,
-                    content: false,
-                    chats: false,
-                    tools: self.root.config()?.tools,
-                    filters: Filters::default(),
-                };
-                let mut fallback = None;
-                let mut semantic = None;
-                let config = self.root.config()?;
-                let use_semantic = mode == "semantic"
-                    || (sort == "score"
-                        && config.embeddings != "off"
-                        && crate::semantic::eligible(&q)
-                        && crate::semantic::installed(&self.root));
-                let lane =
-                    use_semantic.then(|| crate::semantic::begin(&self.root, &c, &options, true));
-                let keyword = query::search(&c, &options)?;
-                let result = if let Some(lane) = lane {
-                    match lane.and_then(|work| crate::semantic::finish(&c, work)) {
-                        Ok(mut found) => {
-                            crate::semantic::mark_weak(
-                                &c,
-                                &options,
-                                &mut found.result.hits,
-                                !keyword.hits.is_empty(),
-                            )?;
-                            // An answered meaning lane always covers its snapshot.
-                            if mode == "semantic" {
-                                semantic = Some(json!(found.coverage));
-                            }
-                            if mode == "semantic" {
-                                found.result
-                            } else {
-                                crate::hybrid::merge(keyword, Some(found.result), n, true)
-                            }
-                        }
-                        // An explicit meaning search never answers with keyword rows: 0.4.9's
-                        // explorer returned none, with a state that sends the reader to grep
-                        // and without the cause, since the browser gets no local paths
-                        // (py/server.py:142-159, 513-515; py/search.py:581-599).
-                        Err(error) if mode == "semantic" => {
-                            let status = crate::semantic::failed(&error);
-                            let mut unavailable = json!({"state":status["state"],"complete":false,"fallback_recommended":true});
-                            if let Some(progress) = status.get("progress") {
-                                unavailable["progress"] = progress.clone();
-                            }
-                            semantic = Some(unavailable);
-                            query::Results::default()
-                        }
-                        Err(error) if crate::semantic::is_building(&error) => keyword,
-                        Err(error) => {
-                            crate::logging::semantic_failure(&self.root, &error);
-                            fallback = Some("meaning search unavailable; showing keyword matches");
-                            keyword
-                        }
-                    }
-                } else {
-                    keyword
-                };
-                Ok(Response::json(
-                    200,
-                    json!({"query":q,"mode":mode,"sort":sort,"engine":if result.hits.iter().any(|h| h.matched=="semantic"){"keyword+semantic"}else{"keyword"},"notice":fallback,"semantic":semantic,"freshness":crate::render::freshness(checked.unwrap_or(false)),"total":result.total,"totals_exact":result.total_basis=="exact","hits":result.hits}),
-                ))
-            }
+            "/api/status" => endpoints::status(&c, checked),
+            "/api/chats" => endpoints::chats(&c, r),
+            "/api/around" => endpoints::around(&c, r),
+            "/api/search" => endpoints::search(&self.root, &c, checked, r),
             _ => Ok(Response::error(404, "not found")),
         }
     }
+}
+/// The app page, its inline style and script allowed by a fresh nonce.
+fn app() -> Response {
+    let nonce = match token() {
+        Ok(t) => t,
+        Err(_) => return Response::error(503, "random token unavailable"),
+    };
+    let html = APP
+        .replacen("<style>", &format!("<style nonce=\"{nonce}\">"), 1)
+        .replacen("<script>", &format!("<script nonce=\"{nonce}\">"), 1);
+    Response{code:200,body:html.into_bytes(),headers:vec![("Content-Type".into(),"text/html; charset=utf-8".into()),("Content-Security-Policy".into(),format!("default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'"))]}
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::decode;
+    use serde_json::Value;
+    use std::io::Write;
     fn req(port: u16, method: &str, path: &str, headers: &str) -> Request {
         request(&format!(
             "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{headers}\r\n"
@@ -829,6 +536,7 @@ mod freshness_tests {
 #[cfg(test)]
 mod socket_tests {
     use super::*;
+    use std::io::Write;
     #[test]
     fn accepted_nonblocking_socket_waits_for_request() {
         let t = tempfile::tempdir().unwrap();
@@ -870,6 +578,7 @@ mod socket_tests {
 #[cfg(test)]
 mod boundary_tests {
     use super::*;
+    use serde_json::Value;
     #[test]
     fn cookie_alone_never_authorizes_or_refreshes() {
         let temp = tempfile::tempdir().unwrap();

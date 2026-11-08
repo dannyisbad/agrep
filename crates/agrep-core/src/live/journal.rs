@@ -196,211 +196,311 @@ pub(crate) fn parse(agent: &str, m: &mut Meta, v: &Value) -> Vec<Value> {
     if ts == 0 {
         ts = stamp(&v["created_at"])
     }
-    let mut base = m.base(agent, ts);
+    let base = m.base(agent, ts);
     match agent {
-        "claude" | "pi" => {
-            let kind = text(&v["type"]);
-            if agent == "claude" && v["isSidechain"] == true && !m.side {
-                return out;
-            }
-            if kind == "queue-operation" {
-                out.push(event(
-                    &base,
-                    "queued",
-                    json!({"op":v["operation"],"text":cap(text(&v["content"]),160)}),
-                ));
-                return out;
-            }
-            if kind == "custom" && v["customType"] == "session_exit" {
-                out.push(event(
-                    &base,
-                    "done",
-                    json!({"why":if v["data"]["kind"]=="signal"{"interrupted"}else{"done"}}),
-                ));
-                return out;
-            }
-            let msg = &v["message"];
-            let role = if agent == "pi" {
-                text(&msg["role"])
-            } else {
-                kind
-            };
-            if agent == "pi" && kind != "message" {
-                return out;
-            }
-            if let Some(model) = msg["model"].as_str().filter(|s| !s.starts_with('<')) {
-                m.model = model.into();
-                base["model"] = json!(model)
-            }
-            if agent == "pi" && !msg["timestamp"].is_null() {
-                base["ts"] = json!(stamp(&msg["timestamp"]))
-            }
-            let c = &msg["content"];
-            let blocks = c.as_array().cloned().unwrap_or_default();
-            match role {
-                "assistant"=>{
-                    if let Some(s)=c.as_str().filter(|s|!s.trim().is_empty()){out.push(event(&base,"reply",json!({"text":cap(s,4000)})))}
-                    for b in &blocks {match text(&b["type"]){
-                        "text" if !text(&b["text"]).trim().is_empty()=>out.push(event(&base,"reply",json!({"text":cap(text(&b["text"]),4000)}))),
-                        "tool_use"|"toolCall"=>out.push(event(&base,"tool",json!({"name":b["name"],"call_id":b["id"],"input":input(if agent=="pi"{&b["arguments"]}else{&b["input"]})}))),_=>{}}}
-                    let stop=msg["stopReason"].as_str().or(msg["stop_reason"].as_str()).unwrap_or("");
-                    if (!stop.is_empty() && agent=="pi" && !matches!(stop,"toolUse"|"tool_use")) || matches!(stop,"end_turn"|"stop_sequence"|"max_tokens") {out.push(event(&base,"done",if matches!(stop,"aborted"|"error"){json!({"why":"interrupted"})}else{json!({})}))}
-                },
-                "user"=>{
-                    for b in &blocks {if b["type"]=="tool_result"{out.push(event(&base,"tool_done",json!({"call_id":b["tool_use_id"],"ok":b["is_error"]!=true,"output":cap(&content(&b["content"]),400)})))}}
-                    let s=content(c);
-                    if s.trim_start().starts_with("[Request interrupted"){out.push(event(&base,"done",json!({"why":"interrupted"})))}
-                    else if v["isMeta"]!=true && !noise(&s,false) && !matches!(v["userType"].as_str(),Some(t) if !t.is_empty()&&t!="external"){out.push(event(&base,"user",json!({"text":cap(&s,4000)})))}
-                },
-                "toolResult"=>{out.push(event(&base,"tool_done",json!({"call_id":msg["toolCallId"],"name":msg["toolName"],"output":cap(&content(c),400),"ok":msg["isError"].as_bool().map(|v|!v)})))},
-                "bashExecution"=>{out.push(event(&base,"tool",json!({"name":"bash","input":cap(text(&msg["command"]),400),"call_id":v["id"]})));out.push(event(&base,"tool_done",json!({"name":"bash","output":cap(text(&msg["output"]),400),"call_id":v["id"],"ok":msg["exitCode"].as_i64().map(|v|v==0 && msg["cancelled"]!=true)})))},_=>{}
-            }
-        }
-        "codex" => {
-            let p = &v["payload"];
-            let record = text(&v["type"]);
-            let kind = text(&p["type"]);
-            if m.side {
-                if record == "event_msg" && kind == "task_started" {
-                    let turn = text(&p["turn_id"]);
-                    if !m.started && turn.len() == 36 && turn > m.session.as_str() {
-                        m.start_turn = turn.into();
-                    }
-                    return out;
-                }
-                let mut anchor = None;
-                if record == "response_item"
-                    && kind == "agent_message"
-                    && !m.agent_path.is_empty()
-                    && p["recipient"] == m.agent_path
-                {
-                    let visible = content(&p["content"]);
-                    let visible = if visible.is_empty() {
-                        text(&p["message"]).to_owned()
-                    } else {
-                        visible
-                    };
-                    let message_type = visible
-                        .lines()
-                        .find_map(|l| l.strip_prefix("Message Type:"))
-                        .map(str::trim)
-                        .unwrap_or("");
-                    if ["NEW_TASK", "MESSAGE", "FOLLOWUP_TASK"].contains(&message_type) {
-                        let body = visible
-                            .split_once("Payload:")
-                            .map(|(_, s)| s.trim())
-                            .unwrap_or(&visible);
-                        anchor = Some(format!(
-                            "[subagent {}] {body}",
-                            if message_type == "NEW_TASK" {
-                                "task"
-                            } else {
-                                "message"
-                            }
-                        ));
-                    }
-                } else if record == "response_item"
-                    && kind == "message"
-                    && p["role"] == "user"
-                    && m.agent_path.is_empty()
-                {
-                    let raw = content(&p["content"]);
-                    let turn = text(&p["internal_chat_message_metadata_passthrough"]["turn_id"]);
-                    let eligible = m.started
-                        || (!m.start_turn.is_empty()
-                            && if turn.is_empty() {
-                                !m.replayed
-                            } else {
-                                turn == m.start_turn
-                            });
-                    if eligible && !noise(&raw, true) {
-                        anchor = Some(format!(
-                            "[subagent {}] {raw}",
-                            if m.started { "message" } else { "task" }
-                        ));
-                    }
-                }
-                if let Some(anchor) = anchor {
-                    let identity = format!(
-                        "{}:{}:{}",
-                        v["timestamp"],
-                        p["internal_chat_message_metadata_passthrough"]["turn_id"],
-                        anchor
-                    );
-                    if m.seen.insert(identity) {
-                        m.started = true;
-                        out.push(event(
-                            &base,
-                            "user",
-                            json!({"text":cap(&anchor,4000),"who":"subagent"}),
-                        ));
-                    }
-                    return out;
-                }
-                if !m.started {
-                    return out;
-                }
-            }
-            match record {
-                "event_msg"=>match kind {"task_complete"=>out.push(event(&base,"done",json!({}))),"turn_aborted"=>out.push(event(&base,"done",json!({"why":"interrupted"}))),_=>{}},
-                "response_item"=>match kind {
-                    "function_call"|"custom_tool_call"=>out.push(event(&base,"tool",json!({"name":p["name"],"call_id":p["call_id"],"input":input(p.get("arguments").or(p.get("input")).unwrap_or(&Value::Null))}))),
-                    "function_call_output"|"custom_tool_call_output"=>{let(s,ok)=output(&p["output"]);out.push(event(&base,"tool_done",json!({"call_id":p["call_id"],"output":s,"ok":ok})))},
-                    "message"=>{let s=content(&p["content"]);let role=text(&p["role"]);if role=="assistant"&&!s.trim().is_empty(){out.push(event(&base,"reply",json!({"text":cap(&s,4000)})))}else if role=="user"&&!m.side&&!noise(&s,true){out.push(event(&base,"user",json!({"text":cap(&s,4000)}))) }},_=>{}
-                },_=>{}
-            }
-        }
-        "antigravity" => match (text(&v["type"]), text(&v["source"])) {
-            ("USER_INPUT", "USER_EXPLICIT") => {
-                let s = text(&v["content"]);
-                let s = s
-                    .split_once("<USER_REQUEST>")
-                    .map(|(_, t)| t.split("</USER_REQUEST>").next().unwrap_or(t))
-                    .unwrap_or(s);
-                if !s.trim().is_empty() {
-                    out.push(event(&base, "user", json!({"text":cap(s,4000)})))
-                }
-            }
-            ("PLANNER_RESPONSE", "MODEL") => {
-                for call in v["tool_calls"].as_array().into_iter().flatten() {
-                    let args = &call["args"];
-                    let input = ["CommandLine", "AbsolutePath", "Query", "toolSummary"]
-                        .iter()
-                        .find_map(|k| args[k].as_str())
-                        .unwrap_or("");
-                    m.announced
-                        .push_back((text(&call["name"]).into(), cap(input, 400)));
-                }
-                while m.announced.len() > 50 {
-                    m.announced.pop_front();
-                }
-                if !text(&v["content"]).trim().is_empty() {
-                    out.push(event(
-                        &base,
-                        "reply",
-                        json!({"text":cap(text(&v["content"]),4000)}),
-                    ))
-                }
-                if v["tool_calls"].as_array().is_none_or(|a| a.is_empty()) {
-                    out.push(event(&base, "done", json!({})))
-                }
-            }
-            (
-                "RUN_COMMAND" | "VIEW_FILE" | "GREP_SEARCH" | "CODE_ACTION" | "LIST_DIRECTORY"
-                | "GENERIC",
-                "MODEL",
-            ) => {
-                let (name, input) = m
-                    .announced
-                    .pop_front()
-                    .unwrap_or_else(|| (text(&v["type"]).to_lowercase(), String::new()));
-                out.push(event(&base,"tool_done",json!({"name":name,"input":input,"output":cap(text(&v["content"]),400),"ok":match text(&v["status"]){"DONE"=>Some(true),"ERROR"=>Some(false),_=>None}})));
-            }
-            _ => {}
-        },
+        "claude" | "pi" => message(agent, m, v, base, &mut out),
+        "codex" => codex(m, v, &base, &mut out),
+        "antigravity" => antigravity(m, v, &base, &mut out),
         _ => {}
     }
     out
+}
+fn blocks(content: &Value) -> impl Iterator<Item = &Value> {
+    content.as_array().into_iter().flatten()
+}
+/// Claude and pi journal records.
+fn message(agent: &str, m: &mut Meta, v: &Value, mut base: Value, out: &mut Vec<Value>) {
+    let kind = text(&v["type"]);
+    if agent == "claude" && v["isSidechain"] == true && !m.side {
+        return;
+    }
+    if kind == "queue-operation" {
+        out.push(event(
+            &base,
+            "queued",
+            json!({"op":v["operation"],"text":cap(text(&v["content"]),160)}),
+        ));
+        return;
+    }
+    if kind == "custom" && v["customType"] == "session_exit" {
+        out.push(event(
+            &base,
+            "done",
+            json!({"why":if v["data"]["kind"]=="signal"{"interrupted"}else{"done"}}),
+        ));
+        return;
+    }
+    let msg = &v["message"];
+    let role = if agent == "pi" {
+        text(&msg["role"])
+    } else {
+        kind
+    };
+    if agent == "pi" && kind != "message" {
+        return;
+    }
+    if let Some(model) = msg["model"].as_str().filter(|s| !s.starts_with('<')) {
+        m.model = model.into();
+        base["model"] = json!(model)
+    }
+    if agent == "pi" && !msg["timestamp"].is_null() {
+        base["ts"] = json!(stamp(&msg["timestamp"]))
+    }
+    match role {
+        "assistant" => assistant(agent, &base, msg, out),
+        "user" => user(&base, v, &msg["content"], out),
+        "toolResult" => out.push(event(
+            &base,
+            "tool_done",
+            json!({"call_id":msg["toolCallId"],"name":msg["toolName"],"output":cap(&content(&msg["content"]),400),"ok":msg["isError"].as_bool().map(|v|!v)}),
+        )),
+        "bashExecution" => {
+            out.push(event(
+                &base,
+                "tool",
+                json!({"name":"bash","input":cap(text(&msg["command"]),400),"call_id":v["id"]}),
+            ));
+            out.push(event(
+                &base,
+                "tool_done",
+                json!({"name":"bash","output":cap(text(&msg["output"]),400),"call_id":v["id"],"ok":msg["exitCode"].as_i64().map(|v|v==0 && msg["cancelled"]!=true)}),
+            ));
+        }
+        _ => {}
+    }
+}
+fn assistant(agent: &str, base: &Value, msg: &Value, out: &mut Vec<Value>) {
+    let c = &msg["content"];
+    if let Some(s) = c.as_str().filter(|s| !s.trim().is_empty()) {
+        out.push(event(base, "reply", json!({"text":cap(s,4000)})))
+    }
+    for b in blocks(c) {
+        match text(&b["type"]) {
+            "text" if !text(&b["text"]).trim().is_empty() => out.push(event(
+                base,
+                "reply",
+                json!({"text":cap(text(&b["text"]),4000)}),
+            )),
+            "tool_use" | "toolCall" => {
+                let arguments = if agent == "pi" {
+                    &b["arguments"]
+                } else {
+                    &b["input"]
+                };
+                out.push(event(
+                    base,
+                    "tool",
+                    json!({"name":b["name"],"call_id":b["id"],"input":input(arguments)}),
+                ))
+            }
+            _ => {}
+        }
+    }
+    let stop = msg["stopReason"]
+        .as_str()
+        .or(msg["stop_reason"].as_str())
+        .unwrap_or("");
+    if (!stop.is_empty() && agent == "pi" && !matches!(stop, "toolUse" | "tool_use"))
+        || matches!(stop, "end_turn" | "stop_sequence" | "max_tokens")
+    {
+        let fields = if matches!(stop, "aborted" | "error") {
+            json!({"why":"interrupted"})
+        } else {
+            json!({})
+        };
+        out.push(event(base, "done", fields))
+    }
+}
+fn user(base: &Value, v: &Value, c: &Value, out: &mut Vec<Value>) {
+    for b in blocks(c).filter(|b| b["type"] == "tool_result") {
+        out.push(event(
+            base,
+            "tool_done",
+            json!({"call_id":b["tool_use_id"],"ok":b["is_error"]!=true,"output":cap(&content(&b["content"]),400)}),
+        ))
+    }
+    let s = content(c);
+    if s.trim_start().starts_with("[Request interrupted") {
+        out.push(event(base, "done", json!({"why":"interrupted"})))
+    } else if v["isMeta"] != true
+        && !noise(&s, false)
+        && !matches!(v["userType"].as_str(), Some(t) if !t.is_empty() && t != "external")
+    {
+        out.push(event(base, "user", json!({"text":cap(&s,4000)})))
+    }
+}
+fn codex(m: &mut Meta, v: &Value, base: &Value, out: &mut Vec<Value>) {
+    if m.side && codex_side(m, v, base, out) {
+        return;
+    }
+    let p = &v["payload"];
+    match (text(&v["type"]), text(&p["type"])) {
+        ("event_msg", "task_complete") => out.push(event(base, "done", json!({}))),
+        ("event_msg", "turn_aborted") => {
+            out.push(event(base, "done", json!({"why":"interrupted"})))
+        }
+        ("response_item", "function_call" | "custom_tool_call") => {
+            let arguments = p
+                .get("arguments")
+                .or(p.get("input"))
+                .unwrap_or(&Value::Null);
+            out.push(event(
+                base,
+                "tool",
+                json!({"name":p["name"],"call_id":p["call_id"],"input":input(arguments)}),
+            ))
+        }
+        ("response_item", "function_call_output" | "custom_tool_call_output") => {
+            let (s, ok) = output(&p["output"]);
+            out.push(event(
+                base,
+                "tool_done",
+                json!({"call_id":p["call_id"],"output":s,"ok":ok}),
+            ))
+        }
+        ("response_item", "message") => {
+            let s = content(&p["content"]);
+            let role = text(&p["role"]);
+            if role == "assistant" && !s.trim().is_empty() {
+                out.push(event(base, "reply", json!({"text":cap(&s,4000)})))
+            } else if role == "user" && !m.side && !noise(&s, true) {
+                out.push(event(base, "user", json!({"text":cap(&s,4000)})))
+            }
+        }
+        _ => {}
+    }
+}
+/// A sub-agent rollout replays its parent's history before its own task: records are
+/// held back until the task anchor. Returns whether the record was consumed here.
+fn codex_side(m: &mut Meta, v: &Value, base: &Value, out: &mut Vec<Value>) -> bool {
+    let p = &v["payload"];
+    let record = text(&v["type"]);
+    let kind = text(&p["type"]);
+    if record == "event_msg" && kind == "task_started" {
+        let turn = text(&p["turn_id"]);
+        if !m.started && turn.len() == 36 && turn > m.session.as_str() {
+            m.start_turn = turn.into();
+        }
+        return true;
+    }
+    if let Some(anchor) = side_anchor(m, p, record, kind) {
+        let identity = format!(
+            "{}:{}:{}",
+            v["timestamp"], p["internal_chat_message_metadata_passthrough"]["turn_id"], anchor
+        );
+        if m.seen.insert(identity) {
+            m.started = true;
+            out.push(event(
+                base,
+                "user",
+                json!({"text":cap(&anchor,4000),"who":"subagent"}),
+            ));
+        }
+        return true;
+    }
+    !m.started
+}
+/// The task or message a sub-agent received, as its visible user turn.
+fn side_anchor(m: &Meta, p: &Value, record: &str, kind: &str) -> Option<String> {
+    if record != "response_item" {
+        return None;
+    }
+    if kind == "agent_message" && !m.agent_path.is_empty() && p["recipient"] == m.agent_path {
+        let visible = content(&p["content"]);
+        let visible = if visible.is_empty() {
+            text(&p["message"]).to_owned()
+        } else {
+            visible
+        };
+        let message_type = visible
+            .lines()
+            .find_map(|l| l.strip_prefix("Message Type:"))
+            .map(str::trim)
+            .unwrap_or("");
+        if !["NEW_TASK", "MESSAGE", "FOLLOWUP_TASK"].contains(&message_type) {
+            return None;
+        }
+        let body = visible
+            .split_once("Payload:")
+            .map(|(_, s)| s.trim())
+            .unwrap_or(&visible);
+        let label = if message_type == "NEW_TASK" {
+            "task"
+        } else {
+            "message"
+        };
+        return Some(format!("[subagent {label}] {body}"));
+    }
+    if kind == "message" && p["role"] == "user" && m.agent_path.is_empty() {
+        let raw = content(&p["content"]);
+        let turn = text(&p["internal_chat_message_metadata_passthrough"]["turn_id"]);
+        let eligible = m.started
+            || (!m.start_turn.is_empty()
+                && if turn.is_empty() {
+                    !m.replayed
+                } else {
+                    turn == m.start_turn
+                });
+        if eligible && !noise(&raw, true) {
+            let label = if m.started { "message" } else { "task" };
+            return Some(format!("[subagent {label}] {raw}"));
+        }
+    }
+    None
+}
+fn antigravity(m: &mut Meta, v: &Value, base: &Value, out: &mut Vec<Value>) {
+    match (text(&v["type"]), text(&v["source"])) {
+        ("USER_INPUT", "USER_EXPLICIT") => {
+            let s = text(&v["content"]);
+            let s = s
+                .split_once("<USER_REQUEST>")
+                .map(|(_, t)| t.split("</USER_REQUEST>").next().unwrap_or(t))
+                .unwrap_or(s);
+            if !s.trim().is_empty() {
+                out.push(event(base, "user", json!({"text":cap(s,4000)})))
+            }
+        }
+        ("PLANNER_RESPONSE", "MODEL") => {
+            for call in v["tool_calls"].as_array().into_iter().flatten() {
+                let args = &call["args"];
+                let input = ["CommandLine", "AbsolutePath", "Query", "toolSummary"]
+                    .iter()
+                    .find_map(|k| args[k].as_str())
+                    .unwrap_or("");
+                m.announced
+                    .push_back((text(&call["name"]).into(), cap(input, 400)));
+            }
+            while m.announced.len() > 50 {
+                m.announced.pop_front();
+            }
+            if !text(&v["content"]).trim().is_empty() {
+                out.push(event(
+                    base,
+                    "reply",
+                    json!({"text":cap(text(&v["content"]),4000)}),
+                ))
+            }
+            if v["tool_calls"].as_array().is_none_or(|a| a.is_empty()) {
+                out.push(event(base, "done", json!({})))
+            }
+        }
+        (
+            "RUN_COMMAND" | "VIEW_FILE" | "GREP_SEARCH" | "CODE_ACTION" | "LIST_DIRECTORY"
+            | "GENERIC",
+            "MODEL",
+        ) => {
+            let (name, input) = m
+                .announced
+                .pop_front()
+                .unwrap_or_else(|| (text(&v["type"]).to_lowercase(), String::new()));
+            out.push(event(
+                base,
+                "tool_done",
+                json!({"name":name,"input":input,"output":cap(text(&v["content"]),400),"ok":match text(&v["status"]){"DONE"=>Some(true),"ERROR"=>Some(false),_=>None}}),
+            ));
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]

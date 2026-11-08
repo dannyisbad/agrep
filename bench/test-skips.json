@@ -149,7 +149,7 @@
       "reason": "Requires an Apple7-or-newer integrated Metal GPU with the complete semantic kernel capability set. Hosted macOS runners have no capable GPU (Apple-silicon VM: no device; Intel VM: unsupported family/features). The product capability check gates this test; portable CPU fallback tests always run, and all four GPU tests are required locally before release."
     },
     {
-      "test": "crates/agrep-core/src/semantic_bert.rs::tests::vector_exponential_geglu_preserves_erf_values",
+      "test": "crates/agrep-core/src/semantic_bert/mod.rs::tests::vector_exponential_geglu_preserves_erf_values",
       "gates": [
         "cfg(target_os=\"macos\")"
       ],
@@ -264,7 +264,7 @@
       "reason": "Chooses native shell redirection syntax; every platform checks that index ran the hook before it exited."
     },
     {
-      "test": "crates/agrep-core/src/semantic_bert.rs::tests::fused_cpu_geglu_matches_candle_in_serial_and_parallel_batches",
+      "test": "crates/agrep-core/src/semantic_bert/mod.rs::tests::fused_cpu_geglu_matches_candle_in_serial_and_parallel_batches",
       "gates": [
         "cfg(not(target_os=\"macos\"))",
         "cfg(target_os=\"macos\")"

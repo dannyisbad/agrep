@@ -50,50 +50,113 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
     let policy = caller.policy(request);
     let apply_self =
         !args.scope.include_self && (args.scope.no_self || (!pattern.is_empty() && !direct));
-    let mut hits = HashMap::new();
-    let mut exact = true;
-    // 0.4.9's content lookup found nothing for a pattern without a word, such as `-`, and
-    // still matched it against chat identity (py/search.py:8764-8801).
-    if !direct && !agrep_core::boundary_rank::query_tokens(&pattern).is_empty() {
-        let options = Options {
-            pattern: pattern.clone(),
-            regex: false,
-            word: false,
-            sort: "score".into(),
-            limit: if args.max == 0 {
-                0
-            } else {
-                20.max(args.max.saturating_mul(2))
-            },
-            exact: args.max == 0,
-            count_only: false,
-            count_by_tier: false,
-            content: false,
-            chats: true,
-            tools,
-            filters: filters.clone(),
-        };
-        // Content heads come from outside the withheld rows, so a chat's head can sit
-        // before the caller's window.
-        let result = query::search(
-            &c,
-            &agrep_core::caller::options(&options, &caller, !apply_self, args.scope.no_self),
-        )?;
-        exact = result.total_basis == "exact" && result.total <= result.hits.len();
-        for (rank, hit) in result.hits.into_iter().enumerate() {
-            hits.insert((hit.agent.clone(), hit.session.clone()), (rank, hit));
+    let selection = Selection {
+        args: &args,
+        filters: &filters,
+        caller: &caller,
+        identity: identity.as_deref(),
+        apply_self,
+        direct,
+    };
+    let (hits, exact) = content_hits(&c, &selection, &pattern, tools)?;
+    let (selected, excluded, total) = select_chats(selection, &all, &hits);
+    let checked = agrep_core::render::checked(no_auto);
+    let truncated = selected.len() < total || !exact;
+    // 0.4.9 named a page cut by -n with its larger rerun (py/search.py:8888-8912).
+    let more_command = (args.max > 0 && truncated).then(|| more_command(&args, &filters, no_auto));
+    // A listed chat proves the filters matched; only an empty page names empty ones.
+    let coverage = if selected.is_empty() {
+        agrep_core::coverage::dimensions(&c, &filters)?
+    } else {
+        json!({"empty_dimensions":[],"checked":true})
+    };
+    if args.json {
+        let mut completeness = json!({"shown":selected.len(),"total":total,"total_basis":if exact{"exact"}else{"floor"},"unit":"matching chat","truncated":truncated});
+        if let Some(command) = &more_command {
+            completeness["more_command"] = json!(command);
         }
+        let mut meta = json!({"kind":"agrep-meta","completeness":completeness,"filter_coverage":coverage,"freshness":render::machine_freshness(no_auto),"self_exclusion":caller.metadata(request,None),"self_excluded":excluded});
+        if selected.is_empty() {
+            meta["hits"] = json!([]);
+        }
+        println!("{}", agrep_core::json_output::to_string(&meta)?);
     }
+    let index = agrep_core::handles::SessionIndex::load(&c)?;
+    print_chats(
+        &c,
+        &selected,
+        &hits,
+        &index,
+        RowStyle {
+            args: &args,
+            caller: &caller,
+            color,
+            tools,
+            apply_self,
+            direct,
+        },
+    )?;
+    if !args.json {
+        eprintln!(
+            "showing {} of {}{} matching chat{}, {}{}{}",
+            selected.len(),
+            total,
+            if exact { "" } else { "+" },
+            if total == 1 { "" } else { "s" },
+            if pattern.is_empty() || direct {
+                "newest first"
+            } else {
+                "best match first"
+            },
+            if !args.side && !direct {
+                " (side chats hidden; --side shows them)"
+            } else {
+                ""
+            },
+            more_command
+                .as_ref()
+                .map(|command| format!(" · larger page: {command}"))
+                .unwrap_or_default()
+        );
+        if let Some(notice) = policy.and_then(|p| p.notice(excluded, "chat")) {
+            eprintln!("{notice}");
+        }
+        agrep_core::coverage::disclose(&coverage);
+        render::note_no_auto(no_auto);
+    }
+    Ok(if !selected.is_empty() {
+        0
+    } else if checked && exact {
+        1
+    } else {
+        2
+    })
+}
+
+type Hits = HashMap<(String, String), (usize, query::Hit)>;
+struct Selection<'a> {
+    args: &'a Chats,
+    filters: &'a query::Filters,
+    caller: &'a agrep_core::caller::Caller,
+    identity: Option<&'a str>,
+    apply_self: bool,
+    direct: bool,
+}
+fn select_chats<'a>(
+    ctx: Selection<'_>,
+    all: &'a [h::Session],
+    hits: &Hits,
+) -> (Vec<&'a h::Session>, usize, usize) {
     let mut excluded = 0;
     let mut selected: Vec<_> = all
         .iter()
         .filter(|s| {
-            if !h::in_scope(s, &filters) {
+            if !h::in_scope(s, ctx.filters) {
                 return false;
             }
             let hit = hits.get(&(s.agent.clone(), s.id.clone()));
-            let matched = if direct {
-                identity.as_ref().is_some_and(|id| s.id.starts_with(id))
+            let matched = if ctx.direct {
+                ctx.identity.as_ref().is_some_and(|id| s.id.starts_with(id))
             } else {
                 // 0.4.9's haystack, less the concept 0.5 does not compute
                 // (py/search.py:8579-8583).
@@ -106,7 +169,8 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
                     s.title
                 )
                 .to_lowercase();
-                args.pattern
+                ctx.args
+                    .pattern
                     .iter()
                     .all(|p| identity.contains(&p.to_lowercase()))
                     || hit.is_some()
@@ -114,15 +178,15 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
             if !matched {
                 return false;
             }
-            if apply_self
-                && !direct
+            if ctx.apply_self
+                && !ctx.direct
                 && agrep_core::caller::excludes(
-                    &caller,
+                    ctx.caller,
                     &s.agent,
                     &s.id,
                     hit.map_or(0, |(_, hit)| hit.turn),
                     false,
-                    args.scope.no_self,
+                    ctx.args.scope.no_self,
                 )
             {
                 excluded += 1;
@@ -142,67 +206,73 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
         )
     });
     let total = selected.len();
-    if args.max > 0 {
-        selected.truncate(args.max);
+    if ctx.args.max > 0 {
+        selected.truncate(ctx.args.max);
     }
-    let checked = agrep_core::render::checked(no_auto);
-    let truncated = selected.len() < total || !exact;
-    // 0.4.9 named a page cut by -n with its larger rerun (py/search.py:8888-8912).
-    let more_command = (args.max > 0 && truncated).then(|| {
-        let mut argv: Vec<String> = vec!["agrep".into(), "chats".into()];
-        if let Some(agent) = &args.scope.agent {
-            argv.extend(["--agent".into(), agent.clone()]);
-        }
-        if let Some(project) = &filters.project {
-            argv.push(format!("--project={project}"));
-        }
-        if let Some(project) = &args.scope.exclude_project {
-            argv.push(format!("--exclude-project={project}"));
-        }
-        for (flag, value) in [
-            ("--since", &args.scope.since),
-            ("--until", &args.scope.until),
-        ] {
-            if let Some(value) = value {
-                argv.extend([flag.into(), value.clone()]);
-            }
-        }
-        for (flag, on) in [
-            ("--side", args.side),
-            ("--self", args.scope.include_self),
-            ("--no-self", args.scope.no_self),
-            ("--json", args.json),
-            ("--no-auto", no_auto),
-        ] {
-            if on {
-                argv.push(flag.into());
-            }
-        }
-        argv.extend(["-n".into(), 80.max(args.max * 4).to_string()]);
-        if !args.pattern.is_empty() {
-            argv.push("--".into());
-            argv.extend(args.pattern.iter().cloned());
-        }
-        agrep_core::surface::shell(&argv)
-    });
-    // A listed chat proves the filters matched; only an empty page names empty ones.
-    let coverage = if selected.is_empty() {
-        agrep_core::coverage::dimensions(&c, &filters)?
-    } else {
-        json!({"empty_dimensions":[],"checked":true})
-    };
-    if args.json {
-        let mut completeness = json!({"shown":selected.len(),"total":total,"total_basis":if exact{"exact"}else{"floor"},"unit":"matching chat","truncated":truncated});
-        if let Some(command) = &more_command {
-            completeness["more_command"] = json!(command);
-        }
-        let mut meta = json!({"kind":"agrep-meta","completeness":completeness,"filter_coverage":coverage,"freshness":render::machine_freshness(no_auto),"self_exclusion":caller.metadata(request,None),"self_excluded":excluded});
-        if selected.is_empty() {
-            meta["hits"] = json!([]);
-        }
-        println!("{}", agrep_core::json_output::to_string(&meta)?);
+    (selected, excluded, total)
+}
+
+fn more_command(args: &Chats, filters: &query::Filters, no_auto: bool) -> String {
+    let mut argv: Vec<String> = vec!["agrep".into(), "chats".into()];
+    if let Some(agent) = &args.scope.agent {
+        argv.extend(["--agent".into(), agent.clone()]);
     }
-    let index = agrep_core::handles::SessionIndex::load(&c)?;
+    if let Some(project) = &filters.project {
+        argv.push(format!("--project={project}"));
+    }
+    if let Some(project) = &args.scope.exclude_project {
+        argv.push(format!("--exclude-project={project}"));
+    }
+    for (flag, value) in [
+        ("--since", &args.scope.since),
+        ("--until", &args.scope.until),
+    ] {
+        if let Some(value) = value {
+            argv.extend([flag.into(), value.clone()]);
+        }
+    }
+    for (flag, on) in [
+        ("--side", args.side),
+        ("--self", args.scope.include_self),
+        ("--no-self", args.scope.no_self),
+        ("--json", args.json),
+        ("--no-auto", no_auto),
+    ] {
+        if on {
+            argv.push(flag.into());
+        }
+    }
+    argv.extend(["-n".into(), 80.max(args.max * 4).to_string()]);
+    if !args.pattern.is_empty() {
+        argv.push("--".into());
+        argv.extend(args.pattern.iter().cloned());
+    }
+    agrep_core::surface::shell(&argv)
+}
+
+struct RowStyle<'a> {
+    args: &'a Chats,
+    caller: &'a agrep_core::caller::Caller,
+    color: &'a str,
+    tools: bool,
+    apply_self: bool,
+    direct: bool,
+}
+fn print_chats(
+    c: &rusqlite::Connection,
+    selected: &[&h::Session],
+    hits: &Hits,
+    index: &agrep_core::handles::SessionIndex,
+    style: RowStyle<'_>,
+) -> Result<()> {
+    let RowStyle {
+        args,
+        caller,
+        color,
+        tools,
+        apply_self,
+        direct,
+    } = style;
     // 0.4.9 named each chat by its shortest unique prefix (py/search.py:8862-8866).
     let short = |handle: &str, session: &str| {
         handle.replacen(
@@ -211,10 +281,10 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
             1,
         )
     };
-    for s in &selected {
-        let latest = h::latest_claim(&c, s, tools)?;
+    for s in selected {
+        let latest = h::latest_claim(c, s, tools)?;
         let latest_handle = latest.as_ref().map(|r| short(&h::handle(&s.id, r), &s.id));
-        let turns = h::turn_count(&c, s)?;
+        let turns = h::turn_count(c, s)?;
         let hit = hits
             .get(&(s.agent.clone(), s.id.clone()))
             .map(|(_, hit)| hit);
@@ -259,39 +329,53 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
             );
         }
     }
-    if !args.json {
-        eprintln!(
-            "showing {} of {}{} matching chat{}, {}{}{}",
-            selected.len(),
-            total,
-            if exact { "" } else { "+" },
-            if total == 1 { "" } else { "s" },
-            if pattern.is_empty() || direct {
-                "newest first"
+    Ok(())
+}
+
+fn content_hits(
+    c: &rusqlite::Connection,
+    ctx: &Selection<'_>,
+    pattern: &str,
+    tools: bool,
+) -> Result<(Hits, bool)> {
+    let mut hits = HashMap::new();
+    let mut exact = true;
+    // 0.4.9's content lookup found nothing for a pattern without a word, such as `-`, and
+    // still matched it against chat identity (py/search.py:8764-8801).
+    if !ctx.direct && !agrep_core::boundary_rank::query_tokens(pattern).is_empty() {
+        let options = Options {
+            pattern: pattern.to_owned(),
+            regex: false,
+            word: false,
+            sort: "score".into(),
+            limit: if ctx.args.max == 0 {
+                0
             } else {
-                "best match first"
+                20.max(ctx.args.max.saturating_mul(2))
             },
-            if !args.side && !direct {
-                " (side chats hidden; --side shows them)"
-            } else {
-                ""
-            },
-            more_command
-                .as_ref()
-                .map(|command| format!(" · larger page: {command}"))
-                .unwrap_or_default()
-        );
-        if let Some(notice) = policy.and_then(|p| p.notice(excluded, "chat")) {
-            eprintln!("{notice}");
+            exact: ctx.args.max == 0,
+            count_only: false,
+            count_by_tier: false,
+            content: false,
+            chats: true,
+            tools,
+            filters: ctx.filters.clone(),
+        };
+        // Content heads come from outside the withheld rows, so a chat's head can sit
+        // before the caller's window.
+        let result = query::search(
+            c,
+            &agrep_core::caller::options(
+                &options,
+                ctx.caller,
+                !ctx.apply_self,
+                ctx.args.scope.no_self,
+            ),
+        )?;
+        exact = result.total_basis == "exact" && result.total <= result.hits.len();
+        for (rank, hit) in result.hits.into_iter().enumerate() {
+            hits.insert((hit.agent.clone(), hit.session.clone()), (rank, hit));
         }
-        agrep_core::coverage::disclose(&coverage);
-        render::note_no_auto(no_auto);
     }
-    Ok(if !selected.is_empty() {
-        0
-    } else if checked && exact {
-        1
-    } else {
-        2
-    })
+    Ok((hits, exact))
 }

@@ -46,6 +46,38 @@ struct Workspace {
     global_mask: Arc<Buffer>,
     local_mask: Arc<Buffer>,
 }
+/// One batch's dimensions: `rows` tokens of `count` hidden values in all.
+struct Batch {
+    batch: usize,
+    seq: usize,
+    rows: usize,
+    count: usize,
+    /// (batch, heads, sequence, head width), as the rope and attention kernels take it.
+    shape: [u32; 4],
+}
+/// The workspace's scratch views. `pair` and `mid` each hold a residual followed by
+/// its normalized copy, at `normalized` and `mlp_normalized`.
+struct Scratch<'a> {
+    pair: &'a View,
+    mid: &'a View,
+    normalized: View,
+    mlp_normalized: View,
+    qkv: &'a View,
+    q: &'a View,
+    k: &'a View,
+    context: &'a View,
+    projected: &'a View,
+    mlp: &'a View,
+    gate: &'a View,
+}
+/// A one-dimensional Metal grid or threadgroup size.
+fn line(width: usize) -> MTLSize {
+    MTLSize {
+        width,
+        height: 1,
+        depth: 1,
+    }
+}
 pub(crate) struct Arena {
     device: MetalDevice,
     kind: Device,
@@ -214,18 +246,7 @@ impl Arena {
         encoder.set_bytes(4, &self.hidden);
         encoder.set_bytes(5, &count);
         encoder.set_bytes(6, &self.eps);
-        encoder.dispatch_thread_groups(
-            MTLSize {
-                width: count / self.hidden,
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width: 128,
-                height: 1,
-                depth: 1,
-            },
-        );
+        encoder.dispatch_thread_groups(line(count / self.hidden), line(128));
         Ok(())
     }
     pub(crate) fn embed(&mut self, ids: &Tensor, lengths: &[usize]) -> Result<Vec<Vec<f32>>> {
@@ -253,241 +274,41 @@ impl Arena {
         }
         let [pair, mid, qkv, q, k, context, projected, mlp, gate]: [&View; 9] =
             std::array::from_fn(|i| &workspace.buffers[i]);
-        let normalized = pair.at(count * 2);
-        let mlp_normalized = mid.at(count * 2);
-        stage(&self.kind, "embedding_norm", || -> Result<()> {
-            let input = View::tensor(ids)?;
-            let encoder = self.device.command_encoder()?;
-            encoder.set_compute_pipeline_state(&self.embedding_kernel);
-            for (i, v) in [
-                (0, &input),
-                (1, &self.embedding),
-                (2, &self.norm),
-                (3, pair),
-            ] {
-                encoder.set_buffer(i, Some(&v.buffer), v.offset);
-            }
-            encoder.set_bytes(4, &self.hidden);
-            encoder.set_bytes(5, &count);
-            encoder.set_bytes(6, &self.eps);
-            encoder.dispatch_thread_groups(
-                MTLSize {
-                    width: rows,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: 128,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-            Ok(())
+        let scratch = Scratch {
+            pair,
+            mid,
+            normalized: pair.at(count * 2),
+            mlp_normalized: mid.at(count * 2),
+            qkv,
+            q,
+            k,
+            context,
+            projected,
+            mlp,
+            gate,
+        };
+        let b = Batch {
+            batch,
+            seq,
+            rows,
+            count,
+            shape: [
+                batch as u32,
+                self.heads as u32,
+                seq as u32,
+                (self.hidden / self.heads) as u32,
+            ],
+        };
+        stage(&self.kind, "embedding_norm", || {
+            self.encode_embedding_norm(ids, pair, &b)
         })?;
-        let shape = [
-            batch as u32,
-            self.heads as u32,
-            seq as u32,
-            (self.hidden / self.heads) as u32,
-        ];
         if seq > 8 {
-            stage(&self.kind, "attention_masks", || -> Result<()> {
-                let encoder = self.device.command_encoder()?;
-                encoder.set_compute_pipeline_state(&self.masks);
-                encoder.set_buffer(0, Some(&workspace.lengths), 0);
-                encoder.set_buffer(1, Some(&workspace.global_mask), 0);
-                encoder.set_buffer(2, Some(&workspace.local_mask), 0);
-                encoder.set_bytes(3, &(seq as u32));
-                encoder.set_bytes(4, &(batch as u32));
-                encoder.set_bytes(
-                    5,
-                    &(self.layers.iter().find_map(|l| l.radius).unwrap_or(0) as u32),
-                );
-                encoder.dispatch_threads(
-                    MTLSize {
-                        width: batch * seq * seq,
-                        height: 1,
-                        depth: 1,
-                    },
-                    MTLSize {
-                        width: 256,
-                        height: 1,
-                        depth: 1,
-                    },
-                );
-                Ok(())
+            stage(&self.kind, "attention_masks", || {
+                self.encode_masks(workspace, &b)
             })?;
         }
         for layer in &self.layers {
-            stage(&self.kind, "qkv", || {
-                self.gemm(
-                    &normalized,
-                    &layer.qkv,
-                    qkv,
-                    rows,
-                    self.hidden,
-                    3 * self.hidden,
-                )
-            })?;
-            stage(&self.kind, "rope", || -> Result<()> {
-                let encoder = self.device.command_encoder()?;
-                encoder.set_compute_pipeline_state(&self.rope);
-                for (i, v) in [
-                    (0, qkv),
-                    (1, &layer.cosine),
-                    (2, &layer.sine),
-                    (3, q),
-                    (4, k),
-                ] {
-                    encoder.set_buffer(i, Some(&v.buffer), v.offset);
-                }
-                encoder.set_bytes(5, &shape);
-                encoder.dispatch_threads(
-                    MTLSize {
-                        width: count / 2,
-                        height: 1,
-                        depth: 1,
-                    },
-                    MTLSize {
-                        width: 128,
-                        height: 1,
-                        depth: 1,
-                    },
-                );
-                Ok(())
-            })?;
-            stage(&self.kind, "attention", || -> Result<()> {
-                if seq > 8 {
-                    let d = self.hidden / self.heads;
-                    let dims = [batch, self.heads, seq, d];
-                    let qs = [self.heads * seq * d, seq * d, d, 1];
-                    let vs = [seq * 3 * self.hidden, d, 3 * self.hidden, 1];
-                    let os = [seq * self.hidden, d, self.hidden, 1];
-                    let ms = if layer.radius.is_some() {
-                        [seq * seq, 0, seq, 1]
-                    } else {
-                        [seq, 0, 0, 1]
-                    };
-                    let mask: &Buffer = if layer.radius.is_some() {
-                        &workspace.local_mask
-                    } else {
-                        &workspace.global_mask
-                    };
-                    let encoder = self.device.command_encoder()?;
-                    return candle_metal_kernels::call_sdpa_full(
-                        self.device.device(),
-                        &encoder,
-                        self.device.kernels(),
-                        q.offset,
-                        &dims,
-                        &qs,
-                        &q.buffer,
-                        k.offset,
-                        &dims,
-                        &qs,
-                        &k.buffer,
-                        4 * self.hidden,
-                        &qkv.buffer,
-                        &vs,
-                        Some(candle_metal_kernels::SdpaDType::F16),
-                        Some(mask),
-                        Some(&ms),
-                        &context.buffer,
-                        &os,
-                        (d as f32).sqrt().recip(),
-                        false,
-                        candle_metal_kernels::SdpaDType::F16,
-                    )
-                    .map_err(|e| candle_core::Error::Msg(e.to_string()));
-                }
-                let encoder = self.device.command_encoder()?;
-                encoder.set_compute_pipeline_state(&self.attention);
-                let v = qkv.at(2 * self.hidden * 2);
-                for (i, v) in [(0, q), (1, k), (2, &v)] {
-                    encoder.set_buffer(i, Some(&v.buffer), v.offset);
-                }
-                encoder.set_buffer(3, Some(&workspace.lengths), 0);
-                let d = self.hidden / self.heads;
-                let qs = [self.heads * seq * d, seq * d, d, 1];
-                let vs = [seq * 3 * self.hidden, d, 3 * self.hidden, 1];
-                encoder.set_bytes(4, &qs);
-                encoder.set_bytes(5, &qs);
-                encoder.set_bytes(6, &vs);
-                encoder.set_bytes(7, &shape);
-                encoder.set_bytes(8, &(d as f32).sqrt().recip());
-                encoder.set_bytes(9, &layer.radius.map_or(-1, |r| r as i32));
-                encoder.set_buffer(10, Some(&context.buffer), context.offset);
-                encoder.dispatch_threads(
-                    MTLSize {
-                        width: rows * self.heads * 32,
-                        height: 1,
-                        depth: 1,
-                    },
-                    MTLSize {
-                        width: 128,
-                        height: 1,
-                        depth: 1,
-                    },
-                );
-                Ok(())
-            })?;
-            stage(&self.kind, "attention_projection", || {
-                self.gemm(
-                    context,
-                    &layer.projection,
-                    projected,
-                    rows,
-                    self.hidden,
-                    self.hidden,
-                )
-            })?;
-            stage(&self.kind, "residual_norm", || {
-                self.norm(projected, pair, &layer.mlp_norm, mid, count)
-            })?;
-            stage(&self.kind, "mlp_in", || {
-                self.gemm(
-                    &mlp_normalized,
-                    &layer.mlp_in,
-                    mlp,
-                    rows,
-                    self.hidden,
-                    2 * self.intermediate,
-                )
-            })?;
-            stage(&self.kind, "geglu", || -> Result<()> {
-                let encoder = self.device.command_encoder()?;
-                encoder.set_compute_pipeline_state(&self.geglu);
-                encoder.set_bytes(0, &(rows * self.intermediate));
-                encoder.set_bytes(1, &self.intermediate);
-                encoder.set_buffer(2, Some(&mlp.buffer), mlp.offset);
-                encoder.set_buffer(3, Some(&gate.buffer), gate.offset);
-                encoder.dispatch_threads(
-                    MTLSize {
-                        width: rows * self.intermediate,
-                        height: 1,
-                        depth: 1,
-                    },
-                    MTLSize {
-                        width: 256,
-                        height: 1,
-                        depth: 1,
-                    },
-                );
-                Ok(())
-            })?;
-            stage(&self.kind, "mlp_out", || {
-                self.gemm(
-                    gate,
-                    &layer.mlp_out,
-                    projected,
-                    rows,
-                    self.intermediate,
-                    self.hidden,
-                )
-            })?;
-            stage(&self.kind, "residual_norm", || {
-                self.norm(projected, mid, &layer.next_norm, pair, count)
-            })?;
+            self.layer(layer, workspace, &scratch, &b)?;
         }
         crate::semantic_profile::event(
             serde_json::json!({"arena_batch":{"rows":batch,"tokens":rows,"workspace_generation":workspace.generation,"reserved_tokens":workspace.capacity,"synchronized_profile":crate::semantic_profile::enabled()}}),
@@ -508,6 +329,186 @@ impl Arena {
             .i((1, .., 0, ..))?
             .to_dtype(DType::F32)?
             .to_vec2::<f32>()
+    }
+    fn encode_embedding_norm(&self, ids: &Tensor, pair: &View, b: &Batch) -> Result<()> {
+        let input = View::tensor(ids)?;
+        let encoder = self.device.command_encoder()?;
+        encoder.set_compute_pipeline_state(&self.embedding_kernel);
+        for (i, v) in [
+            (0, &input),
+            (1, &self.embedding),
+            (2, &self.norm),
+            (3, pair),
+        ] {
+            encoder.set_buffer(i, Some(&v.buffer), v.offset);
+        }
+        encoder.set_bytes(4, &self.hidden);
+        encoder.set_bytes(5, &b.count);
+        encoder.set_bytes(6, &self.eps);
+        encoder.dispatch_thread_groups(line(b.rows), line(128));
+        Ok(())
+    }
+    fn encode_masks(&self, workspace: &Workspace, b: &Batch) -> Result<()> {
+        let encoder = self.device.command_encoder()?;
+        encoder.set_compute_pipeline_state(&self.masks);
+        encoder.set_buffer(0, Some(&workspace.lengths), 0);
+        encoder.set_buffer(1, Some(&workspace.global_mask), 0);
+        encoder.set_buffer(2, Some(&workspace.local_mask), 0);
+        encoder.set_bytes(3, &(b.seq as u32));
+        encoder.set_bytes(4, &(b.batch as u32));
+        encoder.set_bytes(
+            5,
+            &(self.layers.iter().find_map(|l| l.radius).unwrap_or(0) as u32),
+        );
+        encoder.dispatch_threads(line(b.batch * b.seq * b.seq), line(256));
+        Ok(())
+    }
+    fn layer(&self, layer: &Layer, workspace: &Workspace, s: &Scratch, b: &Batch) -> Result<()> {
+        use crate::semantic_profile::stage;
+        let (rows, hidden) = (b.rows, self.hidden);
+        stage(&self.kind, "qkv", || {
+            self.gemm(&s.normalized, &layer.qkv, s.qkv, rows, hidden, 3 * hidden)
+        })?;
+        stage(&self.kind, "rope", || self.encode_rope(layer, s, b))?;
+        stage(&self.kind, "attention", || {
+            self.encode_attention(layer, workspace, s, b)
+        })?;
+        stage(&self.kind, "attention_projection", || {
+            self.gemm(
+                s.context,
+                &layer.projection,
+                s.projected,
+                rows,
+                hidden,
+                hidden,
+            )
+        })?;
+        stage(&self.kind, "residual_norm", || {
+            self.norm(s.projected, s.pair, &layer.mlp_norm, s.mid, b.count)
+        })?;
+        stage(&self.kind, "mlp_in", || {
+            self.gemm(
+                &s.mlp_normalized,
+                &layer.mlp_in,
+                s.mlp,
+                rows,
+                hidden,
+                2 * self.intermediate,
+            )
+        })?;
+        stage(&self.kind, "geglu", || self.encode_geglu(s, b))?;
+        stage(&self.kind, "mlp_out", || {
+            self.gemm(
+                s.gate,
+                &layer.mlp_out,
+                s.projected,
+                rows,
+                self.intermediate,
+                hidden,
+            )
+        })?;
+        stage(&self.kind, "residual_norm", || {
+            self.norm(s.projected, s.mid, &layer.next_norm, s.pair, b.count)
+        })
+    }
+    fn encode_rope(&self, layer: &Layer, s: &Scratch, b: &Batch) -> Result<()> {
+        let encoder = self.device.command_encoder()?;
+        encoder.set_compute_pipeline_state(&self.rope);
+        for (i, v) in [
+            (0, s.qkv),
+            (1, &layer.cosine),
+            (2, &layer.sine),
+            (3, s.q),
+            (4, s.k),
+        ] {
+            encoder.set_buffer(i, Some(&v.buffer), v.offset);
+        }
+        encoder.set_bytes(5, &b.shape);
+        encoder.dispatch_threads(line(b.count / 2), line(128));
+        Ok(())
+    }
+    /// Longer sequences use the full SDPA kernel with the precomputed masks; short ones
+    /// the arena's own kernel, which masks by length and radius.
+    fn encode_attention(
+        &self,
+        layer: &Layer,
+        workspace: &Workspace,
+        s: &Scratch,
+        b: &Batch,
+    ) -> Result<()> {
+        let (batch, seq) = (b.batch, b.seq);
+        if seq > 8 {
+            let d = self.hidden / self.heads;
+            let dims = [batch, self.heads, seq, d];
+            let qs = [self.heads * seq * d, seq * d, d, 1];
+            let vs = [seq * 3 * self.hidden, d, 3 * self.hidden, 1];
+            let os = [seq * self.hidden, d, self.hidden, 1];
+            let ms = if layer.radius.is_some() {
+                [seq * seq, 0, seq, 1]
+            } else {
+                [seq, 0, 0, 1]
+            };
+            let mask: &Buffer = if layer.radius.is_some() {
+                &workspace.local_mask
+            } else {
+                &workspace.global_mask
+            };
+            let encoder = self.device.command_encoder()?;
+            return candle_metal_kernels::call_sdpa_full(
+                self.device.device(),
+                &encoder,
+                self.device.kernels(),
+                s.q.offset,
+                &dims,
+                &qs,
+                &s.q.buffer,
+                s.k.offset,
+                &dims,
+                &qs,
+                &s.k.buffer,
+                4 * self.hidden,
+                &s.qkv.buffer,
+                &vs,
+                Some(candle_metal_kernels::SdpaDType::F16),
+                Some(mask),
+                Some(&ms),
+                &s.context.buffer,
+                &os,
+                (d as f32).sqrt().recip(),
+                false,
+                candle_metal_kernels::SdpaDType::F16,
+            )
+            .map_err(|e| candle_core::Error::Msg(e.to_string()));
+        }
+        let encoder = self.device.command_encoder()?;
+        encoder.set_compute_pipeline_state(&self.attention);
+        let v = s.qkv.at(2 * self.hidden * 2);
+        for (i, v) in [(0, s.q), (1, s.k), (2, &v)] {
+            encoder.set_buffer(i, Some(&v.buffer), v.offset);
+        }
+        encoder.set_buffer(3, Some(&workspace.lengths), 0);
+        let d = self.hidden / self.heads;
+        let qs = [self.heads * seq * d, seq * d, d, 1];
+        let vs = [seq * 3 * self.hidden, d, 3 * self.hidden, 1];
+        encoder.set_bytes(4, &qs);
+        encoder.set_bytes(5, &qs);
+        encoder.set_bytes(6, &vs);
+        encoder.set_bytes(7, &b.shape);
+        encoder.set_bytes(8, &(d as f32).sqrt().recip());
+        encoder.set_bytes(9, &layer.radius.map_or(-1, |r| r as i32));
+        encoder.set_buffer(10, Some(&s.context.buffer), s.context.offset);
+        encoder.dispatch_threads(line(b.rows * self.heads * 32), line(128));
+        Ok(())
+    }
+    fn encode_geglu(&self, s: &Scratch, b: &Batch) -> Result<()> {
+        let encoder = self.device.command_encoder()?;
+        encoder.set_compute_pipeline_state(&self.geglu);
+        encoder.set_bytes(0, &(b.rows * self.intermediate));
+        encoder.set_bytes(1, &self.intermediate);
+        encoder.set_buffer(2, Some(&s.mlp.buffer), s.mlp.offset);
+        encoder.set_buffer(3, Some(&s.gate.buffer), s.gate.offset);
+        encoder.dispatch_threads(line(b.rows * self.intermediate), line(256));
+        Ok(())
     }
 }
 

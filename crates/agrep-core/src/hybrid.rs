@@ -143,7 +143,27 @@ pub fn merge(
             break;
         }
     }
-    let mut hits = if lexical.is_empty() {
+    let mut hits = interleave(lexical, meaning, cap, diverse, overlap_at, strong_lexical);
+    hits.truncate(cap);
+    if hits.iter().any(|h| h.matched == "semantic") {
+        keyword.total = keyword.total.max(hits.len());
+        keyword.total_basis = "floor".into();
+        keyword.hybrid_more = Some(lanes_more);
+    }
+    keyword.hits = hits;
+    keyword
+}
+
+fn interleave(
+    lexical: Vec<Hit>,
+    mut meaning: Vec<Hit>,
+    cap: usize,
+    diverse: bool,
+    overlap_at: Option<usize>,
+    strong_lexical: bool,
+) -> Vec<Hit> {
+    let fam = |h: &Hit| family(h, diverse).to_owned();
+    let hits = if lexical.is_empty() {
         meaning.truncate(cap.min(ROWS));
         meaning
     } else if meaning.is_empty() || cap == 1 {
@@ -176,15 +196,9 @@ pub fn merge(
         hits.insert(lead.min(hits.len()), meaning.remove(0));
         hits
     };
-    hits.truncate(cap);
-    if hits.iter().any(|h| h.matched == "semantic") {
-        keyword.total = keyword.total.max(hits.len());
-        keyword.total_basis = "floor".into();
-        keyword.hybrid_more = Some(lanes_more);
-    }
-    keyword.hits = hits;
-    keyword
+    hits
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -104,44 +104,14 @@ pub fn select(mut frozen: Frozen) -> Page {
         identities.insert(r.identity.clone());
     }
     if frozen.shown == 0 && frozen.requested.is_none() {
-        // 0.4.9's `_reserve_terms_rows`: queries quoted back regrow the phrase lane, so
-        // the direct answer still shows the top bag-of-words rows.
-        let mut need = TERMS_RESERVE.saturating_sub(
-            selected
-                .iter()
-                .filter(|&&i| lane(&frozen.records[i]) == "all")
-                .count(),
+        reserve_terms(
+            &frozen,
+            &mut selected,
+            &mut used,
+            &mut counts,
+            &mut identities,
+            spread,
         );
-        for (i, r) in frozen.records.iter().enumerate() {
-            if need == 0 {
-                break;
-            }
-            if selected.contains(&i)
-                || lane(r) != "all"
-                || (spread
-                    && ((!r.identity.is_empty() && identities.contains(&r.identity))
-                        || counts.get(&r.family).copied().unwrap_or(0) >= FAMILY_CAP))
-            {
-                continue;
-            }
-            used += r.line.len() + 1;
-            selected.push(i);
-            *counts.entry(r.family.clone()).or_default() += 1;
-            identities.insert(r.identity.clone());
-            need -= 1;
-        }
-        while selected.len() > MAX_ROWS || (used > BUDGET && selected.len() > MIN_ROWS) {
-            // Displaced phrase rows defer to the continuation like cap overflow.
-            let Some(victim) = selected
-                .iter()
-                .rposition(|&i| lane(&frozen.records[i]) == "phrase")
-            else {
-                break;
-            };
-            used -= frozen.records[selected[victim]].line.len() + 1;
-            selected.remove(victim);
-        }
-        selected.sort_unstable();
     }
     let lines: Vec<&str> = selected
         .iter()
@@ -160,6 +130,53 @@ pub fn select(mut frozen: Frozen) -> Page {
         text,
         remainder: frozen,
     }
+}
+fn reserve_terms(
+    frozen: &Frozen,
+    selected: &mut Vec<usize>,
+    used: &mut usize,
+    counts: &mut HashMap<String, usize>,
+    identities: &mut std::collections::HashSet<String>,
+    spread: bool,
+) {
+    // 0.4.9's `_reserve_terms_rows`: queries quoted back regrow the phrase lane, so
+    // the direct answer still shows the top bag-of-words rows.
+    let mut need = TERMS_RESERVE.saturating_sub(
+        selected
+            .iter()
+            .filter(|&&i| lane(&frozen.records[i]) == "all")
+            .count(),
+    );
+    for (i, r) in frozen.records.iter().enumerate() {
+        if need == 0 {
+            break;
+        }
+        if selected.contains(&i)
+            || lane(r) != "all"
+            || (spread
+                && ((!r.identity.is_empty() && identities.contains(&r.identity))
+                    || counts.get(&r.family).copied().unwrap_or(0) >= FAMILY_CAP))
+        {
+            continue;
+        }
+        *used += r.line.len() + 1;
+        selected.push(i);
+        *counts.entry(r.family.clone()).or_default() += 1;
+        identities.insert(r.identity.clone());
+        need -= 1;
+    }
+    while selected.len() > MAX_ROWS || (*used > BUDGET && selected.len() > MIN_ROWS) {
+        // Displaced phrase rows defer to the continuation like cap overflow.
+        let Some(victim) = selected
+            .iter()
+            .rposition(|&i| lane(&frozen.records[i]) == "phrase")
+        else {
+            break;
+        };
+        *used -= frozen.records[selected[victim]].line.len() + 1;
+        selected.remove(victim);
+    }
+    selected.sort_unstable();
 }
 /// 0.4.9's `_fit_page_records`: rows that overrun the budget share it. A row no longer
 /// than an even share keeps its length; the others split what is left and are cut at a

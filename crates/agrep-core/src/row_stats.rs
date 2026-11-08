@@ -285,65 +285,9 @@ pub(crate) fn build(tx: &Transaction<'_>) -> Result<()> {
 }
 /// `chunk_rows` rows or more go to the tally workers at a time.
 fn build_in_chunks(tx: &Transaction<'_>, chunk_rows: usize) -> Result<()> {
-    let mut families: Vec<(String, String)> = Vec::new();
-    let mut members: HashMap<String, HashMap<String, u32>> = HashMap::new();
-    {
-        let mut q = tx.prepare("SELECT agent,family,id FROM sessions ORDER BY agent,family")?;
-        let mut rows = q.query([])?;
-        while let Some(row) = rows.next()? {
-            let (agent, family): (String, String) = (row.get(0)?, row.get(1)?);
-            if families
-                .last()
-                .is_none_or(|last| last.0 != agent || last.1 != family)
-            {
-                families.push((agent.clone(), family));
-            }
-            let index = u32::try_from(families.len() - 1)?;
-            members.entry(agent).or_default().insert(row.get(2)?, index);
-        }
-    }
-    let mut ids = Vec::new();
-    let mut owners = Vec::new();
-    {
-        let mut q = tx.prepare("SELECT id,agent,session FROM prose WHERE visible=1 ORDER BY id")?;
-        let mut rows = q.query([])?;
-        let mut last: Option<(String, String, u32)> = None;
-        while let Some(row) = rows.next()? {
-            let agent = row.get_ref(1)?.as_str()?;
-            let session = row.get_ref(2)?.as_str()?;
-            let owner = match &last {
-                Some((a, s, owner)) if a == agent && s == session => *owner,
-                _ => {
-                    let owner = members
-                        .get(agent)
-                        .and_then(|sessions| sessions.get(session))
-                        .copied()
-                        .unwrap_or(NO_FAMILY);
-                    last = Some((agent.to_owned(), session.to_owned(), owner));
-                    owner
-                }
-            };
-            ids.push(row.get::<_, i64>(0)?);
-            owners.push(owner);
-        }
-    }
-    let mut bounds = vec![0usize; families.len() + 1];
-    for &owner in &owners {
-        if owner != NO_FAMILY {
-            bounds[owner as usize + 1] += 1;
-        }
-    }
-    for family in 0..families.len() {
-        bounds[family + 1] += bounds[family];
-    }
-    let mut next = bounds.clone();
-    let mut order = vec![0usize; bounds[families.len()]];
-    for (at, &owner) in owners.iter().enumerate() {
-        if owner != NO_FAMILY {
-            order[next[owner as usize]] = at;
-            next[owner as usize] += 1;
-        }
-    }
+    let (families, members) = family_members(tx)?;
+    let (ids, owners) = visible_owners(tx, &members)?;
+    let (bounds, order) = family_row_order(&owners, families.len());
     let slots: Vec<Mutex<Families>> = (0..rayon::current_num_threads())
         .map(|_| Mutex::default())
         .collect();
@@ -371,20 +315,7 @@ fn build_in_chunks(tx: &Transaction<'_>, chunk_rows: usize) -> Result<()> {
                 }
             }
         });
-        let store = |done: Result<Vec<(u32, Vec<u8>)>>| -> Result<()> {
-            for (family, body) in done? {
-                let (agent, name) = &families[family as usize];
-                let counts: HashMap<String, [u32; 2]> =
-                    serde_json::from_slice(&lz4_flex::decompress_size_prepended(&body)?)?;
-                let mut items: Vec<_> = counts.into_iter().collect();
-                items.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-                for (index, chunk) in items.chunks(FAMILY_PAGE).enumerate() {
-                    let lower = if index == 0 { "" } else { &chunk[0].0 };
-                    write_family_page(tx, agent, name, lower, &chunk.iter().cloned().collect())?;
-                }
-            }
-            Ok(())
-        };
+        let store = |done| store_family_bodies(tx, &families, done);
         let mut fetch = tx.prepare(
             "SELECT id,text FROM prose WHERE id BETWEEN ?1 AND ?2 AND visible=1 ORDER BY id",
         )?;
@@ -395,32 +326,7 @@ fn build_in_chunks(tx: &Transaction<'_>, chunk_rows: usize) -> Result<()> {
             if rows.is_empty() {
                 continue;
             }
-            let mut batch = Batch {
-                family: u32::try_from(family)?,
-                text: String::new(),
-                ends: Vec::with_capacity(rows.len()),
-            };
-            // A run of consecutive visible rows is exactly the visible rows of its id range.
-            for run in rows.chunk_by(|a, b| *b == *a + 1) {
-                let (first, last) = (run[0], run[run.len() - 1]);
-                let mut found = fetch.query(params![ids[first], ids[last]])?;
-                let mut at = first;
-                while let Some(row) = found.next()? {
-                    anyhow::ensure!(
-                        at <= last && row.get::<_, i64>(0)? == ids[at],
-                        "visible prose changed during family statistics"
-                    );
-                    batch
-                        .text
-                        .push_str(std::str::from_utf8(row.get_ref(1)?.as_blob()?)?);
-                    batch.ends.push(batch.text.len());
-                    at += 1;
-                }
-                anyhow::ensure!(
-                    at == last + 1,
-                    "visible prose changed during family statistics"
-                );
-            }
+            let batch = fetch_family_batch(&mut fetch, family, rows, &ids)?;
             queued += rows.len();
             chunk.push(batch);
             if queued >= chunk_rows {
@@ -515,6 +421,132 @@ pub(crate) fn refresh(tx: &Transaction<'_>) -> Result<()> {
     }
     tx.execute("DELETE FROM stats_dirty", [])?;
     Ok(())
+}
+
+type FamilyMembers = HashMap<String, HashMap<String, u32>>;
+fn family_members(tx: &Transaction<'_>) -> Result<(Vec<(String, String)>, FamilyMembers)> {
+    let mut families: Vec<(String, String)> = Vec::new();
+    let mut members: HashMap<String, HashMap<String, u32>> = HashMap::new();
+    {
+        let mut q = tx.prepare("SELECT agent,family,id FROM sessions ORDER BY agent,family")?;
+        let mut rows = q.query([])?;
+        while let Some(row) = rows.next()? {
+            let (agent, family): (String, String) = (row.get(0)?, row.get(1)?);
+            if families
+                .last()
+                .is_none_or(|last| last.0 != agent || last.1 != family)
+            {
+                families.push((agent.clone(), family));
+            }
+            let index = u32::try_from(families.len() - 1)?;
+            members.entry(agent).or_default().insert(row.get(2)?, index);
+        }
+    }
+    Ok((families, members))
+}
+
+fn visible_owners(tx: &Transaction<'_>, members: &FamilyMembers) -> Result<(Vec<i64>, Vec<u32>)> {
+    let mut ids = Vec::new();
+    let mut owners = Vec::new();
+    {
+        let mut q = tx.prepare("SELECT id,agent,session FROM prose WHERE visible=1 ORDER BY id")?;
+        let mut rows = q.query([])?;
+        let mut last: Option<(String, String, u32)> = None;
+        while let Some(row) = rows.next()? {
+            let agent = row.get_ref(1)?.as_str()?;
+            let session = row.get_ref(2)?.as_str()?;
+            let owner = match &last {
+                Some((a, s, owner)) if a == agent && s == session => *owner,
+                _ => {
+                    let owner = members
+                        .get(agent)
+                        .and_then(|sessions| sessions.get(session))
+                        .copied()
+                        .unwrap_or(NO_FAMILY);
+                    last = Some((agent.to_owned(), session.to_owned(), owner));
+                    owner
+                }
+            };
+            ids.push(row.get::<_, i64>(0)?);
+            owners.push(owner);
+        }
+    }
+    Ok((ids, owners))
+}
+
+fn family_row_order(owners: &[u32], families: usize) -> (Vec<usize>, Vec<usize>) {
+    let mut bounds = vec![0usize; families + 1];
+    for &owner in owners {
+        if owner != NO_FAMILY {
+            bounds[owner as usize + 1] += 1;
+        }
+    }
+    for family in 0..families {
+        bounds[family + 1] += bounds[family];
+    }
+    let mut next = bounds.clone();
+    let mut order = vec![0usize; bounds[families]];
+    for (at, &owner) in owners.iter().enumerate() {
+        if owner != NO_FAMILY {
+            order[next[owner as usize]] = at;
+            next[owner as usize] += 1;
+        }
+    }
+    (bounds, order)
+}
+
+fn store_family_bodies(
+    tx: &Transaction<'_>,
+    families: &[(String, String)],
+    done: Result<Vec<(u32, Vec<u8>)>>,
+) -> Result<()> {
+    for (family, body) in done? {
+        let (agent, name) = &families[family as usize];
+        let counts: HashMap<String, [u32; 2]> =
+            serde_json::from_slice(&lz4_flex::decompress_size_prepended(&body)?)?;
+        let mut items: Vec<_> = counts.into_iter().collect();
+        items.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        for (index, chunk) in items.chunks(FAMILY_PAGE).enumerate() {
+            let lower = if index == 0 { "" } else { &chunk[0].0 };
+            write_family_page(tx, agent, name, lower, &chunk.iter().cloned().collect())?;
+        }
+    }
+    Ok(())
+}
+
+fn fetch_family_batch(
+    fetch: &mut rusqlite::Statement<'_>,
+    family: usize,
+    rows: &[usize],
+    ids: &[i64],
+) -> Result<Batch> {
+    let mut batch = Batch {
+        family: u32::try_from(family)?,
+        text: String::new(),
+        ends: Vec::with_capacity(rows.len()),
+    };
+    // A run of consecutive visible rows is exactly the visible rows of its id range.
+    for run in rows.chunk_by(|a, b| *b == *a + 1) {
+        let (first, last) = (run[0], run[run.len() - 1]);
+        let mut found = fetch.query(params![ids[first], ids[last]])?;
+        let mut at = first;
+        while let Some(row) = found.next()? {
+            anyhow::ensure!(
+                at <= last && row.get::<_, i64>(0)? == ids[at],
+                "visible prose changed during family statistics"
+            );
+            batch
+                .text
+                .push_str(std::str::from_utf8(row.get_ref(1)?.as_blob()?)?);
+            batch.ends.push(batch.text.len());
+            at += 1;
+        }
+        anyhow::ensure!(
+            at == last + 1,
+            "visible prose changed during family statistics"
+        );
+    }
+    Ok(batch)
 }
 
 #[cfg(test)]

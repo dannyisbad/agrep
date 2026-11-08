@@ -47,6 +47,60 @@ pub fn run(agents: Vec<String>, json_output: bool, strict: bool, full: bool) -> 
         .transpose()?
         .unwrap_or_default();
     let live = store::census()?;
+    let (mut gaps, mut errors) = source_gaps(&live, &sources, &selected);
+    let (counts, indexed) = indexed_rows(c.as_ref(), full, &selected)?;
+    let mut expected = EvidenceRows::new();
+    if full {
+        expected_rows(&root, &live, &selected, &mut errors, &mut expected)?;
+        for ((agent, session, who, text), count) in &expected {
+            let found = indexed
+                .get(&(agent.clone(), session.clone(), who.clone(), text.clone()))
+                .copied()
+                .unwrap_or(0);
+            if found < *count {
+                gaps.push(json!({"agent":agent,"session":session,"who":who,"rows":count-found,"reason":"parsed row missing from index"}));
+            }
+        }
+        for ((agent, session, who, text), count) in &indexed {
+            let found = expected
+                .get(&(agent.clone(), session.clone(), who.clone(), text.clone()))
+                .copied()
+                .unwrap_or(0);
+            if found < *count {
+                gaps.push(json!({"agent":agent,"session":session,"who":who,"rows":count-found,"reason":"indexed row absent from parsed sources"}));
+            }
+        }
+    }
+    let discovered = live.iter().filter(|s| selected(&s.agent)).count();
+    // 0.4.9 certified nothing when no source file was found (py/audit.py:2383-2388).
+    let unavailable = discovered == 0 && gaps.is_empty() && errors.is_empty();
+    if unavailable {
+        errors.push(json!({"path":null,"reason":"no source file census completed; audit cannot certify completeness"}));
+    }
+    let (exit, status) = if !errors.is_empty() || (strict && !gaps.is_empty()) {
+        (2, "error")
+    } else if !gaps.is_empty() {
+        (1, "warning")
+    } else {
+        (0, "clean")
+    };
+    let v = json!({"version":1,"full":full,"strict":strict,"agents":agents,"counts":counts,"discovered_sources":discovered,"expected_rows":if full{Some(expected.values().sum::<usize>())}else{None},"status":status,"gaps":gaps.len(),"gap_details":gaps,"problem_count":errors.len(),"problems":errors,"exit_code":exit,"index_path":root.db()});
+    report(Report {
+        value: &v,
+        wanted: &wanted,
+        gaps: &gaps,
+        errors: &errors,
+        unavailable,
+        json_output,
+    })?;
+    Ok(exit)
+}
+
+fn source_gaps(
+    live: &[store::Stamp],
+    sources: &[serde_json::Value],
+    selected: &impl Fn(&str) -> bool,
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
     let mut gaps = vec![];
     let mut errors = vec![];
     for source in live.iter().filter(|s| selected(&s.agent)) {
@@ -85,10 +139,18 @@ pub fn run(agents: Vec<String>, json_output: bool, strict: bool, full: bool) -> 
     }) {
         errors.push(json!({"path":source["path"],"reason":source["last_error"]}));
     }
+    (gaps, errors)
+}
+
+fn indexed_rows(
+    c: Option<&rusqlite::Connection>,
+    full: bool,
+    selected: &impl Fn(&str) -> bool,
+) -> Result<(serde_json::Map<String, serde_json::Value>, EvidenceRows)> {
     let mut counts = serde_json::Map::new();
     let mut indexed = EvidenceRows::new();
     for table in ["prose", "tools"] {
-        let Some(c) = &c else {
+        let Some(c) = c else {
             counts.insert(table.into(), json!(0));
             continue;
         };
@@ -130,143 +192,137 @@ pub fn run(agents: Vec<String>, json_output: bool, strict: bool, full: bool) -> 
         }
         counts.insert(table.into(), json!(n));
     }
-    let mut expected = EvidenceRows::new();
-    if full {
-        let policy = agrep_core::row_class::HarnessPolicy::parse(
-            &std::fs::read_to_string(root.0.join("harness_prefixes.txt")).unwrap_or_default(),
-        );
-        for adapter in ADAPTERS.iter().filter(|a| selected(a.name())) {
-            let paths: Vec<std::path::PathBuf> = live
-                .iter()
-                .filter(|s| s.agent == adapter.name())
-                .map(|s| s.path.clone().into())
-                .collect();
-            let mut batch = IntakeBatch {
-                changed: paths.iter().cloned().collect(),
-                source_paths: paths,
-                force: true,
-                ..Default::default()
-            };
-            let (messages, events, outcome, issues) = adapter.collect_checked(&mut batch);
-            let mut groups = vec![(messages, events)];
-            for source in batch.batches {
-                if let Some(error) = source.error {
-                    errors.push(json!({"path":source.key,"reason":error}));
-                }
-                groups.push((source.messages, source.events));
+    Ok((counts, indexed))
+}
+
+fn expected_rows(
+    root: &DataRoot,
+    live: &[store::Stamp],
+    selected: &impl Fn(&str) -> bool,
+    errors: &mut Vec<serde_json::Value>,
+    expected: &mut EvidenceRows,
+) -> Result<()> {
+    let policy = agrep_core::row_class::HarnessPolicy::parse(
+        &std::fs::read_to_string(root.0.join("harness_prefixes.txt")).unwrap_or_default(),
+    );
+    for adapter in ADAPTERS.iter().filter(|a| selected(a.name())) {
+        let paths: Vec<std::path::PathBuf> = live
+            .iter()
+            .filter(|s| s.agent == adapter.name())
+            .map(|s| s.path.clone().into())
+            .collect();
+        let mut batch = IntakeBatch {
+            changed: paths.iter().cloned().collect(),
+            source_paths: paths,
+            force: true,
+            ..Default::default()
+        };
+        let (messages, events, outcome, issues) = adapter.collect_checked(&mut batch);
+        let mut groups = vec![(messages, events)];
+        for source in batch.batches {
+            if let Some(error) = source.error {
+                errors.push(json!({"path":source.key,"reason":error}));
             }
-            for issue in issues.into_iter().chain(batch.issues) {
-                errors.push(json!({"path":issue.path,"reason":issue.reason}));
-            }
-            if !matches!(
-                outcome,
-                agrep_core::intake_batch::ReadOutcome::Complete
-                    | agrep_core::intake_batch::ReadOutcome::Undone
-            ) && errors.is_empty()
-            {
-                errors.push(
-                    json!({"agent":adapter.name(),"reason":format!("source read {outcome:?}")}),
-                );
-            }
-            for (messages, events) in groups {
-                let mut source_rows = EvidenceRows::new();
-                for m in agrep_core::row_class::normalize_messages(messages, &policy) {
-                    for (who, text) in [
-                        (m.who.as_ref(), m.text.as_ref()),
-                        ("agent", m.reply.as_ref()),
-                    ] {
-                        if !text.is_empty() {
-                            *source_rows
-                                .entry((
-                                    m.agent.into(),
-                                    m.session.to_string(),
-                                    who.into(),
-                                    store::digest(text),
-                                ))
-                                .or_default() += 1;
-                        }
-                    }
-                }
-                let mut seen_events = HashSet::new();
-                for e in events {
-                    if e.kind == "control"
-                        || !seen_events.insert((e.agent, e.session.clone(), e.call_id.clone()))
-                    {
-                        continue;
-                    }
-                    let mut head = match e.kind {
-                        "subagent_start" => format!("subagent {}", e.name.trim()),
-                        "subagent_result" => format!("subagent result {}", e.name.trim()),
-                        _ => e.name.trim().into(),
-                    };
-                    if e.ok == Some(false) {
-                        head.push_str(" [failed]");
-                    }
-                    let mut text = if head.is_empty() {
-                        e.input.trim().to_string()
-                    } else if e.input.trim().is_empty() {
-                        head
-                    } else {
-                        format!("{head}: {}", e.input.trim())
-                    };
-                    if !e.output.is_empty() {
-                        text.push('\n');
-                        text.push_str(&e.output);
-                    }
-                    *source_rows
-                        .entry((
-                            e.agent.into(),
-                            e.session,
-                            "tool".into(),
-                            store::digest(text.trim()),
-                        ))
-                        .or_default() += 1;
-                }
-                // Native replay copies contribute one copy, while repeated turns within a
-                // source remain separate evidence. Do not collapse them to a set of texts.
-                for (key, count) in source_rows {
-                    let n = expected.entry(key).or_default();
-                    *n = (*n).max(count);
-                }
-            }
+            groups.push((source.messages, source.events));
         }
-        for ((agent, session, who, text), count) in &expected {
-            let found = indexed
-                .get(&(agent.clone(), session.clone(), who.clone(), text.clone()))
-                .copied()
-                .unwrap_or(0);
-            if found < *count {
-                gaps.push(json!({"agent":agent,"session":session,"who":who,"rows":count-found,"reason":"parsed row missing from index"}));
-            }
+        for issue in issues.into_iter().chain(batch.issues) {
+            errors.push(json!({"path":issue.path,"reason":issue.reason}));
         }
-        for ((agent, session, who, text), count) in &indexed {
-            let found = expected
-                .get(&(agent.clone(), session.clone(), who.clone(), text.clone()))
-                .copied()
-                .unwrap_or(0);
-            if found < *count {
-                gaps.push(json!({"agent":agent,"session":session,"who":who,"rows":count-found,"reason":"indexed row absent from parsed sources"}));
+        if !matches!(
+            outcome,
+            agrep_core::intake_batch::ReadOutcome::Complete
+                | agrep_core::intake_batch::ReadOutcome::Undone
+        ) && errors.is_empty()
+        {
+            errors
+                .push(json!({"agent":adapter.name(),"reason":format!("source read {outcome:?}")}));
+        }
+        for (messages, events) in groups {
+            let mut source_rows = EvidenceRows::new();
+            for m in agrep_core::row_class::normalize_messages(messages, &policy) {
+                for (who, text) in [
+                    (m.who.as_ref(), m.text.as_ref()),
+                    ("agent", m.reply.as_ref()),
+                ] {
+                    if !text.is_empty() {
+                        *source_rows
+                            .entry((
+                                m.agent.into(),
+                                m.session.to_string(),
+                                who.into(),
+                                store::digest(text),
+                            ))
+                            .or_default() += 1;
+                    }
+                }
+            }
+            let mut seen_events = HashSet::new();
+            for e in events {
+                if e.kind == "control"
+                    || !seen_events.insert((e.agent, e.session.clone(), e.call_id.clone()))
+                {
+                    continue;
+                }
+                let mut head = match e.kind {
+                    "subagent_start" => format!("subagent {}", e.name.trim()),
+                    "subagent_result" => format!("subagent result {}", e.name.trim()),
+                    _ => e.name.trim().into(),
+                };
+                if e.ok == Some(false) {
+                    head.push_str(" [failed]");
+                }
+                let mut text = if head.is_empty() {
+                    e.input.trim().to_string()
+                } else if e.input.trim().is_empty() {
+                    head
+                } else {
+                    format!("{head}: {}", e.input.trim())
+                };
+                if !e.output.is_empty() {
+                    text.push('\n');
+                    text.push_str(&e.output);
+                }
+                *source_rows
+                    .entry((
+                        e.agent.into(),
+                        e.session,
+                        "tool".into(),
+                        store::digest(text.trim()),
+                    ))
+                    .or_default() += 1;
+            }
+            // Native replay copies contribute one copy, while repeated turns within a
+            // source remain separate evidence. Do not collapse them to a set of texts.
+            for (key, count) in source_rows {
+                let n = expected.entry(key).or_default();
+                *n = (*n).max(count);
             }
         }
     }
-    let discovered = live.iter().filter(|s| selected(&s.agent)).count();
-    // 0.4.9 certified nothing when no source file was found (py/audit.py:2383-2388).
-    let unavailable = discovered == 0 && gaps.is_empty() && errors.is_empty();
-    if unavailable {
-        errors.push(json!({"path":null,"reason":"no source file census completed; audit cannot certify completeness"}));
-    }
-    let (exit, status) = if !errors.is_empty() || (strict && !gaps.is_empty()) {
-        (2, "error")
-    } else if !gaps.is_empty() {
-        (1, "warning")
-    } else {
-        (0, "clean")
-    };
-    let v = json!({"version":1,"full":full,"strict":strict,"agents":agents,"counts":counts,"discovered_sources":discovered,"expected_rows":if full{Some(expected.values().sum::<usize>())}else{None},"status":status,"gaps":gaps.len(),"gap_details":gaps,"problem_count":errors.len(),"problems":errors,"exit_code":exit,"index_path":root.db()});
+    Ok(())
+}
+
+struct Report<'a> {
+    value: &'a serde_json::Value,
+    wanted: &'a [&'a str],
+    gaps: &'a [serde_json::Value],
+    errors: &'a [serde_json::Value],
+    unavailable: bool,
+    json_output: bool,
+}
+fn report(report: Report<'_>) -> Result<()> {
+    let Report {
+        value: v,
+        wanted,
+        gaps,
+        errors,
+        unavailable,
+        json_output,
+    } = report;
     if json_output {
         println!("{}", agrep_core::json_output::to_string(&v)?)
     } else if unavailable {
-        let scope = match wanted.as_slice() {
+        let scope = match wanted {
             [agent] => *agent,
             _ => "supported",
         };
@@ -289,5 +345,5 @@ pub fn run(agents: Vec<String>, json_output: bool, strict: bool, full: bool) -> 
             println!("refresh with agrep index --full");
         }
     }
-    Ok(exit)
+    Ok(())
 }

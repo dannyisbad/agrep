@@ -22,7 +22,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 use serde::Deserialize;
@@ -32,8 +32,9 @@ use crate::ingest::registry::{metadata_is_link, plain_metadata};
 use crate::ingest::{
     cap_event_output, cap_str, cap_str_with_chars, is_wrapper, project_name, EVENT_CAP,
 };
+use crate::intake::{Skip, Tally};
 use crate::intake_batch::SourceReadIssue;
-use crate::model::{Event, Message};
+use crate::model::{Event, Message, RawMessage};
 
 fn plain_dir_chain(
     root: &Path,
@@ -164,25 +165,26 @@ fn dominant_cwd(events: &[TLine]) -> Option<String> {
         .map(|(cwd, _)| cwd)
 }
 
+#[derive(Deserialize)]
+struct Mail {
+    id: Option<String>,
+    sender: Option<String>,
+    timestamp: Option<serde_json::Value>,
+    #[serde(rename = "renderDetails")]
+    render: Option<RenderDetails>,
+    content: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RenderDetails {
+    #[serde(rename = "messageTitle")]
+    title: Option<String>,
+}
+
 /// The inter-agent mailbox: `.system_generated/messages/*.json`, each
 /// `{sender:"<uuid>/task-N"|..., timestamp, renderDetails:{messageTitle}, content}`.
 /// Task-result mail becomes subagent_result events; system notices are skipped.
 fn collect_mailbox(brain_dir: &Path, session: &str, evts: &mut Vec<Event>) -> bool {
-    #[derive(Deserialize)]
-    struct Mail {
-        id: Option<String>,
-        sender: Option<String>,
-        timestamp: Option<serde_json::Value>,
-        #[serde(rename = "renderDetails")]
-        render: Option<RenderDetails>,
-        content: Option<String>,
-    }
-    #[derive(Deserialize)]
-    struct RenderDetails {
-        #[serde(rename = "messageTitle")]
-        title: Option<String>,
-    }
-
     let dir = match plain_dir_chain(brain_dir, &[".system_generated", "messages"]) {
         Ok(Some(dir)) => dir,
         Ok(None) => return true,
@@ -225,73 +227,84 @@ fn collect_mailbox(brain_dir: &Path, session: &str, evts: &mut Vec<Event>) -> bo
         if p.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        // seen = this mailbox JSON record
-        let tally = crate::intake::tally();
-        tally.seen();
-        let data = match crate::ingest::read_lossy(&p) {
-            Ok(d) => d,
-            Err(e) => {
-                crate::ingest::warn_source_skip("antigravity", &p, &e);
-                tally.error(&format!("cannot read: {e}"));
-                healthy = false;
-                continue;
-            }
-        };
-        let m: Mail = match serde_json::from_str(&data) {
-            Ok(m) => m,
-            Err(e) => {
-                tally.error(&format!("{e}: {}", crate::intake::clip(&data, 80)));
-                continue;
-            }
-        };
-        let sender = m.sender.as_deref().unwrap_or("");
-        if !sender.contains("/task-") {
-            tally.skip(crate::intake::Skip::Meta);
-            continue; // cross-agent mail + system notices; only task results are subagent output
-        }
-        let task = sender.rsplit('/').next().unwrap_or(sender).to_string();
-        let ts = m.timestamp.as_ref().map(parse_timestamp::json).unwrap_or(0);
-        let title = m
-            .render
-            .as_ref()
-            .and_then(|r| r.title.as_deref())
-            .unwrap_or("");
-        let input_chars = task.chars().count();
-        let (output, output_chars, output_bytes) = m
-            .content
-            .as_deref()
-            .map(cap_event_output)
-            .unwrap_or_default();
-        tally.agent_row();
-        tally.event();
-        evts.push(Event {
-            turn: None,
-            agent: "antigravity",
-            session: session.to_string(),
-            ts,
-            kind: "subagent_result",
-            name: if title.is_empty() {
-                task.clone()
-            } else {
-                cap_str(title, 200)
-            },
-            input: task,
-            output,
-            input_chars,
-            output_chars,
-            output_bytes,
-            ok: None,
-            call_id: m.id.unwrap_or_else(|| {
-                p.file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_default()
-            }),
-            child_session: String::new(),
-            meta: String::new(),
-            state: String::new(),
-        });
+        healthy &= read_mail(&p, session, evts);
     }
     healthy
+}
+
+/// One mailbox JSON record; false when it cannot be read.
+fn read_mail(p: &Path, session: &str, evts: &mut Vec<Event>) -> bool {
+    // seen = this mailbox JSON record
+    let tally = crate::intake::tally();
+    tally.seen();
+    let data = match crate::ingest::read_lossy(p) {
+        Ok(d) => d,
+        Err(e) => {
+            crate::ingest::warn_source_skip("antigravity", p, &e);
+            tally.error(&format!("cannot read: {e}"));
+            return false;
+        }
+    };
+    let m: Mail = match serde_json::from_str(&data) {
+        Ok(m) => m,
+        Err(e) => {
+            tally.error(&format!("{e}: {}", crate::intake::clip(&data, 80)));
+            return true;
+        }
+    };
+    let sender = m.sender.as_deref().unwrap_or("");
+    if !sender.contains("/task-") {
+        // cross-agent mail + system notices; only task results are subagent output
+        tally.skip(Skip::Meta);
+        return true;
+    }
+    let task = sender.rsplit('/').next().unwrap_or(sender).to_string();
+    tally.agent_row();
+    tally.event();
+    evts.push(task_result(m, task, p, session));
+    true
+}
+
+/// A task's result mail as a subagent_result event.
+fn task_result(m: Mail, task: String, p: &Path, session: &str) -> Event {
+    let ts = m.timestamp.as_ref().map(parse_timestamp::json).unwrap_or(0);
+    let title = m
+        .render
+        .as_ref()
+        .and_then(|r| r.title.as_deref())
+        .unwrap_or("");
+    let input_chars = task.chars().count();
+    let (output, output_chars, output_bytes) = m
+        .content
+        .as_deref()
+        .map(cap_event_output)
+        .unwrap_or_default();
+    Event {
+        turn: None,
+        agent: "antigravity",
+        session: session.to_string(),
+        ts,
+        kind: "subagent_result",
+        name: if title.is_empty() {
+            task.clone()
+        } else {
+            cap_str(title, 200)
+        },
+        input: task,
+        output,
+        input_chars,
+        output_chars,
+        output_bytes,
+        ok: None,
+        call_id: m.id.unwrap_or_else(|| {
+            p.file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default()
+        }),
+        child_session: String::new(),
+        meta: String::new(),
+        state: String::new(),
+    }
 }
 
 fn parse_session(brain_dir: &Path) -> (Vec<Message>, Vec<Event>, bool) {
@@ -299,27 +312,10 @@ fn parse_session(brain_dir: &Path) -> (Vec<Message>, Vec<Event>, bool) {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-
-    let logs = match plain_dir_chain(brain_dir, &[".system_generated", "logs"]) {
-        Ok(Some(logs)) => logs,
-        Ok(None) => return (Vec::new(), Vec::new(), true),
-        Err(error) => {
-            crate::ingest::warn_source_skip("antigravity", brain_dir, &error);
-            return (Vec::new(), Vec::new(), false);
-        }
+    let transcript = match transcript_path(brain_dir) {
+        Ok(transcript) => transcript,
+        Err(healthy) => return (Vec::new(), Vec::new(), healthy),
     };
-    let transcript = logs.join("transcript.jsonl");
-    match fs::symlink_metadata(&transcript) {
-        Ok(meta) if meta.is_file() && !metadata_is_link(&meta) => {}
-        Ok(_) => return (Vec::new(), Vec::new(), true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return (Vec::new(), Vec::new(), true)
-        }
-        Err(error) => {
-            crate::ingest::warn_source_skip("antigravity", &transcript, &error);
-            return (Vec::new(), Vec::new(), false);
-        }
-    }
     // seen = non-blank transcript.jsonl events
     let tally = crate::intake::tally();
     let data = match crate::ingest::read_lossy(&transcript) {
@@ -337,8 +333,61 @@ fn parse_session(brain_dir: &Path) -> (Vec<Message>, Vec<Event>, bool) {
     };
 
     // Parse every event once; we need a full pass for the dominant Cwd anyway.
+    let events = transcript_events(&data, &tally);
+    let project = dominant_cwd(&events)
+        .map(|cwd| project_name(&cwd))
+        .unwrap_or_else(|| "antigravity".to_string());
+
+    let mut parse = TranscriptParse {
+        session: &session,
+        project: &project,
+        tally: &tally,
+        out: Vec::new(),
+        evts: Vec::new(),
+        announced: VecDeque::new(),
+        seq: 0,
+        turn: 0,
+        worked: false,
+    };
+    for e in &events {
+        parse.event(e);
+    }
+    let TranscriptParse { out, mut evts, .. } = parse;
+    let healthy = collect_mailbox(brain_dir, &session, &mut evts);
+    (
+        out.into_iter()
+            .map(crate::model::RawMessage::freeze)
+            .collect(),
+        evts,
+        healthy,
+    )
+}
+
+/// `.system_generated/logs/transcript.jsonl` when it is a plain file under plain directories,
+/// or whether the session is healthy without one.
+fn transcript_path(brain_dir: &Path) -> Result<PathBuf, bool> {
+    let logs = match plain_dir_chain(brain_dir, &[".system_generated", "logs"]) {
+        Ok(Some(logs)) => logs,
+        Ok(None) => return Err(true),
+        Err(error) => {
+            crate::ingest::warn_source_skip("antigravity", brain_dir, &error);
+            return Err(false);
+        }
+    };
+    let transcript = logs.join("transcript.jsonl");
+    match fs::symlink_metadata(&transcript) {
+        Ok(meta) if meta.is_file() && !metadata_is_link(&meta) => Ok(transcript),
+        Ok(_) => Err(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(true),
+        Err(error) => {
+            crate::ingest::warn_source_skip("antigravity", &transcript, &error);
+            Err(false)
+        }
+    }
+}
+
+fn transcript_events(data: &str, tally: &Tally) -> Vec<TLine> {
     let mut events: Vec<TLine> = Vec::new();
-    let mut healthy = true;
     for line in data.lines() {
         if line.is_empty() {
             continue;
@@ -351,157 +400,177 @@ fn parse_session(brain_dir: &Path) -> (Vec<Message>, Vec<Event>, bool) {
             }
         }
     }
+    events
+}
 
-    let project = dominant_cwd(&events)
-        .map(|cwd| project_name(&cwd))
-        .unwrap_or_else(|| "antigravity".to_string());
+/// One session's transcript events read in order.
+struct TranscriptParse<'a> {
+    session: &'a str,
+    project: &'a str,
+    tally: &'a Tally,
+    out: Vec<RawMessage>,
+    evts: Vec<Event>,
+    /// PLANNER_RESPONSE announces tool calls; the matching action event follows with the
+    /// output - pair FIFO.
+    announced: VecDeque<(String, String, usize)>,
+    seq: u32,
+    turn: u32,
+    /// The transcript orders prose and actions: an action sets the flag the next prose consumes.
+    worked: bool,
+}
 
-    let mut out: Vec<crate::model::RawMessage> = Vec::new();
-    let mut evts: Vec<Event> = Vec::new();
-    // PLANNER_RESPONSE announces tool calls; the matching action event follows with the output - pair FIFO.
-    let mut announced: VecDeque<(String, String, usize)> = VecDeque::new();
-    let mut seq = 0u32;
-    let mut turn = 0u32;
-    // the transcript orders prose and actions: an action sets the flag the next prose consumes
-    let mut worked = false;
-    for e in &events {
-        // The model's prose turn (PLANNER_RESPONSE) -> attach as the reply to the
-        // user message it answers, and queue any announced tool calls.
+impl TranscriptParse<'_> {
+    fn event(&mut self, e: &TLine) {
         if e.ty.as_deref() == Some("PLANNER_RESPONSE") && e.source.as_deref() == Some("MODEL") {
-            // A new planner step supersedes announced-but-never-executed calls
-            // (rejected/cancelled); a stale head would misname every later pairing.
-            announced.clear();
-            if let Some(txt) = e.content.as_ref().and_then(|c| c.as_str()) {
-                if let Some(last) = out.last_mut() {
-                    crate::ingest::append_reply(last, txt);
-                    crate::ingest::ReplyOrder::joined_known(&mut last.reply_shape, worked);
-                    worked = false;
-                }
-            }
-            if let Some(tcs) = &e.tool_calls {
-                for tc in tcs {
-                    let name = tc.name.clone().unwrap_or_else(|| "?".to_string());
-                    let (input, input_chars) =
-                        tc.args.as_ref().map(summarize_agy_args).unwrap_or_default();
-                    announced.push_back((name, input, input_chars));
-                }
-            }
-            tally.agent_row();
-            continue;
+            self.planner_response(e);
+            return;
         }
-        // Execution of an announced call: output in content, DONE/ERROR in status.
         if e.source.as_deref() == Some("MODEL") {
-            if let Some(ty) = e.ty.as_deref() {
-                if is_action_type(ty) {
-                    let (name, input, input_chars) = announced
-                        .pop_front()
-                        .unwrap_or_else(|| (ty.to_lowercase(), String::new(), 0));
-                    let (output, output_chars, output_bytes) = e
-                        .content
-                        .as_ref()
-                        .and_then(|c| c.as_str())
-                        .map(cap_event_output)
-                        .unwrap_or_default();
-                    let ok = match e.status.as_deref() {
-                        Some("DONE") => Some(true),
-                        Some("ERROR") => Some(false),
-                        _ => None,
-                    };
-                    seq += 1;
-                    tally.agent_row();
-                    tally.event();
-                    worked |= !crate::ingest::is_bookkeeping_tool(&name);
-                    evts.push(Event {
-                        turn: None,
-                        agent: "antigravity",
-                        session: session.clone(),
-                        ts: parse_timestamp::rfc3339(e.created_at.as_deref()),
-                        kind: "tool",
-                        name,
-                        input,
-                        output,
-                        input_chars,
-                        output_chars,
-                        output_bytes,
-                        ok,
-                        call_id: format!("ag{}", seq),
-                        child_session: String::new(),
-                        meta: String::new(),
-                        state: String::new(),
-                    });
-                    continue;
+            match e.ty.as_deref() {
+                Some(ty) if is_action_type(ty) => {
+                    self.action(e, ty);
+                    return;
                 }
-                if ty == "INVOKE_SUBAGENT" {
-                    // Consume its announcement so later actions in this step stay paired.
-                    if announced
-                        .front()
-                        .is_some_and(|(name, _, _)| name.eq_ignore_ascii_case(ty))
-                    {
-                        announced.pop_front();
-                    }
-                    seq += 1;
-                    tally.agent_row();
-                    tally.event();
-                    worked = true;
-                    let (input, input_chars) = e
-                        .content
-                        .as_ref()
-                        .and_then(|c| c.as_str())
-                        .map(|s| cap_str_with_chars(s, EVENT_CAP))
-                        .unwrap_or_default();
-                    evts.push(Event {
-                        turn: None,
-                        agent: "antigravity",
-                        session: session.clone(),
-                        ts: parse_timestamp::rfc3339(e.created_at.as_deref()),
-                        kind: "subagent_start",
-                        name: "subagent".to_string(),
-                        input,
-                        output: String::new(),
-                        input_chars,
-                        output_chars: 0,
-                        output_bytes: 0,
-                        ok: None,
-                        call_id: format!("ag{}", seq),
-                        child_session: String::new(),
-                        meta: String::new(),
-                        state: String::new(),
-                    });
-                    continue;
+                Some(ty @ "INVOKE_SUBAGENT") => {
+                    self.subagent_start(e, ty);
+                    return;
                 }
+                _ => {}
             }
         }
-        // the user's own typed input only.
-        if e.ty.as_deref() != Some("USER_INPUT") || e.source.as_deref() != Some("USER_EXPLICIT") {
-            tally.skip(crate::intake::Skip::NonMessage);
-            continue;
-        }
-        let raw = match e.content.as_ref().and_then(|c| c.as_str()) {
-            Some(s) => s,
-            None => {
-                tally.skip(crate::intake::Skip::EmptyText);
-                continue;
+        self.user_input(e);
+    }
+
+    /// The model's prose turn: attach as the reply to the user message it answers, and queue
+    /// any announced tool calls.
+    fn planner_response(&mut self, e: &TLine) {
+        // A new planner step supersedes announced-but-never-executed calls
+        // (rejected/cancelled); a stale head would misname every later pairing.
+        self.announced.clear();
+        if let Some(txt) = e.content.as_ref().and_then(|c| c.as_str()) {
+            if let Some(last) = self.out.last_mut() {
+                crate::ingest::append_reply(last, txt);
+                crate::ingest::ReplyOrder::joined_known(&mut last.reply_shape, self.worked);
+                self.worked = false;
             }
+        }
+        if let Some(tcs) = &e.tool_calls {
+            for tc in tcs {
+                let name = tc.name.clone().unwrap_or_else(|| "?".to_string());
+                let (input, input_chars) =
+                    tc.args.as_ref().map(summarize_agy_args).unwrap_or_default();
+                self.announced.push_back((name, input, input_chars));
+            }
+        }
+        self.tally.agent_row();
+    }
+
+    /// Execution of an announced call: output in content, DONE/ERROR in status.
+    fn action(&mut self, e: &TLine, ty: &str) {
+        let (name, input, input_chars) = self
+            .announced
+            .pop_front()
+            .unwrap_or_else(|| (ty.to_lowercase(), String::new(), 0));
+        let (output, output_chars, output_bytes) = e
+            .content
+            .as_ref()
+            .and_then(|c| c.as_str())
+            .map(cap_event_output)
+            .unwrap_or_default();
+        let ok = match e.status.as_deref() {
+            Some("DONE") => Some(true),
+            Some("ERROR") => Some(false),
+            _ => None,
         };
-        let text = match extract_user_request(raw) {
-            Some(t) => t,
-            None => {
-                tally.skip(crate::intake::Skip::EmptyText);
-                continue;
-            }
+        self.seq += 1;
+        self.tally.agent_row();
+        self.tally.event();
+        self.worked |= !crate::ingest::is_bookkeeping_tool(&name);
+        self.evts.push(Event {
+            turn: None,
+            agent: "antigravity",
+            session: self.session.to_string(),
+            ts: parse_timestamp::rfc3339(e.created_at.as_deref()),
+            kind: "tool",
+            name,
+            input,
+            output,
+            input_chars,
+            output_chars,
+            output_bytes,
+            ok,
+            call_id: format!("ag{}", self.seq),
+            child_session: String::new(),
+            meta: String::new(),
+            state: String::new(),
+        });
+    }
+
+    fn subagent_start(&mut self, e: &TLine, ty: &str) {
+        // Consume its announcement so later actions in this step stay paired.
+        if self
+            .announced
+            .front()
+            .is_some_and(|(name, _, _)| name.eq_ignore_ascii_case(ty))
+        {
+            self.announced.pop_front();
+        }
+        self.seq += 1;
+        self.tally.agent_row();
+        self.tally.event();
+        self.worked = true;
+        let (input, input_chars) = e
+            .content
+            .as_ref()
+            .and_then(|c| c.as_str())
+            .map(|s| cap_str_with_chars(s, EVENT_CAP))
+            .unwrap_or_default();
+        self.evts.push(Event {
+            turn: None,
+            agent: "antigravity",
+            session: self.session.to_string(),
+            ts: parse_timestamp::rfc3339(e.created_at.as_deref()),
+            kind: "subagent_start",
+            name: "subagent".to_string(),
+            input,
+            output: String::new(),
+            input_chars,
+            output_chars: 0,
+            output_bytes: 0,
+            ok: None,
+            call_id: format!("ag{}", self.seq),
+            child_session: String::new(),
+            meta: String::new(),
+            state: String::new(),
+        });
+    }
+
+    /// The user's own typed input only.
+    fn user_input(&mut self, e: &TLine) {
+        if e.ty.as_deref() != Some("USER_INPUT") || e.source.as_deref() != Some("USER_EXPLICIT") {
+            self.tally.skip(Skip::NonMessage);
+            return;
+        }
+        let Some(raw) = e.content.as_ref().and_then(|c| c.as_str()) else {
+            self.tally.skip(Skip::EmptyText);
+            return;
+        };
+        let Some(text) = extract_user_request(raw) else {
+            self.tally.skip(Skip::EmptyText);
+            return;
         };
         if is_wrapper(&text) || is_injected_metadata(&text) {
-            tally.skip(crate::intake::Skip::Wrapper);
-            continue;
+            self.tally.skip(Skip::Wrapper);
+            return;
         }
-        tally.row();
-        worked = false;
-        out.push(crate::model::RawMessage {
+        self.tally.row();
+        self.worked = false;
+        self.out.push(RawMessage {
             agent: "antigravity",
-            project: project.clone(),
-            session: session.clone(),
+            project: self.project.to_string(),
+            session: self.session.to_string(),
             ts: parse_timestamp::rfc3339(e.created_at.as_deref()),
-            turn,
+            turn: self.turn,
             text,
             model: String::new(),
             reply: String::new(),
@@ -510,45 +579,18 @@ fn parse_session(brain_dir: &Path) -> (Vec<Message>, Vec<Event>, bool) {
             parent: String::new(),
             reply_shape: Default::default(),
         });
-        turn += 1;
+        self.turn += 1;
     }
-
-    healthy &= collect_mailbox(brain_dir, &session, &mut evts);
-    (
-        out.into_iter()
-            .map(crate::model::RawMessage::freeze)
-            .collect(),
-        evts,
-        healthy,
-    )
 }
 
 type Collected = (Vec<Message>, Vec<Event>, bool, Vec<SourceReadIssue>);
 
 /// Walk every `brain/<uuid>/` session and collect the user's Antigravity prompts + events.
 fn collect_from_root(root: &Path) -> Collected {
-    match fs::symlink_metadata(root) {
-        Ok(meta) if meta.is_dir() && !metadata_is_link(&meta) => {}
-        Ok(_) => return (Vec::new(), Vec::new(), true, Vec::new()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return (Vec::new(), Vec::new(), true, Vec::new())
-        }
-        Err(error) => {
-            crate::ingest::warn_source_skip("antigravity", root, &error);
-            return (Vec::new(), Vec::new(), false, Vec::new());
-        }
-    }
-    let dirs = match fs::read_dir(root) {
-        Ok(d) => d,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return (Vec::new(), Vec::new(), true, Vec::new())
-        }
-        Err(error) => {
-            crate::ingest::warn_source_skip("antigravity", root, &error);
-            return (Vec::new(), Vec::new(), false, Vec::new());
-        }
+    let dirs = match read_root(root) {
+        Ok(dirs) => dirs,
+        Err(healthy) => return (Vec::new(), Vec::new(), healthy, Vec::new()),
     };
-
     let mut session_dirs = Vec::new();
     let mut healthy = true;
     for entry in dirs {
@@ -570,7 +612,32 @@ fn collect_from_root(root: &Path) -> Collected {
             }
         }
     }
+    parse_all(&session_dirs, healthy)
+}
 
+/// The store root's listing, or whether the store is healthy without one.
+fn read_root(root: &Path) -> Result<fs::ReadDir, bool> {
+    match fs::symlink_metadata(root) {
+        Ok(meta) if meta.is_dir() && !metadata_is_link(&meta) => {}
+        Ok(_) => return Err(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(true),
+        Err(error) => {
+            crate::ingest::warn_source_skip("antigravity", root, &error);
+            return Err(false);
+        }
+    }
+    match fs::read_dir(root) {
+        Ok(d) => Ok(d),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(true),
+        Err(error) => {
+            crate::ingest::warn_source_skip("antigravity", root, &error);
+            Err(false)
+        }
+    }
+}
+
+/// Parse every session directory in parallel, isolating panics, and merge in walk order.
+fn parse_all(session_dirs: &[PathBuf], mut healthy: bool) -> Collected {
     let parsed: Vec<_> = session_dirs
         .par_iter()
         .map(|d| {

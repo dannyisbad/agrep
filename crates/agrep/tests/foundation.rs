@@ -459,6 +459,89 @@ fn reindex_and_full_preserve_rows_and_token_stores() {
         );
     }
 }
+#[test]
+fn reindex_rebuilds_the_tool_symbols_a_first_build_writes() {
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let d = t.path().join("d");
+    let chat = transcript(&h, &["question"]);
+    let call = serde_json::json!({"type":"message","id":"call","parentId":"m0","timestamp":"2026-10-29T12:00:02Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"done","name":"shell","arguments":{"command":"inspect"}}]}});
+    let done = serde_json::json!({"type":"message","id":"done","parentId":"call","timestamp":"2026-10-29T12:00:03Z","message":{"role":"toolResult","toolCallId":"done","toolName":"shell","content":[{"type":"text","text":"toolpayload"}]}});
+    let body = fs::read_to_string(&chat).unwrap();
+    fs::write(&chat, format!("{body}{call}\n{done}\n")).unwrap();
+    // A chat with turns but no tool calls, whose project label no tool row uses.
+    let codex = h.join(".codex/sessions/rollout-2026-10-29T12-00-00-000Z_codex-chat.jsonl");
+    fs::create_dir_all(codex.parent().unwrap()).unwrap();
+    let date = "2026-10-29T12:00:00Z";
+    let lines = [
+        serde_json::json!({"type":"session_meta","timestamp":date,"payload":{"id":"codex-chat","cwd":"/work/codexproject"}}),
+        serde_json::json!({"type":"event_msg","timestamp":date,"payload":{"type":"user_message","message":"codex question"}}),
+        serde_json::json!({"type":"response_item","timestamp":date,"payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"codex question"}]}}),
+    ];
+    fs::write(&codex, lines.map(|l| l.to_string() + "\n").concat()).unwrap();
+    let symbols = || {
+        Connection::open(d.join("index.db"))
+            .unwrap()
+            .prepare("SELECT id,value FROM symbols ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    ok(cli(&h, &d, &["index"]));
+    let built = symbols();
+    let first = ok(cli(&h, &d, &["toolpayload", "--no-auto"])).stdout;
+    assert_eq!(
+        String::from_utf8_lossy(&first),
+        "test-session\tpi\tproject\t0\ttool\tshell: inspect toolpayload\n"
+    );
+    for rebuild in [&["reindex"][..], &["reindex", "--full"]] {
+        ok(cli(&h, &d, rebuild));
+        assert_eq!(
+            ok(cli(&h, &d, &["toolpayload", "--no-auto"])).stdout,
+            first,
+            "{rebuild:?}"
+        );
+        assert_eq!(symbols(), built, "{rebuild:?}");
+    }
+}
+#[test]
+fn reindex_assigns_the_source_ids_a_first_build_does() {
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let chat = |id: &str| {
+        let p = h.join(format!(".pi/agent/sessions/project/{id}.jsonl"));
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let lines = [
+            serde_json::json!({"type":"session","id":id,"version":3,"cwd":"/work/project","timestamp":"2026-10-29T12:00:00Z"}),
+            serde_json::json!({"type":"message","id":"m0","parentId":null,"timestamp":"2026-10-29T12:00:01Z","message":{"role":"user","content":format!("{id} question")}}),
+        ];
+        fs::write(&p, lines.map(|l| l.to_string() + "\n").concat()).unwrap();
+        p
+    };
+    let ids = |d: &Path| {
+        Connection::open(d.join("index.db"))
+            .unwrap()
+            .prepare("SELECT s.rowid,s.path,p.source FROM sources s JOIN prose p ON p.source=s.rowid ORDER BY s.rowid")
+            .unwrap()
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let d = t.path().join("d");
+    let gone = chat("gone");
+    ok(cli(&h, &d, &["index"]));
+    chat("kept");
+    ok(cli(&h, &d, &["index"]));
+    fs::remove_file(gone).unwrap();
+    ok(cli(&h, &d, &["index"]));
+    ok(cli(&h, &d, &["reindex"]));
+    let first = t.path().join("first");
+    ok(cli(&h, &first, &["index"]));
+    assert_eq!(ids(&d), ids(&first));
+}
 
 #[test]
 fn gemini_recorded_flows_keep_roles_replies_and_parents() {

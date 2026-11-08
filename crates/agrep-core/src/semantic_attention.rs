@@ -37,44 +37,77 @@ impl<'a> Rows<'a> {
     }
 }
 
-// Accelerate can use the matrix unit for a bounded score tile. Its rows share
-// the union of their local windows; masked entries are normalized to zero.
-// Scratch is at most 32*S floats per head job, not a full S*S score matrix.
 #[cfg(target_os = "macos")]
-fn blas_tiles(
-    q: &Rows<'_>,
-    k: &Rows<'_>,
-    v: &Rows<'_>,
-    dims: [usize; 4],
-    lengths: &[usize],
-    radius: Option<usize>,
-    scale: f32,
-) -> Result<Vec<f32>> {
-    use rayon::prelude::*;
-    unsafe extern "C" {
-        fn cblas_sgemm(
-            order: i32,
-            ta: i32,
-            tb: i32,
-            m: i32,
-            n: i32,
-            k: i32,
-            alpha: f32,
-            a: *const f32,
-            lda: i32,
-            b: *const f32,
-            ldb: i32,
-            beta: f32,
-            c: *mut f32,
-            ldc: i32,
-        );
-        fn vvexpf(y: *mut f32, x: *const f32, n: *const i32);
+unsafe extern "C" {
+    fn cblas_sgemm(
+        order: i32,
+        ta: i32,
+        tb: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        a: *const f32,
+        lda: i32,
+        b: *const f32,
+        ldb: i32,
+        beta: f32,
+        c: *mut f32,
+        ldc: i32,
+    );
+    fn vvexpf(y: *mut f32, x: *const f32, n: *const i32);
+}
+
+/// The keys a query row attends to, `low..high` of batch `b`'s `head`.
+#[derive(Clone, Copy)]
+struct Window {
+    b: usize,
+    head: usize,
+    low: usize,
+    high: usize,
+}
+
+impl Attention<'_> {
+    // Accelerate can use the matrix unit for a bounded score tile. Its rows share
+    // the union of their local windows; masked entries are normalized to zero.
+    // Scratch is at most 32*S floats per head job, not a full S*S score matrix.
+    #[cfg(target_os = "macos")]
+    fn tiled_blas(&self, q: &Rows<'_>, k: &Rows<'_>, v: &Rows<'_>, dims: [usize; 4]) -> Vec<f32> {
+        use rayon::prelude::*;
+        let [batch, heads, seq, width] = dims;
+        let head = |job: usize| self.blas_head(q, k, v, dims, job);
+        let parts: Vec<_> = if batch * heads * seq < 256 {
+            (0..batch * heads).map(head).collect()
+        } else {
+            (0..batch * heads).into_par_iter().map(head).collect()
+        };
+        let mut output = vec![0.; batch * heads * seq * width];
+        for (job, part) in parts.iter().enumerate() {
+            let b = job / heads;
+            let h = job % heads;
+            for pos in 0..seq {
+                output[((b * seq + pos) * heads + h) * width
+                    ..((b * seq + pos) * heads + h + 1) * width]
+                    .copy_from_slice(&part[pos * width..(pos + 1) * width]);
+            }
+        }
+        output
     }
-    let [batch, heads, seq, width] = dims;
-    let head = |job: usize| {
+    /// One (batch, head) job: its positions' outputs, head-major.
+    #[cfg(target_os = "macos")]
+    fn blas_head(
+        &self,
+        q: &Rows<'_>,
+        k: &Rows<'_>,
+        v: &Rows<'_>,
+        dims: [usize; 4],
+        job: usize,
+    ) -> Vec<f32> {
+        let [_, heads, seq, width] = dims;
+        let (radius, scale) = (self.radius, self.scale);
         let b = job / heads;
         let h = job % heads;
-        let n = lengths[b];
+        let n = self.lengths[b];
         let mut queries = vec![0.; n * width];
         let mut values = queries.clone();
         let mut keys = queries.clone();
@@ -149,23 +182,84 @@ fn blas_tiles(
             }
         }
         output
-    };
-    let parts: Vec<_> = if batch * heads * seq < 256 {
-        (0..batch * heads).map(head).collect()
-    } else {
-        (0..batch * heads).into_par_iter().map(head).collect()
-    };
-    let mut output = vec![0.; batch * heads * seq * width];
-    for (job, part) in parts.iter().enumerate() {
-        let b = job / heads;
-        let h = job % heads;
-        for pos in 0..seq {
-            output
-                [((b * seq + pos) * heads + h) * width..((b * seq + pos) * heads + h + 1) * width]
-                .copy_from_slice(&part[pos * width..(pos + 1) * width]);
+    }
+    /// The output row `index` of the (batch, position, head) order.
+    fn fill(&self, [q, k, v]: [&Rows<'_>; 3], dims: [usize; 4], index: usize, out: &mut [f32]) {
+        let [_, heads, seq, width] = dims;
+        let pos = index / heads % seq;
+        let head = index % heads;
+        let b = index / (seq * heads);
+        if pos >= self.lengths[b] {
+            return;
+        }
+        let low = self.radius.map_or(0, |radius| pos.saturating_sub(radius));
+        let high = self.radius.map_or(self.lengths[b], |radius| {
+            (pos + radius + 1).min(self.lengths[b])
+        });
+        let mut scaled = [0f32; 256];
+        for (out, value) in scaled[..width].iter_mut().zip(q.row(b, head, pos)) {
+            *out = *value * self.scale;
+        }
+        let query = &scaled[..width];
+        let window = Window { b, head, low, high };
+        if self.vector_exp {
+            vector_row(query, k, v, window, out);
+        } else {
+            online_row(query, k, v, window, out);
         }
     }
-    Ok(output)
+}
+/// One bounded row of scores, rather than an S x S matrix. Larger exponential vectors
+/// amortize the math-library call.
+fn vector_row(query: &[f32], k: &Rows<'_>, v: &Rows<'_>, w: Window, out: &mut [f32]) {
+    let mut scores = [0f32; 1024];
+    let scores = &mut scores[..w.high - w.low];
+    let mut maximum = f32::NEG_INFINITY;
+    for (j, score) in scores.iter_mut().enumerate() {
+        *score = dot(query, k.row(w.b, w.head, w.low + j));
+        maximum = maximum.max(*score);
+    }
+    for score in scores.iter_mut() {
+        *score -= maximum;
+    }
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let n = scores.len() as i32;
+        vvexpf(scores.as_mut_ptr(), scores.as_ptr(), &n);
+    }
+    #[cfg(not(target_os = "macos"))]
+    for score in scores.iter_mut() {
+        *score = score.exp();
+    }
+    let denominator: f32 = scores.iter().sum();
+    for (j, score) in scores.iter().enumerate() {
+        add_weighted(out, v.row(w.b, w.head, w.low + j), *score);
+    }
+    out.iter_mut().for_each(|x| *x /= denominator);
+}
+/// Online softmax over tiles of 32 keys.
+fn online_row(query: &[f32], k: &Rows<'_>, v: &Rows<'_>, w: Window, out: &mut [f32]) {
+    let mut maximum = f32::NEG_INFINITY;
+    let mut denominator = 0.;
+    for start in (w.low..w.high).step_by(32) {
+        let end = (start + 32).min(w.high);
+        let mut scores = [0.; 32];
+        let mut next = maximum;
+        for (j, score) in scores[..end - start].iter_mut().enumerate() {
+            *score = dot(query, k.row(w.b, w.head, start + j));
+            next = next.max(*score);
+        }
+        let correction = (maximum - next).exp();
+        denominator *= correction;
+        out.iter_mut().for_each(|x| *x *= correction);
+        for (j, score) in scores[..end - start].iter().enumerate() {
+            let weight = (*score - next).exp();
+            denominator += weight;
+            add_weighted(out, v.row(w.b, w.head, start + j), weight);
+        }
+        maximum = next;
+    }
+    out.iter_mut().for_each(|x| *x /= denominator);
 }
 
 #[inline]
@@ -258,104 +352,25 @@ impl CustomOp3 for Attention<'_> {
         if ql.dims() != kl.dims() || ql.dims() != vl.dims() || self.lengths.len() != ql.dims()[0] {
             candle_core::bail!("attention shape mismatch");
         }
-        let [batch, heads, seq, width]: [usize; 4] = ql.dims().try_into().unwrap();
+        let dims: [usize; 4] = ql.dims().try_into().unwrap();
+        let [batch, heads, seq, width] = dims;
         if width == 0 || width > 256 || seq == 0 || seq > 1024 {
             candle_core::bail!("empty attention dimension");
         }
         if self.lengths.iter().any(|n| *n > seq) {
             candle_core::bail!("attention length exceeds sequence");
         }
+        let shape = Shape::from((batch, seq, heads * width));
         #[cfg(target_os = "macos")]
         if self.blas_tiles {
-            let output = blas_tiles(
-                &q,
-                &k,
-                &v,
-                [batch, heads, seq, width],
-                self.lengths,
-                self.radius,
-                self.scale,
-            )?;
-            return Ok((
-                CpuStorage::F32(output),
-                Shape::from((batch, seq, heads * width)),
-            ));
+            return Ok((CpuStorage::F32(self.tiled_blas(&q, &k, &v, dims)), shape));
         }
         let _ = self.blas_tiles;
         let mut output = vec![0.; batch * heads * seq * width];
-        let fill = |index: usize, out: &mut [f32]| {
-            let pos = index / heads % seq;
-            let head = index % heads;
-            let b = index / (seq * heads);
-            if pos >= self.lengths[b] {
-                return;
-            }
-            let low = self.radius.map_or(0, |radius| pos.saturating_sub(radius));
-            let high = self.radius.map_or(self.lengths[b], |radius| {
-                (pos + radius + 1).min(self.lengths[b])
-            });
-            let mut scaled = [0f32; 256];
-            for (out, value) in scaled[..width].iter_mut().zip(q.row(b, head, pos)) {
-                *out = *value * self.scale;
-            }
-            let query = &scaled[..width];
-            if self.vector_exp {
-                // One bounded row of scores, rather than an S x S matrix.
-                // Larger exponential vectors amortize the math-library call.
-                let mut scores = [0f32; 1024];
-                let scores = &mut scores[..high - low];
-                let mut maximum = f32::NEG_INFINITY;
-                for (j, score) in scores.iter_mut().enumerate() {
-                    *score = dot(query, k.row(b, head, low + j));
-                    maximum = maximum.max(*score);
-                }
-                for score in scores.iter_mut() {
-                    *score -= maximum;
-                }
-                #[cfg(target_os = "macos")]
-                unsafe {
-                    unsafe extern "C" {
-                        fn vvexpf(y: *mut f32, x: *const f32, n: *const i32);
-                    }
-                    let n = scores.len() as i32;
-                    vvexpf(scores.as_mut_ptr(), scores.as_ptr(), &n);
-                }
-                #[cfg(not(target_os = "macos"))]
-                for score in scores.iter_mut() {
-                    *score = score.exp();
-                }
-                let denominator: f32 = scores.iter().sum();
-                for (j, score) in scores.iter().enumerate() {
-                    add_weighted(out, v.row(b, head, low + j), *score);
-                }
-                out.iter_mut().for_each(|x| *x /= denominator);
-                return;
-            }
-            let mut maximum = f32::NEG_INFINITY;
-            let mut denominator = 0.;
-            for start in (low..high).step_by(32) {
-                let end = (start + 32).min(high);
-                let mut scores = [0.; 32];
-                let mut next = maximum;
-                for (j, score) in scores[..end - start].iter_mut().enumerate() {
-                    *score = dot(query, k.row(b, head, start + j));
-                    next = next.max(*score);
-                }
-                let correction = (maximum - next).exp();
-                denominator *= correction;
-                out.iter_mut().for_each(|x| *x *= correction);
-                for (j, score) in scores[..end - start].iter().enumerate() {
-                    let weight = (*score - next).exp();
-                    denominator += weight;
-                    add_weighted(out, v.row(b, head, start + j), weight);
-                }
-                maximum = next;
-            }
-            out.iter_mut().for_each(|x| *x /= denominator);
-        };
+        let rows = [&q, &k, &v];
         if batch * heads * seq < 256 {
             for (index, row) in output.chunks_mut(width).enumerate() {
-                fill(index, row);
+                self.fill(rows, dims, index, row);
             }
         } else {
             output
@@ -363,14 +378,11 @@ impl CustomOp3 for Attention<'_> {
                 .enumerate()
                 .for_each(|(job, chunk)| {
                     for (r, out) in chunk.chunks_mut(width).enumerate() {
-                        fill(job * 8 + r, out);
+                        self.fill(rows, dims, job * 8 + r, out);
                     }
                 });
         }
-        Ok((
-            CpuStorage::F32(output),
-            Shape::from((batch, seq, heads * width)),
-        ))
+        Ok((CpuStorage::F32(output), shape))
     }
 }
 

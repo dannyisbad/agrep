@@ -94,6 +94,26 @@ pub fn resume_args(s: &Session) -> Result<Vec<OsString>> {
     args.push(s.id.clone().into());
     Ok(args)
 }
+/// As in 0.4.9, an interactive agent gets a group of its own in this session and is
+/// lent the terminal. In a pipeline (`agrep run x | less`) the terminal stays with the
+/// whole job, so the agent gets a session of its own and never stops a partner that
+/// reads /dev/tty.
+#[cfg(unix)]
+fn isolate(command: &mut Command, interactive: bool) {
+    use std::os::unix::process::CommandExt;
+    if interactive {
+        command.process_group(0);
+    } else {
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+}
 pub fn run(exe: &Path, args: &[OsString], cwd: &Path) -> Result<i32> {
     if !cwd.is_dir() {
         bail!("working directory does not exist: {}", cwd.display())
@@ -103,25 +123,7 @@ pub fn run(exe: &Path, args: &[OsString], cwd: &Path) -> Result<i32> {
     #[cfg(unix)]
     let interactive = unsafe { libc::isatty(0) == 1 && libc::isatty(1) == 1 };
     #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // As in 0.4.9, an interactive agent gets a group of its own in this session and is
-        // lent the terminal. In a pipeline (`agrep run x | less`) the terminal stays with the
-        // whole job, so the agent gets a session of its own and never stops a partner that
-        // reads /dev/tty.
-        if interactive {
-            command.process_group(0);
-        } else {
-            unsafe {
-                command.pre_exec(|| {
-                    if libc::setsid() < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-        }
-    }
+    isolate(&mut command, interactive);
     #[cfg(windows)]
     windows_job()?;
     #[cfg(windows)]

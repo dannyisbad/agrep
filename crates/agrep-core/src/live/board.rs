@@ -127,40 +127,10 @@ pub fn select(snapshot: &Snapshot, o: &Options) -> Vec<Row> {
         let active = family.iter().any(|s| s.active);
         let side_count = family.iter().filter(|s| s.sub).count();
         let side_working = family.iter().filter(|s| s.sub && s.working).count();
-        for s in &family {
-            if o.agent.as_ref().is_some_and(|a| a != &s.agent)
-                || o.session.as_ref().is_some_and(|q| !s.session.contains(q))
-            {
-                continue;
-            }
-            if let Some(p) = &o.project {
-                let p = p.to_lowercase();
-                if if s.sub {
-                    !s.project.to_lowercase().contains(&p)
-                } else {
-                    !family.iter().any(|s| s.project.to_lowercase().contains(&p))
-                } {
-                    continue;
-                }
-            }
-            let w = if s.sub { s.working } else { working };
-            let a = if s.sub { s.active } else { active };
-            if match o.state.as_str() {
-                "working" => !w,
-                "idle" => w,
-                "active" => !a,
-                _ => false,
-            } {
-                continue;
-            }
-            if match o.side.as_str() {
-                "roots" => s.sub,
-                "only" => !s.sub,
-                "collapse" => s.sub && !s.working && o.session.is_none(),
-                _ => false,
-            } {
-                continue;
-            }
+        for s in family
+            .iter()
+            .filter(|s| shown(s, &family, working, active, o))
+        {
             rows.push(Row {
                 session: s.clone(),
                 family: key.clone(),
@@ -188,6 +158,41 @@ pub fn select(snapshot: &Snapshot, o: &Options) -> Vec<Row> {
             .then_with(|| a.session.session.cmp(&b.session.session))
     });
     rows
+}
+/// Whether the options select this member of a family. A root answers for its family's
+/// project, working and active state; a side session for its own.
+fn shown(s: &Session, family: &[Session], working: bool, active: bool, o: &Options) -> bool {
+    if o.agent.as_ref().is_some_and(|a| a != &s.agent)
+        || o.session.as_ref().is_some_and(|q| !s.session.contains(q))
+    {
+        return false;
+    }
+    if let Some(p) = &o.project {
+        let p = p.to_lowercase();
+        if if s.sub {
+            !s.project.to_lowercase().contains(&p)
+        } else {
+            !family.iter().any(|s| s.project.to_lowercase().contains(&p))
+        } {
+            return false;
+        }
+    }
+    let w = if s.sub { s.working } else { working };
+    let a = if s.sub { s.active } else { active };
+    if match o.state.as_str() {
+        "working" => !w,
+        "idle" => w,
+        "active" => !a,
+        _ => false,
+    } {
+        return false;
+    }
+    !match o.side.as_str() {
+        "roots" => s.sub,
+        "only" => !s.sub,
+        "collapse" => s.sub && !s.working && o.session.is_none(),
+        _ => false,
+    }
 }
 pub fn title(s: &Session) -> String {
     if !s.title.is_empty() {
@@ -243,6 +248,19 @@ pub fn machine(snapshot: &Snapshot, o: &Options) -> (Value, i32) {
     };
     let limit = o.limit.unwrap_or(if o.json { 20 } else { usize::MAX });
     let sessions:Vec<_>=rows.iter().take(limit).map(|r|{let s=&r.session;let h=handle(&s.session);json!({"active":s.active,"agent":s.agent,"family_active":r.family_active,"family_updated_ms":r.family_updated,"family_working":r.family_working,"handle":h,"parent":s.parent,"project":s.project,"session":s.session,"side":s.sub,"side_count":r.side_count,"side_working":r.side_working,"state":s.state,"title":safe(&title(s),200),"updated_ms":s.last_ts,"working":s.working})}).collect();
+    let retry = retry_argv(o);
+    let retry_line = retry
+        .iter()
+        .map(|s| format!("'{}'", s.replace('\'', "'\\''")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    (
+        json!({"kind":"agrep-board-snapshot","scope":"live-window","sessions":sessions,"snapshot_complete":complete,"partial":!complete,"page_complete":matched<=limit,"window_seconds":90,"sort":o.sort,"history_command":"agrep chats --json","selector":{"exact_matches":exact,"matches":matched,"query":o.session.as_deref().unwrap_or(""),"status":status},"filters":{"agent":o.agent.as_deref().unwrap_or("all"),"project":o.project.as_deref().unwrap_or(""),"session":o.session.as_deref().unwrap_or(""),"side":o.side,"state":o.state},"feed":{"scope":"recent-tail"},"completeness":{"booting":snapshot.booting,"matched":matched,"matched_basis":if complete{"exact"}else{"floor"},"shown":matched.min(limit),"sessions_complete":complete,"truncated":matched>limit,"source_errors":errors.len(),"source_error_details":errors.into_iter().take(5).collect::<Vec<_>>(),"retry":if snapshot.booting{Some(retry_line)}else{None},"retry_argv":if snapshot.booting{Some(retry)}else{None},}}),
+        rc,
+    )
+}
+/// The command that repeats this selection once the watcher has finished booting.
+fn retry_argv(o: &Options) -> Vec<String> {
     let mut retry = vec![
         "agrep".to_owned(),
         "board".into(),
@@ -273,15 +291,7 @@ pub fn machine(snapshot: &Snapshot, o: &Options) -> (Value, i32) {
     if let Some(n) = o.limit {
         retry.extend(["--max".into(), n.to_string()])
     }
-    let retry_line = retry
-        .iter()
-        .map(|s| format!("'{}'", s.replace('\'', "'\\''")))
-        .collect::<Vec<_>>()
-        .join(" ");
-    (
-        json!({"kind":"agrep-board-snapshot","scope":"live-window","sessions":sessions,"snapshot_complete":complete,"partial":!complete,"page_complete":matched<=limit,"window_seconds":90,"sort":o.sort,"history_command":"agrep chats --json","selector":{"exact_matches":exact,"matches":matched,"query":o.session.as_deref().unwrap_or(""),"status":status},"filters":{"agent":o.agent.as_deref().unwrap_or("all"),"project":o.project.as_deref().unwrap_or(""),"session":o.session.as_deref().unwrap_or(""),"side":o.side,"state":o.state},"feed":{"scope":"recent-tail"},"completeness":{"booting":snapshot.booting,"matched":matched,"matched_basis":if complete{"exact"}else{"floor"},"shown":matched.min(limit),"sessions_complete":complete,"truncated":matched>limit,"source_errors":errors.len(),"source_error_details":errors.into_iter().take(5).collect::<Vec<_>>(),"retry":if snapshot.booting{Some(retry_line)}else{None},"retry_argv":if snapshot.booting{Some(retry)}else{None},}}),
-        rc,
-    )
+    retry
 }
 pub fn frame(
     snapshot: &Snapshot,
@@ -322,69 +332,9 @@ pub fn frame(
         .and_then(|id| rows.iter().find(|r| r.session.session == id))
         .map(|r| &r.session)
     {
-        lines.push(format!(
-            "{} {} · {} · {}",
-            s.agent, s.session, s.project, s.state
-        ));
-        lines.push(title(s));
-        let n = s.recent.len().saturating_sub(scroll);
-        let start = n.saturating_sub(height.saturating_sub(lines.len() + 1));
-        for e in &s.recent[start..n] {
-            lines.push(format!(
-                "{} {} {}",
-                super::text(&e["type"]),
-                super::text(&e["name"]),
-                super::text(
-                    e.get("text")
-                        .or(e.get("input"))
-                        .or(e.get("output"))
-                        .unwrap_or(&Value::Null)
-                )
-            ));
-        }
+        focus_lines(s, scroll, height, &mut lines);
     } else {
-        for (i, r) in rows.iter().take(o.limit.unwrap_or(usize::MAX)).enumerate() {
-            let s = &r.session;
-            lines.push(format!(
-                "{} {} {} {:10} {:16} {:18} {}",
-                if i == selected { ">" } else { " " },
-                i + 1,
-                if if s.sub { s.working } else { r.family_working } {
-                    "●"
-                } else {
-                    "○"
-                },
-                s.agent,
-                s.project,
-                if !s.working && r.family_working {
-                    format!("{} side working", r.side_working)
-                } else {
-                    s.state.clone()
-                },
-                title(s)
-            ));
-            if o.expanded {
-                lines.push(format!("    {} {}", s.model, handle(&s.session)));
-                for e in s.recent.iter().rev().take(3).rev() {
-                    lines.push(format!(
-                        "    {} {} {}",
-                        super::text(&e["type"]),
-                        super::text(&e["name"]),
-                        super::text(&e["text"])
-                    ));
-                }
-            }
-        }
-        if rows.is_empty() {
-            lines.push(
-                if snapshot.booting {
-                    "scanning agent stores…"
-                } else {
-                    "no sessions in the live window"
-                }
-                .into(),
-            )
-        }
+        list_lines(&rows, o, selected, snapshot.booting, &mut lines);
     }
     lines
         .into_iter()
@@ -392,6 +342,73 @@ pub fn frame(
         .map(|s| safe(&s, width))
         .collect::<Vec<_>>()
         .join("\n")
+}
+/// One session's recent events, as many as fit above the scroll position.
+fn focus_lines(s: &Session, scroll: usize, height: usize, lines: &mut Vec<String>) {
+    lines.push(format!(
+        "{} {} · {} · {}",
+        s.agent, s.session, s.project, s.state
+    ));
+    lines.push(title(s));
+    let n = s.recent.len().saturating_sub(scroll);
+    let start = n.saturating_sub(height.saturating_sub(lines.len() + 1));
+    for e in &s.recent[start..n] {
+        lines.push(format!(
+            "{} {} {}",
+            super::text(&e["type"]),
+            super::text(&e["name"]),
+            super::text(
+                e.get("text")
+                    .or(e.get("input"))
+                    .or(e.get("output"))
+                    .unwrap_or(&Value::Null)
+            )
+        ));
+    }
+}
+fn list_lines(rows: &[Row], o: &Options, selected: usize, booting: bool, lines: &mut Vec<String>) {
+    for (i, r) in rows.iter().take(o.limit.unwrap_or(usize::MAX)).enumerate() {
+        let s = &r.session;
+        lines.push(format!(
+            "{} {} {} {:10} {:16} {:18} {}",
+            if i == selected { ">" } else { " " },
+            i + 1,
+            if if s.sub { s.working } else { r.family_working } {
+                "●"
+            } else {
+                "○"
+            },
+            s.agent,
+            s.project,
+            if !s.working && r.family_working {
+                format!("{} side working", r.side_working)
+            } else {
+                s.state.clone()
+            },
+            title(s)
+        ));
+        if o.expanded {
+            lines.push(format!("    {} {}", s.model, handle(&s.session)));
+            for e in s.recent.iter().rev().take(3).rev() {
+                lines.push(format!(
+                    "    {} {} {}",
+                    super::text(&e["type"]),
+                    super::text(&e["name"]),
+                    super::text(&e["text"])
+                ));
+            }
+        }
+    }
+    if rows.is_empty() {
+        lines.push(
+            if booting {
+                "scanning agent stores…"
+            } else {
+                "no sessions in the live window"
+            }
+            .into(),
+        )
+    }
 }
 pub fn public(snapshot: &Snapshot) -> Value {
     let o = Options {

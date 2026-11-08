@@ -1,5 +1,6 @@
-use super::super::*;
 use agrep_core::surface::line;
+use agrep_core::{data::DataRoot, semantic, store};
+use anyhow::Result;
 use std::time::Instant;
 
 pub(crate) fn run(full: bool, with_semantic: bool) -> Result<i32> {

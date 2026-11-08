@@ -254,6 +254,38 @@ struct WindowPlan {
 unsafe extern "C" fn destroy_window(value: *mut c_void) {
     drop(Box::from_raw(value.cast::<WindowPlan>()));
 }
+
+fn decode_window_plan(data: &[u8]) -> std::result::Result<WindowPlan, i32> {
+    let mut at = 0;
+    let term_len =
+        crate::store::take_varint(data, &mut at).map_err(|_| ffi::SQLITE_MISMATCH)? as usize;
+    let words = crate::store::take_varint(data, &mut at).map_err(|_| ffi::SQLITE_MISMATCH)?;
+    let mut offsets = Vec::new();
+    let mut lengths = Vec::new();
+    for _ in 0..words {
+        lengths.push(crate::store::take_varint(data, &mut at).map_err(|_| ffi::SQLITE_MISMATCH)?);
+        let n = crate::store::take_varint(data, &mut at).map_err(|_| ffi::SQLITE_MISMATCH)?;
+        if n == 0 {
+            return Err(ffi::SQLITE_MISMATCH);
+        }
+        let mut positions = Vec::new();
+        for _ in 0..n {
+            positions
+                .push(crate::store::take_varint(data, &mut at).map_err(|_| ffi::SQLITE_MISMATCH)?);
+        }
+        offsets.push(positions);
+    }
+    if at != data.len() {
+        return Err(ffi::SQLITE_MISMATCH);
+    }
+    let unit_weights = offsets.iter().all(|within| within.len() == 1);
+    Ok(WindowPlan {
+        offsets,
+        unit_weights,
+        lengths,
+        term_len,
+    })
+}
 unsafe fn window_value(
     api: *const ffi::Fts5ExtensionApi,
     fts: *mut ffi::Fts5Context,
@@ -272,38 +304,10 @@ unsafe fn window_value(
         if size <= 0 || data.is_null() {
             return Err(ffi::SQLITE_MISMATCH);
         }
-        let data = std::slice::from_raw_parts(data, size as usize);
-        let mut at = 0;
-        let term_len =
-            crate::store::take_varint(data, &mut at).map_err(|_| ffi::SQLITE_MISMATCH)? as usize;
-        let words = crate::store::take_varint(data, &mut at).map_err(|_| ffi::SQLITE_MISMATCH)?;
-        let mut offsets = Vec::new();
-        let mut lengths = Vec::new();
-        for _ in 0..words {
-            lengths
-                .push(crate::store::take_varint(data, &mut at).map_err(|_| ffi::SQLITE_MISMATCH)?);
-            let n = crate::store::take_varint(data, &mut at).map_err(|_| ffi::SQLITE_MISMATCH)?;
-            if n == 0 {
-                return Err(ffi::SQLITE_MISMATCH);
-            }
-            let mut positions = Vec::new();
-            for _ in 0..n {
-                positions.push(
-                    crate::store::take_varint(data, &mut at).map_err(|_| ffi::SQLITE_MISMATCH)?,
-                );
-            }
-            offsets.push(positions);
-        }
-        if at != data.len() {
-            return Err(ffi::SQLITE_MISMATCH);
-        }
-        let unit_weights = offsets.iter().all(|within| within.len() == 1);
-        plan = Box::into_raw(Box::new(WindowPlan {
-            offsets,
-            unit_weights,
-            lengths,
-            term_len,
-        }));
+        plan = Box::into_raw(Box::new(decode_window_plan(std::slice::from_raw_parts(
+            data,
+            size as usize,
+        ))?));
         let rc = set(fts, plan.cast(), Some(destroy_window));
         if rc != ffi::SQLITE_OK {
             return Err(rc);

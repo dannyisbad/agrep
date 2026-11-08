@@ -1,9 +1,11 @@
 //! Consent-driven integrations. Enrollment describes only objects this install wrote.
+mod settings;
 use crate::ingest::registry::path_eq;
 use crate::{data::DataRoot, safe_fs};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use settings::render_json;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -223,142 +225,6 @@ fn install_file(path: PathBuf, bytes: &[u8], previous: &[Installed]) -> Result<I
         directories,
     })
 }
-/// 0.4.9's spaced one-line separators (`, ` and `: `), which serde_json's compact
-/// formatter lacks.
-struct Spaced;
-impl serde_json::ser::Formatter for Spaced {
-    fn begin_array_value<W: ?Sized + std::io::Write>(
-        &mut self,
-        w: &mut W,
-        first: bool,
-    ) -> std::io::Result<()> {
-        w.write_all(if first { b"" } else { b", " })
-    }
-    fn begin_object_key<W: ?Sized + std::io::Write>(
-        &mut self,
-        w: &mut W,
-        first: bool,
-    ) -> std::io::Result<()> {
-        w.write_all(if first { b"" } else { b", " })
-    }
-    fn begin_object_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
-        w.write_all(b": ")
-    }
-}
-// Replace only the top-level hooks value. Other user JSON stays byte-for-byte; the hooks
-// take the file's style as 0.4.9's `_render_settings` read it (py/hookinstall.py:325-342):
-// its indentation and line endings, spaced separators on one line when it has `": `, and
-// `\u` escapes when it holds one.
-fn render_json(value: &Value, old: &[u8]) -> Result<Vec<u8>> {
-    use serde::Serialize;
-    let raw = std::str::from_utf8(old)?;
-    if raw.trim().is_empty() {
-        return Ok((serde_json::to_string_pretty(value)? + "\n").into_bytes());
-    }
-    let fields: std::collections::BTreeMap<String, &serde_json::value::RawValue> =
-        serde_json::from_str(raw)?;
-    let span = |v: &serde_json::value::RawValue| {
-        let start = v.get().as_ptr() as usize - raw.as_ptr() as usize;
-        start..start + v.get().len()
-    };
-    let eol = if raw.contains("\r\n") { "\r\n" } else { "\n" };
-    let indent = raw
-        .lines()
-        .skip(1)
-        .find_map(|line| {
-            let trimmed = line.trim_start_matches([' ', '\t']);
-            trimmed
-                .starts_with('"')
-                .then_some(&line[..line.len() - trimmed.len()])
-        })
-        .unwrap_or("  ");
-    let one_line = !raw.contains('\n');
-    let spaced = !one_line || raw.contains("\": ");
-    let render = |hooks: &Value| -> Result<String> {
-        let mut bytes = Vec::new();
-        if one_line && spaced {
-            hooks.serialize(&mut serde_json::Serializer::with_formatter(
-                &mut bytes, Spaced,
-            ))?;
-        } else if one_line {
-            hooks.serialize(&mut serde_json::Serializer::new(&mut bytes))?;
-        } else {
-            hooks.serialize(&mut serde_json::Serializer::with_formatter(
-                &mut bytes,
-                serde_json::ser::PrettyFormatter::with_indent(indent.as_bytes()),
-            ))?;
-        }
-        let mut text = String::from_utf8(bytes)?;
-        if raw.contains("\\u") {
-            text = text
-                .chars()
-                .map(|c| {
-                    if c.is_ascii() {
-                        c.to_string()
-                    } else {
-                        c.encode_utf16(&mut [0; 2])
-                            .iter()
-                            .map(|unit| format!("\\u{unit:04x}"))
-                            .collect()
-                    }
-                })
-                .collect();
-        }
-        Ok(if one_line {
-            text
-        } else {
-            text.replace('\n', &format!("{eol}{indent}"))
-        })
-    };
-    let mut result = raw.to_owned();
-    match (fields.get("hooks"), value.get("hooks")) {
-        (Some(previous), Some(hooks)) => {
-            result.replace_range(span(previous), &render(hooks)?);
-        }
-        (Some(previous), None) => {
-            let current = span(previous);
-            let previous_end = fields
-                .iter()
-                .filter(|(key, _)| key.as_str() != "hooks")
-                .map(|(_, v)| span(v).end)
-                .filter(|end| *end < current.start)
-                .max();
-            let start = previous_end.unwrap_or_else(|| raw.find('{').unwrap() + 1);
-            let mut end = current.end;
-            if previous_end.is_none() {
-                let tail = &raw[end..];
-                if let Some(comma) = tail.find(',').filter(|i| tail[..*i].trim().is_empty()) {
-                    end += comma + 1;
-                }
-            }
-            result.replace_range(start..end, "");
-        }
-        (None, Some(hooks)) => {
-            let last = fields.values().map(|v| span(v).end).max();
-            let start = last.unwrap_or_else(|| raw.find('{').unwrap() + 1);
-            let gap = if !one_line {
-                format!("{eol}{indent}")
-            } else if spaced && last.is_some() {
-                " ".into()
-            } else {
-                String::new()
-            };
-            result.insert_str(
-                start,
-                &format!(
-                    "{}{gap}\"hooks\"{}{}",
-                    if last.is_some() { "," } else { "" },
-                    if spaced { ": " } else { ":" },
-                    render(hooks)?
-                ),
-            );
-        }
-        (None, None) => {}
-    }
-    serde_json::from_str::<Value>(&result)?;
-    Ok(result.into_bytes())
-}
-
 fn install_hook(path: PathBuf, event: &str, entry: Value) -> Result<Installed> {
     let directories = missing_directories(&path);
     let old = safe_fs::read_optional(&path)?;
@@ -440,6 +306,31 @@ pub fn hook_paths(home: &Path) -> Vec<PathBuf> {
     paths
 }
 
+/// One object of an install: the same path and the same kind of entry.
+fn same_object(a: &Installed, b: &Installed) -> bool {
+    path_eq(&a.path, &b.path) && std::mem::discriminant(&a.kind) == std::mem::discriminant(&b.kind)
+}
+/// A reinstalled object keeps what its first install recorded: whether it created the
+/// file, the directories it made, and a block's separator.
+fn inherit(item: &mut Installed, previous: &[Installed]) {
+    let Some(old) = previous.iter().find(|i| same_object(i, item)) else {
+        return;
+    };
+    item.created = old.created;
+    item.directories.extend(old.directories.clone());
+    item.directories.sort();
+    item.directories.dedup();
+    if let (
+        Kind::Block { separator, .. },
+        Kind::Block {
+            separator: old_separator,
+            ..
+        },
+    ) = (&mut item.kind, &old.kind)
+    {
+        *separator = old_separator.clone();
+    }
+}
 /// Install the selected files; persist each successful object before moving to the next.
 /// A partial failure leaves sufficient enrollment for a later remove.
 pub fn install(root: &DataRoot, teach: bool, hooks: bool) -> Result<Vec<String>> {
@@ -451,29 +342,8 @@ pub fn install(root: &DataRoot, teach: bool, hooks: bool) -> Result<Vec<String>>
     let mut record = |result: Result<Installed>| -> Result<()> {
         match result {
             Ok(mut item) => {
-                if let Some(old) = previous.iter().find(|i| {
-                    path_eq(&i.path, &item.path)
-                        && std::mem::discriminant(&i.kind) == std::mem::discriminant(&item.kind)
-                }) {
-                    item.created = old.created;
-                    item.directories.extend(old.directories.clone());
-                    item.directories.sort();
-                    item.directories.dedup();
-                    if let (
-                        Kind::Block { separator, .. },
-                        Kind::Block {
-                            separator: old_separator,
-                            ..
-                        },
-                    ) = (&mut item.kind, &old.kind)
-                    {
-                        *separator = old_separator.clone();
-                    }
-                }
-                config.enrollment.retain(|i| {
-                    !(path_eq(&i.path, &item.path)
-                        && std::mem::discriminant(&i.kind) == std::mem::discriminant(&item.kind))
-                });
+                inherit(&mut item, &previous);
+                config.enrollment.retain(|i| !same_object(i, &item));
                 config.enrollment.push(item);
                 root.save_config(&config)?;
             }
@@ -487,30 +357,39 @@ pub fn install(root: &DataRoot, teach: bool, hooks: bool) -> Result<Vec<String>>
         }
     }
     if hooks {
-        if home.join(".claude").is_dir() {
-            record(install_hook(
-                home.join(".claude/settings.json"),
-                "PreCompact",
-                json!({"matcher":"manual|auto","hooks":[{"type":"command","command":"agrep __hook claude"}]}),
-            ))?;
-        }
-        for dir in codex_dirs(&home) {
-            record(install_hook(
-                dir.join("hooks.json"),
-                "SessionStart",
-                json!({"matcher":"^compact$","hooks":[{"type":"command","command":"agrep __hook codex","timeout":2,"statusMessage":"Post-compact recovery available","additionalContextLimit":700}]}),
-            ))?;
-        }
-        for base in extension_dirs(&home) {
-            record(install_file(
-                base.join("extensions/agrep-postcompact.ts"),
-                include_bytes!("pi_postcompact.ts"),
-                &previous,
-            ))?;
-        }
+        install_hooks(&home, &previous, &mut record)?;
     }
     root.save_config(&config)?;
     Ok(errors)
+}
+/// The post-compaction hook of every detected client.
+fn install_hooks(
+    home: &Path,
+    previous: &[Installed],
+    record: &mut impl FnMut(Result<Installed>) -> Result<()>,
+) -> Result<()> {
+    if home.join(".claude").is_dir() {
+        record(install_hook(
+            home.join(".claude/settings.json"),
+            "PreCompact",
+            json!({"matcher":"manual|auto","hooks":[{"type":"command","command":"agrep __hook claude"}]}),
+        ))?;
+    }
+    for dir in codex_dirs(home) {
+        record(install_hook(
+            dir.join("hooks.json"),
+            "SessionStart",
+            json!({"matcher":"^compact$","hooks":[{"type":"command","command":"agrep __hook codex","timeout":2,"statusMessage":"Post-compact recovery available","additionalContextLimit":700}]}),
+        ))?;
+    }
+    for base in extension_dirs(home) {
+        record(install_file(
+            base.join("extensions/agrep-postcompact.ts"),
+            include_bytes!("pi_postcompact.ts"),
+            previous,
+        ))?;
+    }
+    Ok(())
 }
 
 pub fn remove_block(path: &Path, separator: &str, skill: bool, created: bool) -> Result<()> {

@@ -96,6 +96,19 @@ pub(crate) fn write_query(source: &Path, dest: &Path) -> Result<()> {
     {
         bail!("unsupported tokenizer model options");
     }
+    let tokens = vocabulary(&model)?;
+    let merges = merge_table(&model, &tokens)?;
+    let mut sorted: Vec<u32> = (0..tokens.len() as u32).collect();
+    sorted.sort_unstable_by_key(|&id| tokens[id as usize].as_bytes());
+    let out = encode(&serde_json::to_vec(&json)?, &tokens, &sorted, merges)?;
+    let temp = dest.with_added_extension("partial");
+    fs::write(&temp, &out)?;
+    fs::OpenOptions::new().write(true).open(&temp)?.sync_all()?;
+    fs::rename(temp, dest)?;
+    Ok(())
+}
+/// The vocabulary's tokens in id order.
+fn vocabulary(model: &serde_json::Value) -> Result<Vec<&String>> {
     let vocab = model["vocab"].as_object().context("tokenizer vocabulary")?;
     let mut tokens = vec![None; vocab.len()];
     for (token, id) in vocab {
@@ -107,7 +120,11 @@ pub(crate) fn write_query(source: &Path, dest: &Path) -> Result<()> {
             bail!("vocabulary ids are not dense and unique");
         }
     }
-    let tokens: Vec<&String> = tokens.into_iter().flatten().collect();
+    Ok(tokens.into_iter().flatten().collect())
+}
+/// ((left id, right id), (rank, merged id)) in pair order.
+type MergeTable = Vec<((u32, u32), (u32, u32))>;
+fn merge_table(model: &serde_json::Value, tokens: &[&String]) -> Result<MergeTable> {
     let ids: HashMap<&str, u32> = tokens
         .iter()
         .enumerate()
@@ -133,19 +150,24 @@ pub(crate) fn write_query(source: &Path, dest: &Path) -> Result<()> {
     }
     let mut merges: Vec<_> = merges.into_iter().collect();
     merges.sort_unstable();
-    let mut sorted: Vec<u32> = (0..tokens.len() as u32).collect();
-    sorted.sort_unstable_by_key(|&id| tokens[id as usize].as_bytes());
-    let header = serde_json::to_vec(&json)?;
+    Ok(merges)
+}
+fn encode(
+    header: &[u8],
+    tokens: &[&String],
+    sorted: &[u32],
+    merges: MergeTable,
+) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let u32_of = |n: usize| u32::try_from(n).context("tokenizer table too large");
     out.extend_from_slice(MAGIC);
     for n in [header.len(), tokens.len(), merges.len()] {
         out.extend(u32_of(n)?.to_le_bytes());
     }
-    out.extend(&header);
+    out.extend(header);
     let mut offset = 0;
     out.extend(0u32.to_le_bytes());
-    for token in &tokens {
+    for token in tokens {
         offset += token.len();
         out.extend(u32_of(offset)?.to_le_bytes());
     }
@@ -160,11 +182,7 @@ pub(crate) fn write_query(source: &Path, dest: &Path) -> Result<()> {
     for token in tokens {
         out.extend(token.as_bytes());
     }
-    let temp = dest.with_added_extension("partial");
-    fs::write(&temp, &out)?;
-    fs::OpenOptions::new().write(true).open(&temp)?.sync_all()?;
-    fs::rename(temp, dest)?;
-    Ok(())
+    Ok(out)
 }
 
 /// The library's BPE model over tables read from `write_query`'s file: lookups are
@@ -268,39 +286,8 @@ impl QueryBpe {
     fn string(&self, id: u32) -> tokenizers::Result<String> {
         Ok(String::from_utf8(self.token(id).to_vec())?)
     }
-}
-
-#[derive(Clone, Copy)]
-struct Symbol {
-    id: u32,
-    prev: isize,
-    next: isize,
-    len: usize,
-}
-
-/// The library `Word`'s pending merge: lowest rank first, then leftmost.
-#[derive(PartialEq, Eq)]
-struct Merge {
-    pos: usize,
-    rank: u32,
-    id: u32,
-}
-impl Ord for Merge {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other.rank.cmp(&self.rank).then(other.pos.cmp(&self.pos))
-    }
-}
-impl PartialOrd for Merge {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Model for QueryBpe {
-    type Trainer = BpeTrainer;
-    /// `BPE::tokenize` without dropout, prefixes, suffixes, unknown or byte-fallback
-    /// tokens: characters outside the vocabulary are dropped, then `Word::merge_all`.
-    fn tokenize(&self, sequence: &str) -> tokenizers::Result<Vec<Token>> {
+    /// The sequence's characters as vocabulary symbols; characters outside it are dropped.
+    fn symbols(&self, sequence: &str) -> Vec<Symbol> {
         let mut symbols: Vec<Symbol> = Vec::with_capacity(sequence.len());
         for (at, c) in sequence.char_indices() {
             let text = &sequence[at..at + c.len_utf8()];
@@ -317,6 +304,10 @@ impl Model for QueryBpe {
                 });
             }
         }
+        symbols
+    }
+    /// `Word::merge_all`: merged symbols keep their position with `len` 0.
+    fn merge_all(&self, symbols: &mut [Symbol]) {
         let mut queue: BinaryHeap<Merge> = symbols
             .windows(2)
             .enumerate()
@@ -368,6 +359,42 @@ impl Model for QueryBpe {
                 }
             }
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Symbol {
+    id: u32,
+    prev: isize,
+    next: isize,
+    len: usize,
+}
+
+/// The library `Word`'s pending merge: lowest rank first, then leftmost.
+#[derive(PartialEq, Eq)]
+struct Merge {
+    pos: usize,
+    rank: u32,
+    id: u32,
+}
+impl Ord for Merge {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other.rank.cmp(&self.rank).then(other.pos.cmp(&self.pos))
+    }
+}
+impl PartialOrd for Merge {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Model for QueryBpe {
+    type Trainer = BpeTrainer;
+    /// `BPE::tokenize` without dropout, prefixes, suffixes, unknown or byte-fallback
+    /// tokens: characters outside the vocabulary are dropped, then `Word::merge_all`.
+    fn tokenize(&self, sequence: &str) -> tokenizers::Result<Vec<Token>> {
+        let mut symbols = self.symbols(sequence);
+        self.merge_all(&mut symbols);
         let mut start = 0;
         symbols
             .into_iter()

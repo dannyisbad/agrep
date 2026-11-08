@@ -164,82 +164,116 @@ pub fn scan() -> io::Result<Vec<Process>> {
             if pid <= 0 {
                 continue;
             }
-            let mut name = [0u8; 1024];
-            let n = proc_name(pid, name.as_mut_ptr().cast(), name.len() as u32);
-            if n <= 0 {
-                continue;
-            }
-            let name = String::from_utf8_lossy(&name[..n as usize]);
-            if classify(&name, &name).is_none() && !matches!(name.as_ref(), "node" | "bun") {
-                continue;
-            }
-            let mut mib = [1, 49, pid];
-            let mut args = vec![0u8; 262144];
-            let mut size = args.len();
-            if libc::sysctl(
-                mib.as_mut_ptr(),
-                3,
-                args.as_mut_ptr().cast(),
-                &mut size,
-                std::ptr::null_mut(),
-                0,
-            ) != 0
-            {
-                size = 0;
-            }
-            let cmd = mac_args(&args[..size]).join(" ");
-            let mut vnode = [0u8; 2352];
-            let n = proc_pidinfo(pid, 9, 0, vnode.as_mut_ptr().cast(), vnode.len() as i32);
-            let cwd = if n == vnode.len() as i32 {
-                String::from_utf8_lossy(
-                    vnode[152..1176]
-                        .split(|b| *b == 0)
-                        .next()
-                        .unwrap_or_default(),
-                )
-                .into_owned()
-            } else {
-                String::new()
-            };
-            if let Some(p) = record(pid as u32, &name, &cmd, cwd) {
+            if let Some(p) = mac_process(pid) {
                 out.push(p)
             }
         }
         Ok(out)
     }
 }
+/// An agent process from its name, arguments and working directory.
+///
+/// # Safety
+/// Native APIs receive correctly sized writable buffers; no pointers escape.
+#[cfg(target_os = "macos")]
+unsafe fn mac_process(pid: i32) -> Option<Process> {
+    let mut name = [0u8; 1024];
+    let n = proc_name(pid, name.as_mut_ptr().cast(), name.len() as u32);
+    if n <= 0 {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&name[..n as usize]);
+    if classify(&name, &name).is_none() && !matches!(name.as_ref(), "node" | "bun") {
+        return None;
+    }
+    let mut mib = [1, 49, pid];
+    let mut args = vec![0u8; 262144];
+    let mut size = args.len();
+    if libc::sysctl(
+        mib.as_mut_ptr(),
+        3,
+        args.as_mut_ptr().cast(),
+        &mut size,
+        std::ptr::null_mut(),
+        0,
+    ) != 0
+    {
+        size = 0;
+    }
+    let cmd = mac_args(&args[..size]).join(" ");
+    let mut vnode = [0u8; 2352];
+    let n = proc_pidinfo(pid, 9, 0, vnode.as_mut_ptr().cast(), vnode.len() as i32);
+    let cwd = if n == vnode.len() as i32 {
+        String::from_utf8_lossy(
+            vnode[152..1176]
+                .split(|b| *b == 0)
+                .next()
+                .unwrap_or_default(),
+        )
+        .into_owned()
+    } else {
+        String::new()
+    };
+    record(pid as u32, &name, &cmd, cwd)
+}
+
+// Both supported Windows targets use the 64-bit PEB/UNICODE_STRING layout.
+#[cfg(windows)]
+unsafe fn bytes(
+    h: windows_sys::Win32::Foundation::HANDLE,
+    address: usize,
+    size: usize,
+) -> Option<Vec<u8>> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    let mut b = vec![0; size];
+    let mut n = 0;
+    (ReadProcessMemory(h, address as _, b.as_mut_ptr().cast(), size, &mut n) != 0 && n == size)
+        .then_some(b)
+}
+#[cfg(windows)]
+unsafe fn string(h: windows_sys::Win32::Foundation::HANDLE, address: usize) -> Option<String> {
+    let head = bytes(h, address, 16)?;
+    let n = u16::from_le_bytes(head[..2].try_into().ok()?) as usize;
+    let ptr = u64::from_le_bytes(head[8..16].try_into().ok()?) as usize;
+    let b = bytes(h, ptr, n.min(16384))?;
+    Some(String::from_utf16_lossy(
+        &b.chunks_exact(2)
+            .map(|s| u16::from_le_bytes([s[0], s[1]]))
+            .collect::<Vec<_>>(),
+    ))
+}
+/// The command line and working directory from the process parameters of its PEB.
+#[cfg(windows)]
+unsafe fn command_and_cwd(h: windows_sys::Win32::Foundation::HANDLE) -> (String, String) {
+    use windows_sys::Wdk::System::Threading::NtQueryInformationProcess;
+    use windows_sys::Win32::System::Threading::PROCESS_BASIC_INFORMATION;
+    let mut pbi: PROCESS_BASIC_INFORMATION = std::mem::zeroed();
+    let mut returned = 0;
+    let mut cmd = String::new();
+    let mut cwd = String::new();
+    if NtQueryInformationProcess(
+        h,
+        0,
+        (&mut pbi as *mut PROCESS_BASIC_INFORMATION).cast(),
+        std::mem::size_of_val(&pbi) as u32,
+        &mut returned,
+    ) == 0
+    {
+        if let Some(raw) = bytes(h, pbi.PebBaseAddress as usize + 0x20, 8) {
+            let params = u64::from_le_bytes(raw.try_into().unwrap()) as usize;
+            cmd = string(h, params + 0x70).unwrap_or_default();
+            cwd = string(h, params + 0x38).unwrap_or_default();
+        }
+    }
+    (cmd, cwd)
+}
 
 #[cfg(windows)]
 pub fn scan() -> io::Result<Vec<Process>> {
     use windows_sys::Win32::{
         Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
-        System::{
-            Diagnostics::{Debug::ReadProcessMemory, ToolHelp::*},
-            Threading::*,
-        },
+        System::{Diagnostics::ToolHelp::*, Threading::*},
     };
-    // Both supported Windows targets use the 64-bit PEB/UNICODE_STRING layout.
-    unsafe fn bytes(
-        h: windows_sys::Win32::Foundation::HANDLE,
-        address: usize,
-        size: usize,
-    ) -> Option<Vec<u8>> {
-        let mut b = vec![0; size];
-        let mut n = 0;
-        (ReadProcessMemory(h, address as _, b.as_mut_ptr().cast(), size, &mut n) != 0 && n == size)
-            .then_some(b)
-    }
-    unsafe fn string(h: windows_sys::Win32::Foundation::HANDLE, address: usize) -> Option<String> {
-        let head = bytes(h, address, 16)?;
-        let n = u16::from_le_bytes(head[..2].try_into().ok()?) as usize;
-        let ptr = u64::from_le_bytes(head[8..16].try_into().ok()?) as usize;
-        let b = bytes(h, ptr, n.min(16384))?;
-        Some(String::from_utf16_lossy(
-            &b.chunks_exact(2)
-                .map(|s| u16::from_le_bytes([s[0], s[1]]))
-                .collect::<Vec<_>>(),
-        ))
-    }
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snapshot == INVALID_HANDLE_VALUE {
@@ -260,26 +294,7 @@ pub fn scan() -> io::Result<Vec<Process>> {
                     row.th32ProcessID,
                 );
                 if !h.is_null() {
-                    use windows_sys::Wdk::System::Threading::NtQueryInformationProcess;
-                    use windows_sys::Win32::System::Threading::PROCESS_BASIC_INFORMATION;
-                    let mut pbi: PROCESS_BASIC_INFORMATION = std::mem::zeroed();
-                    let mut returned = 0;
-                    let mut cmd = String::new();
-                    let mut cwd = String::new();
-                    if NtQueryInformationProcess(
-                        h,
-                        0,
-                        (&mut pbi as *mut PROCESS_BASIC_INFORMATION).cast(),
-                        std::mem::size_of_val(&pbi) as u32,
-                        &mut returned,
-                    ) == 0
-                    {
-                        if let Some(raw) = bytes(h, pbi.PebBaseAddress as usize + 0x20, 8) {
-                            let params = u64::from_le_bytes(raw.try_into().unwrap()) as usize;
-                            cmd = string(h, params + 0x70).unwrap_or_default();
-                            cwd = string(h, params + 0x38).unwrap_or_default();
-                        }
-                    }
+                    let (cmd, cwd) = command_and_cwd(h);
                     if let Some(p) = record(row.th32ProcessID, &name, &cmd, cwd) {
                         out.push(p)
                     }

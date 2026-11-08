@@ -54,18 +54,20 @@ Ubuntu x64 runner, on a 100,000-row history unless noted:
 
 | Command | 0.4.9 | 0.5 |
 |---|---:|---:|
-| first `agrep index` | 16.7 s | 8.8 s |
-| check with nothing changed | 345 ms | 10 ms |
-| refresh after one new turn | 2.8 s | 28 ms |
-| keyword search | 732 ms | 28 ms |
-| `recall` | 462 ms | 38 ms |
-| first meaning query after setup (1,000-row history) | 920 ms | 53 ms |
-| meaning-only search, CPU (1,000-row history) | 107 ms | 46 ms |
+| first `agrep index` | 12.3 s | 4.8 s |
+| check with nothing changed | 294 ms | 8 ms |
+| refresh after one new turn | 2.9 s | 15 ms |
+| search right after a new turn | 580 ms | 32 ms |
+| keyword search | 546 ms | 23 ms |
+| `recall` | 358 ms | 31 ms |
+| first meaning query after setup (1,000-row history) | 772 ms | 44 ms |
+| meaning-only search, CPU (1,000-row history) | 84 ms | 37 ms |
 
-On a 1.2-million-row personal history (Apple M2 Max) the first index takes
-86 s against 0.4.9's 334 s, using at most about 1.6 GB of memory. CI repeats
-the comparison on Linux, macOS and Windows, x64 and arm64, and every case must
-beat 0.4.9 at median and p95.
+Right after a new turn, 0.5 indexes it before answering, so the answer
+includes it; 0.4.9 answers from its last index. On a 1.2-million-row personal
+history (Apple M2 Max) the first index takes 81 s against 0.4.9's 294 s, using
+at most about 1.6 GB of memory. CI repeats the comparison on Linux, macOS and
+Windows, x64 and arm64, and every case must beat 0.4.9 at median and p95.
 
 **Before upgrading from 0.4, run `agrep remove` with 0.4** to remove its
 instruction blocks, hooks and uninstall sentinel. Then install 0.5, build a

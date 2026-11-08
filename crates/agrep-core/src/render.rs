@@ -485,35 +485,7 @@ pub fn emit_semantic(
     } else if s.compact {
         (out, footer) = compact_page(r, q, _f, s, &marks, truncated, exhaustible)?;
     } else {
-        let mut sessions = Vec::<(&str, Vec<&Hit>)>::new();
-        for hit in demote_meta(r.hits.iter().collect()) {
-            if let Some((_, rows)) = sessions.iter_mut().find(|(id, _)| *id == hit.session) {
-                rows.push(hit)
-            } else {
-                sessions.push((&hit.session, vec![hit]));
-            }
-        }
-        for (i, (_, hits)) in sessions.iter().enumerate() {
-            if i > 0 {
-                out.push('\n');
-            }
-            out += &chat_head(hits[0], hits.len(), true);
-            for h in hits {
-                let mark = match h.who.as_str() {
-                    "agent" => "→",
-                    "subagent" => "⇒",
-                    "tool" => "⚙",
-                    _ => "›",
-                };
-                out += &format!(
-                    "  \x1b[33m{:>4}\x1b[0m \x1b[2m{mark}\x1b[0m {}\x1b[2m{}{}\x1b[0m\n",
-                    h.turn,
-                    marks.paint(h, true),
-                    if h.self_marker { " ~self" } else { "" },
-                    if h.meta_marker { " ~meta" } else { "" }
-                );
-            }
-        }
+        out = classic_page(r, |hit| marks.paint(hit, true));
     }
     surface::write(&out)?;
     if let Some(line) = footer {
@@ -529,6 +501,39 @@ pub fn emit_semantic(
         eprintln!("{}", completeness_line(r, s, exhaustible));
     }
     Ok(())
+}
+fn classic_page(r: &Results, paint: impl Fn(&Hit) -> String) -> String {
+    let mut out = String::new();
+    let mut sessions = Vec::<(&str, Vec<&Hit>)>::new();
+    for hit in demote_meta(r.hits.iter().collect()) {
+        if let Some((_, rows)) = sessions.iter_mut().find(|(id, _)| *id == hit.session) {
+            rows.push(hit)
+        } else {
+            sessions.push((&hit.session, vec![hit]));
+        }
+    }
+    for (i, (_, hits)) in sessions.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out += &chat_head(hits[0], hits.len(), true);
+        for h in hits {
+            let mark = match h.who.as_str() {
+                "agent" => "→",
+                "subagent" => "⇒",
+                "tool" => "⚙",
+                _ => "›",
+            };
+            out += &format!(
+                "  \x1b[33m{:>4}\x1b[0m \x1b[2m{mark}\x1b[0m {}\x1b[2m{}{}\x1b[0m\n",
+                h.turn,
+                paint(h),
+                if h.self_marker { " ~self" } else { "" },
+                if h.meta_marker { " ~meta" } else { "" }
+            );
+        }
+    }
+    out
 }
 /// A compact page's rows, frozen behind their continuation, and the footer printed below
 /// them.

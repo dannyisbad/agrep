@@ -477,6 +477,44 @@ fn batch_end(
     }
     end
 }
+/// The tokenizer with the 1024-token window, and its load time in milliseconds.
+fn load_tokenizer(path: &Path, query: bool) -> Result<(TextTokenizer, f64)> {
+    let _span = crate::semantic_profile::span("tokenizer_load");
+    let start = std::time::Instant::now();
+    // Explicit provisioning writes the query tables beside the other
+    // converted files; bulk embedding builds the library's model.
+    let mut tok = if query {
+        TextTokenizer::Query(Box::new(semantic_tokenizer::load_query(
+            &path.join("tokenizer-query.bin"),
+        )?))
+    } else {
+        TextTokenizer::Library(Box::new(semantic_tokenizer::load(
+            &path.join("tokenizer-compact.json"),
+        )?))
+    };
+    tok.window(1024)?;
+    Ok((tok, start.elapsed().as_secs_f64() * 1000.))
+}
+/// The backbone, and with `mapped` the weights it reads in place.
+fn load_model(
+    path: &Path,
+    device: &Device,
+    dtype: DType,
+    mapped: bool,
+) -> Result<(ModernBert, Option<MappedWeights>)> {
+    let config: Config = serde_json::from_slice(&fs::read(path.join("config.json"))?)?;
+    // The same F32 checkpoint backs mapped queries and bulk CPU tensors.
+    // Metal converts it to F16 once at load, retaining no second file.
+    let vb = unsafe {
+        VarBuilder::from_mmaped_safetensors(&[path.join("weights-f32.safetensors")], dtype, device)?
+    }
+    .rename_f(|name| checkpoint_name(name).to_owned());
+    let _span = crate::semantic_profile::span("weights_load");
+    let weights = mapped
+        .then(|| MappedWeights::open(&path.join("weights-f32.safetensors")))
+        .transpose()?;
+    Ok((ModernBert::load(vb, &config, weights.as_ref())?, weights))
+}
 impl Embedder {
     /// Bulk embedding: every weight is copied into tensors once per process.
     pub fn load(path: &Path, device: Device) -> Result<Self> {
@@ -508,42 +546,9 @@ impl Embedder {
             DType::F32
         };
         let (model, tok, weights_ms, tokenizer_ms) = std::thread::scope(|scope| -> Result<_> {
-            let tokenizer = scope.spawn(|| -> Result<_> {
-                let _span = crate::semantic_profile::span("tokenizer_load");
-                let start = std::time::Instant::now();
-                // Explicit provisioning writes the query tables beside the other
-                // converted files; bulk embedding builds the library's model.
-                let mut tok = if query {
-                    TextTokenizer::Query(Box::new(semantic_tokenizer::load_query(
-                        &path.join("tokenizer-query.bin"),
-                    )?))
-                } else {
-                    TextTokenizer::Library(Box::new(semantic_tokenizer::load(
-                        &path.join("tokenizer-compact.json"),
-                    )?))
-                };
-                tok.window(1024)?;
-                Ok((tok, start.elapsed().as_secs_f64() * 1000.))
-            });
+            let tokenizer = scope.spawn(|| load_tokenizer(path, query));
             let start = std::time::Instant::now();
-            let config: Config = serde_json::from_slice(&fs::read(path.join("config.json"))?)?;
-            // The same F32 checkpoint backs mapped queries and bulk CPU tensors.
-            // Metal converts it to F16 once at load, retaining no second file.
-            let vb = unsafe {
-                VarBuilder::from_mmaped_safetensors(
-                    &[path.join("weights-f32.safetensors")],
-                    dtype,
-                    &device,
-                )?
-            }
-            .rename_f(|name| checkpoint_name(name).to_owned());
-            let (model, weights) = {
-                let _span = crate::semantic_profile::span("weights_load");
-                let weights = mapped
-                    .then(|| MappedWeights::open(&path.join("weights-f32.safetensors")))
-                    .transpose()?;
-                (ModernBert::load(vb, &config, weights.as_ref())?, weights)
-            };
+            let (model, weights) = load_model(path, &device, dtype, mapped)?;
             if crate::semantic_profile::enabled() {
                 device.synchronize()?;
             }

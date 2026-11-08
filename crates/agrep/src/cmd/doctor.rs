@@ -122,67 +122,7 @@ pub fn run(deep: bool, fix: bool, no_semantic: bool, json_output: bool) -> Resul
         };
         checks.push(json!({"check":"semantic_model","state":semantic,"detail":s["semantic"]["integrity_error"]}));
     }
-    let integration_errors = s["integrations"].as_array().is_some_and(|entries| {
-        entries
-            .iter()
-            .any(|e| e["drifted"] == true || e["state"] == "unreadable")
-    });
-    let errors = s["sources"]
-        .as_array()
-        .is_some_and(|a| a.iter().any(|v| !v["last_error"].is_null()));
-    let healthy = s["format"] == "valid"
-        && s["index"]["state"] == "ready"
-        && !checks.iter().any(|c| c["state"] == "failed")
-        && !errors
-        && !integration_errors;
-    let exit = i32::from(repair_failed);
-    let v = json!({"version":1,"status":&s,"checks":&checks,"repairs":&repaired,"exit":exit});
-    if json_output {
-        println!("{}", agrep_core::json_output::to_string(&v)?)
-    } else {
-        println!(
-            "doctor: {}",
-            if healthy {
-                "checks passed"
-            } else {
-                "action needed"
-            }
-        );
-        // A failed check names its cause, as 0.4.9's rows did.
-        for check in &checks {
-            let state = check["state"].as_str().unwrap_or("unknown");
-            let detail = match &check["detail"] {
-                serde_json::Value::String(s) => s.clone(),
-                serde_json::Value::Array(items) => items
-                    .iter()
-                    .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_owned))
-                    .collect::<Vec<_>>()
-                    .join("; "),
-                _ => String::new(),
-            };
-            let name = check["check"].as_str().unwrap_or("check");
-            if state == "failed" && !detail.is_empty() {
-                println!("{name}: {state} - {}", agrep_core::render::safe(&detail));
-            } else {
-                println!("{name}: {state}");
-            }
-        }
-        for repair in &repaired {
-            println!("repaired: {repair}");
-        }
-        for entry in s["integrations"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|e| e["drifted"] == true)
-        {
-            println!(
-                "integration needs repair: {}",
-                entry["path"].as_str().unwrap_or("")
-            );
-        }
-    }
-    Ok(exit)
+    report(&s, &checks, &repaired, repair_failed, json_output)
 }
 
 fn rebuild(root: &DataRoot, build: impl FnOnce(&DataRoot) -> Result<()>) -> Result<()> {
@@ -224,6 +164,77 @@ fn rebuild(root: &DataRoot, build: impl FnOnce(&DataRoot) -> Result<()>) -> Resu
     let _ = std::fs::remove_dir_all(&repair.0);
     outcome
 }
+
+fn report(
+    s: &serde_json::Value,
+    checks: &[serde_json::Value],
+    repaired: &[&str],
+    repair_failed: bool,
+    json_output: bool,
+) -> Result<i32> {
+    let integration_errors = s["integrations"].as_array().is_some_and(|entries| {
+        entries
+            .iter()
+            .any(|e| e["drifted"] == true || e["state"] == "unreadable")
+    });
+    let errors = s["sources"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|v| !v["last_error"].is_null()));
+    let healthy = s["format"] == "valid"
+        && s["index"]["state"] == "ready"
+        && !checks.iter().any(|c| c["state"] == "failed")
+        && !errors
+        && !integration_errors;
+    let exit = i32::from(repair_failed);
+    let v = json!({"version":1,"status":&s,"checks":&checks,"repairs":&repaired,"exit":exit});
+    if json_output {
+        println!("{}", agrep_core::json_output::to_string(&v)?)
+    } else {
+        println!(
+            "doctor: {}",
+            if healthy {
+                "checks passed"
+            } else {
+                "action needed"
+            }
+        );
+        // A failed check names its cause, as 0.4.9's rows did.
+        for check in checks {
+            let state = check["state"].as_str().unwrap_or("unknown");
+            let detail = match &check["detail"] {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Array(items) => items
+                    .iter()
+                    .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_owned))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+                _ => String::new(),
+            };
+            let name = check["check"].as_str().unwrap_or("check");
+            if state == "failed" && !detail.is_empty() {
+                println!("{name}: {state} - {}", agrep_core::render::safe(&detail));
+            } else {
+                println!("{name}: {state}");
+            }
+        }
+        for repair in repaired {
+            println!("repaired: {repair}");
+        }
+        for entry in s["integrations"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|e| e["drifted"] == true)
+        {
+            println!(
+                "integration needs repair: {}",
+                entry["path"].as_str().unwrap_or("")
+            );
+        }
+    }
+    Ok(exit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

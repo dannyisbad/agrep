@@ -2,18 +2,19 @@
 pub mod board;
 mod journal;
 mod privacy;
+mod reader;
+mod service;
+mod session;
 mod sqlite;
 use crate::{ingest::registry, process};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+pub use service::Service;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
-    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex},
-    thread,
     time::Duration,
 };
 
@@ -31,42 +32,6 @@ pub const WINDOW_MS: i64 = 90_000;
 const LINE_CAP: usize = 1024 * 1024;
 const JSON_CAP: usize = 4 * 1024 * 1024;
 
-struct BoundedLine {
-    body: Vec<u8>,
-    bytes: u64,
-    complete: bool,
-    oversized: bool,
-}
-fn bounded_line(reader: &mut impl BufRead, discarding: bool) -> std::io::Result<BoundedLine> {
-    let mut line = BoundedLine {
-        body: Vec::new(),
-        bytes: 0,
-        complete: false,
-        oversized: discarding,
-    };
-    loop {
-        let available = reader.fill_buf()?;
-        if available.is_empty() {
-            return Ok(line);
-        }
-        let length = available
-            .iter()
-            .position(|&b| b == b'\n')
-            .map_or(available.len(), |n| n + 1);
-        line.complete = available[length - 1] == b'\n';
-        line.bytes += length as u64;
-        if !line.oversized && line.body.len().saturating_add(length) <= LINE_CAP {
-            line.body.extend_from_slice(&available[..length]);
-        } else {
-            line.oversized = true;
-            line.body.clear();
-        }
-        reader.consume(length);
-        if line.complete {
-            return Ok(line);
-        }
-    }
-}
 pub fn now() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -418,102 +383,7 @@ impl Watcher {
         let event_type = text(&e["type"]).to_owned();
         let kind = event_type.as_str();
         let ts = e["ts"].as_i64().filter(|t| *t > 0).unwrap_or_else(now);
-        for field in ["project", "title", "model", "parent"] {
-            let v = text(&e[field]);
-            if v.is_empty() {
-                continue;
-            }
-            match field {
-                "project" => s.project = v.into(),
-                "title" => s.title = v.into(),
-                "model" => s.model = v.into(),
-                "parent" => s.parent = v.into(),
-                _ => {}
-            }
-        }
-        s.sub |= e["sub_session"].as_bool().unwrap_or(false) || !s.parent.is_empty();
-        s.last_ts = s.last_ts.max(ts);
-        if kind == "user" {
-            s.turn_n += 1;
-        }
-        if matches!(kind, "user" | "reply") && !text(&e["text"]).trim().is_empty() {
-            s.last_text = cap(text(&e["text"]), 1000);
-        }
-        match kind {
-            "tool" => {
-                s.pending
-                    .insert(text(&e["call_id"]).into(), (text(&e["name"]).into(), ts));
-            }
-            "tool_done" => {
-                if let Some((name, start)) = s.pending.remove(text(&e["call_id"])) {
-                    if text(&e["name"]).is_empty() {
-                        e["name"] = json!(name)
-                    }
-                    e["dur"] = json!((ts - start).max(0));
-                }
-            }
-            "user" | "done" => s.pending.clear(),
-            _ => {}
-        }
-        match kind {
-            "user" => s.state = "thinking".into(),
-            "reply" => s.state = "replying".into(),
-            "tool" | "tool_done" => {
-                s.state = s
-                    .pending
-                    .values()
-                    .next_back()
-                    .map(|(name, _)| {
-                        format!(
-                            "⚙ {name}{}",
-                            if s.pending.len() > 1 {
-                                format!(" +{}", s.pending.len() - 1)
-                            } else {
-                                String::new()
-                            }
-                        )
-                    })
-                    .unwrap_or_else(|| "thinking".into())
-            }
-            "done" => {
-                s.state = e["why"].as_str().unwrap_or("done").into();
-                s.writer = false;
-            }
-            "queued" => {
-                if text(&e["op"]) == "enqueue" {
-                    s.queued += 1;
-                    s.queued_text = text(&e["text"]).into()
-                } else {
-                    s.queued = s.queued.saturating_sub(1);
-                    if s.queued == 0 {
-                        s.queued_text.clear()
-                    }
-                }
-            }
-            _ => {}
-        }
-        if matches!(kind, "user" | "reply" | "tool" | "tool_done") {
-            s.working = true;
-            s.state_ts = ts;
-        }
-        if kind == "done" {
-            s.working = false;
-            s.state_ts = ts;
-        }
-        e["tn"] = json!(s.turn_n);
-        e["sstate"] = json!(s.state);
-        e["sworking"] = json!(s.working);
-        e["sts"] = json!(s.state_ts);
-        if !s.model.is_empty() {
-            e["smodel"] = json!(s.model)
-        }
-        if kind == "queued" {
-            e["squeued"] = json!(s.queued);
-            e["squeued_text"] = json!(s.queued_text)
-        }
-        if s.sub && kind == "user" {
-            e["who"] = json!("subagent")
-        }
+        s.apply(&mut e, kind, ts);
         // A failed consumer does not acknowledge the journal offset or state mutation.
         if !self.booting {
             sink(&e).map_err(|e| anyhow::Error::new(SinkError(e)))?;
@@ -525,143 +395,6 @@ impl Watcher {
             }
         }
         self.sessions.insert(key, s);
-        Ok(())
-    }
-    fn journal(
-        &mut self,
-        agent: &str,
-        path: &Path,
-        source: &mut Source,
-        sink: &mut impl FnMut(&Value) -> Result<()>,
-    ) -> Result<()> {
-        let mut options = fs::OpenOptions::new();
-        options.read(true);
-        registry::secure_read_options(&mut options);
-        let file = options.open(path)?;
-        let meta = file.metadata()?;
-        anyhow::ensure!(meta.is_file(), "source is not a regular file");
-        #[cfg(not(unix))]
-        let identity = {
-            use std::os::windows::fs::MetadataExt;
-            format!("{}", meta.creation_time())
-        };
-        // Change token includes mtime: identity only describes replacement, not growth.
-        #[cfg(unix)]
-        let identity = {
-            use std::os::unix::fs::MetadataExt;
-            format!("{}:{}", meta.dev(), meta.ino())
-        };
-        let is_new = source.identity.is_empty();
-        if is_new
-            && now()
-                - meta
-                    .modified()?
-                    .duration_since(std::time::UNIX_EPOCH)?
-                    .as_millis() as i64
-                > WINDOW_MS
-        {
-            return Ok(());
-        }
-        if source.identity != identity || source.offset > meta.len() {
-            *source = Source {
-                identity,
-                ..Source::default()
-            };
-            source.meta = journal::Meta::from_path(agent, path);
-            if path.extension().is_some_and(|e| e == "jsonl") {
-                let mut head = BufReader::new(&file).take(meta.len());
-                for _ in 0..12 {
-                    let line = bounded_line(&mut head, false)?;
-                    if line.bytes == 0 {
-                        break;
-                    }
-                    if line.oversized {
-                        source.skipped_records += 1;
-                    } else if let Ok(row) = serde_json::from_slice(&line.body) {
-                        source.meta.header(agent, &row);
-                    }
-                    if !line.complete {
-                        break;
-                    }
-                }
-                if meta.len() > 65_536 {
-                    source.offset = meta.len() - 65_536;
-                    let mut reader = BufReader::new(&file);
-                    reader.seek(SeekFrom::Start(source.offset))?;
-                    let mut reader = reader.take(meta.len().saturating_sub(source.offset));
-                    let line = bounded_line(&mut reader, true)?;
-                    source.offset += line.bytes;
-                    source.discarding_line = !line.complete;
-                }
-            }
-        }
-        if path.extension().is_some_and(|e| e == "json") {
-            if meta.len() > JSON_CAP as u64 {
-                if !source.oversized_json {
-                    source.skipped_records += 1;
-                }
-                source.oversized_json = true;
-                source.offset = meta.len();
-                return Ok(());
-            }
-            if source.offset == meta.len() {
-                return Ok(());
-            }
-            let mut reader = BufReader::new(&file);
-            reader.seek(SeekFrom::Start(0))?;
-            let mut bytes = Vec::new();
-            reader.take(JSON_CAP as u64 + 1).read_to_end(&mut bytes)?;
-            if bytes.len() > JSON_CAP {
-                if !source.oversized_json {
-                    source.skipped_records += 1;
-                }
-                source.oversized_json = true;
-                source.offset = meta.len();
-                return Ok(());
-            }
-            source.oversized_json = false;
-            let row: Value = serde_json::from_slice(&bytes)?;
-            let sender = text(&row["sender"]);
-            if sender.contains("/task-") {
-                self.emit(json!({"agent":agent,"session":source.meta.session,"type":"subagent_result","ts":now(),"name":row["renderDetails"]["messageTitle"].as_str().unwrap_or(sender),"output":cap(text(&row["content"]),400)}),sink)?;
-            }
-            source.offset = meta.len();
-            return Ok(());
-        }
-        let mut reader = BufReader::new(file);
-        reader.seek(SeekFrom::Start(source.offset))?;
-        let mut reader = reader.take(meta.len().saturating_sub(source.offset));
-        loop {
-            let line = bounded_line(&mut reader, source.discarding_line)?;
-            if line.bytes == 0 {
-                break;
-            }
-            if line.oversized {
-                if !source.discarding_line {
-                    source.skipped_records += 1;
-                }
-                source.discarding_line = !line.complete;
-                source.offset += line.bytes;
-                if !line.complete {
-                    break;
-                }
-                continue;
-            }
-            if !line.complete {
-                break;
-            }
-            if !line.body.iter().all(u8::is_ascii_whitespace) {
-                let row: Value = serde_json::from_slice(&line.body)
-                    .with_context(|| format!("invalid JSON at byte {}", source.offset))?;
-                let mut parsed_meta = source.meta.clone();
-                let events = journal::parse(agent, &mut parsed_meta, &row);
-                for e in events {
-                    self.emit(e, sink)?;
-                }
-                source.meta = parsed_meta;
-            }
-            source.offset += line.bytes;
-        }
         Ok(())
     }
     pub fn snapshot(&self) -> Snapshot {
@@ -726,70 +459,6 @@ impl std::fmt::Display for SinkError {
 impl std::error::Error for SinkError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.0.as_ref())
-    }
-}
-
-/// One foreground-owned watcher shared by every browser request / board frame.
-pub struct Service {
-    shared: Arc<(Mutex<(u64, Snapshot)>, Condvar)>,
-    stop: Arc<std::sync::atomic::AtomicBool>,
-    thread: Option<thread::JoinHandle<()>>,
-}
-impl Default for Service {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-impl Service {
-    pub fn new() -> Self {
-        let shared = Arc::new((Mutex::new((0, Snapshot::default())), Condvar::new()));
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let out = shared.clone();
-        let done = stop.clone();
-        let thread = thread::spawn(move || {
-            let mut watcher = Watcher::new();
-            while !done.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = watcher.poll(&mut |_| Ok(()));
-                let (lock, cv) = &*out;
-                let mut shared = lock.lock().unwrap();
-                shared.0 += 1;
-                shared.1 = watcher.snapshot();
-                drop(shared);
-                cv.notify_all();
-                // No watch covers agent stores, so they are polled every 700 ms.
-                let guard = lock.lock().unwrap();
-                let _ = cv.wait_timeout(guard, Duration::from_millis(700)).unwrap();
-            }
-        });
-        Self {
-            shared,
-            stop,
-            thread: Some(thread),
-        }
-    }
-    pub fn snapshot(&self, wait: Duration) -> Snapshot {
-        let (lock, cv) = &*self.shared;
-        let guard = lock.lock().unwrap();
-        let (guard, _) = cv.wait_timeout_while(guard, wait, |s| s.1.booting).unwrap();
-        guard.1.clone()
-    }
-    pub fn snapshot_if_changed(&self, generation: &mut u64, snapshot: &mut Snapshot) -> bool {
-        let guard = self.shared.0.lock().unwrap();
-        if *generation == guard.0 {
-            return false;
-        }
-        *generation = guard.0;
-        *snapshot = guard.1.clone();
-        true
-    }
-}
-impl Drop for Service {
-    fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        self.shared.1.notify_all();
-        // Cancellation never extends a caller's bounded one-shot wait. A detached
-        // census finishes its current read, sees stop, and drops all owned state.
-        self.thread.take();
     }
 }
 
@@ -1102,7 +771,7 @@ mod read_limit_tests {
     #[test]
     fn header_and_json_file_sizes_are_bounded() {
         let bytes = vec![b'x'; LINE_CAP + 1];
-        let line = bounded_line(&mut std::io::Cursor::new(&bytes), false).unwrap();
+        let line = reader::bounded_line(&mut std::io::Cursor::new(&bytes), false).unwrap();
         assert!(line.oversized);
         assert!(line.body.len() <= LINE_CAP);
         let temp = tempfile::tempdir().unwrap();

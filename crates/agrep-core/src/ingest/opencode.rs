@@ -32,8 +32,9 @@ use crate::ingest::registry::{metadata_is_link, path_eq, relative_path};
 use crate::ingest::{
     cap_event_output, cap_str, is_wrapper, project_name, summarize_tool_input_with_chars, EVENT_CAP,
 };
+use crate::intake::{Skip, Tally};
 use crate::intake_batch::ReadOutcome;
-use crate::model::{Event, Message};
+use crate::model::{Event, Message, RawMessage};
 use std::ffi::OsStr;
 use std::path::Path;
 
@@ -189,74 +190,6 @@ pub(crate) fn is_injected_part(text: &str) -> bool {
         || is_wrapper(text)
 }
 
-#[derive(Default)]
-struct PendingText {
-    session: String,
-    message_id: String,
-    directory: String,
-    parent: String,
-    ts: i64,
-    role: String,
-    model: String,
-    text: String,
-    source_parts: u64,
-    /// A work part came between the previous prose and this message's first text part.
-    worked: bool,
-}
-
-fn flush_text(
-    pending: PendingText,
-    out: &mut Vec<crate::model::RawMessage>,
-    turn: &mut u32,
-    tally: &crate::intake::Tally,
-) {
-    if pending.role == "user" {
-        if pending.text.trim().is_empty() {
-            for _ in 0..pending.source_parts {
-                tally.skip(crate::intake::Skip::EmptyText);
-            }
-            return;
-        }
-        if is_wrapper(&pending.text) {
-            for _ in 0..pending.source_parts {
-                tally.skip(crate::intake::Skip::Wrapper);
-            }
-            return;
-        }
-        for _ in 1..pending.source_parts {
-            tally.skip(crate::intake::Skip::NonMessage);
-        }
-        tally.row();
-        out.push(crate::model::RawMessage {
-            agent: "opencode",
-            project: project_name(&pending.directory),
-            session: pending.session,
-            ts: pending.ts,
-            turn: *turn,
-            text: pending.text,
-            model: String::new(),
-            reply: String::new(),
-            reply_chars: 0,
-            side: !pending.parent.is_empty(),
-            parent: pending.parent,
-            reply_shape: Default::default(),
-        });
-        *turn += 1;
-    } else if pending.role == "assistant" {
-        if let Some(last) = out
-            .last_mut()
-            .filter(|message| message.session == pending.session)
-        {
-            crate::ingest::append_reply(last, &pending.text);
-            crate::ingest::ReplyOrder::joined_known(&mut last.reply_shape, pending.worked);
-
-            if last.model.is_empty() && !pending.model.is_empty() {
-                last.model = pending.model;
-            }
-        }
-    }
-}
-
 /// One row per readable text/tool unit, shaped identically for both schemas so the
 /// accumulation pipeline below stays shared. SQLite filters, extracts, and caps
 /// fields before they cross the FFI. SQLite text functions stop at embedded NUL,
@@ -351,87 +284,35 @@ const PART_SQL_V2: &str = "SELECT m.session_id, s.directory, m.time_created, m.i
 const CHILD_SQL_V2: &str = "SELECT id, parent_id, COALESCE(title,''), time_created \
      FROM session_v2 WHERE parent_id IS NOT NULL AND parent_id != ''";
 
-/// Pull messages and tool events from one opencode database in one scan.
-fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>, ReadOutcome) {
-    // seen = message-query part rows plus inspected child-session rows
-    let tally = crate::intake::tally();
-    let conn = match crate::ingest::open_sqlite_ro(path) {
-        Ok(c) => c,
-        Err(e) => {
-            // the file exists (callers filter on that), so a failed open is real news
-            crate::intake::diagnostic(format_args!(
-                "  ! opencode: cannot open {}: {}",
-                crate::ingest::terminal_safe(path.display()),
-                crate::ingest::terminal_safe(&e)
-            ));
-            tally.error(&format!("cannot open: {e}"));
-            crate::ingest::note_read_failure(path, e.to_string());
-            // A database that moved under its snapshot is read again by the next pass; a lock or
-            // a journal may clear or persist, and a defect no retry heals is unreadable.
-            let outcome = if crate::ingest::sqlite_open_moved(&e) {
-                ReadOutcome::Moved
-            } else if crate::ingest::sqlite_open_defect(path, &e).is_some() {
-                ReadOutcome::Invalid
-            } else {
-                ReadOutcome::Unavailable
-            };
-            return (Vec::new(), Vec::new(), outcome);
-        }
-    };
-    // opencode 2.x migrates in place and drops the v1 tables, so table presence is
-    // the schema authority; an unreadable sqlite_master is a failed read, not v1.
-    let v2 = match conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master \
-         WHERE type='table' AND name='session_message')",
-        [],
-        |row| row.get::<_, i64>(0),
-    ) {
-        Ok(flag) => flag != 0,
-        Err(e) => {
-            tally.error(&format!("schema probe: {e}"));
-            return (Vec::new(), Vec::new(), ReadOutcome::Invalid);
-        }
-    };
-    let (part_sql, child_sql) = if v2 {
-        (PART_SQL_V2, CHILD_SQL_V2)
-    } else {
-        (PART_SQL_V1, CHILD_SQL_V1)
-    };
+/// One part row of `PART_SQL_V1`/`PART_SQL_V2`, by column position.
+struct PartRow {
+    session_id: String,
+    directory: Option<String>,
+    m_ts: i64,
+    m_id: String,
+    role: Option<String>,
+    model: Option<String>,
+    p_ty: String,
+    p_text: Option<String>,
+    tool: Option<String>,
+    call_id: Option<String>,
+    status: Option<String>,
+    input: Option<String>,
+    output: String,
+    output_chars: usize,
+    output_bytes: usize,
+    p_ts: i64,
+    p_id: String,
+    parent_id: String,
+    /// whether a session row exists at all (LEFT JOIN); text parts without one are dropped
+    has_session: bool,
+    message_json_valid: bool,
+    part_json_valid: bool,
+}
 
-    let mut stmt = match conn.prepare(part_sql) {
-        Ok(s) => s,
-        Err(e) => {
-            tally.error(&format!("part query: {e}"));
-            return (Vec::new(), Vec::new(), ReadOutcome::Invalid);
-        }
-    };
-
-    struct Row {
-        session_id: String,
-        directory: Option<String>,
-        m_ts: i64,
-        m_id: String,
-        role: Option<String>,
-        model: Option<String>,
-        p_ty: String,
-        p_text: Option<String>,
-        tool: Option<String>,
-        call_id: Option<String>,
-        status: Option<String>,
-        input: Option<String>,
-        output: String,
-        output_chars: usize,
-        output_bytes: usize,
-        p_ts: i64,
-        p_id: String,
-        parent_id: String,
-        /// whether a session row exists at all (LEFT JOIN); text parts without one are dropped
-        has_session: bool,
-        message_json_valid: bool,
-        part_json_valid: bool,
-    }
-    let rows = match stmt.query_map([], |row| {
-        Ok(Row {
+impl PartRow {
+    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
             session_id: row.get(0)?,
             directory: row.get(1)?,
             m_ts: row.get(2)?,
@@ -460,62 +341,113 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>, ReadOutcome)
             message_json_valid: row.get::<_, i64>(19)? != 0,
             part_json_valid: row.get::<_, i64>(20)? != 0,
         })
-    }) {
-        Ok(r) => r,
-        Err(e) => {
-            tally.error(&format!("part rows: {e}"));
-            return (Vec::new(), Vec::new(), ReadOutcome::Invalid);
-        }
-    };
+    }
+}
 
-    let mut out: Vec<crate::model::RawMessage> = Vec::new();
-    let mut turn = 0u32;
-    let mut pending: Option<PendingText> = None;
+/// A text part that passed the per-part filters, on its way into its message.
+struct TextPart {
+    session: String,
+    message_id: String,
+    directory: String,
+    parent: String,
+    ts: i64,
+    role: String,
+    model: String,
+    text: String,
+}
+
+#[derive(Default)]
+struct PendingText {
+    session: String,
+    message_id: String,
+    directory: String,
+    parent: String,
+    ts: i64,
+    role: String,
+    model: String,
+    text: String,
+    source_parts: u64,
+    /// A work part came between the previous prose and this message's first text part.
+    worked: bool,
+}
+
+/// One database's part-row scan: text parts join per message into user rows carrying
+/// their assistant replies; tool parts are buffered for `tool_events`.
+struct PartScan<'t> {
+    tally: &'t Tally,
+    out: Vec<RawMessage>,
+    turn: u32,
+    pending: Option<PendingText>,
     // part rows arrive in store order (message time, then part key): a work part sets the
     // flag the next prose consumes; a prompt opens a turn with none
-    let mut worked = false;
-    let mut worked_session = String::new();
-
+    worked: bool,
+    worked_session: String,
     // Tool rows are buffered, then sorted by (session, part time, part id) before becoming Events.
-    let mut tool_rows: Vec<Row> = Vec::new();
+    tool_rows: Vec<PartRow>,
     // False when any part row, JSON-validity check, or row conversion failed; signals that
     // some data was skipped, so cached rows from prior scans may not safely be replaced.
-    let mut main_scope_covered = true;
+    covered: bool,
+}
 
-    for r in rows {
-        tally.seen();
-        let r = match r {
-            Ok(r) => r,
+impl<'t> PartScan<'t> {
+    fn new(tally: &'t Tally) -> Self {
+        Self {
+            tally,
+            out: Vec::new(),
+            turn: 0,
+            pending: None,
+            worked: false,
+            worked_session: String::new(),
+            tool_rows: Vec::new(),
+            covered: true,
+        }
+    }
+
+    fn row(&mut self, row: rusqlite::Result<PartRow>) {
+        self.tally.seen();
+        let row = match row {
+            Ok(row) => row,
             Err(e) => {
-                tally.error(&format!("part row: {e}"));
-                main_scope_covered = false;
-                continue;
+                self.tally.error(&format!("part row: {e}"));
+                self.covered = false;
+                return;
             }
         };
-        if !r.part_json_valid {
-            tally.error(&format!("malformed part JSON: {}", r.p_id));
-            main_scope_covered = false;
-            continue;
+        if !row.part_json_valid {
+            self.tally
+                .error(&format!("malformed part JSON: {}", row.p_id));
+            self.covered = false;
+            return;
         }
-        if !r.message_json_valid {
-            tally.error(&format!("malformed message JSON: {}", r.m_id));
-            main_scope_covered = false;
-            continue;
+        if !row.message_json_valid {
+            self.tally
+                .error(&format!("malformed message JSON: {}", row.m_id));
+            self.covered = false;
+            return;
         }
-        if r.session_id != worked_session {
-            worked_session.clone_from(&r.session_id);
-            worked = false;
+        if row.session_id != self.worked_session {
+            self.worked_session.clone_from(&row.session_id);
+            self.worked = false;
         }
-        if r.p_ty == "tool" {
-            tally.agent_row();
-            worked |= !r
-                .tool
-                .as_deref()
-                .is_some_and(crate::ingest::is_bookkeeping_tool);
-            tool_rows.push(r);
-            continue;
+        if row.p_ty == "tool" {
+            self.tool_row(row);
+        } else if let Some(part) = self.text_part(row) {
+            self.append_text(part);
         }
-        let Row {
+    }
+
+    fn tool_row(&mut self, row: PartRow) {
+        self.tally.agent_row();
+        self.worked |= !row
+            .tool
+            .as_deref()
+            .is_some_and(crate::ingest::is_bookkeeping_tool);
+        self.tool_rows.push(row);
+    }
+
+    /// The row's text part, or None (counted) when a per-part filter drops it.
+    fn text_part(&self, row: PartRow) -> Option<TextPart> {
+        let PartRow {
             session_id,
             directory,
             m_ts,
@@ -526,206 +458,368 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>, ReadOutcome)
             parent_id,
             has_session,
             ..
-        } = r;
+        } = row;
         // Drop text parts without a session row.
         if !has_session {
-            tally.skip(crate::intake::Skip::Meta);
-            continue;
+            self.tally.skip(Skip::Meta);
+            return None;
         }
         let directory = directory.unwrap_or_default();
         let role = role.unwrap_or_default();
         let model = model.unwrap_or_default();
         if role != "user" && role != "assistant" {
-            tally.skip(crate::intake::Skip::NonHuman);
-            continue;
+            self.tally.skip(Skip::NonHuman);
+            return None;
         }
-        let ptext = match p_text {
+        let text = match p_text {
             Some(t) if !t.trim().is_empty() => t,
             _ => {
-                tally.skip(crate::intake::Skip::EmptyText);
-                continue;
+                self.tally.skip(Skip::EmptyText);
+                return None;
             }
         };
         // Drop opencode-injected wrappers at the PART level - user turns only (the
         // assistant's prose is what we want to keep verbatim as the reply).
-        if role == "user" && is_injected_part(&ptext) {
-            tally.skip(crate::intake::Skip::Wrapper);
-            continue;
+        if role == "user" && is_injected_part(&text) {
+            self.tally.skip(Skip::Wrapper);
+            return None;
         }
         if role == "assistant" {
-            tally.agent_row();
+            self.tally.agent_row();
         }
+        Some(TextPart {
+            session: session_id,
+            message_id: m_id,
+            directory,
+            parent: parent_id,
+            ts: m_ts,
+            role,
+            model,
+            text,
+        })
+    }
 
-        if pending
-            .as_ref()
-            .is_some_and(|current| current.session != session_id)
+    fn append_text(&mut self, part: TextPart) {
+        if let Some(previous) = self
+            .pending
+            .take_if(|current| current.session != part.session)
         {
-            flush_text(
-                pending.take().expect("pending row"),
-                &mut out,
-                &mut turn,
-                &tally,
-            );
-            turn = 0;
+            self.flush(previous);
+            self.turn = 0;
         }
-
-        if pending
+        if self
+            .pending
             .as_ref()
-            .is_none_or(|current| current.message_id != m_id)
+            .is_none_or(|current| current.message_id != part.message_id)
         {
-            if let Some(current) = pending.take() {
-                flush_text(current, &mut out, &mut turn, &tally);
+            if let Some(previous) = self.pending.take() {
+                self.flush(previous);
             }
-            let worked_before = std::mem::take(&mut worked);
-            pending = Some(PendingText {
-                session: session_id,
-                message_id: m_id,
-                directory,
-                parent: parent_id,
-                ts: m_ts,
-                worked: role == "assistant" && worked_before,
-                role,
-                model,
+            let worked_before = std::mem::take(&mut self.worked);
+            self.pending = Some(PendingText {
+                session: part.session,
+                message_id: part.message_id,
+                directory: part.directory,
+                parent: part.parent,
+                ts: part.ts,
+                worked: part.role == "assistant" && worked_before,
+                role: part.role,
+                model: part.model,
                 ..PendingText::default()
             });
         }
-
-        let current = pending
+        let current = self
+            .pending
             .as_mut()
             .expect("a text row must have an accumulator");
         if !current.text.is_empty() {
             current.text.push('\n');
         }
-        current.text.push_str(&ptext);
+        current.text.push_str(&part.text);
         current.source_parts += 1;
     }
-    if let Some(current) = pending {
-        flush_text(current, &mut out, &mut turn, &tally);
+
+    fn flush(&mut self, pending: PendingText) {
+        if pending.role == "user" {
+            self.flush_user(pending);
+        } else if pending.role == "assistant" {
+            self.join_reply(pending);
+        }
     }
 
-    tool_rows.sort_by(|a, b| {
+    fn flush_user(&mut self, pending: PendingText) {
+        if pending.text.trim().is_empty() {
+            self.tally.skip_n(Skip::EmptyText, pending.source_parts);
+            return;
+        }
+        if is_wrapper(&pending.text) {
+            self.tally.skip_n(Skip::Wrapper, pending.source_parts);
+            return;
+        }
+        self.tally
+            .skip_n(Skip::NonMessage, pending.source_parts.saturating_sub(1));
+        self.tally.row();
+        self.out.push(RawMessage {
+            agent: "opencode",
+            project: project_name(&pending.directory),
+            session: pending.session,
+            ts: pending.ts,
+            turn: self.turn,
+            text: pending.text,
+            model: String::new(),
+            reply: String::new(),
+            reply_chars: 0,
+            side: !pending.parent.is_empty(),
+            parent: pending.parent,
+            reply_shape: Default::default(),
+        });
+        self.turn += 1;
+    }
+
+    fn join_reply(&mut self, pending: PendingText) {
+        let Some(last) = self
+            .out
+            .last_mut()
+            .filter(|message| message.session == pending.session)
+        else {
+            return;
+        };
+        crate::ingest::append_reply(last, &pending.text);
+        crate::ingest::ReplyOrder::joined_known(&mut last.reply_shape, pending.worked);
+        if last.model.is_empty() && !pending.model.is_empty() {
+            last.model = pending.model;
+        }
+    }
+
+    /// The user rows, the buffered tool rows and whether every part row was read.
+    fn finish(mut self) -> (Vec<RawMessage>, Vec<PartRow>, bool) {
+        if let Some(current) = self.pending.take() {
+            self.flush(current);
+        }
+        (self.out, self.tool_rows, self.covered)
+    }
+}
+
+fn tool_events(mut rows: Vec<PartRow>, tally: &Tally) -> Vec<Event> {
+    rows.sort_by(|a, b| {
         a.session_id
             .cmp(&b.session_id)
             .then(a.p_ts.cmp(&b.p_ts))
             .then(a.p_id.cmp(&b.p_id))
     });
-    let mut events: Vec<Event> = Vec::with_capacity(tool_rows.len());
-    for r in tool_rows {
-        let name = r.tool.unwrap_or_else(|| "?".to_string());
-        let args = r
-            .input
-            .as_deref()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
-        let (input, input_chars) = args
-            .as_ref()
-            .map(summarize_tool_input_with_chars)
-            .unwrap_or_default();
-        let state = crate::ingest::task_state(&name, args.as_ref());
-        let recovered_nul_output = r.output.contains('\0');
-        let (output, output_chars, output_bytes) = if recovered_nul_output {
-            cap_event_output(&r.output)
-        } else {
-            (
-                cap_str(&r.output, EVENT_CAP),
-                r.output_chars,
-                r.output_bytes,
-            )
-        };
-        let ok = match r.status.as_deref() {
-            Some("completed") => Some(true),
-            Some("error") => Some(false),
-            _ => None,
-        };
+    let mut events: Vec<Event> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let event = tool_event(row);
         tally.event();
-        events.push(Event {
-            turn: None,
-            agent: "opencode",
-            session: r.session_id,
-            ts: r.p_ts,
-            kind: "tool",
-            name,
-            input,
-            output,
-            input_chars,
-            output_chars,
-            output_bytes,
-            ok,
-            call_id: r.call_id.unwrap_or(r.p_id),
-            child_session: String::new(),
-            meta: String::new(),
-            state,
-        });
+        events.push(event);
     }
+    events
+}
 
-    // Subagent sessions: a child session (parent_id set) becomes a subagent_start event
-    // in the parent. The child is independently viewable, so just link it.
-    let child_query = conn.prepare(child_sql);
-    // A child row or query the reader could not decode leaves that link unobserved, not
-    // absent; the subagent scope is then uncovered and cannot license wholesale replacement.
-    let mut child_scope_covered = true;
-    match child_query {
-        Ok(mut stmt) => match stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-            ))
-        }) {
-            Ok(srows) => {
-                for row in srows {
-                    tally.seen();
-                    let (child, parent, title, ts) = match row {
-                        Ok(row) => row,
-                        Err(e) => {
-                            tally.error(&format!("session row: {e}"));
-                            child_scope_covered = false;
-                            continue;
-                        }
-                    };
-                    tally.agent_row();
-                    tally.event();
-                    events.push(Event {
-                        turn: None,
-                        agent: "opencode",
-                        session: parent,
-                        ts,
-                        kind: "subagent_start",
-                        name: if title.is_empty() {
-                            "subagent".to_string()
-                        } else {
-                            cap_str(&title, 200)
-                        },
-                        input: String::new(),
-                        output: String::new(),
-                        input_chars: 0,
-                        output_chars: 0,
-                        output_bytes: 0,
-                        ok: None,
-                        call_id: child.clone(),
-                        child_session: child,
-                        meta: String::new(),
-                        state: String::new(),
-                    });
-                }
-            }
-            Err(e) => {
-                tally.seen();
-                tally.error(&format!("session rows: {e}"));
-                child_scope_covered = false;
-            }
-        },
+fn tool_event(r: PartRow) -> Event {
+    let name = r.tool.unwrap_or_else(|| "?".to_string());
+    let args = r
+        .input
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+    let (input, input_chars) = args
+        .as_ref()
+        .map(summarize_tool_input_with_chars)
+        .unwrap_or_default();
+    let state = crate::ingest::task_state(&name, args.as_ref());
+    let recovered_nul_output = r.output.contains('\0');
+    let (output, output_chars, output_bytes) = if recovered_nul_output {
+        cap_event_output(&r.output)
+    } else {
+        (
+            cap_str(&r.output, EVENT_CAP),
+            r.output_chars,
+            r.output_bytes,
+        )
+    };
+    let ok = match r.status.as_deref() {
+        Some("completed") => Some(true),
+        Some("error") => Some(false),
+        _ => None,
+    };
+    Event {
+        turn: None,
+        agent: "opencode",
+        session: r.session_id,
+        ts: r.p_ts,
+        kind: "tool",
+        name,
+        input,
+        output,
+        input_chars,
+        output_chars,
+        output_bytes,
+        ok,
+        call_id: r.call_id.unwrap_or(r.p_id),
+        child_session: String::new(),
+        meta: String::new(),
+        state,
+    }
+}
+
+/// Subagent sessions: a child session (parent_id set) becomes a subagent_start event
+/// in the parent. The child is independently viewable, so just link it.
+/// Returns false when a child row or query the reader could not decode leaves that link
+/// unobserved, not absent; the subagent scope is then uncovered and cannot license
+/// wholesale replacement.
+fn push_subagent_starts(
+    conn: &rusqlite::Connection,
+    child_sql: &str,
+    tally: &Tally,
+    events: &mut Vec<Event>,
+) -> bool {
+    let mut stmt = match conn.prepare(child_sql) {
+        Ok(stmt) => stmt,
         Err(e) => {
             tally.seen();
             tally.error(&format!("session query: {e}"));
-            child_scope_covered = false;
+            return false;
         }
+    };
+    let rows = match stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tally.seen();
+            tally.error(&format!("session rows: {e}"));
+            return false;
+        }
+    };
+    let mut covered = true;
+    for row in rows {
+        tally.seen();
+        let (child, parent, title, ts) = match row {
+            Ok(row) => row,
+            Err(e) => {
+                tally.error(&format!("session row: {e}"));
+                covered = false;
+                continue;
+            }
+        };
+        tally.agent_row();
+        tally.event();
+        events.push(subagent_start(child, parent, &title, ts));
     }
+    covered
+}
 
+fn subagent_start(child: String, parent: String, title: &str, ts: i64) -> Event {
+    Event {
+        turn: None,
+        agent: "opencode",
+        session: parent,
+        ts,
+        kind: "subagent_start",
+        name: if title.is_empty() {
+            "subagent".to_string()
+        } else {
+            cap_str(title, 200)
+        },
+        input: String::new(),
+        output: String::new(),
+        input_chars: 0,
+        output_chars: 0,
+        output_bytes: 0,
+        ok: None,
+        call_id: child.clone(),
+        child_session: child,
+        meta: String::new(),
+        state: String::new(),
+    }
+}
+
+/// Reports a database that exists but would not open, and classifies the failure.
+fn open_failure(path: &Path, e: &rusqlite::Error, tally: &Tally) -> ReadOutcome {
+    // the file exists (callers filter on that), so a failed open is real news
+    crate::intake::diagnostic(format_args!(
+        "  ! opencode: cannot open {}: {}",
+        crate::ingest::terminal_safe(path.display()),
+        crate::ingest::terminal_safe(e)
+    ));
+    tally.error(&format!("cannot open: {e}"));
+    crate::ingest::note_read_failure(path, e.to_string());
+    // A database that moved under its snapshot is read again by the next pass; a lock or
+    // a journal may clear or persist, and a defect no retry heals is unreadable.
+    if crate::ingest::sqlite_open_moved(e) {
+        ReadOutcome::Moved
+    } else if crate::ingest::sqlite_open_defect(path, e).is_some() {
+        ReadOutcome::Invalid
+    } else {
+        ReadOutcome::Unavailable
+    }
+}
+
+/// The (part, child-session) queries for this database's schema; None when the probe fails.
+fn schema_queries(
+    conn: &rusqlite::Connection,
+    tally: &Tally,
+) -> Option<(&'static str, &'static str)> {
+    // opencode 2.x migrates in place and drops the v1 tables, so table presence is
+    // the schema authority; an unreadable sqlite_master is a failed read, not v1.
+    let v2 = match conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+         WHERE type='table' AND name='session_message')",
+        [],
+        |row| row.get::<_, i64>(0),
+    ) {
+        Ok(flag) => flag != 0,
+        Err(e) => {
+            tally.error(&format!("schema probe: {e}"));
+            return None;
+        }
+    };
+    Some(if v2 {
+        (PART_SQL_V2, CHILD_SQL_V2)
+    } else {
+        (PART_SQL_V1, CHILD_SQL_V1)
+    })
+}
+
+/// Pull messages and tool events from one opencode database in one scan.
+fn collect_db(path: &Path) -> (Vec<Message>, Vec<Event>, ReadOutcome) {
+    // seen = message-query part rows plus inspected child-session rows
+    let tally = crate::intake::tally();
+    let conn = match crate::ingest::open_sqlite_ro(path) {
+        Ok(c) => c,
+        Err(e) => return (Vec::new(), Vec::new(), open_failure(path, &e, &tally)),
+    };
+    let Some((part_sql, child_sql)) = schema_queries(&conn, &tally) else {
+        return (Vec::new(), Vec::new(), ReadOutcome::Invalid);
+    };
+    let mut stmt = match conn.prepare(part_sql) {
+        Ok(s) => s,
+        Err(e) => {
+            tally.error(&format!("part query: {e}"));
+            return (Vec::new(), Vec::new(), ReadOutcome::Invalid);
+        }
+    };
+    let rows = match stmt.query_map([], PartRow::read) {
+        Ok(r) => r,
+        Err(e) => {
+            tally.error(&format!("part rows: {e}"));
+            return (Vec::new(), Vec::new(), ReadOutcome::Invalid);
+        }
+    };
+    let mut scan = PartScan::new(&tally);
+    for row in rows {
+        scan.row(row);
+    }
+    let (out, tool_rows, main_scope_covered) = scan.finish();
+    let mut events = tool_events(tool_rows, &tally);
+    let child_scope_covered = push_subagent_starts(&conn, child_sql, &tally, &mut events);
     (
-        out.into_iter()
-            .map(crate::model::RawMessage::freeze)
-            .collect(),
+        out.into_iter().map(RawMessage::freeze).collect(),
         events,
         if child_scope_covered && main_scope_covered {
             ReadOutcome::Complete
