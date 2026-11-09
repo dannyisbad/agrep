@@ -141,6 +141,8 @@ pub struct SourceBatch {
     pub bytes_read: usize,
     pub bytes_parsed: usize,
     pub parse_ms: f64,
+    /// Working directory per session, for a source whose file does not open with one.
+    pub cwds: HashMap<String, String>,
 }
 #[derive(Default)]
 pub struct IntakeBatch {
@@ -159,6 +161,9 @@ pub struct IntakeBatch {
     /// as it is ready to write it.
     pub defer: bool,
     pub pending: Vec<Pending>,
+    /// Working directory per session from a whole-store (`Fingerprint::Always`) adapter,
+    /// carried into the batch built from its pass.
+    pub cwds: HashMap<String, String>,
 }
 type Parse = dyn Fn(&Path) -> (Vec<Message>, Vec<Event>, Option<ReadOutcome>) + Send + Sync;
 /// A changed file source and everything its parse needs.
@@ -246,14 +251,6 @@ pub fn epoch_ns(t: SystemTime) -> Option<i64> {
     t.duration_since(SystemTime::UNIX_EPOCH)
         .ok()
         .and_then(|d| i64::try_from(d.as_nanos()).ok())
-}
-pub fn racy_stamp(stamp: i64, start: i64, now: i64) -> bool {
-    let mut granule = 1;
-    while granule < 1_000_000_000 && stamp % (granule * 10) == 0 {
-        granule *= 10;
-    }
-    let margin = granule.max(20_000_000);
-    stamp > start.saturating_sub(margin) && stamp <= now.saturating_add(2_000_000_000)
 }
 pub fn collect_cached_retiring_for<F, R>(
     c: &mut IntakeBatch,

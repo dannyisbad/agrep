@@ -11,6 +11,18 @@ pub fn search_with(c: &Connection, o: &Options, plans: &mut Plans) -> Result<Res
     if o.filters.no_meta && (o.count_only || o.count_by_tier) {
         bail!("--no-meta cannot narrow -c/--count-by-tier; machine counts keep grep parity");
     }
+    // 0.4.9's keyword lane found no row for a pattern without a word, such as `_`
+    // (py/corpusdb.py:4757-4758, 4817-4818).
+    if !o.regex
+        && !o.word
+        && !o.pattern.trim().is_empty()
+        && boundary_rank::query_tokens(&o.pattern).is_empty()
+    {
+        return Ok(Results {
+            total_basis: "exact".into(),
+            ..Default::default()
+        });
+    }
     let started = Instant::now();
     plans.0.scopes.clear();
     let mut result = if o.filters.no_meta {

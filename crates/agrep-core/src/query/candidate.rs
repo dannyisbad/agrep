@@ -5,6 +5,7 @@ pub(super) struct RowContext<'a, 'p> {
     pub(super) plan: &'p TablePlan<'a>,
     pub(super) coverage: Option<&'p CoverageBounds>,
     pub(super) admitted: Option<&'p HashMap<i64, Vec<i64>>>,
+    pub(super) anchored: Option<&'p HashMap<i64, Vec<i64>>>,
     pub(super) occurrences: Option<&'p HashMap<i64, u32>>,
     pub(super) eager_prose: bool,
     pub(super) lazy_identity: bool,
@@ -80,7 +81,7 @@ impl<'a, 'p, 'row, 'stmt> Candidate<'a, 'p, 'row, 'stmt> {
         if self.excluded_by_ceiling(&metadata, cutoff.as_ref(), result)? {
             return Ok(());
         }
-        if let Some(admitted) = admitted {
+        for admitted in [admitted, self.ctx.anchored].into_iter().flatten() {
             let id: i64 = r.get(0)?;
             if admitted
                 .get(&(id / BLOCK))

@@ -67,18 +67,22 @@ fn refresh_inner(
         });
     }
     let first = !root.db().exists();
+    // A rebuild writes a new database as a first build does and then replaces the live one,
+    // which readers keep using meanwhile; a crash leaves it whole.
+    let fresh = first || rebuild;
     let initial = root.path().join("index.building.db");
-    if first {
+    if fresh || initial.exists() {
+        // Left by a build that did not finish.
         clear_initial(&initial)?;
     }
     let opening = Instant::now();
-    let mut c = if first {
+    let mut c = if fresh {
         open_writer(&initial, false)?
     } else {
         writer(root)?
     };
     let open_ms = opening.elapsed().as_secs_f64() * 1000.;
-    if first {
+    if fresh {
         defer_initial_bookkeeping(&c)?;
     }
     let old = {
@@ -101,13 +105,17 @@ fn refresh_inner(
         open_ms,
         ..Default::default()
     };
-    if changed.is_empty() && removed.is_empty() && !first {
+    if changed.is_empty() && removed.is_empty() && !fresh {
         info.total_ms = start.elapsed().as_secs_f64() * 1000.;
         return Ok(info);
     }
     if first {
         // 0.4.9's notice (py/indexd_runtime.py:944-946): the size is unknown here.
-        eprintln!("building the search db (a first build can take a while on a large history) …");
+        crate::errln!(
+            "building the search db (a first build can take a while on a large history) …"
+        );
+    } else if rebuild {
+        crate::errln!("rebuilding the search db (a rebuild can take a while on a large history) …");
     }
     let changed_stamps: Vec<_> = stamps
         .iter()
@@ -115,10 +123,10 @@ fn refresh_inner(
         .collect();
     let (active, cursors) = parsing_state(&c, &changed_stamps, &removed, &changed, full)?;
     let parse_start = Instant::now();
-    let parsers = parser_pool(first || full);
+    let parsers = parser_pool(fresh || full);
     let parser_width = std::thread::available_parallelism()
         .map_or(1, usize::from)
-        .min(if first || full { 8 } else { 4 });
+        .min(if fresh || full { 8 } else { 4 });
     let batches = Collection {
         root,
         stamps: &stamps,
@@ -144,10 +152,7 @@ fn refresh_inner(
     if scope.is_none() {
         crate::freshness::save(&tx, &census)?;
     }
-    if rebuild {
-        clear_rebuilt_rows(&tx)?;
-    }
-    let mut state = RefreshState::new(parsers, first, rebuild);
+    let mut state = RefreshState::new(parsers, fresh);
     for key in &removed {
         state.retire_source(&tx, key)?;
         tx.execute("DELETE FROM sources WHERE path=?", [key])?;
@@ -176,14 +181,13 @@ fn refresh_inner(
             .insert(adapter, adapter_write_start.elapsed().as_secs_f64() * 1000.);
     }
     let errors = state.finish(&tx, &mut info, stamps, &changed, parse_wait, write_start)?;
-    // 0.4.9 listed a chat only through its turns (py/corpusdb.py:2221-2234).
     tx.execute("INSERT INTO state VALUES('refreshed',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[chrono::Utc::now().timestamp_millis().to_string()])?;
     if scope.is_none() {
         tx.execute("INSERT INTO state VALUES('harness',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[policy_digest])?;
     }
     let phase = Instant::now();
     tx.commit()?;
-    close_refresh(c, first, &initial, root)?;
+    close_refresh(c, fresh, &initial, root, rebuild && !first)?;
     info.commit_ms = phase.elapsed().as_secs_f64() * 1000.;
     let (row_ns, fts_ns) = WRITE_TIMES.get();
     info.row_diff_ms = row_ns as f64 / 1_000_000.;
@@ -205,7 +209,6 @@ struct Collection<'a> {
 }
 struct RefreshState {
     first: bool,
-    rebuild: bool,
     changes: Changes,
     turnless_before: HashSet<(String, String)>,
     canonical_sessions: HashSet<(String, String)>,
@@ -215,16 +218,11 @@ struct RefreshState {
     pages: crate::incremental::GraphPages,
 }
 impl RefreshState {
-    fn new(
-        parsers: &'static std::sync::LazyLock<rayon::ThreadPool>,
-        first: bool,
-        rebuild: bool,
-    ) -> Self {
+    fn new(parsers: &'static std::sync::LazyLock<rayon::ThreadPool>, first: bool) -> Self {
         Self {
             first,
-            rebuild,
             changes: Changes {
-                bulk: first || rebuild,
+                bulk: first,
                 ..Default::default()
             },
             turnless_before: HashSet::new(),
@@ -506,6 +504,7 @@ impl Collection<'_> {
                     } else {
                         Some(format!("{} source parse incomplete", a.name()))
                     },
+                    cwds: std::mem::take(&mut batch.cwds),
                     ..Default::default()
                 })
             }
@@ -532,57 +531,6 @@ impl Collection<'_> {
         };
         Ok(batches)
     }
-}
-
-fn clear_rebuilt_rows(tx: &Transaction<'_>) -> Result<()> {
-    for t in ["prose", "tools"] {
-        if t == "prose" {
-            tx.execute("DELETE FROM prose", [])?;
-        }
-        tx.execute(&format!("DELETE FROM {t}_fts"), [])?;
-        tx.execute(&format!("DELETE FROM {t}_case_fts"), [])?;
-    }
-    tx.execute("DELETE FROM event_rows", [])?;
-    tx.execute("DELETE FROM sessions", [])?;
-    tx.execute("DELETE FROM gram_postings", [])?;
-    tx.execute("DELETE FROM block_grams", [])?;
-    tx.execute("DELETE FROM blocks", [])?;
-    tx.execute("DELETE FROM tool_blocks", [])?;
-    for table in [
-        "family_nodes",
-        "family_alias_claims",
-        "reply_shapes",
-        "term_stats",
-        "parser_cursors",
-        "parser_graph",
-        "row_stats",
-        "family_token_counts",
-        "stats_dirty",
-        "session_sources",
-        "tool_words",
-        "tool_word_blocks",
-        "tool_trigrams",
-        "bound_rebuild",
-        "gram_raises",
-        "tool_lexicon",
-        "tool_word_dirty",
-        "tool_word_batch",
-        "prose_terms",
-        "tool_blob_sources",
-        "tool_blobs",
-        "blob_gc",
-        "event_sessions",
-        // Every source is reparsed; emptying it gives the rows the source ids a first build
-        // assigns rather than ids left by sources added and removed since then.
-        "sources",
-    ] {
-        tx.execute(&format!("DELETE FROM {table}"), [])?;
-    }
-    // Symbol 0 is the empty value the schema seeds and the tool writer refers to without
-    // inserting it; without it every empty project or model of a tool row reads as NULL.
-    // Re-seeding it, rather than sparing it, also repairs an index rebuilt without it.
-    tx.execute_batch("DELETE FROM symbols; INSERT INTO symbols VALUES(0,'');")?;
-    Ok(())
 }
 
 impl RefreshState {
@@ -648,7 +596,6 @@ impl RefreshState {
     ) -> Result<()> {
         let Self {
             first,
-            rebuild,
             canonical_sessions,
             forced_sessions,
             fast_sessions,
@@ -686,9 +633,7 @@ impl RefreshState {
                     .map(|e| (e.agent.to_string(), e.session.clone())),
             )
             .collect();
-        // A rebuild starts from emptied tables, so like a first build no chat was turnless
-        // before it; recording them would re-key their tool rows to the chat's project.
-        if !first && !*rebuild {
+        if !first {
             for (agent, session) in &changed_sessions {
                 if !tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM prose INDEXED BY prose_session WHERE agent=?1 AND session=?2)")?.query_row(params![agent,session], |r| r.get::<_,bool>(0))? {
                 turnless_before.insert((agent.clone(),session.clone()));
@@ -758,7 +703,6 @@ impl RefreshState {
     ) -> Result<usize> {
         let Self {
             first,
-            rebuild,
             mut changes,
             turnless_before,
             canonical_sessions,
@@ -780,18 +724,12 @@ impl RefreshState {
         fast_sessions.retain(|s| !forced_sessions.contains(s));
         let phase = Instant::now();
         canonicalize(tx, &canonical_sessions, &fast_sessions, &mut changes, first)?;
-        settle_turnless(
-            tx,
-            &turnless_before,
-            &canonical_sessions,
-            &mut changes,
-            first,
-        )?;
+        settle_turnless(tx, &turnless_before, &canonical_sessions, first)?;
         info.canonical_ms = phase.elapsed().as_secs_f64() * 1000.;
         changes.fts.apply(tx)?;
         let presence = if first { build_fts(tx)? } else { None };
         let phase = Instant::now();
-        crate::tool_index::refresh(tx, first || rebuild, presence)?;
+        crate::tool_index::refresh(tx, first, presence)?;
         info.dictionary_ms = phase.elapsed().as_secs_f64() * 1000.;
         // Sources parse while earlier ones are written; only the writer's waits for a
         // parse count as parsing.
@@ -802,7 +740,7 @@ impl RefreshState {
             .as_secs_f64()
             * 1000.;
         let phase = Instant::now();
-        if first || rebuild {
+        if first {
             update_blocks(tx, &changes.blocks, None)?;
         } else {
             raise_changed_bounds(tx, &mut changes)?;
@@ -811,7 +749,7 @@ impl RefreshState {
         tx.execute("DELETE FROM tool_bound_updates", [])?;
         info.bounds_ms = phase.elapsed().as_secs_f64() * 1000.;
         let phase = Instant::now();
-        finish_statistics(tx, first, rebuild, &canonical_sessions)?;
+        finish_statistics(tx, first, &canonical_sessions)?;
         info.stats_ms = phase.elapsed().as_secs_f64() * 1000.;
         Ok(errors.len())
     }
@@ -822,14 +760,23 @@ fn save_source_stamps(
     changed: &HashSet<PathBuf>,
     errors: &HashMap<String, String>,
 ) -> Result<()> {
+    // A source the census could not stamp fails for that reason; reading it then fails too,
+    // but only as a consequence.
+    let mut stamped_failures = HashSet::new();
     for s in stamps {
-        let error = errors.get(&s.path).cloned().or(s.error).or_else(|| {
-            errors.iter().find_map(|(path, error)| {
-                Path::new(&s.path)
-                    .starts_with(Path::new(path))
-                    .then(|| error.clone())
-            })
-        });
+        if s.error.is_some() {
+            stamped_failures.insert(s.path.clone());
+        }
+        let error = s
+            .error
+            .or_else(|| errors.get(&s.path).cloned())
+            .or_else(|| {
+                errors.iter().find_map(|(path, error)| {
+                    Path::new(&s.path)
+                        .starts_with(Path::new(path))
+                        .then(|| error.clone())
+                })
+            });
         if !changed.contains(Path::new(&s.path)) {
             if let Some(error) = error {
                 tx.prepare_cached(
@@ -841,7 +788,10 @@ fn save_source_stamps(
         }
         tx.prepare_cached("INSERT INTO sources VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(path) DO UPDATE SET size=?3,mtime_ns=?4,change_token=?5,last_error=?6")?.execute(params![s.path,s.agent,s.size,s.mtime_ns,s.token,error])?;
     }
-    for (path, error) in errors {
+    for (path, error) in errors
+        .iter()
+        .filter(|(path, _)| !stamped_failures.contains(*path))
+    {
         tx.execute(
             "UPDATE sources SET last_error=?2 WHERE path=?1",
             params![path, error],
@@ -853,19 +803,19 @@ fn save_source_stamps(
 fn finish_statistics(
     tx: &Transaction<'_>,
     first: bool,
-    rebuild: bool,
     canonical_sessions: &HashSet<(String, String)>,
 ) -> Result<()> {
+    // A chat is listed while search holds any of its rows: a turn, or a tool call.
     if first {
-        tx.execute("DELETE FROM sessions WHERE NOT EXISTS(SELECT 1 FROM prose p INDEXED BY prose_session WHERE p.agent=sessions.agent AND p.session=sessions.id)",[])?;
+        tx.execute("DELETE FROM sessions WHERE NOT EXISTS(SELECT 1 FROM prose p INDEXED BY prose_session WHERE p.agent=sessions.agent AND p.session=sessions.id) AND NOT EXISTS(SELECT 1 FROM event_sessions es JOIN event_rows e ON e.session_key=es.id WHERE es.agent=sessions.agent AND es.session=sessions.id AND e.active=1 AND e.blob IS NOT NULL)",[])?;
     } else {
-        let mut q = tx.prepare_cached("DELETE FROM sessions WHERE agent=?1 AND id=?2 AND NOT EXISTS(SELECT 1 FROM prose p INDEXED BY prose_session WHERE p.agent=?1 AND p.session=?2)")?;
+        let mut q = tx.prepare_cached("DELETE FROM sessions WHERE agent=?1 AND id=?2 AND NOT EXISTS(SELECT 1 FROM prose p INDEXED BY prose_session WHERE p.agent=?1 AND p.session=?2) AND NOT EXISTS(SELECT 1 FROM event_sessions es JOIN event_rows e ON e.session_key=es.id WHERE es.agent=?1 AND es.session=?2 AND e.active=1 AND e.blob IS NOT NULL)")?;
         for (agent, session) in canonical_sessions {
             q.execute(params![agent, session])?;
         }
     }
     resolve_families(tx, canonical_sessions)?;
-    crate::prose_index::refresh(tx, first || rebuild)?;
+    crate::prose_index::refresh(tx, first)?;
     if first {
         crate::row_stats::build(tx)?;
     } else {
@@ -890,24 +840,108 @@ fn finish_statistics(
     Ok(())
 }
 
-fn close_refresh(c: Connection, first: bool, initial: &Path, root: &DataRoot) -> Result<()> {
-    if first {
-        c.execute_batch("PRAGMA journal_mode=WAL;")?;
-        c.close().map_err(|(_, e)| e)?;
-        // A connection that has not used the FTS tables caches none of their structures.
-        let mut sealing = open_writer(initial, true)?;
-        let tx = sealing.transaction()?;
-        crate::fts_segments::seal(&tx)?;
-        tx.commit()?;
-        sealing.close().map_err(|(_, e)| e)?;
+/// Seals a new database and puts it in place of `index.db`: renamed, for a first build, or
+/// installed over the live index, for a rebuild (see [`install`]).
+fn close_refresh(
+    c: Connection,
+    fresh: bool,
+    initial: &Path,
+    root: &DataRoot,
+    replace: bool,
+) -> Result<()> {
+    if !fresh {
+        let _span = crate::semantic_profile::span("refresh_connection_close");
+        return c.close().map_err(|(_, e)| e.into());
+    }
+    c.execute_batch("PRAGMA journal_mode=WAL;")?;
+    c.close().map_err(|(_, e)| e)?;
+    // A connection that has not used the FTS tables caches none of their structures.
+    let mut sealing = open_writer(initial, true)?;
+    let tx = sealing.transaction()?;
+    crate::fts_segments::seal(&tx)?;
+    if replace {
+        carry(&reader(root)?, &tx)?;
+    }
+    tx.commit()?;
+    sealing.close().map_err(|(_, e)| e)?;
+    if replace {
+        install(initial, root)?;
+    } else {
         fs::rename(initial, root.db())?;
         #[cfg(unix)]
         fs::File::open(root.path())?.sync_all()?;
-    } else {
-        let _span = crate::semantic_profile::span("refresh_connection_close");
-        c.close().map_err(|(_, e)| e)?;
     }
     Ok(())
+}
+
+/// Replaces the live index with the rebuilt `initial`. While no other connection has the
+/// live index open, the file is renamed over it as a first build's is. Otherwise it is
+/// copied in one SQLite transaction, which the readers' snapshots survive. Either way a
+/// crash before the end leaves the old index whole.
+fn install(initial: &Path, root: &DataRoot) -> Result<()> {
+    // Windows refuses to rename over a file another process has open.
+    #[cfg(unix)]
+    if rename_unshared(initial, root)? {
+        return Ok(());
+    }
+    let rebuilt = open_writer(initial, true)?;
+    let mut live = writer(root)?;
+    let copy = rusqlite::backup::Backup::new(&rebuilt, &mut live)?;
+    anyhow::ensure!(
+        copy.step(-1)? == rusqlite::backup::StepResult::Done,
+        "the live index stayed locked"
+    );
+    drop(copy);
+    live.close().map_err(|(_, e)| e)?;
+    rebuilt.close().map_err(|(_, e)| e)?;
+    clear_initial(initial)
+}
+
+/// Renames `initial` over `index.db` under an exclusive lock on it, which SQLite grants only
+/// while no other connection has read it: a WAL connection keeps its shared lock until it
+/// closes. The old file's write-ahead log is checkpointed and emptied first, so the rebuilt
+/// file inherits no frames of it. A connection that opened the old file but first reads
+/// after the rename sees its file moved and reopens the path (`connection::unmoved`).
+#[cfg(unix)]
+fn rename_unshared(initial: &Path, root: &DataRoot) -> Result<bool> {
+    let live = Connection::open(root.db())?;
+    live.busy_timeout(std::time::Duration::ZERO)?;
+    match live.execute_batch(
+        "PRAGMA locking_mode=EXCLUSIVE; PRAGMA wal_checkpoint(TRUNCATE); BEGIN EXCLUSIVE;",
+    ) {
+        Ok(()) => {}
+        Err(rusqlite::Error::SqliteFailure(e, _))
+            if matches!(
+                e.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ) =>
+        {
+            return Ok(false)
+        }
+        Err(e) => return Err(e.into()),
+    }
+    fs::rename(initial, root.db())?;
+    fs::File::open(root.path())?.sync_all()?;
+    // The old file is gone, so closing neither checkpoints into it nor deletes the log.
+    live.close().map_err(|(_, e)| e)?;
+    Ok(true)
+}
+
+/// What a rebuild keeps from the index it replaces, since no transcript holds it: the meaning
+/// vectors and the rows they still cover, and every state value the build did not set.
+fn carry(old: &Connection, tx: &Transaction<'_>) -> Result<()> {
+    let mut values = old.prepare("SELECT key,value FROM state WHERE key!='semantic_ref_count'")?;
+    let mut keep = tx.prepare("INSERT OR IGNORE INTO state VALUES(?1,?2)")?;
+    for row in values.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, rusqlite::types::Value>(1)?,
+        ))
+    })? {
+        let (key, value) = row?;
+        keep.execute(params![key, value])?;
+    }
+    crate::semantic_store::carry(old, tx)
 }
 
 fn harness_policy(

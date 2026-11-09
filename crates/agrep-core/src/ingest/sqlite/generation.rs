@@ -6,12 +6,14 @@ use std::path::Path;
 use super::sqlite_sidecar;
 
 /// Metadata generation for a SQLite database and its committed WAL. The shared-memory file is
-/// lock coordination rather than durable content and must not invalidate warm generations.
+/// lock coordination rather than durable content and must not invalidate warm generations. A
+/// store root that links to a database is measured at its target, where its WAL lives.
 pub(crate) fn sqlite_generation_token(path: &std::path::Path) -> std::io::Result<String> {
     use std::fmt::Write;
 
+    let path = crate::ingest::registry::source_path(path);
     let mut bytes = Vec::with_capacity(64);
-    for (index, candidate) in [path.to_path_buf(), sqlite_sidecar(path, "-wal")]
+    for (index, candidate) in [path.to_path_buf(), sqlite_sidecar(&path, "-wal")]
         .into_iter()
         .enumerate()
     {

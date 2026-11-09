@@ -27,7 +27,7 @@ pub fn open(root: &DataRoot) -> Result<File> {
 }
 pub fn semantic_failure(root: &DataRoot, error: &anyhow::Error) {
     if data::read_only() {
-        eprintln!(
+        crate::errln!(
             "semantic search failed; returning keyword results: {}",
             surface::safe(&format!("{error:#}"), false)
         );
@@ -46,7 +46,7 @@ pub fn semantic_failure(root: &DataRoot, error: &anyhow::Error) {
             surface::safe(&error.to_string(), false)
         );
     }
-    eprintln!("{message}");
+    crate::errln!("{message}");
 }
 
 /// Optional query inference reports a panic through its normal error channel.

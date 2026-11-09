@@ -73,9 +73,10 @@ S = round(T * R * W * B, 4)
   cannot earn a near-phrase score merely because it sits beside another term.
   `-w` counts its whole-word pattern in the snippet; `-E` counts its matches with
   no tightness, `T = 1 - 0.5^n`.
-- `R = 0.5^(age_days / 14)`. Human prompts retain a floor above the fresh
-  recap/tool score ceilings. Explicit `-w` and `-E` searches also retain a
-  recency floor.
+- `R = 0.5^(age_days / 14)`, the age counted to `clock::now_ms()` (the system clock
+  unless `AGREP_NOW_MS` pins it; see [ENGINE.md](ENGINE.md)). Human prompts retain a
+  floor above the fresh recap/tool score ceilings. Explicit `-w` and `-E` searches
+  also retain a recency floor.
 - `W` is the speaker/source prior. User prose leads; agent and subagent prose
   follow; tool output, recaps, control, synthetic, and harness rows are
   progressively downweighted. Rows about tooling rather than history (harness
@@ -196,7 +197,12 @@ meaning evidence: only a strong row of the same family on the page suppresses
 the semantic lead as already covered, and a weak lexical copy of the exact same
 row yields its slot to the semantic-labeled twin (shown once). With strong
 lexical rows and no corroborated meaning row, the leading strong rows stay first
-and one meaning row follows them.
+and one meaning row follows them. When a meaning row is corroborated, the
+meaning rows come first, then the keyword rows of other families, and last the
+keyword rows of the families the meaning rows already represent: no keyword row
+is dropped (0.4.9 dropped those last rows). A compact page keeps them after its
+lanes, so they fill the page when room is left and otherwise wait behind
+`--more`, and a larger `-n` shows them on one page.
 
 ## Recall lane hierarchy
 
@@ -293,7 +299,8 @@ before display caps, across phrase boundary classes and the all-terms lane.
 `phrase_aligned`, `phrase_partial`, `phrase_interior`, `all_terms`, and `total`.
 
 An exhausted compact page with a known exact total stays silent, as does a page
-merged with meaning rows when neither lane held rows it did not return. An
+merged with meaning rows when neither lane held rows it did not return and the
+row limit cut no merged row. An
 incomplete page emits exactly one completeness line: `N matches` for an exact
 total, or `N+ matches (floor)` (`N+ matches (floor; -c exact)` when an exhaustive
 count is available; never on a meaning page, since `-c` counts keyword rows only)

@@ -26,6 +26,10 @@ pub struct Frozen {
     /// Whether `-c` can count a floor total exactly: not for a `--no-meta` page that
     /// dropped rows.
     pub exhaustible: bool,
+    /// The larger `-n` rerun the last page offers when the search held more rows than
+    /// were frozen.
+    #[serde(default)]
+    pub larger_argv: Option<Vec<String>>,
 }
 #[derive(Debug)]
 pub struct Page {
@@ -304,7 +308,12 @@ pub fn footer(f: &Frozen, more: Option<&str>) -> String {
             "{basis} · full results (live rerun): {}",
             surface::shell(&f.full_argv)
         ),
-        None => basis,
+        None => match &f.larger_argv {
+            Some(argv) if f.records.is_empty() => {
+                format!("{basis} · larger page: {}", surface::shell(argv))
+            }
+            _ => basis,
+        },
     }
 }
 #[cfg(test)]
@@ -335,6 +344,7 @@ mod tests {
                 chat_scoped: false,
                 full_argv: vec![],
                 exhaustible: true,
+                larger_argv: None,
             };
             super::select(frozen).text.lines().count()
         };
@@ -377,6 +387,7 @@ mod tests {
             chat_scoped: false,
             full_argv: vec![],
             exhaustible: true,
+            larger_argv: None,
         };
         let page = select(f);
         assert!(page.text.len() <= 3584);

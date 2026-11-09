@@ -4,7 +4,7 @@
 mod message;
 mod resume;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -31,7 +31,12 @@ pub(super) struct Origin<'a> {
 
 enum Input<'a> {
     Text(&'a str),
-    Prepared(&'a [PreparedRecord]),
+    /// Records an incremental read prepared, and the file line the next read
+    /// starts at: only the reader saw the blank lines between records.
+    Prepared {
+        records: &'a [PreparedRecord],
+        next_ordinal: usize,
+    },
 }
 
 /// A full read: one pass over a whole file's text.
@@ -54,11 +59,14 @@ fn parse_data(
     let base = state.ordinal;
     let owned;
     let mut offsets = Vec::new();
-    let (values, line_count) = match data {
-        Input::Prepared(input) => (prepared_values(input, &tally), input.len()),
+    let (values, next_ordinal) = match data {
+        Input::Prepared {
+            records,
+            next_ordinal,
+        } => (prepared_values(records, &tally), next_ordinal),
         Input::Text(data) => {
             owned = text_values(data, base, &tally, &mut offsets);
-            (owned.iter().collect(), data.lines().count())
+            (owned.iter().collect(), base + data.lines().count())
         }
     };
     let records = number_records(&values, &offsets, base);
@@ -70,7 +78,7 @@ fn parse_data(
     for &index in &branch {
         parser.record(&records[index]);
     }
-    parser.finish(base + line_count)
+    parser.finish(next_ordinal)
 }
 
 /// Readable prepared records; malformed ones are counted and sampled here.
@@ -182,7 +190,7 @@ struct Parser<'p> {
     out: Vec<RawMessage>,
     events: Vec<Event>,
     order: crate::ingest::ReplyOrder,
-    pending: HashMap<String, usize>,
+    pending: BTreeMap<String, usize>,
     recap_turns: Vec<u32>,
     turn: u32,
     model: String,

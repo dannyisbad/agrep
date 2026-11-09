@@ -5,6 +5,9 @@ pub(super) struct Traversal<'a, 'p> {
     adaptive_prose: bool,
     ids: Option<CandidateGroups>,
     admitted: Option<HashMap<i64, Vec<i64>>>,
+    /// On a page, the matcher whose plans take anchors, with the rows they admit per
+    /// block. A row is checked against it only after the page's ceiling has read it.
+    anchored: Option<(Matcher, HashMap<i64, Vec<i64>>)>,
     order: Vec<BlockBound>,
     position: HashMap<i64, usize>,
     next: usize,
@@ -86,6 +89,7 @@ impl<'a, 'p> Traversal<'a, 'p> {
             }
             _ => None,
         };
+        let anchored = page_anchors(plan, result)?;
         let order = blocks;
         let position: HashMap<i64, usize> = order
             .iter()
@@ -134,6 +138,7 @@ impl<'a, 'p> Traversal<'a, 'p> {
             adaptive_prose,
             ids,
             admitted,
+            anchored,
             order,
             position,
             next,
@@ -176,6 +181,7 @@ impl<'a, 'p> Traversal<'a, 'p> {
             self.admit_block_run(result, block, max_gap, spanned)?;
             let (ascii, prefetched) = self.prefetch(result, block, bound)?;
             self.account_prefetched(result, prefetched.as_ref());
+            self.admit_anchored(result, block)?;
             let block_ids = if let Some(prefetched) = &prefetched {
                 Some(&prefetched.ids)
             } else {
@@ -184,7 +190,9 @@ impl<'a, 'p> Traversal<'a, 'p> {
                     None => self.runs.get(&block),
                 }
             };
-            if (prefetched.is_some() || self.ids.is_some() || spanned)
+            let narrowed = self.narrow_to_anchors(result, block, block_ids);
+            let block_ids = narrowed.as_ref().or(block_ids);
+            if (prefetched.is_some() || self.ids.is_some() || spanned || narrowed.is_some())
                 && block_ids.is_none_or(Vec::is_empty)
             {
                 continue;
@@ -230,6 +238,7 @@ impl<'a, 'p> Traversal<'a, 'p> {
                 plan: self.plan,
                 coverage: self.coverage.as_ref(),
                 admitted: self.admitted.as_ref(),
+                anchored: self.anchored.as_ref().map(|(_, rows)| rows),
                 occurrences: self.occurrences.as_ref(),
                 eager_prose: query.eager_prose,
                 lazy_identity: query.lazy_identity,
@@ -340,70 +349,129 @@ impl<'a, 'p> Traversal<'a, 'p> {
         spanned: bool,
     ) -> Result<()> {
         let c = self.plan.ctx.c;
-        let o = self.plan.ctx.o;
         let m = self.plan.ctx.m;
         let table = self.plan.ctx.table;
-        let pass_tier = self.plan.ctx.pass_tier;
         let span_plan = &self.plan.span_plan;
         let fts = &self.plan.fts;
         if !spanned || self.runs.contains_key(&block) {
             return Ok(());
         }
-        {
-            let page =
-                (o.limit > 0 && result.hits.len() >= o.limit).then(|| &result.hits[o.limit - 1]);
-            // Blocks the page still admits will be self.visited unless its cutoff rises.
-            let admits = |entry: &BlockBound| {
-                page.is_none_or(|last| {
-                    if o.sort == "time" {
-                        entry.2 >= last.ts
-                    } else {
-                        !Cutoff::of(last, o.chats, entry.2, &entry.3, entry.4)
-                            .excludes(pass_tier, entry.1)
-                    }
-                })
-            };
-            // Probe one block before committing to a longer posting read.
-            let limit = if self.adaptive_prose { 1 } else { RUN_BLOCKS };
-            let mut run = vec![block];
-            for step in [1, -1] {
-                let (mut id, mut skipped) = (block + step, 0);
-                while id >= 0 && run.len() < limit && skipped <= RUN_GAP {
-                    let member = self.position.get(&id).is_some_and(|&at| {
-                        !self.visited.contains(&id)
-                            && !self.runs.contains_key(&id)
-                            && admits(&self.order[at])
-                    });
-                    if member {
-                        run.push(id);
-                        skipped = 0;
-                    } else {
-                        skipped += 1;
-                    }
-                    id += step;
-                }
-            }
-            run.sort_unstable();
-            let max_gap = run
-                .iter()
-                .map(|id| self.order[self.position[id]].5)
-                .max()
-                .unwrap_or(max_gap);
-            let tick = Instant::now();
-            admit_run(
-                c,
-                m,
-                table,
-                fts.as_deref().unwrap_or_default(),
-                span_plan.as_ref().map(|(_, v)| v.as_slice()),
-                &run,
-                Some(max_gap),
-                &mut self.runs,
-                self.occurrences.as_mut(),
-            )?;
-            result.timings.sqlite_ms += tick.elapsed().as_secs_f64() * 1000.;
-        }
+        // Probe one block before committing to a longer posting read.
+        let limit = if self.adaptive_prose { 1 } else { RUN_BLOCKS };
+        let run = self.run_around(result, block, limit, &self.runs);
+        let max_gap = run
+            .iter()
+            .map(|id| self.order[self.position[id]].5)
+            .max()
+            .unwrap_or(max_gap);
+        let tick = Instant::now();
+        admit_run(
+            c,
+            m,
+            table,
+            fts.as_deref().unwrap_or_default(),
+            span_plan.as_ref().map(|(_, v)| v.as_slice()),
+            &run,
+            Some(max_gap),
+            &mut self.runs,
+            self.occurrences.as_mut(),
+        )?;
+        result.timings.sqlite_ms += tick.elapsed().as_secs_f64() * 1000.;
         Ok(())
+    }
+
+    /// `block` with the unvisited blocks around it, up to `limit` in all, that the page
+    /// still admits and `admitted` lacks, in block order.
+    fn run_around(
+        &self,
+        result: &Results,
+        block: i64,
+        limit: usize,
+        admitted: &HashMap<i64, Vec<i64>>,
+    ) -> Vec<i64> {
+        let o = self.plan.ctx.o;
+        let pass_tier = self.plan.ctx.pass_tier;
+        let page = (o.limit > 0 && result.hits.len() >= o.limit).then(|| &result.hits[o.limit - 1]);
+        // Blocks the page still admits will be visited unless its cutoff rises.
+        let admits = |entry: &BlockBound| {
+            page.is_none_or(|last| {
+                if o.sort == "time" {
+                    entry.2 >= last.ts
+                } else {
+                    !Cutoff::of(last, o.chats, entry.2, &entry.3, entry.4)
+                        .excludes(pass_tier, entry.1)
+                }
+            })
+        };
+        let mut run = vec![block];
+        for step in [1, -1] {
+            let (mut id, mut skipped) = (block + step, 0);
+            while id >= 0 && run.len() < limit && skipped <= RUN_GAP {
+                let member = self.position.get(&id).is_some_and(|&at| {
+                    !self.visited.contains(&id)
+                        && !admitted.contains_key(&id)
+                        && admits(&self.order[at])
+                });
+                if member {
+                    run.push(id);
+                    skipped = 0;
+                } else {
+                    skipped += 1;
+                }
+                id += step;
+            }
+        }
+        run.sort_unstable();
+        run
+    }
+
+    /// Before a page reads a bounded block, the rows anchors admit in it.
+    fn admit_anchored(&mut self, result: &mut Results, block: i64) -> Result<()> {
+        let admitted = match &self.anchored {
+            Some((_, admitted)) if block >= 0 && !admitted.contains_key(&block) => admitted,
+            _ => return Ok(()),
+        };
+        let run = self.run_around(result, block, RUN_BLOCKS, admitted);
+        let tick = Instant::now();
+        let (matcher, admitted) = self.anchored.as_mut().expect("matched above");
+        admit_run(
+            self.plan.ctx.c,
+            matcher,
+            "tools",
+            "",
+            None,
+            &run,
+            None,
+            admitted,
+            None,
+        )?;
+        result.timings.sqlite_ms += tick.elapsed().as_secs_f64() * 1000.;
+        Ok(())
+    }
+
+    /// The rows of `block` to read when a page reads only those anchors admit: once its
+    /// total is a floor, or while the block's admitted rows cannot fill it. Otherwise its
+    /// ceiling still reads every row, and each is checked after it.
+    fn narrow_to_anchors(
+        &self,
+        result: &Results,
+        block: i64,
+        block_ids: Option<&Vec<i64>>,
+    ) -> Option<Vec<i64>> {
+        let anchored = self.anchored.as_ref()?.1.get(&block)?;
+        if result.total_basis != "floor"
+            && result.hits.len() + anchored.len() >= self.plan.ctx.o.limit
+        {
+            return None;
+        }
+        Some(match block_ids {
+            Some(ids) => anchored
+                .iter()
+                .copied()
+                .filter(|id| ids.binary_search(id).is_ok())
+                .collect(),
+            None => anchored.clone(),
+        })
     }
 
     fn prefetch(
@@ -481,4 +549,28 @@ impl<'a, 'p> Traversal<'a, 'p> {
             }
         }
     }
+}
+
+type PageAnchors = (Matcher, HashMap<i64, Vec<i64>>);
+/// On a page over tool rows, the matcher whose plans take anchors, with the rows it
+/// admits in a selective scope; bounded blocks are admitted as they are read. None
+/// when anchors add no condition.
+fn page_anchors(plan: &TablePlan<'_>, result: &mut Results) -> Result<Option<PageAnchors>> {
+    let m = plan.ctx.m;
+    if plan.ctx.table != "tools" || m.plan_anchors || !(plan.bounded || plan.selective) {
+        return Ok(None);
+    }
+    let mut anchored = m.clone();
+    anchored.plan_anchors = true;
+    let expression = anchored.fts(None);
+    if expression.is_none() || expression == m.fts(None) {
+        return Ok(None);
+    }
+    let mut rows = HashMap::new();
+    if let Some(scope) = &plan.scope_blocks {
+        let tick = Instant::now();
+        rows = scope_candidates(plan.ctx.c, &anchored, "tools", "", None, scope)?;
+        result.timings.sqlite_ms += tick.elapsed().as_secs_f64() * 1000.;
+    }
+    Ok(Some((anchored, rows)))
 }

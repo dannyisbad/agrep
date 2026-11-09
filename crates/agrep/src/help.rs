@@ -23,6 +23,34 @@ command's flags and examples.";
 /// `about` the command list shows.
 pub(crate) const SUB: &str = "{before-help}{usage-heading} {usage}\n\n{all-args}{after-help}";
 
+/// Below this width a description goes on the line under its option. clap otherwise puts it
+/// beside an option column that can be wider than the terminal: `search --help` at 40 columns
+/// printed one word a line.
+const NEXT_LINE_BELOW: usize = 60;
+/// Help never wraps narrower than this; a narrower terminal wraps the lines itself.
+const MIN_WRAP: usize = 40;
+
+/// The parser, its help laid out for the terminal clap would wrap it to.
+pub(crate) fn command() -> clap::Command {
+    fit(<crate::Cli as clap::CommandFactory>::command(), width())
+}
+
+/// clap's own width: the terminal stdout is, else COLUMNS.
+fn width() -> Option<usize> {
+    terminal_size::terminal_size()
+        .map(|(width, _)| usize::from(width.0))
+        .or_else(|| std::env::var("COLUMNS").ok()?.parse().ok())
+}
+
+fn fit(command: clap::Command, width: Option<usize>) -> clap::Command {
+    match width {
+        Some(width) if width < NEXT_LINE_BELOW => {
+            command.term_width(width.max(MIN_WRAP)).next_line_help(true)
+        }
+        _ => command,
+    }
+}
+
 pub(crate) const NO_AUTO: &str =
     "skip automatic index/freshness work; an empty result exits 2 because absence is unverified";
 pub(crate) const COLOR: &str = "color output: auto (on a terminal, the default), always, or never";
@@ -274,19 +302,52 @@ examples:
 
 exit: 0 indexed; 1 not indexed (explained); 2 ambiguous, unprovable, or invalid arguments.";
 
-pub(crate) const UI: &str = "examples:
-  agrep ui               use an available loopback port
-  agrep ui --port 8732   request a specific loopback port
-
-The server binds only to 127.0.0.1, requires a one-use browser link, and has no mutation endpoints.
-Press Ctrl-C to stop it.
-
-exit: 0 stopped normally, 2 invalid arguments or bind failure.";
-pub(crate) const SERVE: &str = "examples:
-  agrep serve               use an available loopback port
-  agrep serve --port 8732   request a specific loopback port
-
-The server binds only to 127.0.0.1, requires a one-use browser link, and has no mutation endpoints.
-Press Ctrl-C to stop it.
-
-exit: 0 stopped normally, 2 invalid arguments or bind failure.";
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn narrow_help_keeps_words_together() {
+        for (name, base_lines) in [
+            ("search", 484),
+            ("chats", 228),
+            ("recall", 359),
+            ("pack", 360),
+        ] {
+            let mut command = super::fit(<crate::Cli as clap::CommandFactory>::command(), Some(40));
+            let help = command
+                .find_subcommand_mut(name)
+                .unwrap()
+                .render_help()
+                .to_string();
+            let lines: Vec<&str> = help.lines().collect();
+            assert!(
+                lines.len() * 2 < base_lines,
+                "{name}: {} lines",
+                lines.len()
+            );
+            let lone = lines
+                .iter()
+                .filter(|line| line.starts_with(' ') && line.split_whitespace().count() == 1)
+                .filter(|line| {
+                    !line.trim_start().starts_with('-') && !line.trim_start().starts_with('[')
+                })
+                .count();
+            assert!(
+                lone * 10 < lines.len(),
+                "{name}: {lone} one-word lines\n{help}"
+            );
+        }
+        let mut wide = super::fit(<crate::Cli as clap::CommandFactory>::command(), Some(80));
+        let mut plain = <crate::Cli as clap::CommandFactory>::command().term_width(80);
+        assert_eq!(
+            wide.find_subcommand_mut("search")
+                .unwrap()
+                .render_help()
+                .to_string(),
+            plain
+                .find_subcommand_mut("search")
+                .unwrap()
+                .render_help()
+                .to_string()
+        );
+    }
+}

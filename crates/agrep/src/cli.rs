@@ -459,7 +459,7 @@ pub(crate) struct Board {
     #[arg(
         long,
         value_name = "SECONDS",
-        help = "bounded one-shot startup wait (default 0.18; max 10)"
+        help = "bounded one-shot startup wait (default 10; max 10)"
     )]
     pub(crate) wait: Option<f64>,
     #[arg(long, help = "start in expanded mode (per-session events + model)")]
@@ -812,44 +812,6 @@ pub(crate) enum Command {
         events: Option<String>,
         #[arg(long, help = "print the current active-session state once and exit")]
         snapshot: bool,
-    },
-    #[command(
-        about = "open the private read-only history explorer with live Board",
-        help_template = help::SUB,
-        before_help = "open agrep's private read-only history explorer with live Board",
-        after_help = help::UI
-    )]
-    Ui {
-        #[arg(
-            long,
-            default_value_t = 0,
-            help = "loopback port (default: an available random port)"
-        )]
-        port: u16,
-        #[arg(
-            long,
-            help = "skip the automatic freshness check of the agent stores at startup"
-        )]
-        no_auto: bool,
-    },
-    #[command(
-        about = "serve the private history + live Board explorer",
-        help_template = help::SUB,
-        before_help = "serve agrep's private read-only history explorer with live Board on loopback",
-        after_help = help::SERVE
-    )]
-    Serve {
-        #[arg(
-            long,
-            default_value_t = 0,
-            help = "loopback port (default: an available random port)"
-        )]
-        port: u16,
-        #[arg(
-            long,
-            help = "skip the automatic freshness check of the agent stores at startup"
-        )]
-        no_auto: bool,
     },
     #[command(
         about = "launch an agent, recording child-process liveness",

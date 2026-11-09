@@ -5,7 +5,6 @@ use crate::{data::DataRoot, safe_fs};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use settings::render_json;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -25,9 +24,30 @@ pub struct Installed {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Kind {
-    Block { separator: String, skill: bool },
-    File { sha256: String },
-    Hook { event: String, entry: Value },
+    Block {
+        separator: String,
+        skill: bool,
+    },
+    File {
+        sha256: String,
+    },
+    Hook {
+        event: String,
+        entry: Value,
+        #[serde(default)]
+        added: Added,
+    },
+}
+/// The outermost member setup added for a hook entry: remove takes it out again once it is
+/// empty, and leaves alone any container that was the user's. Records without it come from
+/// development builds, which always removed emptied containers up to `hooks`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Added {
+    Entry,
+    Event,
+    #[default]
+    Hooks,
 }
 #[derive(Debug, Clone)]
 pub struct Target {
@@ -38,23 +58,24 @@ pub struct Target {
 }
 
 /// The registry data contains path *parts*, so joining follows the host OS convention.
+/// opencode keeps its sessions under its data directory but reads global rules from its
+/// config directory, so the data directory only proves the client is installed.
 pub fn targets(home: &Path) -> Vec<Target> {
     let mut values = targets_in(home, &std::env::vars_os().collect());
-    let data = crate::ingest::registry::ADAPTERS
-        .iter()
-        .find(|a| a.name() == "opencode")
-        .expect("opencode adapter")
-        .store_roots()
-        .into_iter()
-        .next()
-        .expect("opencode data root");
+    let data = crate::ingest::opencode::data_dirs_at(home);
     for target in &mut values {
         if target.name == "opencode" {
-            target.path = data.join("AGENTS.md");
-            target.detected = data.is_dir();
+            target.detected = data[0].is_dir();
         }
     }
     values
+}
+/// Where development builds wrote opencode's block, which opencode never reads.
+fn misplaced_paths(home: &Path) -> Vec<PathBuf> {
+    crate::ingest::opencode::data_dirs_at(home)
+        .into_iter()
+        .map(|dir| dir.join("AGENTS.md"))
+        .collect()
 }
 pub fn targets_in(
     home: &Path,
@@ -228,36 +249,28 @@ fn install_file(path: PathBuf, bytes: &[u8], previous: &[Installed]) -> Result<I
 fn install_hook(path: PathBuf, event: &str, entry: Value) -> Result<Installed> {
     let directories = missing_directories(&path);
     let old = safe_fs::read_optional(&path)?;
-    let mut value: Value = match &old {
+    let value: Value = match &old {
         Some(b) => serde_json::from_slice(b).context("invalid hook JSON")?,
         None => json!({}),
     };
-    let object = value
-        .as_object_mut()
-        .context("hook JSON must be an object")?;
-    let hooks = object
-        .entry("hooks")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .context("hooks must be an object")?;
-    let entries = hooks
-        .entry(event)
-        .or_insert_with(|| json!([]))
-        .as_array_mut()
-        .context("hook event must be an array")?;
-    if !entries.contains(&entry) {
-        entries.push(entry.clone());
+    let object = value.as_object().context("hook JSON must be an object")?;
+    if let Some(hooks) = object.get("hooks") {
+        let hooks = hooks.as_object().context("hooks must be an object")?;
+        if let Some(entries) = hooks.get(event) {
+            entries.as_array().context("hook event must be an array")?;
+        }
     }
-    safe_fs::write_atomic(
-        &path,
-        &render_json(&value, old.as_deref().unwrap_or_default())?,
-        true,
-    )?;
+    let raw = std::str::from_utf8(old.as_deref().unwrap_or_default())?;
+    let (new, added) = settings::add(raw, event, &entry)?;
+    if old.is_none() || new != raw {
+        safe_fs::write_atomic(&path, new.as_bytes(), true)?;
+    }
     Ok(Installed {
         path,
         kind: Kind::Hook {
             event: event.into(),
             entry,
+            added,
         },
         created: old.is_none(),
         directories,
@@ -311,7 +324,7 @@ fn same_object(a: &Installed, b: &Installed) -> bool {
     path_eq(&a.path, &b.path) && std::mem::discriminant(&a.kind) == std::mem::discriminant(&b.kind)
 }
 /// A reinstalled object keeps what its first install recorded: whether it created the
-/// file, the directories it made, and a block's separator.
+/// file, the directories it made, a block's separator and the containers a hook added.
 fn inherit(item: &mut Installed, previous: &[Installed]) {
     let Some(old) = previous.iter().find(|i| same_object(i, item)) else {
         return;
@@ -320,15 +333,33 @@ fn inherit(item: &mut Installed, previous: &[Installed]) {
     item.directories.extend(old.directories.clone());
     item.directories.sort();
     item.directories.dedup();
-    if let (
-        Kind::Block { separator, .. },
-        Kind::Block {
-            separator: old_separator,
-            ..
-        },
-    ) = (&mut item.kind, &old.kind)
-    {
-        *separator = old_separator.clone();
+    match (&mut item.kind, &old.kind) {
+        (
+            Kind::Block { separator, .. },
+            Kind::Block {
+                separator: old_separator,
+                ..
+            },
+        ) => *separator = old_separator.clone(),
+        (
+            Kind::Hook { added, .. },
+            Kind::Hook {
+                added: old_added, ..
+            },
+        ) => {
+            *added = (*added).max(*old_added);
+        }
+        _ => {}
+    }
+}
+/// An error line that names the file to fix, once.
+fn located(path: &Path, e: &anyhow::Error) -> String {
+    let message = format!("{e:#}");
+    let shown = path.display().to_string();
+    if message.contains(&shown) {
+        message
+    } else {
+        format!("{shown}: {message}")
     }
 }
 /// Install the selected files; persist each successful object before moving to the next.
@@ -337,9 +368,10 @@ pub fn install(root: &DataRoot, teach: bool, hooks: bool) -> Result<Vec<String>>
     let _lock = root.lock(true)?;
     let home = crate::ingest::home();
     let mut config = root.config()?;
-    let previous = config.enrollment.clone();
     let mut errors = Vec::new();
-    let mut record = |result: Result<Installed>| -> Result<()> {
+    retire_misplaced(&home, &mut config, &mut errors);
+    let previous = config.enrollment.clone();
+    let mut record = |path: &Path, result: Result<Installed>| -> Result<()> {
         match result {
             Ok(mut item) => {
                 inherit(&mut item, &previous);
@@ -347,13 +379,13 @@ pub fn install(root: &DataRoot, teach: bool, hooks: bool) -> Result<Vec<String>>
                 config.enrollment.push(item);
                 root.save_config(&config)?;
             }
-            Err(e) => errors.push(format!("{e:#}")),
+            Err(e) => errors.push(located(path, &e)),
         }
         Ok(())
     };
     if teach {
         for target in targets(&home).into_iter().filter(|t| t.detected) {
-            record(install_block(&target))?;
+            record(&target.path, install_block(&target))?;
         }
     }
     if hooks {
@@ -362,44 +394,84 @@ pub fn install(root: &DataRoot, teach: bool, hooks: bool) -> Result<Vec<String>>
     root.save_config(&config)?;
     Ok(errors)
 }
+/// Removes enrolled blocks that development builds wrote where opencode never reads them,
+/// unless that path is also a current target.
+fn retire_misplaced(home: &Path, config: &mut crate::data::Config, errors: &mut Vec<String>) {
+    let current = targets(home);
+    let misplaced: Vec<PathBuf> = misplaced_paths(home)
+        .into_iter()
+        .filter(|p| !current.iter().any(|t| path_eq(&t.path, p)))
+        .collect();
+    let mut directories = Vec::new();
+    config.enrollment.retain(|item| {
+        if !matches!(item.kind, Kind::Block { .. })
+            || !misplaced.iter().any(|p| path_eq(p, &item.path))
+        {
+            return true;
+        }
+        match remove_one(item) {
+            Ok(()) => {
+                directories.extend(item.directories.clone());
+                false
+            }
+            Err(e) => {
+                errors.push(located(&item.path, &e));
+                true
+            }
+        }
+    });
+    remove_directories(directories, errors);
+}
 /// The post-compaction hook of every detected client.
 fn install_hooks(
     home: &Path,
     previous: &[Installed],
-    record: &mut impl FnMut(Result<Installed>) -> Result<()>,
+    record: &mut impl FnMut(&Path, Result<Installed>) -> Result<()>,
 ) -> Result<()> {
     if home.join(".claude").is_dir() {
-        record(install_hook(
-            home.join(".claude/settings.json"),
-            "PreCompact",
-            json!({"matcher":"manual|auto","hooks":[{"type":"command","command":"agrep __hook claude"}]}),
-        ))?;
+        let path = home.join(".claude/settings.json");
+        record(
+            &path,
+            install_hook(
+                path.clone(),
+                "PreCompact",
+                json!({"matcher":"manual|auto","hooks":[{"type":"command","command":"agrep __hook claude"}]}),
+            ),
+        )?;
     }
     for dir in codex_dirs(home) {
-        record(install_hook(
-            dir.join("hooks.json"),
-            "SessionStart",
-            json!({"matcher":"^compact$","hooks":[{"type":"command","command":"agrep __hook codex","timeout":2,"statusMessage":"Post-compact recovery available","additionalContextLimit":700}]}),
-        ))?;
+        let path = dir.join("hooks.json");
+        record(
+            &path,
+            install_hook(
+                path.clone(),
+                "SessionStart",
+                json!({"matcher":"^compact$","hooks":[{"type":"command","command":"agrep __hook codex","timeout":2,"statusMessage":"Post-compact recovery available","additionalContextLimit":700}]}),
+            ),
+        )?;
     }
     for base in extension_dirs(home) {
-        record(install_file(
-            base.join("extensions/agrep-postcompact.ts"),
-            include_bytes!("pi_postcompact.ts"),
-            previous,
-        ))?;
+        let path = base.join("extensions/agrep-postcompact.ts");
+        record(
+            &path,
+            install_file(path.clone(), include_bytes!("pi_postcompact.ts"), previous),
+        )?;
     }
     Ok(())
 }
 
+/// The file's text and its agrep blocks, or why they cannot be found.
+fn blocks(raw: &[u8]) -> Result<(&str, Vec<std::ops::Range<usize>>)> {
+    let raw = std::str::from_utf8(raw).context("instruction file is not UTF-8")?;
+    Ok((raw, spans(raw)?))
+}
 pub fn remove_block(path: &Path, separator: &str, skill: bool, created: bool) -> Result<()> {
     let Some(raw) = safe_fs::read_optional(path)? else {
         return Ok(());
     };
-    let raw = std::str::from_utf8(&raw).context("instruction file is not UTF-8")?;
+    let (raw, ranges) = blocks(&raw)?;
     let mut new = String::new();
     let mut offset = 0;
-    let ranges = spans(raw)?;
     for (i, r) in ranges.iter().enumerate() {
         let prefix = &raw[offset..r.start];
         if i == 0 && !separator.is_empty() && prefix.ends_with(separator) {
@@ -433,57 +505,85 @@ fn remove_one(item: &Installed) -> Result<()> {
             }
             Ok(())
         }
-        Kind::Hook { event, entry } => {
+        Kind::Hook {
+            event,
+            entry,
+            added,
+        } => {
             let Some(old) = safe_fs::read_optional(&item.path)? else {
                 return Ok(());
             };
-            let mut value: Value = serde_json::from_slice(&old)?;
-            if let Some(hooks) = value.get_mut("hooks").and_then(Value::as_object_mut) {
-                if let Some(entries) = hooks.get_mut(event).and_then(Value::as_array_mut) {
-                    entries.retain(|e| e != entry);
-                    if entries.is_empty() {
-                        hooks.shift_remove(event);
-                    }
-                }
-                if hooks.is_empty() {
-                    value.as_object_mut().unwrap().shift_remove("hooks");
-                }
-            }
-            if item.created && value == json!({}) {
+            serde_json::from_slice::<Value>(&old)?;
+            let raw = std::str::from_utf8(&old)?;
+            let new = settings::remove(raw, event, entry, *added)?;
+            if new == raw {
+                Ok(())
+            } else if item.created && serde_json::from_str::<Value>(&new)? == json!({}) {
                 safe_fs::remove(&item.path)
             } else {
-                safe_fs::write_atomic(&item.path, &render_json(&value, &old)?, true)
+                safe_fs::write_atomic(&item.path, new.as_bytes(), true)
             }
         }
     }
 }
-pub fn remove(root: &DataRoot) -> Result<Vec<String>> {
+/// What `remove` could not do, and the unreadable files it left alone because it has no
+/// record of writing them.
+#[derive(Debug, Default)]
+pub struct Removal {
+    pub errors: Vec<String>,
+    pub skipped: Vec<String>,
+}
+pub fn remove(root: &DataRoot) -> Result<Removal> {
     let _lock = root.lock(true)?;
+    let home = crate::ingest::home();
     let mut config = root.config()?;
-    let mut errors = Vec::new();
+    let mut removal = Removal::default();
     let mut remaining = Vec::new();
     let mut directories = Vec::new();
-    let known = targets(&crate::ingest::home());
     for item in &config.enrollment {
         match remove_one(item) {
             Ok(()) => directories.extend(item.directories.clone()),
             Err(e) => {
-                errors.push(format!("{}: {e:#}", item.path.display()));
+                removal.errors.push(located(&item.path, &e));
                 remaining.push(item.clone());
             }
         }
     }
-    for target in known {
-        if !config
-            .enrollment
-            .iter()
-            .any(|i| path_eq(&i.path, &target.path))
+    let mut unenrolled: Vec<(PathBuf, bool)> = Vec::new();
+    let known = targets(&home).into_iter().map(|t| (t.path, t.skill));
+    for (path, skill) in known.chain(misplaced_paths(&home).into_iter().map(|p| (p, false))) {
+        let seen = config.enrollment.iter().map(|i| &i.path);
+        if !seen
+            .chain(unenrolled.iter().map(|(p, _)| p))
+            .any(|p| path_eq(p, &path))
         {
-            if let Err(e) = remove_block(&target.path, "", target.skill, false) {
-                errors.push(format!("{}: {e:#}", target.path.display()));
-            }
+            unenrolled.push((path, skill));
         }
     }
+    for (path, skill) in unenrolled {
+        scrub_unenrolled(&path, skill, &mut removal);
+    }
+    remove_directories(directories, &mut removal.errors);
+    config.enrollment = remaining;
+    root.save_config(&config)?;
+    Ok(removal)
+}
+/// A known target with no enrollment may still hold a block an earlier install wrote.
+/// A file whose markers cannot be read is the user's own, so it is reported and kept.
+fn scrub_unenrolled(path: &Path, skill: bool, removal: &mut Removal) {
+    let result = match safe_fs::read_optional(path) {
+        Ok(Some(raw)) => match blocks(&raw) {
+            Ok(_) => remove_block(path, "", skill, false),
+            Err(e) => return removal.skipped.push(located(path, &e)),
+        },
+        Ok(None) => Ok(()),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = result {
+        removal.errors.push(located(path, &e));
+    }
+}
+fn remove_directories(mut directories: Vec<PathBuf>, errors: &mut Vec<String>) {
     directories.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
     directories.dedup();
     for dir in directories {
@@ -501,15 +601,12 @@ pub fn remove(root: &DataRoot) -> Result<Vec<String>> {
             Err(e) => errors.push(format!("{}: {e}", dir.display())),
         }
     }
-    config.enrollment = remaining;
-    root.save_config(&config)?;
-    Ok(errors)
 }
 
 /// Hidden command used by native client hooks; no interpreter or installed helper required.
 pub fn hook(agent: &str, input: &str) -> Result<()> {
     match agent {
-        "claude" => print!("{}", include_str!("compact-contract.md")),
+        "claude" => crate::out!("{}", include_str!("compact-contract.md"))?,
         "codex" => {
             let Ok(event) = serde_json::from_str::<Value>(input) else {
                 return Ok(());
@@ -532,10 +629,10 @@ pub fn hook(agent: &str, input: &str) -> Result<()> {
             }
             let guidance = include_str!("codex-postcompact.md")
                 .replace("`agrep postcompact`", &format!("`{command}`"));
-            println!(
+            crate::outln!(
                 "{}",
                 json!({"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":guidance}})
-            );
+            )?;
         }
         _ => bail!("unknown hook client"),
     }
@@ -550,7 +647,7 @@ pub fn enrolled_present(item: &Installed) -> Result<bool> {
     Ok(match &item.kind {
         Kind::Block { .. } => !spans(std::str::from_utf8(&bytes)?)?.is_empty(),
         Kind::File { sha256 } => hash(&bytes) == *sha256,
-        Kind::Hook { event, entry } => serde_json::from_slice::<Value>(&bytes)?["hooks"][event]
+        Kind::Hook { event, entry, .. } => serde_json::from_slice::<Value>(&bytes)?["hooks"][event]
             .as_array()
             .is_some_and(|entries| entries.contains(entry)),
     })
@@ -558,14 +655,22 @@ pub fn enrolled_present(item: &Installed) -> Result<bool> {
 /// Repairs only drifted enrollment; consent and archive policy are never changed.
 pub fn repair(root: &DataRoot) -> Result<Vec<String>> {
     let _lock = root.lock(true)?;
-    let config = root.config()?;
-    let targets = targets(&crate::ingest::home());
+    let home = crate::ingest::home();
+    let mut config = root.config()?;
     let mut errors = Vec::new();
-    for item in &config.enrollment {
+    let enrolled = config.enrollment.len();
+    retire_misplaced(&home, &mut config, &mut errors);
+    if config.enrollment.len() != enrolled {
+        root.save_config(&config)?;
+    }
+    let targets = targets(&home);
+    let mut widened = false;
+    for i in 0..config.enrollment.len() {
+        let item = &config.enrollment[i];
         if enrolled_present(item).unwrap_or(false) {
             continue;
         }
-        let result = (|| -> Result<()> {
+        let result = (|| -> Result<Option<Added>> {
             match &item.kind {
                 Kind::Block { skill, .. } => {
                     let name = targets
@@ -580,8 +685,12 @@ pub fn repair(root: &DataRoot) -> Result<Vec<String>> {
                         skill: *skill,
                     })?;
                 }
-                Kind::Hook { event, entry } => {
-                    install_hook(item.path.clone(), event, entry.clone())?;
+                Kind::Hook { event, entry, .. } => {
+                    if let Kind::Hook { added, .. } =
+                        install_hook(item.path.clone(), event, entry.clone())?.kind
+                    {
+                        return Ok(Some(added));
+                    }
                 }
                 Kind::File { .. } => {
                     if safe_fs::read_optional(&item.path)?.is_some() {
@@ -596,40 +705,24 @@ pub fn repair(root: &DataRoot) -> Result<Vec<String>> {
                     safe_fs::write_atomic(&item.path, bytes, true)?;
                 }
             }
-            Ok(())
+            Ok(None)
         })();
-        if let Err(e) = result {
-            errors.push(format!("{}: {e:#}", item.path.display()));
+        match result {
+            // A container the repair had to add again is agrep's to remove.
+            Ok(Some(now)) => {
+                if let Kind::Hook { added, .. } = &mut config.enrollment[i].kind {
+                    if now > *added {
+                        *added = now;
+                        widened = true;
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => errors.push(located(&config.enrollment[i].path, &e)),
         }
+    }
+    if widened {
+        root.save_config(&config)?;
     }
     Ok(errors)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    // Each expectation is what 0.4.9's `_render_settings` wrote for the same file and value.
-    #[test]
-    fn hooks_take_the_files_separators_and_escapes() {
-        let hooks = json!({"Stop": [{"command": "café"}]});
-        for (old, want) in [
-            (
-                r#"{"model": "opus"}"#,
-                r#"{"model": "opus", "hooks": {"Stop": [{"command": "café"}]}}"#,
-            ),
-            (
-                r#"{"model":"opus"}"#,
-                r#"{"model":"opus","hooks":{"Stop":[{"command":"café"}]}}"#,
-            ),
-            (
-                "{\n  \"a\": \"\\u00e9\"\n}\n",
-                "{\n  \"a\": \"\\u00e9\",\n  \"hooks\": {\n    \"Stop\": [\n      {\n        \"command\": \"caf\\u00e9\"\n      }\n    ]\n  }\n}\n",
-            ),
-        ] {
-            let mut value: Value = serde_json::from_str(old).unwrap();
-            value["hooks"] = hooks.clone();
-            let rendered = render_json(&value, old.as_bytes()).unwrap();
-            assert_eq!(String::from_utf8(rendered).unwrap(), want);
-        }
-    }
 }

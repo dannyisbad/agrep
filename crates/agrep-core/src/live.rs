@@ -221,13 +221,21 @@ impl Watcher {
             },
         );
     }
+    /// Only a root may be a link, which is followed to its kind (see `RootKind::of`).
     fn walk(
         &mut self,
         path: &Path,
         adapter: &dyn registry::Adapter,
         found: &mut Vec<(String, PathBuf)>,
+        root: bool,
     ) {
-        let m = match fs::symlink_metadata(path) {
+        let metadata = if root {
+            registry::followed_root(path, || registry::RootKind::of(adapter.store_content(path)))
+                .map(|(_, metadata)| metadata)
+        } else {
+            fs::symlink_metadata(path)
+        };
+        let m = match metadata {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
             Err(e) => {
@@ -270,7 +278,7 @@ impl Watcher {
                 Ok(entries) => {
                     for entry in entries {
                         match entry {
-                            Ok(e) => self.walk(&e.path(), adapter, found),
+                            Ok(e) => self.walk(&e.path(), adapter, found, false),
                             Err(e) => self.error(adapter.name(), path, e),
                         }
                     }
@@ -288,7 +296,7 @@ impl Watcher {
             .filter(|a| AGENTS.contains(&a.name()))
         {
             for root in adapter.store_roots() {
-                self.walk(&root, *adapter, &mut files);
+                self.walk(&root, *adapter, &mut files, true);
             }
         }
         files.sort();
@@ -296,11 +304,12 @@ impl Watcher {
         for (agent, path) in files {
             let mut source = self.sources.remove(&path).unwrap_or_default();
             let result = if path.extension().is_some_and(|e| e == "db" || e == "vscdb") {
-                let fingerprint = database_fingerprint(&path);
+                let read = registry::source_path(&path);
+                let fingerprint = database_fingerprint(&read);
                 if fingerprint == source.fingerprint {
                     Ok(())
                 } else {
-                    sqlite::poll(&agent, &path, &mut source, self, sink)
+                    sqlite::poll(&agent, &read, &mut source, self, sink)
                         .map(|()| source.fingerprint = fingerprint)
                 }
             } else {
@@ -652,10 +661,10 @@ mod horizon_tests {
             .unwrap();
         let mut watcher = Watcher::new();
         let mut files = vec![];
-        watcher.walk(t.path(), &crate::ingest::claude::Claude, &mut files);
+        watcher.walk(t.path(), &crate::ingest::claude::Claude, &mut files, true);
         assert!(files.is_empty());
         watcher.sources.insert(p.clone(), Source::default());
-        watcher.walk(t.path(), &crate::ingest::claude::Claude, &mut files);
+        watcher.walk(t.path(), &crate::ingest::claude::Claude, &mut files, true);
         assert_eq!(files.len(), 1);
     }
 }

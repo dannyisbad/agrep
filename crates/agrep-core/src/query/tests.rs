@@ -393,6 +393,64 @@ mod matcher_cache_tests {
             "(\"one\") AND (\"windows\") AND (\"six\")"
         );
     }
+    // A term the dictionary cannot expand enters tool plans through its rarest run, and
+    // only where no page ceiling reads rows it rules out.
+    #[test]
+    fn unexpandable_tool_terms_anchor_on_their_rarest_run() {
+        let c = Connection::open_in_memory().unwrap();
+        store::schema(&c).unwrap();
+        let blocks = crate::tool_index::encode_blocks(&[0]);
+        for (term, doc) in [("std", 900), ("sync", 40), ("async", 60)] {
+            c.execute(
+                "INSERT INTO tool_words(term,doc,blocks) VALUES(?1,?2,?3)",
+                rusqlite::params![term, doc, blocks],
+            )
+            .unwrap();
+        }
+        for (gram, doc) in [("std", 900), ("syn", 100), ("ync", 100), ("asy", 60)] {
+            c.execute(
+                "INSERT INTO tool_trigrams(gram,doc) VALUES(?1,?2)",
+                rusqlite::params![i64::from_str_radix(gram, 36).unwrap(), doc],
+            )
+            .unwrap();
+        }
+        let o = Options {
+            pattern: "Std::Sync".into(),
+            regex: false,
+            word: false,
+            sort: "score".into(),
+            limit: 40,
+            exact: false,
+            count_only: false,
+            count_by_tier: false,
+            content: false,
+            chats: false,
+            tools: true,
+            filters: Filters::default(),
+        };
+        let mut cache = PlanCache::default();
+        let mut matcher = cache.matcher(&o, &c).unwrap();
+        matcher.phase = 1;
+        matcher.order_for(&c, "tools", &mut cache).unwrap();
+        assert_eq!(matcher.fts(None), None);
+        assert_eq!(
+            matcher.tool_fts(None, true).as_deref(),
+            Some("(\"async\" OR \"sync\")")
+        );
+        matcher.plan_anchors = true;
+        assert_eq!(matcher.fts(Some(&[1])), None);
+        assert_eq!(
+            matcher.fts(Some(&[0])).as_deref(),
+            Some("(\"async\" OR \"sync\")")
+        );
+        // A run no word contains is no token either: its clause admits nothing.
+        let mut o = o;
+        o.pattern = "zzq::sync".into();
+        let mut matcher = cache.matcher(&o, &c).unwrap();
+        matcher.plan_anchors = true;
+        matcher.order_for(&c, "tools", &mut cache).unwrap();
+        assert_eq!(matcher.fts(None).as_deref(), Some("(\"zzq\")"));
+    }
     #[test]
     fn common_tool_questions_prefer_consecutive_literal_anchors() {
         let c = Connection::open_in_memory().unwrap();

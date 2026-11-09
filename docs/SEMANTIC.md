@@ -66,7 +66,10 @@ none of `--json`, `--flat`, `-l`, `--lexical`, `-w`, `-E`, `-c`, `--count-by-tie
   asks the kernel to load them when some are not resident (Unix only).
 - Meaning rows come only from visible prose rows whose digest still matches the embedded
   text; control, synthetic, recap and harness rows are left out unless `--who` names
-  them. Filters and caller exclusion apply as in the keyword lane.
+  them. Filters and caller exclusion apply as in the keyword lane. Notes from omp's
+  advisor sidecars (files named `__advisor.jsonl`: an automated reviewer's status notes
+  on a session it watches) are never embedded, so they never return as meaning rows, even
+  under `--who subagent`; keyword search finds them as subagent rows.
 - By default one result is kept per conversation family; `--all-side-chats` keeps one
   per session. A meaning row is labeled `meaning match`.
 - `semantic_policy::FLOOR` (0.82) is the lowest cosine that can be shown. Merging
@@ -93,7 +96,9 @@ and exits 2. A complete semantic-only search that finds nothing exits 1.
 - The worker embeds the queue newest-first in batches of 128 rows, and stops between
   batches while a writer or an explicit command waits. Identical content
   reuses its existing chunks: `semantic_chunks` is keyed by a content key (the row
-  digest plus its preparation variant), and `semantic_refs` maps each row to it.
+  digest plus its preparation variant), and `semantic_refs` maps each row to it. An
+  advisor sidecar's row gets the content key `none:<digest>`, which no chunk carries:
+  it counts as covered without a vector.
 - A batch's vectors go into one immutable block file `vectors/<sha256>.q8f16`, named by
   the SHA-256 of its bytes. Each record is a little-endian F32 scale, 384 int8 values
   and 384 F16 values. The file is written as `.pending`, fsynced and renamed (and the
@@ -130,9 +135,13 @@ and exits 2. A complete semantic-only search that finds nothing exits 1.
   real chunk and retains its vector before admitting the remaining work. A bounded
   preflight avoids decoding large rebuild queues. Background bulk embedding never
   calibrates query admission.
-- `status` reports the build counts and remaining time. The worker records its
-  throughput and smooths it across batches, using an initial estimate until its first
-  completed batch. This build estimate is separate from the inline CPU budget. Setup
+- `status` reports the build counts and remaining time, as `-s` does (`about 15m 19s
+  left`). The drain records the rows it covered per second of wall time, rows whose text
+  was already embedded included, weighting batches by their time over about the last
+  minute and leaving out the batch that loaded the model; until a drain has recorded
+  one, an initial estimate. `index --semantic` and
+  `reindex` rewrite a line on a terminal's stderr with the rows covered, that rate and the
+  time left. This build estimate is separate from the inline CPU budget. Setup
   explains that the build runs in the background and meaning results join searches
   when the remaining work fits the inline budget.
 - The scan quantizes the query to int8 and takes int8 dot products with SIMD (AVX2 on
@@ -145,8 +154,9 @@ and exits 2. A complete semantic-only search that finds nothing exits 1.
   most 200), which makes the total a floor.
 - `reclaim` deletes chunks no row references, blocks left without chunks, and block
   files nothing references once they are ten minutes old, so older snapshots can finish
-  reading them. `reindex --full` drops every reference and block record and re-queues
-  all visible rows.
+  reading them. `reindex` keeps the chunks, blocks and every row reference whose content
+  key survives the rebuild. `reindex --full` drops every reference and block record and
+  re-queues all visible rows.
 
 ## Quality gates
 

@@ -98,7 +98,7 @@ impl Identity {
             return;
         }
         let conflict = self.reason == "identity-conflict";
-        eprintln!(
+        crate::errln!(
             "{}",
             match (forced, recall, conflict) {
                 (true, true, _) => {

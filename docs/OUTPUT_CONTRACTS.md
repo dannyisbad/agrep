@@ -43,11 +43,11 @@ rerunning a query against a changed corpus.
 
 Normal commands check source files and answer from a committed snapshot.
 Index-reading commands finish their source census and ingest its changes before querying.
-This includes each explorer request; `postcompact` also refreshes the sessions used to
-resolve its displayed family root. Changes present when a command or request began are
-included; a record still being written at that instant can be absent. Freshness records
-and status contain no pending-source count or behind notice. Background maintenance does
-not ingest source changes. `--more` reads the first page's frozen results.
+`postcompact` also refreshes the sessions used to resolve its displayed family root.
+Changes present when a command began are included; a record still being written at that
+instant can be absent. Freshness records and status contain no pending-source count or
+behind notice. Background maintenance does not ingest source changes. `--more` reads the
+first page's frozen results.
 
 `--no-auto` and a read-only data root suppress automatic freshness work and mark freshness
 unchecked. `--no-auto` retains its existing unchecked notices and machine records.
@@ -148,14 +148,28 @@ independently of cached ingest counters; strict mode promotes coverage gaps.
 Status/doctor distinguish unchecked from failed, list named parse errors, and
 show model/coverage information without obsolete process coordination states.
 
+`status --json` is one bounded object whose size does not grow with the history:
+`version`, `data_root`, `format`, `disk_bytes`, `disk_files`, `index` (`state`, and when
+ready `counts` and `last_refresh`), `last_indexed_age_s`, `sessions`, `messages` (user-side
+prose rows, each with its reply, as `index` and a keyword miss count them), `prose`,
+`tools`, `source_errors`, `agents` (per agent: `agent`, `sessions`, `sources`,
+`parse_errors`), `semantic`, `integrations`, `archive`, `permissions` and `freshness`. It
+lists no individual source. `doctor --json` is `{"version":1,"status":…,"checks":[…],
+"repairs":[…],"exit":…}`: its `status` adds `sources`, only the sources whose last read
+failed (path, agent, bytes, mtime, last error, change token); each check has `check`,
+`state` and `detail`, and a problem's check adds `action`, the step that resolves it. The
+text form prints one line per check, then one `source failed: PATH: ERROR` line per failed
+source.
+
 Setup/remove preserve text outside their owned instruction blocks and remove
 only enrolled integrations or recognizable agrep blocks. Archive restore checks
 content and requires explicit `--force` to replace an existing file.
 
 ## Explicit rebuilds and optional meaning failures
 
-`reindex --full` rebuilds derived rows, invalidates every vector reference and
-queues visible rows for embedding. `index` and `reindex` print 0.4.9's human report
+`reindex` rebuilds derived rows and keeps vector references of rows whose text is
+unchanged; `reindex --full` also invalidates every vector reference and queues visible
+rows for embedding. `index` and `reindex` print 0.4.9's human report
 (message and session counts, the refresh's time and phases, and the setup pointer
 while no agent is enrolled). With `AGREP_QUERY_TIMING` set they also print the
 refresh's statistics as a JSON `{"index": …}` line on stderr.

@@ -1,5 +1,5 @@
 01930000 · pi · /work/alpha  turns 0-2 of 0-2
-1 tool events omitted · 1 messages omitted · agrep around 01930000 0 -C 4 --full
+1 tool event omitted · 1 message omitted · agrep around 01930000 0 -C 4 --full
 ── turn 0 ──────────────────────────────────────── 2026-01-02 03:04
 user: why did the retry backoff cap at 30s
 agent: the 60s ceiling tripped the account throttle

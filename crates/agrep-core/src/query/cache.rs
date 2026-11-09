@@ -161,6 +161,68 @@ impl PlanCache {
         }
         Ok(self.words[term].clone())
     }
+    /// Every indexed tool word containing `run`, a non-ASCII run unicode61 keeps whole as
+    /// itself, and the run alone as a token when it is too short for the dictionary.
+    pub(super) fn run_words(
+        &mut self,
+        c: &Connection,
+        run: &str,
+    ) -> Result<std::sync::Arc<Expansion>> {
+        if let Some(words) = self.runs.get(run) {
+            return Ok(words.clone());
+        }
+        let chars: Vec<char> = run.chars().collect();
+        let mut words = Vec::new();
+        let mut push = |r: &rusqlite::Row<'_>| -> Result<()> {
+            words.push(crate::tool_index::Word {
+                term: r.get(0)?,
+                doc: r.get(1)?,
+                blocks: crate::tool_index::word_blocks(c, r.get(3)?, r.get_ref(2)?.as_blob()?)?,
+            });
+            Ok(())
+        };
+        if chars.len() >= 3 {
+            let expression = chars
+                .windows(3)
+                .map(|gram| format!("\"{}\"", gram.iter().collect::<String>()))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            let mut q = c.prepare("SELECT w.term,w.doc,w.blocks,w.id FROM tool_lexicon l CROSS JOIN tool_words w ON w.id=l.rowid WHERE tool_lexicon MATCH ?1 AND instr(w.term,?2)>0 AND w.doc>0")?;
+            let mut rows = q.query(rusqlite::params![expression, run])?;
+            while let Some(r) = rows.next()? {
+                push(r)?;
+            }
+        } else {
+            // The trigram lexicon cannot look up two characters: read every word.
+            let mut q = c.prepare(
+                "SELECT term,doc,blocks,id FROM tool_words WHERE instr(term,?1)>0 AND doc>0",
+            )?;
+            let mut rows = q.query([run])?;
+            while let Some(r) = rows.next()? {
+                push(r)?;
+            }
+            let mut blocks: Vec<u32> = Vec::new();
+            let mut doc = 0;
+            let mut q = c.prepare("SELECT rowid FROM tools_fts WHERE tools_fts MATCH ?")?;
+            for id in q.query_map([format!("\"{run}\"")], |r| r.get::<_, i64>(0))? {
+                let block = u32::try_from(id? / BLOCK)?;
+                if blocks.last() != Some(&block) {
+                    blocks.push(block);
+                }
+                doc += 1;
+            }
+            if doc > 0 {
+                words.push(crate::tool_index::Word {
+                    term: run.to_owned(),
+                    doc,
+                    blocks,
+                });
+            }
+        }
+        let words = std::sync::Arc::new(Expansion::new(words));
+        self.runs.insert(run.to_owned(), words.clone());
+        Ok(words)
+    }
     /// A three-character term's word frequency total without expanding it.
     pub(super) fn trigram_doc(&mut self, c: &Connection, term: &str) -> Result<Option<usize>> {
         if let Some(&doc) = self.trigram_docs.get(term) {

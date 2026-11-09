@@ -39,14 +39,46 @@ pub fn state(c: &Connection, key: &str) -> Result<Option<String>> {
     )
 }
 pub fn source_rows(c: &Connection) -> Result<Vec<Value>> {
-    let mut q = c.prepare(
-        "SELECT path,agent,size,mtime_ns,last_error,change_token FROM sources ORDER BY agent,path",
-    )?;
+    rows(c, "")
+}
+/// The sources whose last read failed, which keep their last good rows.
+pub fn failed_sources(c: &Connection) -> Result<Vec<Value>> {
+    rows(c, " WHERE last_error IS NOT NULL")
+}
+fn rows(c: &Connection, filter: &str) -> Result<Vec<Value>> {
+    let mut q = c.prepare(&format!(
+        "SELECT path,agent,size,mtime_ns,last_error,change_token FROM sources{filter} ORDER BY agent,path"
+    ))?;
     let result=q.query_map([],|r| {
         let path:String=r.get(0)?;let agent:String=r.get(1)?;
         Ok(json!({"path":source_path(&path,&agent),"derived":path.starts_with('@')||path.starts_with("token:"),"agent":agent,"bytes":r.get::<_,i64>(2)?,"mtime_ns":r.get::<_,i64>(3)?,"last_error":r.get::<_,Option<String>>(4)?,"change_token":r.get::<_,crate::store::SourceToken>(5)?.diagnostic()}))
     })?.collect::<rusqlite::Result<_>>()?;
     Ok(result)
+}
+/// 0.4.9's message count: one record per visible user-side prose row, its reply attached.
+pub fn messages(c: &Connection) -> Result<i64> {
+    Ok(c.query_row(
+        "SELECT coalesce((SELECT CAST(value AS INTEGER) FROM state WHERE key='prose_user_count'),0)",
+        [],
+        |r| r.get(0),
+    )?)
+}
+/// Per-agent sessions, transcript sources (derived store keys excluded) and sources whose
+/// last read failed.
+fn agents(c: &Connection) -> Result<Vec<Value>> {
+    let sessions: std::collections::HashMap<String, i64> = c
+        .prepare("SELECT agent,count(*) FROM sessions GROUP BY agent")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut q = c.prepare(
+        "SELECT agent,sum(substr(path,1,1)!='@' AND substr(path,1,6)!='token:'),count(last_error) \
+         FROM sources GROUP BY agent ORDER BY agent",
+    )?;
+    let rows = q.query_map([], |r| {
+        let agent: String = r.get(0)?;
+        Ok(json!({"agent":agent,"sessions":sessions.get(&agent).copied().unwrap_or(0),"sources":r.get::<_,i64>(1)?,"parse_errors":r.get::<_,i64>(2)?}))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 pub fn status(root: &DataRoot) -> Result<Value> {
     let marker = fs::read(root.0.join("FORMAT"));
@@ -61,7 +93,7 @@ pub fn status(root: &DataRoot) -> Result<Value> {
     } else {
         None
     };
-    let mut out = json!({"version":env!("CARGO_PKG_VERSION"),"data_root":root.0,"format":format,"disk_bytes":usage.map(|u| u.0),"disk_files":usage.map(|u| u.1),"index":{"state":"missing"},"sources":[],"agents":[],"semantic":{"model_present":false,"indexed_rows":0,"total_rows":0,"backlog":0},"integrations":[],"archive":{"present":root.0.join("archive").is_dir()}});
+    let mut out = json!({"version":env!("CARGO_PKG_VERSION"),"data_root":root.0,"format":format,"disk_bytes":usage.map(|u| u.0),"disk_files":usage.map(|u| u.1),"index":{"state":"missing"},"agents":[],"semantic":{"model_present":false,"indexed_rows":0,"total_rows":0,"backlog":0},"integrations":[],"archive":{"present":root.0.join("archive").is_dir()}});
     if format != "valid" {
         return Ok(out);
     }
@@ -105,31 +137,14 @@ pub fn status(root: &DataRoot) -> Result<Value> {
     let refreshed: Option<i64> = state(&c, "refreshed")?.and_then(|ms| ms.parse().ok());
     out["index"] = json!({"state":"ready","counts":counts,"last_refresh":refreshed});
     out["last_indexed_age_s"] =
-        json!(refreshed.map(|ms| (chrono::Utc::now().timestamp_millis() - ms).max(0) / 1000));
+        json!(refreshed.map(|ms| (crate::clock::now_ms() - ms).max(0) / 1000));
     if let Some(counts) = counts.as_object() {
         for (key, value) in counts {
             out[key] = value.clone();
         }
     }
-
-    let sources = source_rows(&c)?;
-    let mut agents = std::collections::BTreeMap::<String, (usize, usize)>::new();
-    for source in &sources {
-        let entry = agents
-            .entry(source["agent"].as_str().unwrap_or("").into())
-            .or_default();
-        if source["derived"] != true {
-            entry.0 += 1;
-        }
-        if !source["last_error"].is_null() {
-            entry.1 += 1;
-        }
-    }
-    out["agents"] = json!(agents
-        .into_iter()
-        .map(|(a, (n, e))| json!({"agent":a,"sources":n,"parse_errors":e}))
-        .collect::<Vec<_>>());
-    out["sources"] = json!(sources);
+    out["messages"] = json!(messages(&c)?);
+    out["agents"] = json!(agents(&c)?);
     let coverage = crate::semantic::coverage(&c)?;
     let installed = crate::semantic::installed(root);
     let progress = crate::semantic::build_progress(&c, &coverage)?;

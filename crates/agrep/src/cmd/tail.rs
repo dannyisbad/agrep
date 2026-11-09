@@ -2,7 +2,7 @@ use agrep_core::{
     live::{self, Watcher},
     terminal::Signals,
 };
-use anyhow::{ensure, Result};
+use anyhow::Result;
 use serde_json::{json, Value};
 use std::{
     io::{self, Write},
@@ -60,17 +60,23 @@ fn follow(
         .collect();
     types.sort();
     types.dedup();
-    ensure!(!types.is_empty(), "--events requires an event type or all");
-    ensure!(
-        !types.iter().any(|s| s == "all") || types.len() == 1,
-        "all must be the only --events value"
-    );
-    ensure!(
-        types
-            .iter()
-            .all(|s| s == "all" || live::EVENT_TYPES.contains(&s.as_str())),
-        "unsupported event type"
-    );
+    if types.is_empty() {
+        return Err(refuse("--events requires an event type or \"all\"".into()));
+    }
+    if types.iter().any(|s| s == "all") && types.len() > 1 {
+        return Err(refuse("\"all\" must be the only --events value".into()));
+    }
+    let unknown: Vec<_> = types
+        .iter()
+        .filter(|s| s.as_str() != "all" && !live::EVENT_TYPES.contains(&s.as_str()))
+        .map(String::as_str)
+        .collect();
+    if !unknown.is_empty() {
+        return Err(refuse(format!(
+            "unsupported event type: {}",
+            unknown.join(", ")
+        )));
+    }
     let signals = Signals::new()?;
     if agrep_core::terminal::output_is_closed() {
         return Ok(0);

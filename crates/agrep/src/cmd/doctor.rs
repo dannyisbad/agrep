@@ -78,10 +78,10 @@ pub fn run(deep: bool, fix: bool, no_semantic: bool, json_output: bool) -> Resul
             repair_failed = true;
             checks.push(json!({"check":"repair","state":"failed","detail":"rebuilding a corrupt index requires confirmation on a terminal; run agrep doctor --fix"}));
         } else {
-            eprint!(
+            agrep_core::surface::note(format_args!(
                 "Rebuild corrupt index at {} from source files? [y/N] ",
                 root.db().display()
-            );
+            ));
             std::io::stderr().flush()?;
             let mut answer = String::new();
             std::io::stdin().read_line(&mut answer)?;
@@ -104,25 +104,68 @@ pub fn run(deep: bool, fix: bool, no_semantic: bool, json_output: bool) -> Resul
             }
         }
     }
+    if agrep_core::data::unwritable() {
+        checks.push(json!({"check":"data_directory","state":"failed",
+            "detail":format!("{} isn't writable; new transcripts can't be indexed until it is", root.0.display()),
+            "action":"make it writable, or point AGREP_DATA_DIR at a writable directory"}));
+    }
+    if let Some(check) = index_check(&s) {
+        checks.push(check);
+    }
+    if s["index"]["state"] == "ready" {
+        s["sources"] = json!(diagnostics::failed_sources(&store::reader(&root)?)?);
+    }
+    if let Some(failed) = s["sources"].as_array().filter(|f| !f.is_empty()) {
+        checks.push(json!({"check":"sources","state":"failed",
+            "detail":format!("{} failed to read; their last good rows stay searchable", failed.len()),
+            "action":"each is read again once it changes"}));
+    }
     if s["permissions"]["private"] == false {
         checks.push(json!({"check":"directory_permissions","state":"failed","detail":s["permissions"]["exposed"]}));
     }
     if !no_semantic {
         diagnostics::verify_model(&root, &mut s);
-        let semantic = if s["semantic"]["integrity_error"].is_string() {
-            "failed"
+        let incomplete = agrep_core::semantic_model::incomplete(&root);
+        let mut check = json!({"check":"semantic_model","state":"not_checked","detail":s["semantic"]["integrity_error"]});
+        if s["semantic"]["integrity_error"].is_string() || incomplete {
+            check["state"] = json!("failed");
+            check["action"] = json!("`agrep setup` reinstalls it");
+            if incomplete {
+                check["detail"] = json!("a model download or install stopped partway");
+            }
         } else if deep {
-            if s["semantic"]["model_present"] == true {
+            check["state"] = json!(if s["semantic"]["model_present"] == true {
                 "present"
             } else {
                 "not installed"
-            }
-        } else {
-            "not_checked"
-        };
-        checks.push(json!({"check":"semantic_model","state":semantic,"detail":s["semantic"]["integrity_error"]}));
+            });
+        }
+        checks.push(check);
+    }
+    match agrep_core::archive::problems(&root) {
+        Ok(problems) => checks.extend(problems.into_iter().map(|(detail, action)| {
+            json!({"check":"archive","state":"failed","detail":detail,"action":action})
+        })),
+        Err(e) => checks.push(json!({"check":"archive","state":"failed","detail":format!("{e:#}"),
+            "action":"`agrep archive --status` shows the archive's state"})),
     }
     report(&s, &checks, &repaired, repair_failed, json_output)
+}
+/// A missing or unusable index, and what makes it usable.
+fn index_check(s: &serde_json::Value) -> Option<serde_json::Value> {
+    if s["format"] == "unsupported" || s["format"] == "unreadable" {
+        return Some(json!({"check":"index","state":"failed",
+            "detail":format!("data format {}", s["format"].as_str().unwrap_or("")),
+            "action":"point AGREP_DATA_DIR at a directory this agrep owns"}));
+    }
+    let state = s["index"]["state"].as_str().unwrap_or("unreadable");
+    let action = match state {
+        "ready" => return None,
+        "first build in progress" => "wait for it to finish",
+        "unreadable" => "`agrep doctor --fix` rebuilds it from the transcripts",
+        _ => "run `agrep index`",
+    };
+    Some(json!({"check":"index","state":state,"detail":s["index"]["error"],"action":action}))
 }
 
 fn rebuild(root: &DataRoot, build: impl FnOnce(&DataRoot) -> Result<()>) -> Result<()> {
@@ -177,28 +220,24 @@ fn report(
             .iter()
             .any(|e| e["drifted"] == true || e["state"] == "unreadable")
     });
-    let errors = s["sources"]
-        .as_array()
-        .is_some_and(|a| a.iter().any(|v| !v["last_error"].is_null()));
     let healthy = s["format"] == "valid"
         && s["index"]["state"] == "ready"
         && !checks.iter().any(|c| c["state"] == "failed")
-        && !errors
         && !integration_errors;
     let exit = i32::from(repair_failed);
     let v = json!({"version":1,"status":&s,"checks":&checks,"repairs":&repaired,"exit":exit});
     if json_output {
-        println!("{}", agrep_core::json_output::to_string(&v)?)
+        agrep_core::outln!("{}", agrep_core::json_output::to_string(&v)?)?
     } else {
-        println!(
+        agrep_core::outln!(
             "doctor: {}",
             if healthy {
                 "checks passed"
             } else {
                 "action needed"
             }
-        );
-        // A failed check names its cause, as 0.4.9's rows did.
+        )?;
+        // A problem names its cause and the action that resolves it, as 0.4.9's rows did.
         for check in checks {
             let state = check["state"].as_str().unwrap_or("unknown");
             let detail = match &check["detail"] {
@@ -210,15 +249,25 @@ fn report(
                     .join("; "),
                 _ => String::new(),
             };
-            let name = check["check"].as_str().unwrap_or("check");
-            if state == "failed" && !detail.is_empty() {
-                println!("{name}: {state} - {}", agrep_core::render::safe(&detail));
-            } else {
-                println!("{name}: {state}");
+            let action = check["action"].as_str();
+            let mut line = format!("{}: {state}", check["check"].as_str().unwrap_or("check"));
+            if (state == "failed" || action.is_some()) && !detail.is_empty() {
+                line += &format!(" - {}", agrep_core::render::safe(&detail));
             }
+            if let Some(action) = action {
+                line += &format!(" - {action}");
+            }
+            agrep_core::outln!("{line}")?;
+        }
+        for source in s["sources"].as_array().into_iter().flatten() {
+            agrep_core::outln!(
+                "source failed: {}: {}",
+                agrep_core::render::safe(source["path"].as_str().unwrap_or("")),
+                agrep_core::render::safe(source["last_error"].as_str().unwrap_or(""))
+            )?;
         }
         for repair in repaired {
-            println!("repaired: {repair}");
+            agrep_core::outln!("repaired: {repair}")?;
         }
         for entry in s["integrations"]
             .as_array()
@@ -226,10 +275,10 @@ fn report(
             .flatten()
             .filter(|e| e["drifted"] == true)
         {
-            println!(
-                "integration needs repair: {}",
+            agrep_core::outln!(
+                "integration needs repair: {} - `agrep doctor --fix` repairs it",
                 entry["path"].as_str().unwrap_or("")
-            );
+            )?;
         }
     }
     Ok(exit)

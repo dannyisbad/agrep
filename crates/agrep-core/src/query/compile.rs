@@ -141,7 +141,15 @@ impl Matcher {
     }
 
     pub(super) fn new(o: &Options, c: &Connection) -> Result<Self> {
-        let tokens = boundary_rank::query_tokens(&o.pattern);
+        // 0.4.9 searched a one-word keyword query for its whole trimmed text, so `--x` keeps
+        // its dashes (py/corpusdb.py:4731-4736, 4826-4828).
+        let split = boundary_rank::query_tokens(&o.pattern);
+        let trimmed = o.pattern.trim();
+        let tokens = if !o.word && !o.regex && split.len() == 1 && split[0] != trimmed {
+            vec![trimmed]
+        } else {
+            split
+        };
         let mut lowercase_terms = Vec::new();
         let dotted_candidates = if !o.word && !o.regex {
             tokens
@@ -177,7 +185,7 @@ impl Matcher {
             // Presence counts return before phrase matching or snippet scoring.
             (None, vec![], None, None)
         } else {
-            let tokens: Vec<String> = boundary_rank::query_tokens(&o.pattern)
+            let tokens: Vec<String> = tokens
                 .iter()
                 .map(|t| regex::escape(&store::search_fold(t)))
                 .collect();
@@ -190,10 +198,7 @@ impl Matcher {
             let capture = regex::Regex::new(&groups.join(gap))?;
             (None, vec![], Some(capture.clone()), Some(capture))
         };
-        let query_chars = boundary_rank::query_tokens(&o.pattern)
-            .iter()
-            .map(|t| t.chars().count())
-            .sum();
+        let query_chars = tokens.iter().map(|t| t.chars().count()).sum();
         let mut stats = Stats::new();
         for token in boundary_rank::query_tokens(&o.pattern) {
             let normalized = store::normalize(token);
@@ -233,6 +238,8 @@ impl Matcher {
             tool_terms: HashMap::new(),
             tool_supported: HashSet::new(),
             tool_presence: Vec::new(),
+            tool_anchors: HashMap::new(),
+            plan_anchors: false,
             coverage_term: None,
             coverage_excluded: HashSet::new(),
         })

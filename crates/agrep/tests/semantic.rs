@@ -574,3 +574,66 @@ fn first_missing_model_request_has_only_the_setup_instruction() {
     );
     assert!(!t.path().join("data").exists());
 }
+
+// QA finding 9: a corrupt model was named without its fix, and every command's background
+// worker logged the same SHA-256 mismatch again. The worker now records the rejection and
+// leaves those files alone until they change; status and doctor say `agrep setup` repairs it.
+#[test]
+fn a_corrupt_model_is_rejected_once_and_named_with_its_fix() {
+    let t = tempfile::tempdir().unwrap();
+    transcript(&t);
+    assert!(agrep(&t).arg("index").output().unwrap().status.success());
+    fs::create_dir(t.path().join("model")).unwrap();
+    for (name, size, _) in agrep_core::semantic_model::FILES {
+        fs::File::create(t.path().join("model").join(name))
+            .unwrap()
+            .set_len(size)
+            .unwrap();
+    }
+    let work = || agrep(&t).args(["__work", "semantic"]).output().unwrap();
+    let first = work();
+    assert_eq!(first.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&first.stderr).contains("SHA-256 mismatch"));
+    let again = work();
+    assert!(again.status.success());
+    assert!(
+        again.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+    let status = String::from_utf8(agrep(&t).arg("status").output().unwrap().stdout).unwrap();
+    assert!(
+        status.contains(" - `agrep setup` reinstalls it\n"),
+        "{status}"
+    );
+    let doctor = String::from_utf8(agrep(&t).arg("doctor").output().unwrap().stdout).unwrap();
+    assert!(doctor.starts_with("doctor: action needed\n"), "{doctor}");
+    assert!(
+        doctor.lines().any(
+            |l| l.starts_with("semantic_model: failed - model SHA-256 mismatch: ")
+                && l.ends_with(" - `agrep setup` reinstalls it")
+        ),
+        "{doctor}"
+    );
+    // A download that stopped partway is named the same way.
+    for (name, _, _) in &agrep_core::semantic_model::FILES[1..] {
+        fs::remove_file(t.path().join("model").join(name)).unwrap();
+    }
+    let doctor = String::from_utf8(agrep(&t).arg("doctor").output().unwrap().stdout).unwrap();
+    assert!(
+        doctor.contains("\nsemantic_model: failed - a model download or install stopped partway - `agrep setup` reinstalls it\n"),
+        "{doctor}"
+    );
+}
+
+// QA finding 9: on a home with no index, doctor said only `action needed`.
+#[test]
+fn doctor_names_a_missing_index_and_its_command() {
+    let t = tempfile::tempdir().unwrap();
+    let out = agrep(&t).arg("doctor").output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "doctor: action needed\nindex: missing - run `agrep index`\nsemantic_model: not_checked\n"
+    );
+}

@@ -139,7 +139,7 @@ pub(in crate::cmd::recall) fn json(page: &Page, envelope: &mut Value) -> Result<
         // py/search.py:1938-1942).
         let meaning = h.matched == "semantic";
         let score = if meaning {
-            agrep_core::query::meaning_score(h, chrono::Utc::now().timestamp_millis())
+            agrep_core::query::meaning_score(h, agrep_core::clock::now_ms())
         } else {
             h.score
         };

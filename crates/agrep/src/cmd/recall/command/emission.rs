@@ -7,7 +7,7 @@ pub(super) fn emit_probe(
     checked: bool,
 ) -> Result<i32> {
     if let Some(notice) = &notice {
-        eprintln!("{notice}");
+        agrep_core::errln!("{notice}");
     }
     let confident = blocks
         .iter()
@@ -157,7 +157,7 @@ pub(super) fn emit_page(
     fell_back: bool,
 ) -> Result<i32> {
     if let Some(line) = agrep_core::query::meta_notice(state.meta_dropped, state.meta_retained) {
-        eprintln!("{line}");
+        agrep_core::errln!("{line}");
     }
     // 0.4.9 named an empty filter dimension after the page or its zero line.
     let disclose = || {
@@ -197,11 +197,11 @@ pub(super) fn emit_page(
     // 0.4.9's lane-down disclosure (py/recall.py:2601-2616): recall never goes silently
     // keyword-only.
     if state.model_missing {
-        eprintln!(
+        agrep_core::errln!(
             "meaning unavailable; keyword-only (semantic model not installed: run agrep setup)"
         );
     }
-    let color = color == "always" || (color == "auto" && std::io::stdout().is_terminal());
+    let color = crate::cmd::color_on(color);
     let page = page::Page::new(blocks, &ctx.input.queries, ctx.input.a.budget);
     if ctx.input.a.json {
         emit_json(
@@ -216,13 +216,13 @@ pub(super) fn emit_page(
     } else if blocks.is_empty() && state.semantic_unavailable {
         // 0.4.9's line stands alone (py/recall.py:2745-2747).
         let meta = semantic_meta(&state.lane_runs, ctx.input.queries.len() > 1, false, false);
-        eprintln!("{}", semantic::unavailable_notice(&meta["semantic_status"]));
+        agrep_core::errln!("{}", semantic::unavailable_notice(&meta["semantic_status"]));
         return Ok(exit);
     } else if blocks.is_empty() {
         let n: i64 = ctx
             .c
             .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))?;
-        eprintln!(
+        agrep_core::errln!(
             "no hits across {} indexed session{}.",
             surface::number(n.max(0) as usize),
             if n == 1 { "" } else { "s" }
@@ -234,7 +234,7 @@ pub(super) fn emit_page(
     }
     render::note_no_auto(ctx.input.no_auto);
     if let Some(notice) = &notice {
-        eprintln!("{notice}");
+        agrep_core::errln!("{notice}");
     }
     Ok(exit)
 }

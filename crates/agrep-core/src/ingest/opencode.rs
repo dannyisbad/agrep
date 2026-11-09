@@ -28,7 +28,9 @@
 //! injected wrappers, then concatenate survivors) - never per message. We
 //! under-include rather than risk labeling agent/system text as the user's.
 
-use crate::ingest::registry::{metadata_is_link, path_eq, relative_path};
+use crate::ingest::registry::{
+    metadata_is_link, path_eq, refused_root_link, relative_path, root_file, root_metadata,
+};
 use crate::ingest::{
     cap_event_output, cap_str, is_wrapper, project_name, summarize_tool_input_with_chars, EVENT_CAP,
 };
@@ -67,7 +69,7 @@ fn data_dirs_for(
     }
 }
 
-fn data_dirs_at(home: &Path) -> Vec<std::path::PathBuf> {
+pub(crate) fn data_dirs_at(home: &Path) -> Vec<std::path::PathBuf> {
     let xdg = std::env::var_os("XDG_DATA_HOME");
     let local = std::env::var_os("LOCALAPPDATA");
     data_dirs_for(
@@ -101,6 +103,7 @@ fn explicit_db_at(data_dir: &Path) -> Option<std::path::PathBuf> {
     explicit_db_from(&raw, data_dir)
 }
 
+/// A database found in a data dir: a plain regular file; links there are never followed.
 fn regular_db(path: &Path) -> bool {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.is_file() && !metadata_is_link(&meta) => true,
@@ -110,6 +113,20 @@ fn regular_db(path: &Path) -> bool {
         }
         Ok(_) => false,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            crate::ingest::warn_source_skip("opencode", path, &error);
+            false
+        }
+    }
+}
+
+/// The database `OPENCODE_DB` names, a store root: a regular file, or a link to one followed once.
+fn explicit_db(path: &Path) -> bool {
+    match root_file(path) {
+        Ok((_, meta)) => meta.is_file(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        // The census reports a refused link against the root itself.
+        Err(error) if refused_root_link(&error) => false,
         Err(error) => {
             crate::ingest::warn_source_skip("opencode", path, &error);
             false
@@ -129,16 +146,16 @@ fn discovered_name(path: &Path) -> bool {
         })
 }
 
-fn databases_in(dir: &Path) -> Vec<std::path::PathBuf> {
+/// The databases in data dir `dir`, a store root that may be a link, followed once. The
+/// explicit database, when it sits here, is the caller's to judge.
+fn databases_in(dir: &Path, explicit: Option<&Path>) -> Vec<std::path::PathBuf> {
     let mut paths = Vec::new();
-    match std::fs::symlink_metadata(dir) {
-        Ok(meta) if meta.is_dir() && !metadata_is_link(&meta) => {}
-        Ok(meta) if metadata_is_link(&meta) => {
-            crate::ingest::warn_source_skip("opencode", dir, "symlink sources are not followed");
-            return paths;
-        }
+    match root_metadata(dir) {
+        Ok(meta) if meta.is_dir() => {}
         Ok(_) => return paths,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return paths,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound || refused_root_link(&error) => {
+            return paths
+        }
         Err(error) => {
             crate::ingest::warn_source_skip("opencode", dir, &error);
             return paths;
@@ -160,7 +177,10 @@ fn databases_in(dir: &Path) -> Vec<std::path::PathBuf> {
             }
         };
         let path = entry.path();
-        if discovered_name(&path) && regular_db(&path) {
+        if discovered_name(&path)
+            && !explicit.is_some_and(|explicit| path_eq(explicit, &path))
+            && regular_db(&path)
+        {
             paths.push(path);
         }
     }
@@ -840,14 +860,17 @@ pub fn collect(cache: &mut crate::intake_batch::IntakeBatch) -> (Vec<Message>, V
     let mut events = Vec::new();
     let mut seen = Vec::new();
     for dir in dirs {
-        let mut files = databases_in(&dir);
-        if let Some(path) = explicit
-            .as_ref()
-            .filter(|path| relative_path(path, &dir).is_some())
-        {
-            if regular_db(path) && !contains_path(&files, path) {
-                files.push(path.clone());
-                files.sort();
+        let inside = explicit
+            .as_deref()
+            .filter(|path| relative_path(path, &dir).is_some());
+        let mut files = databases_in(&dir, inside);
+        if let Some(path) = inside {
+            if !contains_path(&seen, path) {
+                seen.push(path.to_path_buf());
+                if explicit_db(path) {
+                    files.push(path.to_path_buf());
+                    files.sort();
+                }
             }
         }
         for path in &files {
@@ -860,7 +883,7 @@ pub fn collect(cache: &mut crate::intake_batch::IntakeBatch) -> (Vec<Message>, V
         events.extend(pass.events);
     }
     if let Some(path) = explicit.filter(|path| !contains_path(&seen, path)) {
-        let files = if regular_db(&path) {
+        let files = if explicit_db(&path) {
             std::slice::from_ref(&path)
         } else {
             &[]

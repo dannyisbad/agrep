@@ -73,7 +73,7 @@ pub(super) fn sql_filters(
                 .query_map([], |r| r.get(0))?
                 .collect::<rusqlite::Result<Vec<String>>>()?
                 .into_iter()
-                .filter(|p| project_ok(p, pattern))
+                .filter(|p| crate::history::project_matches(p, pattern))
                 .collect();
             if projects.is_empty() {
                 if !exclude {
@@ -147,18 +147,6 @@ pub fn caller_allows(f: &Filters, h: &Hit) -> bool {
                 || (c.exclude_family && h.family == c.family)
                 || (h.session == c.session && c.exclude_from_turn.is_some_and(|p| h.turn >= p)))
     })
-}
-pub(crate) fn project_ok(value: &str, pattern: &str) -> bool {
-    let p = pattern.to_lowercase();
-    let v = value.to_lowercase();
-    if p.contains(['*', '?', '[']) {
-        globset::GlobBuilder::new(&p)
-            .literal_separator(false)
-            .build()
-            .is_ok_and(|g| g.compile_matcher().is_match(&v))
-    } else {
-        v == p || v.rsplit(['/', '\\']).next() == Some(p.as_str())
-    }
 }
 
 fn session_filters(

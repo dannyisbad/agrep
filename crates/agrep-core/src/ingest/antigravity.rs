@@ -17,9 +17,10 @@
 //!
 //! Project: there is no cwd field on the user events, so we infer the workspace from
 //! the most frequent `tool_calls[*].args.Cwd` seen in the session's transcript
-//! (dominant value is the working dir), then run
+//! (dominant value is the working dir, stored as the session's cwd for resume), then run
 //! it through `project_name`. Falls back to "antigravity" when no Cwd is present.
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -140,29 +141,36 @@ fn is_injected_metadata(text: &str) -> bool {
 }
 
 /// Most frequent `tool_calls[*].args.Cwd` across the transcript → the session's
-/// working directory. Returns None if no Cwd was ever recorded.
+/// working directory; a tie goes to the directory seen first, as 0.4.9's
+/// `max(counts, key=counts.get)` over an insertion-ordered dict did
+/// (py/hookless/native.py:310-335). Returns None if no Cwd was ever recorded.
 fn dominant_cwd(events: &[TLine]) -> Option<String> {
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for e in events {
-        if let Some(tcs) = &e.tool_calls {
-            for tc in tcs {
-                if let Some(cwd) = tc
-                    .args
-                    .as_ref()
-                    .and_then(|a| a.get("Cwd"))
-                    .and_then(|v| v.as_str())
-                {
-                    if !cwd.is_empty() {
-                        *counts.entry(cwd.to_string()).or_insert(0) += 1;
-                    }
-                }
-            }
-        }
+    let mut counts: HashMap<String, (usize, Reverse<usize>)> = HashMap::new();
+    let cwds = events
+        .iter()
+        .filter_map(|e| e.tool_calls.as_ref())
+        .flatten()
+        .filter_map(|tc| tc.args.as_ref()?.get("Cwd")?.as_str())
+        .filter_map(decode_cwd)
+        .filter(|cwd| !cwd.is_empty());
+    for (seen, cwd) in cwds.enumerate() {
+        counts.entry(cwd).or_insert((0, Reverse(seen))).0 += 1;
     }
     counts
         .into_iter()
-        .max_by_key(|(_, n)| *n)
+        .max_by_key(|&(_, rank)| rank)
         .map(|(cwd, _)| cwd)
+}
+
+/// Antigravity can store `Cwd` double-encoded, its value itself a JSON string; 0.4.9
+/// decoded that layer, skipped a value decoding to anything but a string, and otherwise
+/// stripped whitespace and quotes (py/hookless/native.py:323-330).
+fn decode_cwd(raw: &str) -> Option<String> {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(serde_json::Value::String(cwd)) => Some(cwd),
+        Ok(_) => None,
+        Err(_) => Some(raw.trim().trim_matches('"').to_owned()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -307,14 +315,18 @@ fn task_result(m: Mail, task: String, p: &Path, session: &str) -> Event {
     }
 }
 
-fn parse_session(brain_dir: &Path) -> (Vec<Message>, Vec<Event>, bool) {
+/// One brain directory's rows, its `(session, working directory)` when a Cwd was recorded,
+/// and whether it read cleanly.
+type SessionParse = (Vec<Message>, Vec<Event>, Option<(String, String)>, bool);
+
+fn parse_session(brain_dir: &Path) -> SessionParse {
     let session = brain_dir
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
     let transcript = match transcript_path(brain_dir) {
         Ok(transcript) => transcript,
-        Err(healthy) => return (Vec::new(), Vec::new(), healthy),
+        Err(healthy) => return (Vec::new(), Vec::new(), None, healthy),
     };
     // seen = non-blank transcript.jsonl events
     let tally = crate::intake::tally();
@@ -328,14 +340,16 @@ fn parse_session(brain_dir: &Path) -> (Vec<Message>, Vec<Event>, bool) {
             ));
             tally.seen();
             tally.error(&format!("cannot read: {e}"));
-            return (Vec::new(), Vec::new(), false);
+            return (Vec::new(), Vec::new(), None, false);
         }
     };
 
     // Parse every event once; we need a full pass for the dominant Cwd anyway.
     let events = transcript_events(&data, &tally);
-    let project = dominant_cwd(&events)
-        .map(|cwd| project_name(&cwd))
+    let cwd = dominant_cwd(&events);
+    let project = cwd
+        .as_deref()
+        .map(project_name)
         .unwrap_or_else(|| "antigravity".to_string());
 
     let mut parse = TranscriptParse {
@@ -359,6 +373,7 @@ fn parse_session(brain_dir: &Path) -> (Vec<Message>, Vec<Event>, bool) {
             .map(crate::model::RawMessage::freeze)
             .collect(),
         evts,
+        cwd.map(|cwd| (session, cwd)),
         healthy,
     )
 }
@@ -583,13 +598,33 @@ impl TranscriptParse<'_> {
     }
 }
 
-type Collected = (Vec<Message>, Vec<Event>, bool, Vec<SourceReadIssue>);
+/// One pass over the store: its rows, each session's working directory (resume starts the
+/// agent there), whether every session read cleanly, and the parses that panicked.
+struct Collected {
+    messages: Vec<Message>,
+    events: Vec<Event>,
+    cwds: HashMap<String, String>,
+    healthy: bool,
+    issues: Vec<SourceReadIssue>,
+}
+
+impl Collected {
+    fn empty(healthy: bool) -> Self {
+        Self {
+            messages: Vec::new(),
+            events: Vec::new(),
+            cwds: HashMap::new(),
+            healthy,
+            issues: Vec::new(),
+        }
+    }
+}
 
 /// Walk every `brain/<uuid>/` session and collect the user's Antigravity prompts + events.
 fn collect_from_root(root: &Path) -> Collected {
     let dirs = match read_root(root) {
         Ok(dirs) => dirs,
-        Err(healthy) => return (Vec::new(), Vec::new(), healthy, Vec::new()),
+        Err(healthy) => return Collected::empty(healthy),
     };
     let mut session_dirs = Vec::new();
     let mut healthy = true;
@@ -617,7 +652,7 @@ fn collect_from_root(root: &Path) -> Collected {
 
 /// The store root's listing, or whether the store is healthy without one.
 fn read_root(root: &Path) -> Result<fs::ReadDir, bool> {
-    match fs::symlink_metadata(root) {
+    match crate::ingest::registry::root_metadata(root) {
         Ok(meta) if meta.is_dir() && !metadata_is_link(&meta) => {}
         Ok(_) => return Err(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(true),
@@ -637,7 +672,7 @@ fn read_root(root: &Path) -> Result<fs::ReadDir, bool> {
 }
 
 /// Parse every session directory in parallel, isolating panics, and merge in walk order.
-fn parse_all(session_dirs: &[PathBuf], mut healthy: bool) -> Collected {
+fn parse_all(session_dirs: &[PathBuf], healthy: bool) -> Collected {
     let parsed: Vec<_> = session_dirs
         .par_iter()
         .map(|d| {
@@ -646,35 +681,37 @@ fn parse_all(session_dirs: &[PathBuf], mut healthy: bool) -> Collected {
             )
         })
         .collect();
-    let mut msgs = Vec::new();
-    let mut evts = Vec::new();
-    let mut issues = Vec::new();
+    let mut collected = Collected::empty(healthy);
     for session in parsed {
         match session {
-            Ok((m, e, true)) => {
-                msgs.extend(m);
-                evts.extend(e);
+            Ok((m, e, cwd, true)) => {
+                collected.messages.extend(m);
+                collected.events.extend(e);
+                collected.cwds.extend(cwd);
             }
-            Ok((_, _, false)) => healthy = false,
+            Ok((_, _, _, false)) => collected.healthy = false,
             Err(issue) => {
-                healthy = false;
-                issues.push(issue);
+                collected.healthy = false;
+                collected.issues.push(issue);
             }
         }
     }
-    (msgs, evts, healthy, issues)
+    collected
 }
 
-pub fn collect() -> Collected {
-    collect_from_root(
+fn collect(cache: &mut crate::intake_batch::IntakeBatch) -> Collected {
+    let mut collected = collect_from_root(
         &crate::ingest::home()
             .join(".gemini")
             .join("antigravity-cli")
             .join("brain"),
-    )
+    );
+    cache.cwds.extend(std::mem::take(&mut collected.cwds));
+    collected
 }
 
-/// Registry entry (see ingest::registry). Full-parse: ignores the cache.
+/// Registry entry (see ingest::registry). Full-parse: reads no cache, and hands each
+/// session's working directory back through it.
 pub struct Antigravity;
 impl crate::ingest::registry::Adapter for Antigravity {
     fn name(&self) -> &'static str {
@@ -683,26 +720,31 @@ impl crate::ingest::registry::Adapter for Antigravity {
     fn fingerprint(&self) -> crate::ingest::registry::Fingerprint {
         crate::ingest::registry::Fingerprint::Always
     }
-    fn collect(&self, _cache: &mut crate::intake_batch::IntakeBatch) -> (Vec<Message>, Vec<Event>) {
-        let (messages, events, _, _) = collect();
-        (messages, events)
+    fn collect(&self, cache: &mut crate::intake_batch::IntakeBatch) -> (Vec<Message>, Vec<Event>) {
+        let collected = collect(cache);
+        (collected.messages, collected.events)
     }
     fn collect_checked(
         &self,
-        _cache: &mut crate::intake_batch::IntakeBatch,
+        cache: &mut crate::intake_batch::IntakeBatch,
     ) -> (
         Vec<Message>,
         Vec<Event>,
         crate::intake_batch::ReadOutcome,
         Vec<SourceReadIssue>,
     ) {
-        let (messages, events, healthy, issues) = collect();
-        let outcome = if healthy {
+        let collected = collect(cache);
+        let outcome = if collected.healthy {
             crate::intake_batch::ReadOutcome::Complete
         } else {
             crate::intake_batch::ReadOutcome::Skipped
         };
-        (messages, events, outcome, issues)
+        (
+            collected.messages,
+            collected.events,
+            outcome,
+            collected.issues,
+        )
     }
     fn store_roots(&self) -> Vec<std::path::PathBuf> {
         vec![crate::ingest::home()
@@ -721,5 +763,53 @@ impl crate::ingest::registry::Adapter for Antigravity {
             .join(".gemini")
             .join("antigravity-cli")
             .join("brain")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn events(cwds: &[&str]) -> Vec<TLine> {
+        cwds.iter()
+            .map(|cwd| {
+                serde_json::from_value(serde_json::json!({
+                    "type": "PLANNER_RESPONSE",
+                    "tool_calls": [{"name": "run_command", "args": {"Cwd": cwd}}]
+                }))
+                .unwrap()
+            })
+            .collect()
+    }
+    #[test]
+    fn dominant_cwd_breaks_ties_by_first_appearance() {
+        let mut tied = [
+            "/w/h", "/w/c", "/w/f", "/w/a", "/w/g", "/w/b", "/w/e", "/w/d",
+        ];
+        for _ in 0..tied.len() {
+            tied.rotate_left(1);
+            let cwds: Vec<&str> = tied.iter().chain(tied.iter().rev()).copied().collect();
+            assert_eq!(dominant_cwd(&events(&cwds)).as_deref(), Some(tied[0]));
+        }
+        let mut cwds: Vec<&str> = tied.iter().chain(tied.iter().rev()).copied().collect();
+        cwds.push("/w/d");
+        assert_eq!(dominant_cwd(&events(&cwds)).as_deref(), Some("/w/d"));
+        assert_eq!(dominant_cwd(&events(&["", ""])), None);
+    }
+    // Expected values follow 0.4.9's `_antigravity_cwd` (py/hookless/native.py:310-335).
+    #[test]
+    fn dominant_cwd_decodes_double_encoded_values_as_0_4_9() {
+        let plain_and_encoded = ["/w/a", r#""/w/b""#, "/w/b"];
+        assert_eq!(
+            dominant_cwd(&events(&plain_and_encoded)).as_deref(),
+            Some("/w/b")
+        );
+        assert_eq!(
+            dominant_cwd(&events(&[r#""C:\\w\\caf\u00e9""#])).as_deref(),
+            Some(r"C:\w\café")
+        );
+        assert_eq!(
+            dominant_cwd(&events(&["7", "null", r#" "/w/d "#])).as_deref(),
+            Some("/w/d")
+        );
     }
 }

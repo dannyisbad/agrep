@@ -79,7 +79,7 @@ impl Drop for Span {
         if let Some((before, thread_before)) = self.usage {
             let after = Usage::now();
             let thread_cpu = thread_before.zip(thread_cpu_ms()).map(|(a, b)| b - a);
-            eprintln!(
+            crate::errln!(
                 "{}",
                 serde_json::json!({
                     "phase":self.name, "wall_ms":self.start.elapsed().as_secs_f64()*1000.,
@@ -100,7 +100,7 @@ impl Drop for Span {
 
 pub fn event(value: serde_json::Value) {
     if timing_enabled() {
-        eprintln!("{value}");
+        crate::errln!("{value}");
     }
 }
 
@@ -136,11 +136,11 @@ pub(crate) fn stage<T, E: From<candle_core::Error>>(
     let encode_ms = start.elapsed().as_secs_f64() * 1000.;
     device.synchronize()?;
     let after = Usage::now();
-    eprintln!(
+    crate::errln!(
         "{}",
         serde_json::json!({"semantic_stage":name,"encode_ms":encode_ms,"complete_ms":start.elapsed().as_secs_f64()*1000.,
-            "cpu_ms":after.cpu_ms-usage.cpu_ms,"major_faults":after.major_faults-usage.major_faults,
-            "involuntary_switches":after.involuntary_switches-usage.involuntary_switches})
+        "cpu_ms":after.cpu_ms-usage.cpu_ms,"major_faults":after.major_faults-usage.major_faults,
+        "involuntary_switches":after.involuntary_switches-usage.involuntary_switches})
     );
     Ok(result)
 }

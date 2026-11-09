@@ -1,7 +1,7 @@
 //! The checkpoint an appended session resumes from, and the incremental entry
 //! point that continues a parse from it.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use super::super::discovery::side_parent;
@@ -15,7 +15,7 @@ pub(super) struct PiState {
     pub(super) out: Vec<RawMessage>,
     pub(super) events: Vec<Event>,
     pub(super) order: crate::ingest::ReplyOrder,
-    pub(super) pending: HashMap<String, usize>,
+    pub(super) pending: BTreeMap<String, usize>,
     pub(super) recap_turns: Vec<u32>,
     pub(super) turn: u32,
     pub(super) model: String,
@@ -27,9 +27,12 @@ pub(super) struct PiState {
     pub(super) ordinal: usize,
 }
 
+/// Continue `previous` over `values`, the records an incremental read prepared
+/// from a file now read through line `next_ordinal`.
 pub(crate) fn resume_prepared(
     path: &Path,
     values: &[PreparedRecord],
+    next_ordinal: usize,
     previous: Option<&str>,
 ) -> anyhow::Result<(
     Vec<Message>,
@@ -43,12 +46,11 @@ pub(crate) fn resume_prepared(
         path,
         parent: side_parent(path),
     };
-    let ((m, e, o), next) = parse_data(
-        origin,
-        crate::intake::tally(),
-        Input::Prepared(values),
-        state,
-    );
+    let input = Input::Prepared {
+        records: values,
+        next_ordinal,
+    };
+    let ((m, e, o), next) = parse_data(origin, crate::intake::tally(), input, state);
     Ok((m, e, o, serde_json::to_string(&next)?))
 }
 

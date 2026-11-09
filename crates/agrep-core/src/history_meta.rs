@@ -171,6 +171,7 @@ fn argv(a: &[String]) -> Invocation {
         };
     }
     let explicit = ["search", "recall", "pack"].contains(&verb.as_str());
+    // `ui` and `serve` opened 0.4.9's browser explorer; transcripts still record those calls.
     if !explicit
         && [
             "index", "reindex", "setup", "remove", "set", "archive", "restore", "run", "resume",

@@ -50,35 +50,83 @@ impl Text for FileText {
             file.rewind()?;
             Ok(file)
         });
-        let mut reader = match file {
-            Ok(file) => BufReader::with_capacity(64 << 10, file),
+        match file {
+            Ok(file) => buffered_lines(BufReader::with_capacity(64 << 10, file), &self.error),
             Err(error) => {
                 *self.error.borrow_mut() = Some(error);
-                return Box::new(std::iter::empty());
+                Box::new(std::iter::empty())
             }
-        };
-        Box::new(std::iter::from_fn(move || {
-            let mut bytes = Vec::new();
-            match reader.read_until(b'\n', &mut bytes) {
-                Ok(0) => None,
-                Ok(_) => {
-                    if bytes.last() == Some(&b'\n') {
-                        bytes.pop();
-                        if bytes.last() == Some(&b'\r') {
-                            bytes.pop();
-                        }
-                    }
-                    Some(Cow::Owned(String::from_utf8(bytes).unwrap_or_else(
-                        |error| String::from_utf8_lossy(error.as_bytes()).into_owned(),
-                    )))
-                }
-                Err(error) => {
-                    *self.error.borrow_mut() = Some(error);
-                    None
-                }
-            }
-        }))
+        }
     }
+}
+
+/// A zstd-compressed JSONL source, decoded afresh on every pass so that no pass holds the
+/// whole decompressed transcript in memory or on disk.
+pub(crate) struct ZstdText<'a> {
+    file: &'a File,
+    error: RefCell<Option<io::Error>>,
+}
+
+impl<'a> ZstdText<'a> {
+    pub(crate) fn new(file: &'a File) -> Self {
+        Self {
+            file,
+            error: RefCell::new(None),
+        }
+    }
+
+    /// The first decoding or read error of the latest pass; a pass stops at it.
+    pub(crate) fn check(&self) -> io::Result<()> {
+        match self.error.borrow_mut().take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Text for ZstdText<'_> {
+    fn lines(&self) -> Box<dyn Iterator<Item = Cow<'_, str>> + '_> {
+        let mut file = self.file;
+        match file
+            .rewind()
+            .and_then(|()| zstd::stream::read::Decoder::new(file))
+        {
+            Ok(decoder) => buffered_lines(BufReader::with_capacity(64 << 10, decoder), &self.error),
+            Err(error) => {
+                *self.error.borrow_mut() = Some(error);
+                Box::new(std::iter::empty())
+            }
+        }
+    }
+}
+
+/// Lines as `str::lines` splits them, decoded like `String::from_utf8_lossy`; a read error
+/// ends the iteration and is kept in `error`.
+fn buffered_lines<'a>(
+    mut reader: impl BufRead + 'a,
+    error: &'a RefCell<Option<io::Error>>,
+) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
+    Box::new(std::iter::from_fn(move || {
+        let mut bytes = Vec::new();
+        match reader.read_until(b'\n', &mut bytes) {
+            Ok(0) => None,
+            Ok(_) => {
+                if bytes.last() == Some(&b'\n') {
+                    bytes.pop();
+                    if bytes.last() == Some(&b'\r') {
+                        bytes.pop();
+                    }
+                }
+                Some(Cow::Owned(String::from_utf8(bytes).unwrap_or_else(
+                    |error| String::from_utf8_lossy(error.as_bytes()).into_owned(),
+                )))
+            }
+            Err(read_error) => {
+                *error.borrow_mut() = Some(read_error);
+                None
+            }
+        }
+    }))
 }
 
 /// Decode like String::from_utf8_lossy without retaining an entire record.

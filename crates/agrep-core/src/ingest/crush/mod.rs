@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use crate::intake_batch::{IntakeBatch, ReadOutcome, SourceReadIssue};
 use crate::model::{Event, Message};
 use discovery::{data_roots, discover, runtime_root, Discovery};
-use session::{conversation_digest, parse_session};
+use session::parse_session;
 use tokens::{live_tokens, open_with_tokens, Opened};
 
 #[cfg(unix)]
@@ -216,9 +216,6 @@ fn listing(discovery: Option<&Discovery>, opened: Option<&Opened>) -> Listing {
 struct ParseFailures {
     /// (database, session, panic reason)
     issues: RefCell<Vec<(PathBuf, String, Option<String>)>>,
-    // A failed conversation is named by its own rows, never by its busy database's generation,
-    // so one stuck chat in a database others keep writing still fails the same way twice.
-    digests: RefCell<Vec<(String, String, String)>>,
 }
 
 impl ParseFailures {
@@ -260,22 +257,11 @@ fn parse_conversation(
         parse_session(connection, &database.project, session)
     });
     match parsed {
-        Ok((messages, events, true)) => {
-            if messages.is_empty() && events.is_empty() {
-                failures.issue(&database.path, session, None);
-            }
-            (messages, events, ReadOutcome::Complete)
-        }
+        Ok((messages, events, true)) => (messages, events, ReadOutcome::Complete),
         // The conversation failed whole: none of its rows are vouched for, and the record
         // below confines the failure to it, so its siblings stay complete.
         Ok((_, _, false)) => {
             failures.issue(&database.path, session, None);
-            if let Some(digest) = conversation_digest(connection, session) {
-                failures
-                    .digests
-                    .borrow_mut()
-                    .push((id.to_owned(), session.to_owned(), digest));
-            }
             (Vec::new(), Vec::new(), ReadOutcome::Invalid)
         }
         Err(panic) => {
@@ -351,13 +337,22 @@ impl crate::ingest::registry::Adapter for Crush {
         discover()
             .map(|discovery| {
                 // An absent registered database is a root the walk finds nothing under: two
-                // such preflights confirm its removal, as for a Stat adapter's store root.
+                // such preflights confirm its removal, as for a Stat adapter's store root. A
+                // data root that could not be inspected stays a root, so the census says why.
+                let data = data_roots();
                 let mut roots: Vec<PathBuf> = discovery
                     .databases
                     .into_iter()
                     .map(|database| database.path)
                     .chain(discovery.unavailable.into_iter().map(|(path, _)| path))
                     .chain(discovery.absent)
+                    .chain(
+                        discovery
+                            .issues
+                            .into_iter()
+                            .map(|(path, _)| path)
+                            .filter(|path| data.contains(path)),
+                    )
                     .collect();
                 roots.sort();
                 roots
@@ -383,5 +378,80 @@ impl crate::ingest::registry::Adapter for Crush {
     }
     fn runtime_issue_root(&self) -> PathBuf {
         runtime_root()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::discovery::Database;
+    use super::*;
+    use rusqlite::hooks::{AuthAction, Authorization};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// One database holding a conversation that parses to nothing and one whose parts are
+    /// not JSON, opened the way a pass opens it, counting each statement that reads `parts`.
+    fn opened(dir: &Path) -> (Opened, Arc<AtomicUsize>) {
+        let path = dir.join("crush.db");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE sessions(id TEXT PRIMARY KEY, parent_session_id TEXT, title TEXT,
+                 updated_at INTEGER, created_at INTEGER);
+             CREATE TABLE messages(id TEXT PRIMARY KEY, session_id TEXT, role TEXT, parts TEXT,
+                 model TEXT, created_at INTEGER, updated_at INTEGER);
+             INSERT INTO sessions VALUES ('quiet', NULL, 'q', 2, 1), ('broken', NULL, 'b', 2, 1);
+             INSERT INTO messages VALUES
+                 ('m1', 'quiet', 'assistant', '[{\"type\":\"reasoning\",\"data\":{}}]', NULL, 1, 1),
+                 ('m2', 'broken', 'user', 'not json', NULL, 1, 1);",
+        )
+        .unwrap();
+        drop(db);
+        let connection = open_ro(&path).unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&reads);
+        connection.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+            if let AuthAction::Read {
+                table_name: "messages",
+                column_name: "parts",
+            } = context.action
+            {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+            Authorization::Allow
+        }));
+        let database = Database {
+            path,
+            project: "p".into(),
+        };
+        let opened = Opened {
+            databases: vec![(database, connection)],
+            tokens: Vec::new(),
+            locations: [("quiet".to_owned(), 0), ("broken".to_owned(), 0)].into(),
+            unavailable: Vec::new(),
+        };
+        (opened, reads)
+    }
+
+    #[test]
+    fn a_conversation_that_parses_to_nothing_is_complete_without_an_issue() {
+        let dir = tempfile::tempdir().unwrap();
+        let (opened, _) = opened(dir.path());
+        let failures = ParseFailures::default();
+        let (messages, events, outcome) =
+            parse_conversation(Some(&opened), "quiet", "quiet", &failures);
+        assert!(messages.is_empty() && events.is_empty());
+        assert!(matches!(outcome, ReadOutcome::Complete));
+        assert!(failures.issues.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_failed_conversation_is_read_once_and_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (opened, reads) = opened(dir.path());
+        let failures = ParseFailures::default();
+        let (_, _, outcome) = parse_conversation(Some(&opened), "broken", "broken", &failures);
+        assert!(matches!(outcome, ReadOutcome::Invalid));
+        assert_eq!(failures.issues.borrow().len(), 1);
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
     }
 }

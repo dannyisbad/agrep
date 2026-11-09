@@ -40,8 +40,6 @@ pub(crate) fn run(cli: Cli, invocation: &cmd::usage::Invocation) -> Result<i32> 
             cmd::usage::tail(invocation)?;
             cmd::tail::run(agent, session, events, snapshot)
         }
-        Some(Command::Serve { port, no_auto }) => cmd::serve::run(port, no_auto),
-        Some(Command::Ui { port, no_auto }) => cmd::ui::run(port, no_auto),
         Some(Command::Chats(s)) => {
             cmd::usage::chats(&s, invocation)?;
             let (no_auto, color) = (s.no_auto, s.color.clone());
@@ -122,10 +120,10 @@ pub(crate) fn run(cli: Cli, invocation: &cmd::usage::Invocation) -> Result<i32> 
         Some(Command::Census) => {
             let root = DataRoot::discover()?;
             root.validate(false)?;
-            println!(
+            agrep_core::outln!(
                 "{}",
                 agrep_core::json_output::to_string(&agrep_core::freshness::pending(&root)?)?
-            );
+            )?;
             Ok(0)
         }
         Some(Command::Hook { agent }) => {

@@ -5,7 +5,7 @@ Design:
 - [ENGINE.md](ENGINE.md): the data root, locks, census and freshness, refresh,
   storage, FTS indexes and merges, query lanes, counts, caller exclusion, `--chat`
   scopes, background work and known limits.
-- [ENGINE-API.md](ENGINE-API.md): the library surface the binary and explorer use.
+- [ENGINE-API.md](ENGINE-API.md): the library surface the binary uses.
 - [SEMANTIC.md](SEMANTIC.md): the embedding model, query path, vector storage and its
   quality gates.
 

@@ -422,27 +422,32 @@ fn call_input(name: &str, function: &Value) -> ((String, usize), String) {
     (input, state)
 }
 
-/// Map each `sessions/<md5>/` dir to its real workdir via the kimi.json registry.
+/// Map each `sessions/<md5>/` dir to its real workdir via the kimi.json registry, a store root
+/// that may be a link to a file, followed once. Without it attribution is incomplete, so a
+/// registry that cannot be read leaves the store unhealthy.
 fn workdir_registry(root: &Path) -> (HashMap<String, String>, bool) {
     let mut map = HashMap::new();
     let path = root.join("kimi.json");
-    match is_plain(&path, fs::Metadata::is_file) {
-        Ok(true) => {}
-        Ok(false) => return (map, true),
-        Err(error) => {
-            crate::ingest::warn_source_skip("kimi", &path, &error);
-            return (map, false);
-        }
-    }
-    let bytes = match crate::ingest::registry::read_bounded_regular_file(&path, REGISTRY_MAX_BYTES)
-    {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => return (map, true),
+    let source = match crate::ingest::registry::root_file(&path) {
+        Ok((source, meta)) if meta.is_file() => source,
+        Ok(_) => return (map, true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (map, true),
+        // The census reports a refused link against kimi.json itself.
+        Err(error) if crate::ingest::registry::refused_root_link(&error) => return (map, false),
         Err(error) => {
             crate::ingest::warn_source_skip("kimi", &path, &error);
             return (map, false);
         }
     };
+    let bytes =
+        match crate::ingest::registry::read_bounded_regular_file(&source, REGISTRY_MAX_BYTES) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return (map, true),
+            Err(error) => {
+                crate::ingest::warn_source_skip("kimi", &path, &error);
+                return (map, false);
+            }
+        };
     let data = match String::from_utf8(bytes) {
         Ok(data) => data,
         Err(error) => {
@@ -485,19 +490,29 @@ fn collect_from_root(root: &Path) -> Collected {
     parse_all(&walk.work, walk.healthy)
 }
 
-/// The `sessions/` listing, or whether the store is healthy without one.
+/// The `sessions/` listing, or whether the store is healthy without one. Kimi's home and its
+/// sessions directory are roots, so either may be a link, which is followed.
 fn read_sessions(root: &Path) -> Result<fs::ReadDir, bool> {
-    for dir in [root.to_path_buf(), root.join("sessions")] {
-        match is_plain(&dir, fs::Metadata::is_dir) {
+    let sessions = root.join("sessions");
+    for dir in [root, sessions.as_path()] {
+        let found = match crate::ingest::registry::root_metadata(dir) {
+            Ok(meta) => Ok(meta.is_dir()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        };
+        match found {
             Ok(true) => {}
             Ok(false) => return Err(true),
+            // The census reports a refused sessions link against that root itself.
+            Err(error) if dir == sessions && crate::ingest::registry::refused_root_link(&error) => {
+                return Err(false)
+            }
             Err(error) => {
-                crate::ingest::warn_source_skip("kimi", &dir, &error);
+                crate::ingest::warn_source_skip("kimi", dir, &error);
                 return Err(false);
             }
         }
     }
-    let sessions = root.join("sessions");
     match fs::read_dir(&sessions) {
         Ok(d) => Ok(d),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(true),

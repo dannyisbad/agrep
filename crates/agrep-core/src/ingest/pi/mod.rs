@@ -102,4 +102,7 @@ impl crate::ingest::registry::Adapter for Pi {
     fn session_alias(&self, path: &Path, session: &str) -> Option<String> {
         discovery::session_alias(path, session)
     }
+    fn side_parent(&self, path: &Path) -> Option<String> {
+        discovery::side_parent(path)
+    }
 }

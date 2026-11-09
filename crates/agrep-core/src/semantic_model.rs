@@ -70,6 +70,15 @@ pub fn installed_at(path: &Path) -> bool {
             .is_ok_and(|m| m.is_file() && m.len() == *len)
     })
 }
+/// A download or conversion stopped partway: some model files are present, but not the
+/// complete pinned set [`installed`] requires.
+pub fn incomplete(root: &DataRoot) -> bool {
+    let path = directory(root);
+    !installed_at(&path)
+        && fs::read_dir(&path).is_ok_and(|mut entries| {
+            entries.any(|e| e.is_ok_and(|e| e.file_name() != "download.lock"))
+        })
+}
 
 /// Start read-ahead before freshness and metadata work. The mapping owns no
 /// mutable data and is only a performance hint; normal load verification still
@@ -280,15 +289,45 @@ fn record_verification(path: &Path, files: &[(&str, u64, &str)]) -> Result<()> {
     File::open(path)?.sync_all()?;
     Ok(())
 }
+/// Installed model bytes that fail their pinned size or SHA-256: only a reinstall changes
+/// the verdict, unlike an I/O or loading failure.
+#[derive(Debug)]
+pub struct Rejected(String);
+impl std::fmt::Display for Rejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for Rejected {}
 fn verify(path: &Path, size: u64, expected: &str) -> Result<()> {
     let file = File::open(path)?;
     if file.metadata()?.len() != size {
-        bail!("incorrect model file size: {}", path.display());
+        return Err(Rejected(format!("incorrect model file size: {}", path.display())).into());
     }
     if digest_file(file)? != expected {
-        bail!("model SHA-256 mismatch: {}", path.display());
+        return Err(Rejected(format!("model SHA-256 mismatch: {}", path.display())).into());
     }
     Ok(())
+}
+/// Whether background work already rejected these exact installed files, so it neither
+/// loads them again nor logs the same failure on every scheduled run.
+pub fn rejected(root: &DataRoot) -> bool {
+    let path = directory(root);
+    let Ok(bytes) = fs::read(path.join("rejected.json")) else {
+        return false;
+    };
+    serde_json::from_slice::<Verified>(&bytes)
+        .is_ok_and(|record| stamps(&path, &FILES).is_ok_and(|now| now == record))
+}
+/// Records the installed files' stamps after their verification failed; replacing any of
+/// them, as `agrep setup` does, clears the verdict.
+pub fn record_rejection(root: &DataRoot) -> Result<()> {
+    let path = directory(root);
+    crate::safe_fs::write_atomic(
+        &path.join("rejected.json"),
+        &serde_json::to_vec(&stamps(&path, &FILES)?)?,
+        true,
+    )
 }
 fn digest_file(mut file: File) -> Result<String> {
     let mut hash = Sha256::new();
@@ -304,13 +343,17 @@ fn digest_file(mut file: File) -> Result<String> {
 }
 /// Only explicit setup, index --semantic and -s callers may invoke this function.
 /// Network failures preserve already verified files and never publish partial bytes.
-pub fn provision(root: &DataRoot) -> Result<()> {
+/// `progress` hears the bytes downloaded so far and the bytes this install downloads.
+pub fn provision(root: &DataRoot, progress: &mut dyn FnMut(u64, u64)) -> Result<()> {
     if crate::data::read_only() {
         bail!("data directory is read-only");
     }
-    provision_at(&directory(root))
+    provision_with(&directory(root), progress)
 }
 pub fn provision_at(path: &Path) -> Result<()> {
+    provision_with(path, &mut |_, _| {})
+}
+fn provision_with(path: &Path, progress: &mut dyn FnMut(u64, u64)) -> Result<()> {
     crate::data::private_dir(path)?;
     if let Some(parent) = path
         .parent()
@@ -326,7 +369,7 @@ pub fn provision_at(path: &Path) -> Result<()> {
         .open(path.join("download.lock"))?;
     lock.lock()?;
     if verify_installed_at(path).is_err() {
-        download_sources(path)?;
+        download_sources(path, progress)?;
         convert_weights(path)?;
     }
     if !cached_verification(path, &FILES) {
@@ -341,6 +384,7 @@ pub fn provision_at(path: &Path) -> Result<()> {
         "weights-f16.safetensors.partial",
         "converted.json.partial",
         "verified.json.partial",
+        "rejected.json",
         "tokenizer-query.partial",
         "tokenizer-query.bin.partial.partial",
     ]
@@ -363,7 +407,22 @@ pub fn provision_at(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn download_sources(path: &Path) -> Result<()> {
+/// Counts the bytes read through it for a progress report.
+struct Counted<'a, R> {
+    inner: R,
+    done: &'a mut u64,
+    total: u64,
+    progress: &'a mut dyn FnMut(u64, u64),
+}
+impl<R: Read> Read for Counted<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        *self.done += n as u64;
+        (self.progress)(*self.done, self.total);
+        Ok(n)
+    }
+}
+fn download_sources(path: &Path, progress: &mut dyn FnMut(u64, u64)) -> Result<()> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .tls_config(
             ureq::tls::TlsConfig::builder()
@@ -374,11 +433,14 @@ fn download_sources(path: &Path) -> Result<()> {
         )
         .build()
         .into();
-    for (name, size, digest) in DOWNLOADS {
+    let needed: Vec<_> = DOWNLOADS
+        .into_iter()
+        .filter(|&(name, size, digest)| verify(&path.join(name), size, digest).is_err())
+        .collect();
+    let total = needed.iter().map(|&(_, size, _)| size).sum();
+    let mut done = 0;
+    for (name, size, digest) in needed {
         let dest = path.join(name);
-        if verify(&dest, size, digest).is_ok() {
-            continue;
-        }
         let temp = path.join(format!("{name}.partial"));
         let outcome = (|| -> Result<()> {
             let url =
@@ -389,7 +451,12 @@ fn download_sources(path: &Path) -> Result<()> {
                 .with_context(|| format!("download {name}"))?;
             let mut file = File::create(&temp)?;
             let n = std::io::copy(
-                &mut response.body_mut().as_reader().take(size + 1),
+                &mut Counted {
+                    inner: response.body_mut().as_reader().take(size + 1),
+                    done: &mut done,
+                    total,
+                    progress: &mut *progress,
+                },
                 &mut file,
             )?;
             if n != size {
@@ -567,7 +634,7 @@ impl Embedder {
             if crate::semantic_profile::enabled() {
                 device.synchronize()?;
             }
-            eprintln!(
+            crate::errln!(
                 "{}",
                 serde_json::json!({"semantic_load":{"verify_ms":verified_ms,"tokenizer_ms":tokenizer_ms,"weights_ms":weights_ms,"total_ms":load_start.elapsed().as_secs_f64()*1000.}})
             );
@@ -729,7 +796,7 @@ impl Embedder {
                 .collect::<Result<_>>()?
         };
         if crate::semantic_profile::enabled() {
-            eprintln!(
+            crate::errln!(
                 "{}",
                 serde_json::json!({"tokenize_ms":started.elapsed().as_secs_f64()*1000.,"rows":texts.len(),"tokens":ids.iter().map(Vec::len).sum::<usize>()})
             );
@@ -751,7 +818,7 @@ impl Embedder {
             let batch = &order[start..end];
             let width = batch.iter().map(|&i| ids[i].len()).max().unwrap();
             if crate::semantic_profile::enabled() {
-                eprintln!(
+                crate::errln!(
                     "{}",
                     serde_json::json!({"batch_rows":batch.len(),"padded_tokens":batch.len()*width,"tokens":batch.iter().map(|&i|ids[i].len()).sum::<usize>()})
                 );
@@ -960,7 +1027,54 @@ mod tests {
         let p = t.path().join("x");
         fs::write(&p, b"ok").unwrap();
         verify(&p, 2, &crate::store::digest("ok")).unwrap();
-        assert!(verify(&p, 2, &crate::store::digest("no")).is_err());
-        assert!(verify(&p, 3, "").is_err());
+        assert!(verify(&p, 2, &crate::store::digest("no"))
+            .unwrap_err()
+            .is::<Rejected>());
+        assert!(verify(&p, 3, "").unwrap_err().is::<Rejected>());
+        assert!(!verify(&t.path().join("absent"), 2, "")
+            .unwrap_err()
+            .is::<Rejected>());
+    }
+    // Background work rejected a corrupt model on every scheduled run, logging the same
+    // mismatch each time (QA finding 9); the verdict now lasts until the files change.
+    #[test]
+    fn a_rejection_lasts_until_the_model_files_change() {
+        let t = tempfile::tempdir().unwrap();
+        let root = DataRoot::open(t.path().join("data"), true).unwrap();
+        let path = root.path().join("model").join(MODEL_ID);
+        assert!(!incomplete(&root));
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("download.lock"), b"").unwrap();
+        assert!(!incomplete(&root));
+        for (name, size, _) in FILES {
+            File::create(path.join(name))
+                .unwrap()
+                .set_len(size)
+                .unwrap();
+            assert_eq!(incomplete(&root), !installed(&root));
+        }
+        assert!(installed(&root) && !rejected(&root));
+        record_rejection(&root).unwrap();
+        assert!(rejected(&root));
+        let config = path.join(FILES[0].0);
+        fs::remove_file(&config).unwrap();
+        File::create(&config).unwrap().set_len(FILES[0].1).unwrap();
+        assert!(!rejected(&root));
+    }
+    #[test]
+    fn download_progress_counts_bytes_across_files() {
+        let (mut done, mut heard) = (0, vec![]);
+        for part in [&b"abc"[..], b"de"] {
+            let mut report = |n: u64, total: u64| heard.push((n, total));
+            let mut counted = Counted {
+                inner: part,
+                done: &mut done,
+                total: 5,
+                progress: &mut report,
+            };
+            std::io::copy(&mut counted, &mut std::io::sink()).unwrap();
+        }
+        assert_eq!(heard.first(), Some(&(3, 5)));
+        assert_eq!(heard.last(), Some(&(5, 5)));
     }
 }

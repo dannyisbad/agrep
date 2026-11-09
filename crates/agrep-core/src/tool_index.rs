@@ -454,6 +454,8 @@ pub(crate) fn refresh(
                 *deltas.entry(code).or_default() += delta;
             }
         }
+        // Ids follow term order, as in a first build, so equal inputs number words equally.
+        new_words.sort_unstable();
         // One statement keeps the lexicon trigger's additions in one FTS segment.
         tx.execute(
             "INSERT INTO tool_words(term,doc) SELECT value->>0,value->>1 FROM json_each(?1)",
@@ -483,7 +485,7 @@ pub(crate) fn refresh(
     tx.execute("DELETE FROM tool_word_old", [])?;
     Ok(())
 }
-fn word_blocks(c: &Connection, id: i64, base: &[u8]) -> Result<Vec<u32>> {
+pub(crate) fn word_blocks(c: &Connection, id: i64, base: &[u8]) -> Result<Vec<u32>> {
     let mut blocks = decode_blocks(base)?;
     let mut q = c.prepare_cached("SELECT block FROM tool_word_blocks WHERE word=?")?;
     for row in q.query_map([id], |r| r.get::<_, u32>(0))? {
@@ -642,6 +644,31 @@ mod frequency_tests {
             tx.commit().unwrap();
             assert!(expand(&c, "needle").unwrap().unwrap().is_empty());
         }
+    }
+    #[test]
+    fn words_a_refresh_adds_are_numbered_in_term_order() {
+        let mut c = fixture::open();
+        let tx = c.transaction().unwrap();
+        fixture::insert(&tx, 1, "seed", true);
+        refresh(&tx, true, None).unwrap();
+        fixture::insert(
+            &tx,
+            2,
+            "kilo alpha juliet bravo india charlie hotel delta golf echo foxtrot lima",
+            true,
+        );
+        refresh(&tx, false, None).unwrap();
+        let added: Vec<String> = tx
+            .prepare("SELECT term FROM tool_words WHERE id>(SELECT id FROM tool_words WHERE term='seed') ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let mut sorted = added.clone();
+        sorted.sort();
+        assert_eq!(added.len(), 12);
+        assert_eq!(added, sorted);
     }
 }
 

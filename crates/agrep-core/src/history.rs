@@ -241,23 +241,28 @@ pub fn identity(reference: &str) -> Result<String> {
     }
     crate::handles::normalize(reference)
 }
-pub fn resolve<'a>(all: &'a [Session], reference: &str) -> Result<(Vec<&'a Session>, bool)> {
+pub fn resolve<'a, I>(sessions: I, reference: &str) -> Result<(Vec<&'a Session>, bool)>
+where
+    I: IntoIterator<Item = &'a Session>,
+    I::IntoIter: Clone,
+{
+    let all = sessions.into_iter();
     let id = identity(reference)?;
-    let exact: Vec<_> = all.iter().filter(|s| s.id == id).collect();
+    let exact: Vec<_> = all.clone().filter(|s| s.id == id).collect();
     if !exact.is_empty() {
         return Ok((exact, false));
     }
-    let prefix: Vec<_> = all.iter().filter(|s| s.id.starts_with(&id)).collect();
+    let prefix: Vec<_> = all.clone().filter(|s| s.id.starts_with(&id)).collect();
     if !prefix.is_empty() {
         return Ok((prefix, false));
     }
     if id.len() >= 6 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
-        let v: Vec<_> = all.iter().filter(|s| s.id.contains(&id)).collect();
+        let v: Vec<_> = all.clone().filter(|s| s.id.contains(&id)).collect();
         if !v.is_empty() {
             return Ok((v, false));
         }
     }
-    let roots: Vec<_> = all.iter().filter(|s| !s.side).collect();
+    let roots: Vec<_> = all.filter(|s| !s.side).collect();
     let project: Vec<_> = roots
         .iter()
         .copied()
@@ -297,7 +302,7 @@ pub fn one_line(s: &str, max: usize) -> String {
         .collect()
 }
 pub fn age(ts: i64) -> String {
-    let seconds = (chrono::Utc::now().timestamp_millis() - ts).max(0) / 1000;
+    let seconds = (crate::clock::now_ms() - ts).max(0) / 1000;
     match seconds {
         0..60 => "now".into(),
         60..3600 => format!("{}m", seconds / 60),
@@ -349,30 +354,7 @@ pub fn resolve_indexed<'a>(
         return Ok(matched);
     }
     let identity = identity(reference)?;
-    let mut q = c.prepare("SELECT src.path,src.agent,e.session FROM sources src JOIN (SELECT source,session FROM reply_shapes GROUP BY source,session UNION SELECT source,session FROM events GROUP BY source,session) e ON e.source=src.rowid WHERE src.path NOT LIKE '@%' AND src.path NOT LIKE 'token:%'")?;
-    let mut aliases = HashSet::new();
-    for row in q.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-        ))
-    })? {
-        let (path, agent, session) = row?;
-        if crate::ingest::registry::path_eq(
-            std::path::Path::new(&path),
-            std::path::Path::new(reference),
-        ) || crate::ingest::registry::session_alias(
-            &agent,
-            std::path::Path::new(&path),
-            &session,
-        )
-        .as_deref()
-            == Some(identity.as_str())
-        {
-            aliases.insert((agent, session));
-        }
-    }
+    let aliases = file_sessions(c, reference, &identity)?;
     let found: Vec<_> = all
         .iter()
         .filter(|s| aliases.contains(&(s.agent.clone(), s.id.clone())))
@@ -382,6 +364,44 @@ pub fn resolve_indexed<'a>(
     } else {
         Ok((found, false))
     }
+}
+/// The sessions an indexed file names for `reference`: every session the file at that
+/// path holds reply shapes or active tool events of, and each one whose file's own name
+/// gives `identity` (`registry::session_alias`).
+fn file_sessions(
+    c: &Connection,
+    reference: &str,
+    identity: &str,
+) -> Result<HashSet<(String, String)>> {
+    let mut found = HashSet::new();
+    let mut sources = c.prepare(
+        "SELECT rowid,path,agent FROM sources WHERE path NOT LIKE '@%' AND path NOT LIKE 'token:%'",
+    )?;
+    // The events view's inner joins: every key names a stored session and symbol.
+    let mut sessions = c.prepare("SELECT session FROM reply_shapes WHERE source=?1 UNION SELECT s.session FROM event_rows e INDEXED BY event_active_key JOIN event_sessions s ON s.id=e.session_key WHERE e.active=1 AND e.source=?1")?;
+    let mut rows = sources.query([])?;
+    while let Some(row) = rows.next()? {
+        let path = std::path::Path::new(row.get_ref(1)?.as_str()?);
+        let agent = row.get_ref(2)?.as_str()?;
+        let named = crate::ingest::registry::path_eq(path, std::path::Path::new(reference));
+        // An alias is the file's own id whenever that differs from the session's, so a
+        // file whose name gives another id aliases none of its sessions to `identity`.
+        if !named
+            && crate::ingest::registry::session_alias(agent, path, "").as_deref() != Some(identity)
+        {
+            continue;
+        }
+        for session in sessions.query_map([row.get::<_, i64>(0)?], |r| r.get::<_, String>(0))? {
+            let session = session?;
+            if named
+                || crate::ingest::registry::session_alias(agent, path, &session).as_deref()
+                    == Some(identity)
+            {
+                found.insert((agent.to_owned(), session));
+            }
+        }
+    }
+    Ok(found)
 }
 
 #[cfg(test)]
@@ -399,5 +419,105 @@ mod tests {
             }
             assert!(!super::project_matches(label, r"C:\Other\Project"));
         }
+    }
+
+    // The files a reference names, as the grouping scan over every event row found them,
+    // read through the sources the reference can name.
+    #[test]
+    fn file_references_read_only_the_files_they_name() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::schema(&c).unwrap();
+        let named = crate::ingest::home()
+            .join(".omp/agent/sessions/slug/2026-01-01T00-00-00-000Z_fileid.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        for (path, agent) in [
+            ("/a.jsonl", "pi"),
+            ("@live", "codex"),
+            ("token:x", "pi"),
+            ("/b.jsonl", "codex"),
+            (named.as_str(), "pi"),
+            ("/d", "codex"),
+        ] {
+            c.execute(
+                "INSERT INTO sources VALUES(?1,?2,0,0,x'',NULL)",
+                rusqlite::params![path, agent],
+            )
+            .unwrap();
+        }
+        c.execute_batch("INSERT INTO event_sessions VALUES(1,'pi','s1'),(2,'codex','s1'),(3,'pi','s2'),(4,'pi','fileid'),(5,'pi','gone');").unwrap();
+        for (id, (source, key, active)) in [
+            (1, 1, 1),
+            (1, 1, 1),
+            (1, 3, 1),
+            (2, 2, 1),
+            (3, 1, 1),
+            (4, 2, 1),
+            (5, 4, 1),
+            (5, 5, 0),
+            (5, 3, 1),
+            (6, 5, 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            c.execute("INSERT INTO event_rows(id,tool_id,source,session_key,call_id,kind_key,name_key,ts,native_turn,position,input_chars,output_chars,output_bytes,child_session,meta,state,project_key,active) VALUES(?1,?1,?2,?3,?1,0,0,0,0,0,0,0,0,'','','',0,?4)", rusqlite::params![id, source, key, active]).unwrap();
+        }
+        for (source, session, turn) in [
+            (1, "s1", 0),
+            (1, "s1", 1),
+            (4, "s9", 0),
+            (5, "hdr", 0),
+            (6, "s2", 0),
+            (2, "s7", 0),
+        ] {
+            c.execute(
+                "INSERT INTO reply_shapes VALUES(?1,?2,?3,'')",
+                rusqlite::params![source, session, turn],
+            )
+            .unwrap();
+        }
+        let pairs: Vec<(String, String, String)> = c
+            .prepare("SELECT src.path,src.agent,e.session FROM sources src JOIN (SELECT source,session FROM reply_shapes GROUP BY source,session UNION SELECT source,session FROM events GROUP BY source,session) e ON e.source=src.rowid WHERE src.path NOT LIKE '@%' AND src.path NOT LIKE 'token:%'")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let mut hits = 0;
+        for reference in [
+            "/a.jsonl", "/b.jsonl", "/d", &named, "@live", "token:x", "fileid", "hdr", "s1", "s2",
+            "gone", "zzzz",
+        ] {
+            let identity = super::identity(reference).unwrap();
+            let scanned: std::collections::HashSet<_> = pairs
+                .iter()
+                .filter(|(path, agent, session)| {
+                    let path = std::path::Path::new(path);
+                    crate::ingest::registry::path_eq(path, std::path::Path::new(reference))
+                        || crate::ingest::registry::session_alias(agent, path, session).as_deref()
+                            == Some(identity.as_str())
+                })
+                .map(|(_, agent, session)| (agent.clone(), session.clone()))
+                .collect();
+            hits += scanned.len();
+            assert_eq!(
+                super::file_sessions(&c, reference, &identity).unwrap(),
+                scanned,
+                "{reference}"
+            );
+        }
+        assert_eq!(hits, 11);
+        let plan: Vec<String> = c
+            .prepare("EXPLAIN QUERY PLAN SELECT session FROM reply_shapes WHERE source=?1 UNION SELECT s.session FROM event_rows e INDEXED BY event_active_key JOIN event_sessions s ON s.id=e.session_key WHERE e.active=1 AND e.source=?1")
+            .unwrap()
+            .query_map([1], |r| r.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            !plan.iter().any(|step| step.starts_with("SCAN")),
+            "{plan:?}"
+        );
     }
 }

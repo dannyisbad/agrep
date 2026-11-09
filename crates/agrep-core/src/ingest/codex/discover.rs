@@ -7,15 +7,42 @@ use super::parse_file;
 use crate::ingest::registry::{metadata_is_link, plain_entry_metadata};
 use crate::model::{Event, Message};
 
+/// Codex compresses a finished rollout to `<name>.jsonl.zst`.
+const COMPRESSED: &str = ".jsonl.zst";
+
 fn is_rollout_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+        .is_some_and(|name| {
+            name.starts_with("rollout-") && (name.ends_with(".jsonl") || name.ends_with(COMPRESSED))
+        })
 }
 
-/// Recursively collect rollout files under `~/.codex/sessions/` (YYYY/MM/DD nesting).
+pub(super) fn is_compressed(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(COMPRESSED))
+}
+
+/// The file stem a rollout's identities derive from, the same for its compressed copy so a
+/// chat keeps its ids when Codex compresses it.
+pub(super) fn rollout_stem(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?;
+    let plain = name
+        .strip_suffix(".zst")
+        .filter(|_| name.ends_with(COMPRESSED));
+    Path::new(plain.unwrap_or(name)).file_stem()?.to_str()
+}
+
+/// Recursively collect rollout files under a Codex root (YYYY/MM/DD nesting). Only the root
+/// (`absent_ok`) may be a link, which is followed.
 fn gather(dir: &Path, files: &mut Vec<std::path::PathBuf>, absent_ok: bool) {
-    match fs::symlink_metadata(dir) {
+    let found = if absent_ok {
+        crate::ingest::registry::root_metadata(dir)
+    } else {
+        fs::symlink_metadata(dir)
+    };
+    match found {
         Ok(meta) if meta.is_dir() && !metadata_is_link(&meta) => {}
         Ok(_) => {
             crate::ingest::warn_source_skip("codex", dir, "source is not a plain directory");
@@ -62,15 +89,24 @@ fn gather(dir: &Path, files: &mut Vec<std::path::PathBuf>, absent_ok: bool) {
     }
 }
 
+/// Codex moves a chat archived in its UI from `sessions/` to `archived_sessions/`; both hold
+/// the user's chats.
+fn roots() -> [std::path::PathBuf; 2] {
+    let codex = crate::ingest::home().join(".codex");
+    [codex.join("sessions"), codex.join("archived_sessions")]
+}
+
 /// Walk all session rollouts and collect the user's Codex messages + tool events.
 pub fn collect(cache: &mut crate::intake_batch::IntakeBatch) -> (Vec<Message>, Vec<Event>) {
-    let root = crate::ingest::home().join(".codex").join("sessions");
-    let files = cache.preflight_source_paths(&root).unwrap_or_else(|| {
-        let mut files = Vec::new();
-        gather(&root, &mut files, true);
-        files.sort_unstable();
-        files
-    });
+    let mut files = Vec::new();
+    for root in roots() {
+        files.extend(cache.preflight_source_paths(&root).unwrap_or_else(|| {
+            let mut files = Vec::new();
+            gather(&root, &mut files, true);
+            files
+        }));
+    }
+    files.sort_unstable();
 
     let pass = crate::intake_batch::collect_cached_for(cache, "codex", &files, parse_file);
     (pass.messages, pass.events)
@@ -89,13 +125,7 @@ impl crate::ingest::registry::Adapter for Codex {
         collect(cache)
     }
     fn store_roots(&self) -> Vec<std::path::PathBuf> {
-        vec![crate::ingest::home().join(".codex").join("sessions")]
-    }
-    fn archive_roots(&self) -> Vec<std::path::PathBuf> {
-        vec![
-            crate::ingest::home().join(".codex/sessions"),
-            crate::ingest::home().join(".codex/archived_sessions"),
-        ]
+        roots().into()
     }
     fn store_content(&self, path: &std::path::Path) -> bool {
         is_rollout_file(path)

@@ -14,15 +14,28 @@ fn pending_sources(h: &Path, d: &Path) -> usize {
         .as_u64()
         .unwrap() as usize
 }
-fn cli(home: &Path, data: &Path, args: &[&str]) -> Output {
-    Command::new(support::binary())
-        .env_clear()
+fn command(home: &Path, data: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new(support::binary());
+    cmd.env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         .env("AGREP_HOME", home)
         .env("AGREP_DATA_DIR", data)
         .env("AGREP_PROFILE", "classic")
-        .args(args)
+        .args(args);
+    cmd
+}
+fn cli(home: &Path, data: &Path, args: &[&str]) -> Output {
+    command(home, data, args)
+        .output()
+        .expect("built agrep executable is required")
+}
+/// Runs that are compared with each other rank against one instant, which follows the
+/// fixtures' times; between real-clock runs rows on a rounding boundary can swap.
+const NOW_MS: &str = "1794300000000";
+fn pinned(home: &Path, data: &Path, args: &[&str]) -> Output {
+    command(home, data, args)
+        .env("AGREP_NOW_MS", NOW_MS)
         .output()
         .expect("built agrep executable is required")
 }
@@ -382,10 +395,13 @@ fn search_contracts() {
     let invalid = cli(&h, &d, &["release", "--unrecognized-flag"]);
     assert_eq!(invalid.status.code(), Some(2));
     assert!(invalid.stdout.is_empty());
+    // clap's whole message (QA finding 5): the refusal, then usage.
+    let text = String::from_utf8(invalid.stderr).unwrap();
     assert_eq!(
-        String::from_utf8(invalid.stderr).unwrap().lines().count(),
-        1
+        text.lines().next(),
+        Some("error: unexpected argument '--unrecognized-flag' found")
     );
+    assert!(text.contains("\nUsage: agrep search "), "{text}");
     assert_eq!(cli(&h, &d, &["-E", "("]).status.code(), Some(2));
     assert_eq!(cli(&h, &d, &["recall", "q"]).status.code(), Some(1));
 }
@@ -542,6 +558,276 @@ fn reindex_assigns_the_source_ids_a_first_build_does() {
     ok(cli(&h, &first, &["index"]));
     assert_eq!(ids(&d), ids(&first));
 }
+/// Pi chats of `turns` user turns, each turn with a tool call, numbered from `from`.
+fn chats(home: &Path, from: usize, count: usize, turns: usize) -> Vec<PathBuf> {
+    (from..from + count)
+        .map(|n| {
+            let p = home.join(format!(".pi/agent/sessions/project/chat-{n}.jsonl"));
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            let mut lines = vec![serde_json::json!({"type":"session","id":format!("chat-{n}"),"version":3,"cwd":"/work/project","timestamp":"2026-10-29T12:00:00Z"}).to_string()];
+            let mut parent = Value::Null;
+            for t in 0..turns {
+                let (user, call, done) = (format!("u{t}"), format!("c{t}"), format!("d{t}"));
+                lines.push(serde_json::json!({"type":"message","id":user,"parentId":parent,"timestamp":"2026-10-29T12:00:01Z","message":{"role":"user","content":format!("chat {n} turn {t} question about widget {}", (n * 7 + t) % 13)}}).to_string());
+                lines.push(serde_json::json!({"type":"message","id":call,"parentId":user,"timestamp":"2026-10-29T12:00:02Z","message":{"role":"assistant","content":[{"type":"toolCall","id":done,"name":"shell","arguments":{"command":format!("inspect {n} {t}")}}]}}).to_string());
+                lines.push(serde_json::json!({"type":"message","id":done,"parentId":call,"timestamp":"2026-10-29T12:00:03Z","message":{"role":"toolResult","toolCallId":done,"toolName":"shell","content":[{"type":"text","text":format!("payload {n} {t}")}]}}).to_string());
+                parent = Value::String(done);
+            }
+            fs::write(&p, lines.join("\n") + "\n").unwrap();
+            p
+        })
+        .collect()
+}
+/// Every row of every table and the schema of the index in `data`, in key order, less the
+/// time of its last refresh.
+fn contents(data: &Path) -> Vec<String> {
+    let c = Connection::open_with_flags(data.join("index.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .unwrap();
+    let mut out: Vec<String> = c
+        .prepare("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY name")
+        .unwrap()
+        .query_map([], |r| {
+            Ok(format!(
+                "{:?}",
+                (0..4)
+                    .map(|i| r.get::<_, Option<String>>(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    let tables: Vec<String> = c
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND sql NOT LIKE 'CREATE VIRTUAL%' ORDER BY name")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    for table in tables {
+        let mut q = c.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
+        let order = (1..=q.column_count())
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>();
+        q = c
+            .prepare(&format!(
+                "SELECT * FROM \"{table}\" ORDER BY {}",
+                order.join(",")
+            ))
+            .unwrap();
+        let width = q.column_count();
+        let rows = q
+            .query_map([], |r| {
+                (0..width)
+                    .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap();
+        for row in rows {
+            let row = row.unwrap();
+            if table == "state" && row[0] == rusqlite::types::Value::Text("refreshed".into()) {
+                continue;
+            }
+            out.push(format!("{table} {row:?}"));
+        }
+    }
+    out
+}
+fn pages(data: &Path) -> (i64, i64, u64) {
+    let c = Connection::open_with_flags(data.join("index.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .unwrap();
+    let pragma = |name: &str| {
+        c.query_row(&format!("PRAGMA {name}"), [], |r| r.get::<_, i64>(0))
+            .unwrap()
+    };
+    let (count, free, size) = (
+        pragma("page_count"),
+        pragma("freelist_count"),
+        pragma("page_size"),
+    );
+    assert_eq!(
+        fs::metadata(data.join("index.db")).unwrap().len(),
+        (count * size) as u64,
+        "the database file holds exactly its pages"
+    );
+    (count, free, (count * size) as u64)
+}
+#[test]
+fn reindex_writes_the_database_a_first_build_writes() {
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let d = t.path().join("d");
+    let early = chats(&h, 0, 30, 12);
+    ok(cli(&h, &d, &["index"]));
+    chats(&h, 30, 30, 12);
+    for gone in &early[..10] {
+        fs::remove_file(gone).unwrap();
+    }
+    chats(&h, 10, 5, 20);
+    ok(cli(&h, &d, &["index"]));
+    let first = t.path().join("first");
+    ok(cli(&h, &first, &["index"]));
+    for rebuild in [&["reindex"][..], &["reindex", "--full"]] {
+        ok(cli(&h, &d, rebuild));
+        assert_eq!(contents(&d), contents(&first), "{rebuild:?}");
+        let (count, free, bytes) = pages(&d);
+        assert_eq!(free, 0, "{rebuild:?}");
+        // Two builds of the same rows can lay out a few pages differently.
+        assert!(
+            bytes <= pages(&first).2 * 101 / 100,
+            "{rebuild:?}: {count} pages"
+        );
+        assert!(!d.join("index.building.db").exists());
+    }
+}
+#[test]
+fn a_reader_keeps_its_snapshot_while_reindex_replaces_the_index() {
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let d = t.path().join("d");
+    chats(&h, 0, 20, 5);
+    ok(cli(&h, &d, &["index"]));
+    let root = DataRoot(d.clone());
+    let rows = |c: &Connection| {
+        c.query_row("SELECT count(*) FROM prose", [], |r| r.get::<_, i64>(0))
+            .unwrap()
+    };
+    let held = store::reader(&root).unwrap();
+    let before = rows(&held);
+    chats(&h, 20, 5, 5);
+    ok(cli(&h, &d, &["reindex"]));
+    assert_eq!(rows(&held), before);
+    assert_eq!(
+        held.query_row("SELECT count(*) FROM sessions", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        20
+    );
+    assert!(rows(&store::reader(&root).unwrap()) > before);
+    drop(held);
+    let first = t.path().join("first");
+    ok(cli(&h, &first, &["index"]));
+    assert_eq!(contents(&d), contents(&first));
+    // The copy reaches the file itself at a later checkpoint, which the reader held off.
+    assert_eq!(
+        store::reader(&root)
+            .unwrap()
+            .query_row("PRAGMA freelist_count", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+#[test]
+fn reindex_keeps_the_vectors_and_state_no_transcript_rebuilds() {
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let d = t.path().join("d");
+    let chat = transcript(&h, &["alpha marker", "beta marker"]);
+    ok(cli(&h, &d, &["index"]));
+    let root = DataRoot(d.clone());
+    fs::create_dir_all(d.join("vectors")).unwrap();
+    fs::write(d.join("vectors/block"), b"vectors").unwrap();
+    store::writer(&root)
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO semantic_blocks VALUES('block',2);
+INSERT INTO semantic_chunks SELECT 'text:'||digest,0,'block',turn FROM prose;
+INSERT INTO semantic_refs SELECT id,digest,'text:'||digest FROM prose;
+DELETE FROM semantic_queue;
+INSERT INTO state VALUES('semantic_rows_per_second','42'),('post_index_pending','1');",
+        )
+        .unwrap();
+    let body = fs::read_to_string(&chat).unwrap();
+    fs::write(&chat, body.replace("beta marker", "gamma marker")).unwrap();
+    ok(cli(&h, &d, &["reindex"]));
+    let c = store::reader(&root).unwrap();
+    let rows = |sql: &str| -> Vec<String> {
+        c.prepare(sql)
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    let text = "CAST(p.text AS TEXT)";
+    assert_eq!(
+        rows(&format!("SELECT {text}||' '||r.content_key FROM semantic_refs r JOIN prose p ON p.id=r.row_id AND p.digest=r.digest")),
+        [format!("alpha marker text:{}", store::digest("alpha marker"))]
+    );
+    assert_eq!(
+        rows(&format!(
+            "SELECT {text} FROM semantic_queue q JOIN prose p ON p.id=q.row_id"
+        )),
+        ["gamma marker"]
+    );
+    assert_eq!(
+        rows("SELECT content_key||' '||block FROM semantic_chunks"),
+        [format!("text:{} block", store::digest("alpha marker"))]
+    );
+    assert_eq!(agrep_core::semantic::coverage(&c).unwrap().embedded, 1);
+    assert_eq!(
+        rows("SELECT key||'='||value FROM state WHERE key IN ('semantic_rows_per_second','post_index_pending') ORDER BY key"),
+        ["post_index_pending=1", "semantic_rows_per_second=42"]
+    );
+    assert!(d.join("vectors/block").exists());
+}
+#[test]
+fn an_index_clears_what_an_interrupted_build_left() {
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let d = t.path().join("d");
+    transcript(&h, &["alpha marker"]);
+    ok(cli(&h, &d, &["index"]));
+    for leftover in ["index.building.db", "index.building.db-journal"] {
+        fs::write(d.join(leftover), b"interrupted").unwrap();
+    }
+    transcript(&h, &["alpha marker", "beta marker"]);
+    ok(cli(&h, &d, &["index"]));
+    assert!(!d.join("index.building.db").exists());
+    assert!(!d.join("index.building.db-journal").exists());
+    ok(cli(&h, &d, &["beta", "-c"]));
+}
+#[test]
+fn a_reindex_killed_partway_leaves_the_index_it_was_replacing() {
+    use std::io::BufRead;
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let d = t.path().join("d");
+    chats(&h, 0, 200, 20);
+    ok(cli(&h, &d, &["index"]));
+    let before = ok(cli(&h, &d, &["widget", "-c", "--no-auto"])).stdout;
+    let mut reindex = Command::new(support::binary())
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", &h)
+        .env("AGREP_HOME", &h)
+        .env("AGREP_DATA_DIR", &d)
+        .arg("reindex")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut notice = String::new();
+    std::io::BufReader::new(reindex.stderr.take().unwrap())
+        .read_line(&mut notice)
+        .unwrap();
+    assert!(notice.starts_with("rebuilding the search db"), "{notice}");
+    reindex.kill().unwrap();
+    reindex.wait().unwrap();
+    assert_eq!(
+        ok(cli(&h, &d, &["widget", "-c", "--no-auto"])).stdout,
+        before
+    );
+    let status: Value =
+        serde_json::from_slice(&ok(cli(&h, &d, &["status", "--json", "--no-auto"])).stdout)
+            .unwrap();
+    assert_eq!(status["index"]["state"], "ready");
+    ok(cli(&h, &d, &["reindex"]));
+    assert_eq!(
+        ok(cli(&h, &d, &["widget", "-c", "--no-auto"])).stdout,
+        before
+    );
+    assert!(!d.join("index.building.db").exists());
+}
 
 #[test]
 fn gemini_recorded_flows_keep_roles_replies_and_parents() {
@@ -688,14 +974,15 @@ fn a_source_under_a_directory_turned_file_is_removed_by_the_refresh() {
     assert_eq!(pending_sources(&h, &d), 1);
     ok(cli(&h, &d, &["index"]));
     assert_eq!(pending_sources(&h, &d), 0);
-    let status: Value =
-        serde_json::from_slice(&ok(cli(&h, &d, &["status", "--json", "--no-auto"])).stdout)
-            .unwrap();
-    assert!(!status["sources"]
-        .as_array()
+    let recorded: i64 = store::reader(&DataRoot(d.clone()))
         .unwrap()
-        .iter()
-        .any(|s| s["path"].as_str().map(Path::new) == Some(source.as_path())));
+        .query_row(
+            "SELECT count(*) FROM sources WHERE path=?1",
+            [source.to_string_lossy()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 0);
 }
 // A directory the census cannot list is recorded with its error, and once it lists again
 // that record names no source: the census asks for a refresh, and the refresh drops it.
@@ -718,17 +1005,14 @@ fn a_directory_error_clears_once_the_directory_reads_again() {
             ],
         )
         .unwrap();
+    // doctor lists the sources whose last read failed; status only counts them.
     let errors = || -> Vec<Value> {
-        let status: Value =
-            serde_json::from_slice(&ok(cli(&h, &d, &["status", "--json", "--no-auto"])).stdout)
-                .unwrap();
-        status["sources"]
+        let doctor: Value =
+            serde_json::from_slice(&ok(cli(&h, &d, &["doctor", "--json"])).stdout).unwrap();
+        doctor["status"]["sources"]
             .as_array()
-            .unwrap()
-            .iter()
-            .filter(|s| !s["last_error"].is_null())
             .cloned()
-            .collect()
+            .unwrap_or_default()
     };
     assert_eq!(errors().len(), 1);
     assert_eq!(pending_sources(&h, &d), 1);
@@ -794,7 +1078,7 @@ fn phase_search_agrees_with_exhaustive_order_for_rows_and_chats() {
         if extra {
             a.push("-l")
         }
-        let all = ok(cli(&h, &d, &a));
+        let all = ok(pinned(&h, &d, &a));
         let all: Vec<Value> = String::from_utf8(all.stdout)
             .unwrap()
             .lines()
@@ -805,7 +1089,7 @@ fn phase_search_agrees_with_exhaustive_order_for_rows_and_chats() {
         if extra {
             a.push("-l")
         }
-        let page = ok(cli(&h, &d, &a));
+        let page = ok(pinned(&h, &d, &a));
         let page: Vec<Value> = String::from_utf8(page.stdout)
             .unwrap()
             .lines()
@@ -1177,7 +1461,7 @@ fn replay_selects_complete_reply_and_deduplicates_tool_calls() {
     let reply = |text: &str| serde_json::json!({"type":"message","id":"reply","parentId":"done","timestamp":"2026-10-29T12:00:04Z","message":{"role":"assistant","content":text}});
     fs::write(
         &original,
-        format!("{base}{call}\n{done}\n{}\n", reply("shortreply")),
+        format!("{base}{call}\n{done}\n{}\n", reply("longreply")),
     )
     .unwrap();
     let replay = original.with_file_name("replay.jsonl");
@@ -1204,7 +1488,6 @@ fn replay_selects_complete_reply_and_deduplicates_tool_calls() {
             "1"
         );
     }
-    assert_eq!(cli(&h, &d, &["shortreply", "-c"]).status.code(), Some(1));
     fs::write(
         &original,
         fs::read_to_string(&original)
@@ -1219,11 +1502,17 @@ fn replay_selects_complete_reply_and_deduplicates_tool_calls() {
             .trim(),
         "1"
     );
-    assert_eq!(cli(&h, &d, &["replaypayload", "-c"]).status.code(), Some(1));
+    // The replay file still holds the call's earlier output, so both stay searchable.
+    assert_eq!(
+        String::from_utf8(ok(cli(&h, &d, &["replaypayload", "-c"])).stdout)
+            .unwrap()
+            .trim(),
+        "1"
+    );
     fs::remove_file(replay).unwrap();
     ok(cli(&h, &d, &["index"]));
     assert_eq!(
-        String::from_utf8(ok(cli(&h, &d, &["shortreply", "-c"])).stdout)
+        String::from_utf8(ok(cli(&h, &d, &["longreply", "-c"])).stdout)
             .unwrap()
             .trim(),
         "1"
@@ -1441,8 +1730,9 @@ fn append_tool_results(path: &Path, parent: &str, from: usize, texts: &[String])
     }
     parent
 }
+/// A pinned run's metadata line and the handles of its rows, in rank order.
 fn handles(h: &Path, d: &Path, args: &[&str]) -> (Value, Vec<Value>) {
-    let out = ok(cli(h, d, args));
+    let out = ok(pinned(h, d, args));
     let mut rows: Vec<Value> = String::from_utf8(out.stdout)
         .unwrap()
         .lines()
@@ -1450,6 +1740,33 @@ fn handles(h: &Path, d: &Path, args: &[&str]) -> (Value, Vec<Value>) {
         .collect();
     let meta = rows.remove(0);
     (meta, rows.iter().map(|r| r["handle"].clone()).collect())
+}
+/// `AGREP_NOW_MS` is the instant recency scores and displayed ages are measured from.
+#[test]
+fn a_pinned_clock_fixes_scores_and_ages() {
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let d = t.path().join("d");
+    transcript(&h, &["needle here"]);
+    ok(cli(&h, &d, &["index"]));
+    // The transcript's rows are stamped 2026-10-29T12:00:01Z.
+    let after = |hours: i64| {
+        let now = (1_793_275_201_000 + hours * 3_600_000).to_string();
+        let run = |args: &[&str]| {
+            let out = command(&h, &d, args).env("AGREP_NOW_MS", &now).output();
+            String::from_utf8(ok(out.unwrap()).stdout).unwrap()
+        };
+        (
+            run(&["chats", "--no-auto"]),
+            run(&["needle", "--json", "--no-auto"]),
+        )
+    };
+    let (chats, ranked) = after(3);
+    assert!(chats.contains(" 3h "), "{chats}");
+    assert_eq!(after(3), (chats, ranked.clone()));
+    let (chats, later) = after(72);
+    assert!(chats.contains(" 3d "), "{chats}");
+    assert_ne!(later, ranked);
 }
 #[test]
 fn tool_block_word_plans_keep_exhaustive_pages() {
@@ -1516,6 +1833,69 @@ fn tool_block_word_plans_keep_exhaustive_pages() {
     append_tool_results(&path, &parent, 1700, &more);
     ok(cli(&h, &d, &["index"]));
     check("append");
+}
+
+// A term with punctuation or an accent reads only the tool rows holding its rarest
+// indexed run, and pages exactly as a read of every row does.
+#[test]
+fn punctuated_tool_terms_read_only_their_anchor_rows() {
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let d = t.path().join("d");
+    let path = transcript(&h, &["notes about the needle", "café std::sync"]);
+    let texts: Vec<String> = (0..1500)
+        .map(|i| match i % 50 {
+            0 => format!("found \"needle\" in std::sync at café {i}"),
+            1 => format!("needle without quotes in std sync at cafe {i}"),
+            2 => format!("needle* globbed (needle {i}"),
+            3 => format!("ログ 日本語 {i}"),
+            4 => format!("日本 {i}"),
+            _ => format!("plain filler output {i}"),
+        })
+        .collect();
+    append_tool_results(&path, "m1", 0, &texts);
+    ok(cli(&h, &d, &["index"]));
+    for (pattern, anchored) in [
+        ("\"needle\"", 90),
+        ("needle*", 90),
+        ("café", 30),
+        ("std::sync", 60),
+        ("(needle", 90),
+        ("日本", 60),
+    ] {
+        assert_eq!(
+            measured_query(&d, pattern, 0, Some("tool")).examined,
+            anchored,
+            "{pattern}"
+        );
+        assert!(
+            measured_query(&d, pattern, 40, Some("tool")).examined <= 2 * anchored,
+            "{pattern}"
+        );
+        for extra in [&[][..], &["--who", "tool"][..], &["-w"][..]] {
+            let mut all = vec![pattern, "--json", "--no-auto", "-n", "0"];
+            all.extend(extra);
+            let (meta, every) = handles(&h, &d, &all);
+            let mut count = vec![pattern, "-c", "--no-auto"];
+            count.extend(extra);
+            let counted = String::from_utf8(cli(&h, &d, &count).stdout).unwrap();
+            assert_eq!(
+                counted.trim(),
+                meta["completeness"]["total"].to_string(),
+                "{pattern} {extra:?}"
+            );
+            for n in ["1", "7", "40"] {
+                let mut page = vec![pattern, "--json", "--no-auto", "-n", n];
+                page.extend(extra);
+                let (_, shown) = handles(&h, &d, &page);
+                let want: Vec<_> = every.iter().take(n.parse().unwrap()).cloned().collect();
+                assert_eq!(shown, want, "{pattern} {extra:?} -n {n} {meta}");
+            }
+        }
+    }
+    // An anchor no indexed word contains admits no row.
+    assert_eq!(measured_query(&d, "zzqqx*", 0, Some("tool")).examined, 0);
+    assert_eq!(cli(&h, &d, &["zzqqx*", "-c"]).status.code(), Some(1));
 }
 
 #[test]
@@ -3072,7 +3452,7 @@ fn explicit_coverage_is_separate_and_identifiers_keep_grep_semantics() {
     let mut o = retrieval_options("specific_useful_missing");
     o.content = true;
     assert!(agrep_core::query::search(&c, &o).unwrap().hits.is_empty());
-    let output = cli(&home, &data, &["--coverage", "specific useful missing"]);
+    let output = pinned(&home, &data, &["--coverage", "specific useful missing"]);
     // 0.4.9 printed the lane on stderr below the miss's explanation and kept the miss's
     // exit status (py/search.py:6484-6531, 8139-8157, 8553-8560).
     assert_eq!(output.status.code(), Some(1));
@@ -3097,7 +3477,7 @@ fn explicit_coverage_is_separate_and_identifiers_keep_grep_semantics() {
         .any(|l| l == "coverage lane: no candidate rows"));
     // 0.4.9 ranked the coverage lane by coverage whatever --sort said.
     for sort in ["time", "position"] {
-        let sorted = cli(
+        let sorted = pinned(
             &home,
             &data,
             &["--coverage", "specific useful missing", "--sort", sort],
@@ -4306,4 +4686,256 @@ fn bounded_pages_equal_exhaustive_rankings_with_snippet_windows() {
     }
     // Nearly every row holds the terms here, yet bounded pages still read fewer rows.
     assert!(bounded < exhaustive, "{bounded} of {exhaustive}");
+}
+
+/// A Codex rollout: a typed prompt with its reply, then calls with and without a native id.
+fn codex_rollout(session: &str, cwd: &str, prompt: &str, tool: &str) -> String {
+    let call = |id: Option<&str>, word: String| {
+        let mut payload = serde_json::json!({"type":"function_call","name":"shell","arguments":serde_json::json!({"command":["echo",word]}).to_string()});
+        if let Some(id) = id {
+            payload["call_id"] = id.into();
+        }
+        serde_json::json!({"timestamp":"2026-06-09T10:00:02Z","type":"response_item","payload":payload})
+    };
+    [
+        serde_json::json!({"timestamp":"2026-06-09T10:00:00Z","type":"session_meta","payload":{"id":session,"cwd":cwd}}),
+        serde_json::json!({"timestamp":"2026-06-09T10:00:01Z","type":"event_msg","payload":{"type":"user_message","message":prompt}}),
+        serde_json::json!({"timestamp":"2026-06-09T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":prompt}]}}),
+        call(Some(&format!("call-{session}")), tool.to_owned()),
+        call(None, format!("{tool}nocallid")),
+        serde_json::json!({"timestamp":"2026-06-09T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":format!("reply to {prompt}")}]}}),
+    ]
+    .map(|line| line.to_string() + "\n")
+    .concat()
+}
+
+fn zstd_packed(text: &str) -> Vec<u8> {
+    zstd::encode_all(text.as_bytes(), 3).unwrap()
+}
+
+/// Search hits as the identities a citation keeps, in the rank order of a pinned run.
+fn cited_hits(h: &Path, d: &Path, query: &str) -> Vec<(Value, Value, Value)> {
+    String::from_utf8(ok(pinned(h, d, &[query, "--json", "--no-auto"])).stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|row| row.get("handle").is_some())
+        .map(|row| {
+            (
+                row["handle"].clone(),
+                row["session"].clone(),
+                row["snippet"].clone(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn compressed_codex_rollouts_are_indexed_once_through_compression() {
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let d = t.path().join("d");
+    let day = h.join(".codex/sessions/2026/06/09");
+    fs::create_dir_all(&day).unwrap();
+    let plain = day.join("rollout-2026-06-09T10-00-00-twin.jsonl");
+    let twin = codex_rollout(
+        "zstd-twin",
+        "/work/twinproject",
+        "twinprompt alpha",
+        "twintool",
+    );
+    fs::write(&plain, &twin).unwrap();
+    let only = codex_rollout(
+        "zstd-only",
+        "/work/onlyproject",
+        "compressedonly bravo",
+        "onlytool",
+    );
+    fs::write(
+        day.join("rollout-2026-06-09T11-00-00-only.jsonl.zst"),
+        zstd_packed(&only),
+    )
+    .unwrap();
+    ok(cli(&h, &d, &["index"]));
+    assert_eq!(cited_hits(&h, &d, "compressedonly").len(), 2);
+    assert_eq!(cited_hits(&h, &d, "onlytool").len(), 2);
+    let cwd: String = Connection::open(d.join("index.db"))
+        .unwrap()
+        .query_row("SELECT cwd FROM sessions WHERE id='zstd-only'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(cwd, "/work/onlyproject");
+    // Codex compresses a finished rollout beside the plain one, then deletes the plain one.
+    let view = || {
+        (
+            cited_hits(&h, &d, "twinprompt"),
+            cited_hits(&h, &d, "twintool"),
+            status_counts(cli(&h, &d, &["status", "--json", "--no-auto"])),
+        )
+    };
+    let before = view();
+    assert_eq!((before.0.len(), before.1.len()), (2, 2));
+    fs::write(
+        day.join("rollout-2026-06-09T10-00-00-twin.jsonl.zst"),
+        zstd_packed(&twin),
+    )
+    .unwrap();
+    ok(cli(&h, &d, &["index"]));
+    assert_eq!(view(), before);
+    fs::remove_file(&plain).unwrap();
+    ok(cli(&h, &d, &["index"]));
+    assert_eq!(view(), before);
+    // A compressed rollout is rewritten rather than appended: a change re-reads it whole.
+    fs::write(
+        day.join("rollout-2026-06-09T11-00-00-only.jsonl.zst"),
+        zstd_packed(&only.replace("compressedonly bravo", "rewrittenzst charlie")),
+    )
+    .unwrap();
+    ok(cli(&h, &d, &["index"]));
+    assert_eq!(cited_hits(&h, &d, "rewrittenzst").len(), 2);
+    assert_eq!(
+        cli(&h, &d, &["compressedonly", "-c"]).status.code(),
+        Some(1)
+    );
+}
+
+#[test]
+fn damaged_compressed_codex_rollouts_are_source_errors_beside_readable_ones() {
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let d = t.path().join("d");
+    let day = h.join(".codex/sessions/2026/06/09");
+    fs::create_dir_all(&day).unwrap();
+    let rollout = |session: &str, prompt: &str| codex_rollout(session, "/work/p", prompt, "tool");
+    fs::write(
+        day.join("rollout-2026-06-09T10-00-00-plain.jsonl"),
+        rollout("plain", "healthyplain prompt"),
+    )
+    .unwrap();
+    fs::write(
+        day.join("rollout-2026-06-09T11-00-00-packed.jsonl.zst"),
+        zstd_packed(&rollout("packed", "healthypacked prompt")),
+    )
+    .unwrap();
+    let whole = zstd_packed(&rollout("truncated", "truncatedonly prompt"));
+    let truncated = day.join("rollout-2026-06-09T12-00-00-truncated.jsonl.zst");
+    fs::write(&truncated, &whole[..whole.len() / 2]).unwrap();
+    let garbage = day.join("rollout-2026-06-09T13-00-00-garbage.jsonl.zst");
+    fs::write(&garbage, "not zstd\n").unwrap();
+    ok(cli(&h, &d, &["index"]));
+    assert_eq!(cited_hits(&h, &d, "healthyplain").len(), 2);
+    assert_eq!(cited_hits(&h, &d, "healthypacked").len(), 2);
+    let failed: Vec<(String, String)> = Connection::open(d.join("index.db"))
+        .unwrap()
+        .prepare("SELECT path,last_error FROM sources WHERE last_error IS NOT NULL ORDER BY path")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    let failed_paths: Vec<_> = failed.iter().map(|(path, _)| PathBuf::from(path)).collect();
+    assert_eq!(failed_paths, [truncated.clone(), garbage.clone()]);
+    assert!(
+        failed
+            .iter()
+            .all(|(_, error)| error.starts_with("cannot decompress: ")),
+        "{failed:?}"
+    );
+    let doctor = String::from_utf8(ok(cli(&h, &d, &["doctor"])).stdout).unwrap();
+    for path in [&truncated, &garbage] {
+        assert!(
+            doctor.contains(&format!(
+                "\nsource failed: {}: cannot decompress: ",
+                path.display()
+            )),
+            "{doctor}"
+        );
+    }
+}
+
+#[test]
+fn full_audit_recounts_compressed_rollouts_and_keeps_damaged_ones_out() {
+    let t = TempDir::new().unwrap();
+    let (h, d) = (t.path().join("h"), t.path().join("d"));
+    let day = h.join(".codex/sessions/2026/06/09");
+    fs::create_dir_all(&day).unwrap();
+    let rollout = |session: &str, prompt: &str| codex_rollout(session, "/work/p", prompt, "tool");
+    fs::write(
+        day.join("rollout-2026-06-09T11-00-00-packed.jsonl.zst"),
+        zstd_packed(&rollout("packed", "healthypacked prompt")),
+    )
+    .unwrap();
+    let whole = zstd_packed(&rollout("truncated", "truncatedonly prompt"));
+    let truncated = day.join("rollout-2026-06-09T12-00-00-truncated.jsonl.zst");
+    fs::write(&truncated, &whole[..whole.len() / 2]).unwrap();
+    ok(cli(&h, &d, &["index"]));
+    let audit = |gappy: bool| {
+        let out = cli(&h, &d, &["audit", "--full", "--json"]);
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let problems: Vec<_> = report["problems"].as_array().unwrap().clone();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p["path"] == truncated.to_str().unwrap()),
+            "{report}"
+        );
+        assert_eq!(report["gaps"].as_u64().unwrap() > 0, gappy, "{report}");
+        report
+    };
+    let clean = audit(false);
+    assert!(clean["expected_rows"].as_u64().unwrap() > 0, "{clean}");
+    let c = store::writer(&DataRoot(d.clone())).unwrap();
+    c.execute("DELETE FROM prose WHERE session='packed'", [])
+        .unwrap();
+    drop(c);
+    let damaged = audit(true);
+    assert!(damaged["gap_details"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|g| g["session"] == "packed" && g["reason"] == "parsed row missing from index"));
+}
+
+#[test]
+fn archived_codex_rollouts_stay_indexed_once_with_their_handles() {
+    for suffix in ["", ".zst"] {
+        let t = TempDir::new().unwrap();
+        let h = t.path().join("h");
+        let d = t.path().join("d");
+        let name = format!("rollout-2026-06-09T10-00-00-archived.jsonl{suffix}");
+        let live = h.join(".codex/sessions/2026/06/09").join(&name);
+        let archived = h.join(".codex/archived_sessions").join(&name);
+        fs::create_dir_all(live.parent().unwrap()).unwrap();
+        fs::create_dir_all(archived.parent().unwrap()).unwrap();
+        let rollout = |prompt: &str| {
+            let text = codex_rollout("zstd-archived", "/work/archived", prompt, "archivedtool");
+            if suffix.is_empty() {
+                text.into_bytes()
+            } else {
+                zstd_packed(&text)
+            }
+        };
+        fs::write(&live, rollout("archivedprompt delta")).unwrap();
+        ok(cli(&h, &d, &["index"]));
+        let view = || {
+            (
+                cited_hits(&h, &d, "archivedprompt"),
+                cited_hits(&h, &d, "archivedtool"),
+                status_counts(cli(&h, &d, &["status", "--json", "--no-auto"])),
+            )
+        };
+        let before = view();
+        assert_eq!((before.0.len(), before.1.len()), (2, 2), "{suffix}");
+        // Archiving in Codex moves the rollout; a copy may briefly exist in both places.
+        fs::copy(&live, &archived).unwrap();
+        ok(cli(&h, &d, &["index"]));
+        assert_eq!(view(), before, "{suffix}");
+        fs::remove_file(&live).unwrap();
+        ok(cli(&h, &d, &["index"]));
+        assert_eq!(view(), before, "{suffix}");
+        fs::write(&archived, rollout("rearchived echo")).unwrap();
+        ok(cli(&h, &d, &["index"]));
+        assert_eq!(cited_hits(&h, &d, "rearchived").len(), 2, "{suffix}");
+    }
 }

@@ -12,7 +12,16 @@ fn walk(
     failures: &mut Vec<String>,
 ) {
     let result = (|| -> Result<()> {
-        let meta = match fs::symlink_metadata(path) {
+        // Only the root may be a link, which is followed to its kind (see `RootKind::of`).
+        let found = if path == root {
+            crate::ingest::registry::followed_root(path, || {
+                crate::ingest::registry::RootKind::of(archive_content(adapter, root, path))
+            })
+            .map(|(_, metadata)| metadata)
+        } else {
+            fs::symlink_metadata(path)
+        };
+        let meta = match found {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e.into()),

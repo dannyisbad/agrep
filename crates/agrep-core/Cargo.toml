@@ -34,8 +34,13 @@ chrono = { workspace = true }
 sha2 = { workspace = true }
 unicode-normalization = { workspace = true }
 unicode-segmentation = { workspace = true }
+# Terminal columns of a board row: CJK and emoji take two.
+unicode-width = { workspace = true }
 flate2 = { workspace = true }
 zlib-rs = "=0.6.8"
+# Codex compresses finished rollouts as .jsonl.zst. Bundled libzstd (C, built like SQLite)
+# decodes them about 4x faster than the pure-Rust ruzstd.
+zstd = { workspace = true }
 # bundled => compiles SQLite from C source (needs cl.exe under the MSVC toolchain on Windows).
 # Used by the opencode sqlite adapter (per-build chat stores live in *.db files).
 
@@ -43,7 +48,6 @@ rusqlite = { version = "0.32", features = ["bundled", "hooks", "functions", "bac
 # kimi-cli keys its per-workdir session dirs by md5(workdir path); ~/.kimi/kimi.json holds
 # the real paths, so we hash each registered path to find its sessions dir.
 md5 = "0.7"
-getrandom = "0.2"
 crossterm = "0.28"
 
 [target.'cfg(unix)'.dependencies]
@@ -56,7 +60,6 @@ signal-hook = "0.3"
 windows-sys = { version = "0.61", features = [
     "Win32_Globalization",
     "Win32_Foundation",
-    "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Diagnostics_Debug",

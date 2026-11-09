@@ -42,6 +42,40 @@ pub fn reset(root: &DataRoot) -> Result<()> {
     tx.commit()?;
     Ok(())
 }
+/// Copies the published vectors of `old`, the index a rebuild replaces, into the rebuilt one
+/// in `tx`. A rebuilt row whose content was covered in `old` stays covered and leaves the
+/// queue; the others stay queued.
+pub(crate) fn carry(old: &Connection, tx: &Connection) -> Result<()> {
+    let mut blocks = old.prepare("SELECT name,rows FROM semantic_blocks")?;
+    let mut keep = tx.prepare("INSERT INTO semantic_blocks VALUES(?1,?2)")?;
+    for row in blocks.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+        let (name, rows) = row?;
+        keep.execute(params![name, rows])?;
+    }
+    let mut chunks = old.prepare("SELECT content_key,ordinal,block,slot FROM semantic_chunks")?;
+    let mut keep = tx.prepare("INSERT INTO semantic_chunks VALUES(?1,?2,?3,?4)")?;
+    for row in chunks.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, i64>(3)?,
+        ))
+    })? {
+        let (key, ordinal, block, slot) = row?;
+        keep.execute(params![key, ordinal, block, slot])?;
+    }
+    tx.execute_batch("CREATE TEMP TABLE covered(content_key TEXT PRIMARY KEY) WITHOUT ROWID")?;
+    let mut covered = old.prepare("SELECT DISTINCT content_key FROM semantic_refs")?;
+    let mut keep = tx.prepare("INSERT INTO temp.covered VALUES(?1)")?;
+    for key in covered.query_map([], |r| r.get::<_, String>(0))? {
+        keep.execute([key?])?;
+    }
+    tx.execute_batch(&format!("INSERT INTO semantic_refs SELECT id,digest,content_key FROM (SELECT p.id,p.digest,{CONTENT_KEY} AS content_key FROM prose p WHERE p.visible=1) WHERE content_key IN temp.covered;
+DELETE FROM semantic_queue WHERE row_id IN (SELECT row_id FROM semantic_refs);
+DROP TABLE temp.covered;"))?;
+    Ok(())
+}
 pub fn coverage(c: &Connection) -> Result<Coverage> {
     let total = c.query_row(
         "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM state WHERE key='prose_count'),0)",
@@ -69,8 +103,13 @@ pub struct Pending {
     pub key: String,
     pub chunks: Vec<String>,
 }
+/// The content key of prose row `p`: its preparation variant and raw digest, which bind
+/// every chunk to the source text. An omp advisor sidecar's notes (automated reviewer
+/// chatter) key as `none:`, which no vector ever carries, so they cover their row without
+/// joining the meaning lane.
+const CONTENT_KEY: &str = "(CASE WHEN EXISTS(SELECT 1 FROM sources s WHERE s.rowid=p.source AND (substr(s.path,-16) IN ('/__advisor.jsonl','\\__advisor.jsonl') OR substr(s.path,-19) IN ('/__advisor.jsonl.gz','\\__advisor.jsonl.gz'))) THEN 'none:' WHEN p.agent='pi' AND p.who='recap' THEN 'recap:' ELSE 'text:' END)||p.digest";
 pub fn batch(c: &Connection, n: usize) -> Result<Vec<Pending>> {
-    let mut s=c.prepare("SELECT p.id,p.digest,p.agent,p.who,p.text FROM semantic_queue q JOIN prose p ON p.id=q.row_id AND p.digest=q.digest WHERE p.visible=1 ORDER BY q.ts DESC,q.row_id DESC LIMIT ?")?;
+    let mut s = c.prepare(&format!("SELECT p.id,p.digest,p.agent,p.who,p.text,{CONTENT_KEY} FROM semantic_queue q JOIN prose p ON p.id=q.row_id AND p.digest=q.digest WHERE p.visible=1 ORDER BY q.ts DESC,q.row_id DESC LIMIT ?"))?;
     let rows = s.query_map([n], |r| {
         Ok((
             r.get::<_, i64>(0)?,
@@ -78,30 +117,26 @@ pub fn batch(c: &Connection, n: usize) -> Result<Vec<Pending>> {
             r.get::<_, String>(2)?,
             r.get::<_, String>(3)?,
             r.get::<_, Vec<u8>>(4)?,
+            r.get::<_, String>(5)?,
         ))
     })?;
     let mut out = vec![];
     for row in rows {
-        let (id, digest, agent, who, bytes) = row?;
-        let text = store::decode("prose", bytes)?;
-        if store::digest(&text) != digest {
-            bail!("semantic source digest mismatch");
-        }
-        // The raw digest plus preparation variant binds ALL chunks to the source text.
-        let key = format!(
-            "{}:{}",
-            if agent == "pi" && who == "recap" {
-                "recap"
-            } else {
-                "text"
-            },
-            digest
-        );
+        let (id, digest, agent, who, bytes, key) = row?;
+        let chunks = if key.starts_with("none:") {
+            Vec::new()
+        } else {
+            let text = store::decode("prose", bytes)?;
+            if store::digest(&text) != digest {
+                bail!("semantic source digest mismatch");
+            }
+            semantic_model::chunks(&agent, &who, &text)
+        };
         out.push(Pending {
             id,
             digest,
             key,
-            chunks: semantic_model::chunks(&agent, &who, &text),
+            chunks,
         });
     }
     Ok(out)
@@ -194,12 +229,11 @@ pub fn publish(
         }
     }
     let mut attached = 0;
+    let attach = format!("INSERT INTO semantic_refs SELECT p.id,p.digest,?1 FROM prose p WHERE p.id=?2 AND p.digest=?3 AND p.visible=1 AND {CONTENT_KEY}=?1 ON CONFLICT(row_id) DO UPDATE SET digest=excluded.digest,content_key=excluded.content_key");
+    let dequeue = format!("DELETE FROM semantic_queue WHERE row_id=?1 AND digest=?2 AND EXISTS(SELECT 1 FROM prose p WHERE p.id=?1 AND {CONTENT_KEY}=?3)");
     for p in pending {
-        attached+=tx.execute("INSERT INTO semantic_refs SELECT id,digest,?1 FROM prose WHERE id=?2 AND digest=?3 AND visible=1 AND (CASE WHEN agent='pi' AND who='recap' THEN 'recap:' ELSE 'text:' END)||digest=?1 ON CONFLICT(row_id) DO UPDATE SET digest=excluded.digest,content_key=excluded.content_key",params![p.key,p.id,p.digest])?;
-        tx.execute(
-            "DELETE FROM semantic_queue WHERE row_id=?1 AND digest=?2 AND EXISTS(SELECT 1 FROM prose WHERE id=?1 AND (CASE WHEN agent='pi' AND who='recap' THEN 'recap:' ELSE 'text:' END)||digest=?3)",
-            params![p.id, p.digest, p.key],
-        )?;
+        attached += tx.execute(&attach, params![p.key, p.id, p.digest])?;
+        tx.execute(&dequeue, params![p.id, p.digest, p.key])?;
     }
     tx.commit()?;
     Ok(attached)

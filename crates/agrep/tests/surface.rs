@@ -600,7 +600,7 @@ fn status_reports_refresh_age_and_footprint_as_0_4_9() {
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(
         lines[1],
-        "5 sessions · 11 prose rows · 2 tool rows · updated just now"
+        "5 sessions · 8 messages · 2 tool rows · updated just now"
     );
     assert!(
         lines[2].starts_with("footprint: ") && lines[2].contains(" MiB across "),
@@ -1446,6 +1446,7 @@ fn budgets_pack_and_frozen_pages() {
         chat_scoped: false,
         full_argv: vec![],
         exhaustible: true,
+        larger_argv: None,
     };
     let handle = pages::save(&root, &f).unwrap().unwrap();
     let old = pages::load(&root, &handle).unwrap();
@@ -2238,7 +2239,7 @@ fn page_footers_follow_rows_on_a_terminal_and_in_a_pipe() {
     let stale = "history may be stale: automatic freshness checks are disabled by --no-auto";
     let compact = [
         "@01930000:2.18ba pi/user alpha <age> now add jitter to the retry",
-        "2+ matches (floor; -c exact)",
+        "2+ matches (floor; -c exact) · larger page: agrep --no-auto --classic -n 80 -- retry",
         stale,
     ];
     for env in [
@@ -2462,7 +2463,7 @@ fn usage_errors_exit_and_read_as_0_4_9() {
         (&["audit", "--agent", "pi,codex"], 2, "agrep audit: --agent must name one of: claude, codex, opencode, antigravity, kimi, cline, gemini, crush, cursor, pi"),
         (&["audit", "--agent", "pi", "--agent", "codex"], 2, "agrep audit: --agent may be supplied only once"),
         (&["audit", "--agent", " "], 2, "agrep audit: --agent needs a value (claude, codex, opencode, antigravity, kimi, cline, gemini, crush, cursor, pi) - an empty value would silently match every agent"),
-        (&["run", "Claude"], 2, "unknown agent 'Claude'; supported for native resume: claude, codex, opencode, antigravity, pi"),
+        (&["run", "Claude"], 2, "unknown agent 'Claude'; supported for agrep run: claude, codex, opencode, antigravity, pi"),
         (&["run", "cursor"], 2, "cursor has no native resume support: sessions are editor-owned and have no safe CLI resume command"),
         (&["around", "@01930000:2.18ba", "--max-chars", "100", "--full"], 2, "agrep around: --max-chars cannot be combined with --full, which uncaps indexed message text; run: agrep around @01930000:2.18ba --full"),
         (&["around", "@01930000:2.18ba", "--max-chars", "4000", "--full"], 2, "agrep around: --max-chars cannot be combined with --full, which uncaps indexed message text; run: agrep around @01930000:2.18ba --full"),
@@ -2718,11 +2719,11 @@ fn a_missing_model_reads_keyword_only_as_0_4_9() {
     }
 }
 
-// Expected values are agrep 0.4.9's output on this fixture: a chat whose only user record
-// is a synthetic sidecar mirror has no turn, so 0.4.9 neither listed it nor searched its
-// tool calls, and both appear once a real turn arrives (py/corpusdb.py:2221-2234).
+// A chat whose only user record is a synthetic sidecar mirror has no turn. 0.4.9 neither
+// listed it nor searched its tool calls until a real turn arrived (py/corpusdb.py:2221-2234);
+// 0.5 lists it and searches its calls from the start (PORTING.md), as one chat of one call.
 #[test]
-fn chats_without_turns_stay_unlisted_and_unsearched_as_0_4_9() {
+fn chats_without_turns_are_listed_and_searched_by_their_calls() {
     let t = TempDir::new().unwrap();
     let (h, d) = (t.path().join("h"), t.path().join("d"));
     let (alpha, beta) = (
@@ -2783,14 +2784,29 @@ fn chats_without_turns_stay_unlisted_and_unsearched_as_0_4_9() {
     };
     let alpha_tool =
         format!("{alpha}\tpi\talpha\t0\ttool\tbash: grep needle src grep needle src: found\n");
-    assert_eq!(listed(ok(cli(&h, &d, &["chats", "--json"], &[]))), [alpha]);
+    let beta_tool =
+        format!("{beta}\tpi\tbeta\t0\ttool\tbash: grep needle docs grep needle docs: found\n");
+    assert_eq!(
+        listed(ok(cli(&h, &d, &["chats", "--json"], &[]))),
+        [beta, alpha]
+    );
     let tools = ok(cli(&h, &d, &["needle", "--who", "tool"], &[]));
-    assert_eq!(String::from_utf8(tools.stdout).unwrap(), alpha_tool);
-    assert_eq!(ok(cli(&h, &d, &["needle", "-c"], &[])).stdout, b"2\n");
-    assert_eq!(cli(&h, &d, &["around", beta], &[]).status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8(tools.stdout).unwrap(),
+        format!("{beta_tool}{alpha_tool}")
+    );
+    assert_eq!(ok(cli(&h, &d, &["needle", "-c"], &[])).stdout, b"3\n");
+    // A call is outside around's default scope, so the turnless chat shows with --full.
+    let around = cli(&h, &d, &["around", beta], &[]);
+    assert_eq!(around.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&around.stderr).contains("use --full to include tool events"));
+    let around = ok(cli(&h, &d, &["around", beta, "--full"], &[]));
+    assert!(String::from_utf8(around.stdout)
+        .unwrap()
+        .contains("grep needle docs"));
     let status = values(&ok(cli(&h, &d, &["status", "--json"], &[])));
-    assert_eq!(status[0]["index"]["counts"]["sessions"], 1);
-    assert_eq!(status[0]["index"]["counts"]["tools"], 1);
+    assert_eq!(status[0]["index"]["counts"]["sessions"], 2);
+    assert_eq!(status[0]["index"]["counts"]["tools"], 2);
     let answer = serde_json::json!({"id":"a1","role":"assistant","model":"pi/sonnet-5","provider":"anthropic","stopReason":"end_turn","content":[{"type":"text","text":"a real answer"}]});
     write(
         beta,
@@ -2806,7 +2822,7 @@ fn chats_without_turns_stay_unlisted_and_unsearched_as_0_4_9() {
     let tools = ok(cli(&h, &d, &["needle", "--who", "tool"], &[]));
     assert_eq!(
         String::from_utf8(tools.stdout).unwrap(),
-        format!("{beta}\tpi\tbeta\t0\ttool\tbash: grep needle docs grep needle docs: found\n{alpha_tool}")
+        format!("{beta_tool}{alpha_tool}")
     );
 }
 
@@ -2908,7 +2924,7 @@ fn index_reports_as_0_4_9_and_its_statistics_as_timing_events() {
         run(&["reindex"]),
         (
             format!("\n=== ingest transcripts ===\n{}  (T)\n\n=== semantic embeddings (optional; not installed) ===\n  skipped without launching a worker; keyword search is ready. Enable it with `agrep setup`.\n\n  reindex complete in T.\n", &indexed["=== indexing transcripts ===\n".len()..]),
-            "refreshing the search db …\n".into()
+            "rebuilding the search db (a rebuild can take a while on a large history) …\n".into()
         )
     );
     // Enrollment retires the pointer, as 0.4.9's teach.json did.
@@ -3159,4 +3175,327 @@ fn repeated_runs_print_the_same_bytes_on_every_surface() {
         );
     }
     assert_eq!(rows("40"), all[..40]);
+}
+
+/// A reader that goes away (`agrep setup | head -1`) or a closed stderr ends the output,
+/// never the command: no panic, and the exit code an open stream would have given.
+#[test]
+fn closed_output_streams_keep_each_commands_exit_code() {
+    use std::process::Stdio;
+    let (_t, h, d) = pi();
+    for args in [
+        &[
+            "setup",
+            "--yes",
+            "--no-semantic",
+            "--no-teach",
+            "--no-hook",
+            "--no-archive",
+        ][..],
+        &["status"],
+        &["status", "--json"],
+        &["chats"],
+        &["summary"],
+        &["set"],
+        &["doctor"],
+        &["why", "no-such-chat"],
+        &["retry"],
+        &["no-such-word-anywhere"],
+        &["archive", "--status"],
+        &["resume", "--list"],
+        &["audit"],
+        &["index"],
+        &["--version"],
+    ] {
+        let open = cli(&h, &d, args, &[]);
+        let closed = |stdout: bool| {
+            let (reader, writer) = std::io::pipe().unwrap();
+            drop(reader);
+            let mut command = command(&h, &d, args, &[]);
+            if stdout {
+                command.stdout(writer).stderr(Stdio::piped());
+            } else {
+                command.stdout(Stdio::piped()).stderr(writer);
+            }
+            command.output().unwrap()
+        };
+        for (stream, output) in [("stdout", closed(true)), ("stderr", closed(false))] {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!stderr.contains("panicked"), "{args:?} {stream}: {stderr}");
+            assert_eq!(
+                output.status.code(),
+                open.status.code(),
+                "{args:?} with a closed {stream}: {stderr}"
+            );
+        }
+    }
+}
+
+// QA finding 5: an argument error printed only clap's first line, naming neither the
+// missing argument nor the valid choices. `set` and `tail` keep 0.4.9's own refusals
+// (cli.py:1661-1672, py/tail.py:108-118).
+#[test]
+fn argument_errors_name_what_is_missing_or_allowed() {
+    let t = TempDir::new().unwrap();
+    let (h, d) = (t.path().join("h"), t.path().join("d"));
+    let stderr = |args: &[&str]| {
+        let o = cli(&h, &d, args, &[]);
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
+        assert!(o.stdout.is_empty(), "{args:?}");
+        String::from_utf8(o.stderr).unwrap()
+    };
+    let recall = stderr(&["recall"]);
+    assert!(
+        recall.starts_with(
+            "error: the following required arguments were not provided:\n  <QUERY>...\n"
+        ),
+        "{recall}"
+    );
+    assert!(
+        recall.contains("Usage: agrep recall <QUERY>..."),
+        "{recall}"
+    );
+    assert!(stderr(&["doctor", "--no-semantic"]).contains("\n  --deep\n"));
+    for (args, values) in [
+        (
+            &["board", "--state", "bogus"][..],
+            "all, active, working, idle",
+        ),
+        (&["summary", "bogus"], "pending, time"),
+        (&["retry", "--color", "bogus"], "auto, always, never"),
+    ] {
+        let text = stderr(args);
+        assert!(
+            text.starts_with("error: invalid value 'bogus' for "),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("[possible values: {values}]")),
+            "{text}"
+        );
+    }
+    for (args, refusal) in [
+        (
+            &["set", "bogus"][..],
+            "agrep set: key must be one of: tools, embeddings, post_index",
+        ),
+        (
+            &["set", "tools"],
+            "agrep set: tools requires a value (on/off)",
+        ),
+        (
+            &["set", "embeddings", "on"],
+            "agrep set: embeddings must be auto/off",
+        ),
+        (
+            &["tail", "--events", "zap,done,bogus"],
+            "agrep tail: unsupported event type: bogus, zap",
+        ),
+        (
+            &["tail", "--events", "all,done"],
+            "agrep tail: \"all\" must be the only --events value",
+        ),
+    ] {
+        assert_eq!(stderr(args), format!("{refusal}\n"), "{args:?}");
+    }
+    assert!(!d.exists());
+}
+
+// QA finding 8: NO_COLOR and FORCE_COLOR were ignored. 0.4.9's rule (py/console.py:175-191):
+// an explicit --color wins, then a non-empty NO_COLOR, then a non-empty FORCE_COLOR, then
+// whether stdout is a terminal.
+#[test]
+fn color_follows_the_flag_then_no_color_then_force_color() {
+    let (_t, h, d) = pi();
+    let painted = |args: &[&str], env: &[(&str, &str)]| {
+        String::from_utf8(ok(cli(&h, &d, args, env)).stdout)
+            .unwrap()
+            .contains('\x1b')
+    };
+    for args in [
+        &["retry"][..],
+        &["chats"],
+        &["recall", "retry", "--lexical"],
+        &["around", "@01930000:2.18ba"],
+        &["resume", "--list"],
+    ] {
+        assert!(!painted(args, &[]), "{args:?}");
+        assert!(!painted(args, &[("FORCE_COLOR", "")]), "{args:?}");
+        assert!(painted(args, &[("FORCE_COLOR", "1")]), "{args:?}");
+        assert!(
+            !painted(args, &[("FORCE_COLOR", "1"), ("NO_COLOR", "1")]),
+            "{args:?}"
+        );
+        let always = [args, &["--color", "always"]].concat();
+        assert!(painted(&always, &[("NO_COLOR", "1")]), "{args:?}");
+        let never = [args, &["--color", "never"]].concat();
+        assert!(!painted(&never, &[("FORCE_COLOR", "1")]), "{args:?}");
+    }
+    // Colour also chooses search's grouped page over the flat one, as in 0.4.9.
+    let grouped = ok(cli(&h, &d, &["retry"], &[("FORCE_COLOR", "1")])).stdout;
+    assert!(!String::from_utf8(grouped).unwrap().contains('\t'));
+}
+
+// QA finding 3: a data directory without write permission failed every command with
+// `Permission denied (os error 13)`; it now answers from its index as under
+// AGREP_DATA_READONLY, says why once, and doctor names the fix.
+#[test]
+fn an_unwritable_data_directory_answers_from_its_index() {
+    let (_t, h, d) = pi();
+    // A transcript change makes freshness want to write.
+    let session = h.join(".pi/agent/sessions/-work-alpha/2026-01-02T03-04-05-000Z_01930000-0000-7000-8000-000000000001.jsonl");
+    let mut text = fs::read_to_string(&session).unwrap();
+    text.push_str(
+        &text
+            .lines()
+            .last()
+            .unwrap()
+            .replace("\"id\":\"", "\"id\":\"later-"),
+    );
+    text.push('\n');
+    fs::write(&session, text).unwrap();
+    let mut entries = vec![d.clone()];
+    entries.extend(fs::read_dir(&d).unwrap().map(|e| e.unwrap().path()));
+    let restore: Vec<_> = entries
+        .iter()
+        .map(|path| (path.clone(), fs::metadata(path).unwrap().permissions()))
+        .collect();
+    for path in entries.iter().rev() {
+        let mut locked = fs::metadata(path).unwrap().permissions();
+        locked.set_readonly(true);
+        fs::set_permissions(path, locked).unwrap();
+    }
+    let notice = format!(
+        "data directory {} isn't writable: answering from its existing index; new transcripts \
+         can't be indexed until it is writable\n",
+        d.display()
+    );
+    for args in [
+        &["retry"][..],
+        &["status"],
+        &["chats"],
+        &["recall", "retry", "--lexical"],
+        &["around", "@01930000:2.18ba"],
+    ] {
+        let o = ok(cli(&h, &d, args, &[]));
+        assert!(!o.stdout.is_empty(), "{args:?}");
+        assert!(
+            String::from_utf8(o.stderr).unwrap().starts_with(&notice),
+            "{args:?}"
+        );
+    }
+    let status: Value =
+        serde_json::from_slice(&ok(cli(&h, &d, &["status", "--json"], &[])).stdout).unwrap();
+    assert_eq!(status["freshness"]["checked"], false);
+    let refused = cli(&h, &d, &["set", "tools", "off"], &[]);
+    assert_eq!(refused.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8(refused.stderr).unwrap(),
+        format!("{notice}agrep: data directory is read-only\n")
+    );
+    let doctor = String::from_utf8(ok(cli(&h, &d, &["doctor"], &[])).stdout).unwrap();
+    assert!(doctor.starts_with("doctor: action needed\n"), "{doctor}");
+    assert!(
+        doctor.contains(&format!(
+            "data_directory: failed - {} isn't writable; new transcripts can't be indexed \
+             until it is - make it writable, or point AGREP_DATA_DIR at a writable directory\n",
+            d.display()
+        )),
+        "{doctor}"
+    );
+    for (path, permissions) in restore {
+        fs::set_permissions(path, permissions).unwrap();
+    }
+    // A missing index there cannot be built, and the refusal names the directory.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let empty = h.join("empty-data");
+        fs::create_dir(&empty).unwrap();
+        fs::set_permissions(&empty, fs::Permissions::from_mode(0o500)).unwrap();
+        let o = cli(&h, &empty, &["retry"], &[]);
+        assert_eq!(o.status.code(), Some(2));
+        assert_eq!(
+            String::from_utf8(o.stderr).unwrap(),
+            format!(
+                "agrep: no index in {}, and agrep may not write there to build one: make the \
+                 directory writable, or point AGREP_DATA_DIR at a writable directory\n",
+                empty.display()
+            )
+        );
+        assert_eq!(
+            fs::metadata(&empty).unwrap().permissions().mode() & 0o777,
+            0o500
+        );
+        fs::set_permissions(&empty, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
+// QA findings 10 and 14: `status --json` listed every source (4 MB on the owner's history)
+// and the corpus was counted three ways. Status is now a bounded summary, and index, status
+// and a keyword miss all count 0.4.9's messages: one per user-side prose row.
+#[test]
+fn status_is_a_bounded_summary_counting_messages_as_index_does() {
+    let t = TempDir::new().unwrap();
+    let (h, d) = (t.path().join("h"), t.path().join("d"));
+    copy(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/home"),
+        &h,
+    );
+    let index = String::from_utf8(ok(cli(&h, &d, &["index"], &[])).stdout).unwrap();
+    assert!(
+        index.contains("  indexed 8 messages across 5 sessions ("),
+        "{index}"
+    );
+    let status: Value =
+        serde_json::from_slice(&ok(cli(&h, &d, &["status", "--json"], &[])).stdout).unwrap();
+    assert!(status.get("sources").is_none());
+    assert_eq!(status["messages"], 8);
+    assert_eq!(
+        status["agents"],
+        serde_json::json!([{"agent":"pi","sessions":5,"sources":5,"parse_errors":0}])
+    );
+    let text = String::from_utf8(ok(cli(&h, &d, &["status"], &[])).stdout).unwrap();
+    assert!(
+        text.contains("\n5 sessions · 8 messages · 2 tool rows · updated"),
+        "{text}"
+    );
+    assert!(text.contains("\ndata format: valid\n"), "{text}");
+    let miss = cli(&h, &d, &["zzqqxxyy"], &[]);
+    assert_eq!(miss.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(miss.stderr).unwrap(),
+        "keyword: 0 matching rows across 8 indexed messages\n"
+    );
+}
+
+// QA finding 11: one-shot boards gave up on the first live scan after 0.18 s, so on a large
+// history every scripted board was partial and exited 2. With no daemon to have scanned
+// already, a one-shot board waits for its own first scan (up to 10 s).
+#[test]
+fn a_one_shot_board_waits_for_its_first_scan() {
+    let t = TempDir::new().unwrap();
+    let (h, d) = (t.path().join("h"), t.path().join("d"));
+    for i in 0..6000 {
+        let dir = h.join(format!(".pi/agent/sessions/-work-p{}", i % 50));
+        fs::create_dir_all(&dir).unwrap();
+        let id = format!("01950000-0000-7000-8000-{i:012}");
+        let lines = [
+            serde_json::json!({"type":"session","id":id,"version":3,"cwd":format!("/work/p{}", i % 50),"timestamp":"2026-01-02T03:04:05.000Z"}),
+            serde_json::json!({"type":"message","id":"u1","parentId":null,"timestamp":"2026-01-02T03:04:06.000Z","message":{"role":"user","content":[{"type":"text","text":format!("question {i}")}]}}),
+        ];
+        fs::write(
+            dir.join(format!("2026-01-02T03-04-05-000Z_{id}.jsonl")),
+            lines.iter().map(|l| format!("{l}\n")).collect::<String>(),
+        )
+        .unwrap();
+    }
+    let o = ok(cli(&h, &d, &["board", "--json"], &[]));
+    let board: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(board["partial"], false);
+    assert_eq!(board["completeness"]["booting"], false);
+    let o = ok(cli(&h, &d, &["board", "--once"], &[]));
+    assert!(!String::from_utf8(o.stderr)
+        .unwrap()
+        .contains("still running"));
 }

@@ -297,99 +297,6 @@ fn resume_and_why_resolve_a_session_created_since_the_last_index() {
     }
 }
 
-struct Server(std::process::Child);
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        self.0.wait().unwrap();
-    }
-}
-fn http(address: &str, request: &str) -> Value {
-    let mut stream = std::net::TcpStream::connect(address).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .unwrap();
-    stream.write_all(request.as_bytes()).unwrap();
-    let mut response = String::new();
-    stream.read_to_string(&mut response).unwrap();
-    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-    serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap()
-}
-#[test]
-fn explorer_refreshes_each_index_request() {
-    let t = fixture();
-    let source = t
-        .path()
-        .join("home/.pi/agent/sessions/project/freshness-session.jsonl");
-    let mut server = Server(
-        command(t.path())
-            .args(["serve", "--port", "0"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap(),
-    );
-    let mut output = BufReader::new(server.0.stdout.take().unwrap());
-    let mut line = String::new();
-    if output.read_line(&mut line).unwrap() == 0 {
-        let mut stderr = String::new();
-        server
-            .0
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_string(&mut stderr)
-            .unwrap();
-        panic!("the explorer exited before printing its URL: {stderr}");
-    }
-    let (address, bootstrap) = line
-        .trim()
-        .strip_prefix("agrep explorer: http://")
-        .unwrap()
-        .split_once("/#bootstrap=")
-        .unwrap();
-    let auth = http(address, &format!("POST /auth HTTP/1.1\r\nHost: {address}\r\nOrigin: http://{address}\r\nX-Agrep-Bootstrap: {bootstrap}\r\nContent-Length: 0\r\n\r\n"));
-    let token = auth["token"].as_str().unwrap();
-    for (i, endpoint) in [
-        "/api/search?q=cobaltneedle",
-        "/api/around?session=freshness-session&turn=3&radius=12",
-        "/api/chats",
-        "/api/status",
-    ]
-    .iter()
-    .enumerate()
-    {
-        let parent = if i == 0 {
-            "initial".into()
-        } else {
-            format!("http{}", i - 1)
-        };
-        append(
-            &source,
-            &format!("http{i}"),
-            Some(&parent),
-            &format!("cobaltneedle{i}"),
-        );
-        let body = http(address, &format!("GET {endpoint} HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {token}\r\n\r\n"));
-        assert!(!body.to_string().contains("pending_sources"));
-        if i < 2 {
-            assert!(
-                body.to_string().contains(&format!("cobaltneedle{i}")),
-                "{body}"
-            );
-        }
-        let probe = command(t.path())
-            .args([&format!("cobaltneedle{i}"), "-c", "--no-auto"])
-            .output()
-            .unwrap();
-        assert!(probe.status.success(), "{probe:?}");
-        assert_eq!(String::from_utf8(probe.stdout).unwrap().trim(), "1");
-        if i == 3 {
-            assert_eq!(body["messages"], 5);
-        }
-    }
-}
-
 #[test]
 fn continuation_retains_its_first_page_when_sources_change() {
     use agrep_core::pages;
@@ -412,6 +319,7 @@ fn continuation_retains_its_first_page_when_sources_change() {
         chat_scoped: false,
         full_argv: vec![],
         exhaustible: true,
+        larger_argv: None,
     };
     let handle = pages::save(&root, &frozen).unwrap().unwrap();
     let source = t

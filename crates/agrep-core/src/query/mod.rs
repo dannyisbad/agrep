@@ -131,6 +131,10 @@ pub struct Results {
     /// (0.4.9's `hybrid_more`); `None` for one lane's result.
     #[serde(skip)]
     pub hybrid_more: Option<bool>,
+    /// On a page merged with meaning rows, how many trailing hits are keyword rows of a
+    /// conversation family a meaning row leads; they follow every other row.
+    #[serde(skip)]
+    pub hybrid_folded: usize,
 }
 #[derive(Default, Clone, Serialize, Deserialize, Debug)]
 pub struct Timings {
@@ -208,6 +212,8 @@ fn has_block(blocks: &[u64], block: i64) -> bool {
 #[derive(Default)]
 struct PlanCache {
     words: HashMap<String, Option<std::sync::Arc<Expansion>>>,
+    /// Expansions of the non-ASCII runs anchors take (`PlanCache::run_words`).
+    runs: HashMap<String, std::sync::Arc<Expansion>>,
     trigram_docs: HashMap<String, Option<usize>>,
     postings: HashMap<(i64, String), Vec<store::Posting>>,
     candidates: HashMap<String, CandidateGroups>,
@@ -261,6 +267,12 @@ struct Matcher {
     tool_supported: HashSet<String>,
     /// Per query term: blocks holding any word of every variant, when all expand.
     tool_presence: Vec<Option<Vec<u64>>>,
+    /// Each variant of a group the dictionary cannot expand, mapped to an expandable
+    /// term every row it matches holds (`Matcher::anchor_group`).
+    tool_anchors: HashMap<String, String>,
+    /// Whether tool plans may read only the rows anchors admit: no page ceiling can
+    /// then mark a total as a floor on a row that cannot match.
+    plan_anchors: bool,
     coverage_term: Option<usize>,
     coverage_excluded: HashSet<usize>,
 }
@@ -298,7 +310,6 @@ mod evaluate;
 mod filters;
 pub use filters::caller_allows;
 use filters::id_list;
-pub(crate) use filters::project_ok;
 use filters::sql_filters;
 mod hit;
 pub use hit::content_digest;

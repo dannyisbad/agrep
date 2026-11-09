@@ -85,7 +85,7 @@ impl VectorScan {
             }
         }
         if crate::semantic_profile::timing_enabled() {
-            eprintln!(
+            crate::errln!(
                 "{}",
                 serde_json::json!({"scan_ms":scan_ms,"candidate_sort_ms":started.elapsed().as_secs_f64()*1000.-scan_ms,"candidates":candidates.len(),"vectors":total_rows})
             );
@@ -281,7 +281,7 @@ pub(super) fn resolve_scan(
         }
     }
     if crate::semantic_profile::timing_enabled() {
-        eprintln!(
+        crate::errln!(
             "{}",
             serde_json::json!({"refine_resolve_ms":started.elapsed().as_secs_f64()*1000.,"refined":refined,"resolved":resolved,"prefetch":stop.is_some()})
         );
@@ -294,19 +294,6 @@ pub(super) fn resolve_scan(
     result.examined = *total_rows;
     result.blocks = names.len();
     Ok(result)
-}
-
-fn project_matches(value: &str, pattern: &str) -> bool {
-    let v = value.to_lowercase();
-    let p = pattern.to_lowercase();
-    if p.contains(['*', '?', '[']) {
-        globset::GlobBuilder::new(&p)
-            .literal_separator(false)
-            .build()
-            .is_ok_and(|g| g.compile_matcher().is_match(&v))
-    } else {
-        v == p || v.rsplit(['/', '\\']).next() == Some(p.as_str())
-    }
 }
 fn matches_filters(h: &Hit, o: &Options) -> bool {
     let f = &o.filters;
@@ -325,11 +312,11 @@ fn matches_filters(h: &Hit, o: &Options) -> bool {
         && !f
             .project
             .as_ref()
-            .is_some_and(|s| !project_matches(&h.project, s))
+            .is_some_and(|s| !crate::history::project_matches(&h.project, s))
         && !f
             .exclude_project
             .as_ref()
-            .is_some_and(|s| project_matches(&h.project, s))
+            .is_some_and(|s| crate::history::project_matches(&h.project, s))
         && !f
             .who
             .as_ref()

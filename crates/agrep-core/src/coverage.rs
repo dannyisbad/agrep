@@ -300,7 +300,7 @@ pub fn disclose(coverage: &Value) {
             } else {
                 format!("{} indexed {label}, closest: {known}", r["indexed_values"])
             };
-            eprintln!(
+            crate::errln!(
                 "{} {} isn't in the index - {held}",
                 r["flag"].as_str().unwrap_or_default(),
                 crate::surface::safe(r["value"].as_str().unwrap_or_default(), false),

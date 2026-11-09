@@ -75,18 +75,28 @@ pub(super) fn read_at(
     Ok(())
 }
 
+/// What resuming at a cursor's offset found: whether its first and last parsed
+/// chunks are unchanged, the partial last chunk the next checkpoint continues,
+/// the bytes read to check, and whether the parsed extent ends inside a line
+/// (a final record consumed before its newline was written).
+pub(super) struct Verified {
+    pub(super) valid: bool,
+    pub(super) tail: Vec<u8>,
+    pub(super) read: usize,
+    pub(super) open_line: bool,
+}
+
 /// Append-only logs need only the first and last parsed chunks checked.
-pub(super) fn verify_chunks(
-    file: &std::fs::File,
-    cursor: &Cursor,
-) -> Result<(bool, Vec<u8>, usize)> {
+pub(super) fn verify_chunks(file: &std::fs::File, cursor: &Cursor) -> Result<Verified> {
     let length = usize::try_from(cursor.offset)?;
     if length == 0 {
-        return Ok((
-            cursor.first_chunk == chunk_digest(&[]) && cursor.last_chunk == chunk_digest(&[]),
-            Vec::new(),
-            0,
-        ));
+        return Ok(Verified {
+            valid: cursor.first_chunk == chunk_digest(&[])
+                && cursor.last_chunk == chunk_digest(&[]),
+            tail: Vec::new(),
+            read: 0,
+            open_line: false,
+        });
     }
     let mut first = vec![0; length.min(CHECKPOINT_CHUNK)];
     read_at(file, &mut first, 0)?;
@@ -101,14 +111,33 @@ pub(super) fn verify_chunks(
         let read = first.len() + last.len();
         (last, read)
     };
-    let valid = first_valid && chunk_digest(&last) == cursor.last_chunk;
-    Ok((
-        valid,
-        if last.len() < CHECKPOINT_CHUNK {
+    Ok(Verified {
+        valid: first_valid && chunk_digest(&last) == cursor.last_chunk,
+        open_line: last.last() != Some(&b'\n'),
+        tail: if last.len() < CHECKPOINT_CHUNK {
             last
         } else {
             Vec::new()
         },
         read,
-    ))
+    })
+}
+
+/// The newline at `offset` that ends the line an open-line cursor stopped in:
+/// empty when nothing was appended, the `\n` or `\r\n` a writer added after the
+/// record, or `None` when the appended bytes continue that line instead.
+pub(super) fn line_terminator(
+    file: &std::fs::File,
+    offset: u64,
+    length: u64,
+) -> Result<Option<&'static [u8]>> {
+    let mut next = [0; 2];
+    let n = length.saturating_sub(offset).min(2) as usize;
+    read_at(file, &mut next[..n], offset)?;
+    Ok(match &next[..n] {
+        [] => Some(b""),
+        [b'\n', ..] => Some(b"\n"),
+        [b'\r', b'\n'] => Some(b"\r\n"),
+        _ => None,
+    })
 }

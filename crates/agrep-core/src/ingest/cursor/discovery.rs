@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::ingest::registry::metadata_is_link;
+use crate::ingest::registry::root_file;
 
 fn user_dir_candidates_at(home: &Path, appdata: Option<&Path>) -> [PathBuf; 3] {
     let windows = appdata
@@ -58,11 +58,12 @@ impl std::error::Error for UserDirError {
     }
 }
 
+/// The first profile whose global database is a regular file, or a store-root link to one.
 fn user_dir_checked_in(candidates: [PathBuf; 3]) -> Result<Option<PathBuf>, UserDirError> {
     for user in candidates {
         let path = user.join("globalStorage").join("state.vscdb");
-        match std::fs::symlink_metadata(&path) {
-            Ok(meta) if meta.is_file() && !metadata_is_link(&meta) => return Ok(Some(user)),
+        match root_file(&path) {
+            Ok((_, meta)) if meta.is_file() => return Ok(Some(user)),
             Ok(_) => {}
             Err(error) if crate::ingest::registry::stat_proves_absent(&path, &error) => {}
             Err(error) => {

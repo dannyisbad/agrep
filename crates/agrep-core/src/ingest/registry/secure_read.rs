@@ -255,6 +255,21 @@ pub fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> std::io::Result
         .map(|snapshot| Some(snapshot.bytes))
 }
 
+/// Stream a source that is rewritten rather than appended: `read` gets the opened file, and
+/// the whole read fails if the file changed at all under it. None when nothing is there.
+pub(crate) fn read_regular_snapshot<T>(
+    path: &Path,
+    read: impl FnOnce(&fs::File) -> T,
+) -> std::io::Result<Option<T>> {
+    let Some(before) = present_metadata(path)? else {
+        return Ok(None);
+    };
+    let file = open_regular_snapshot(path, &before)?;
+    let value = read(&file);
+    verify_regular_snapshot(path, &file, &before)?;
+    Ok(Some(value))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RegularFileEdgeSnapshot {
     pub len: u64,

@@ -1,6 +1,5 @@
 use agrep_core::launch;
 use anyhow::Result;
-use clap::CommandFactory;
 use std::{ffi::OsString, path::PathBuf};
 /// `escaped` says `args` followed a `--`.
 pub fn run(
@@ -38,9 +37,9 @@ pub fn run(
             Some(w) if w.starts_with("--cwd=") => cwd = Some(w["--cwd=".len()..].into()),
             Some("-h" | "--help") => {
                 if let Err(help) =
-                    crate::Cli::command().try_get_matches_from(["agrep", "run", "-h"])
+                    crate::help::command().try_get_matches_from(["agrep", "run", "-h"])
                 {
-                    help.print()?;
+                    let _ = help.print();
                 }
                 return Ok(0);
             }
@@ -48,9 +47,9 @@ pub fn run(
         }
     }
     // 0.4.9 logged the refusal as a bare line (cli.py:1814-1820).
-    launch::capability(&agent).map_err(|e| super::usage::refusal("", e))?;
+    launch::launchable(&agent).map_err(|e| super::usage::refusal("", e))?;
     let Some(exe) = launch::choose_executable(&agent, None)? else {
-        eprintln!("the {agent} CLI is not on PATH");
+        agrep_core::errln!("the {agent} CLI is not on PATH");
         return Ok(127);
     };
     let cwd = cwd.unwrap_or(std::env::current_dir()?);

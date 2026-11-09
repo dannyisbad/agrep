@@ -1,9 +1,9 @@
 # Engine library surface
 
 `crates/agrep-core` is the engine; `crates/agrep` is the command-line binary built on
-it. This page lists what the binary, the explorer and the examples rely on. Everything
-not listed here (FTS tables, block bounds, parser state, dictionaries, statistics) is
-private and may change with the format marker; see [ENGINE.md](ENGINE.md).
+it. This page lists what the binary and the examples rely on. Everything not listed
+here (FTS tables, block bounds, parser state, dictionaries, statistics) is private and
+may change with the format marker; see [ENGINE.md](ENGINE.md).
 
 ## Reader tables
 
@@ -61,6 +61,9 @@ visible prose, visible tool and source-error counts.
   `semantic::finish` around a keyword search, return `semantic::SearchResults`: normal
   `Results` and a numeric `Coverage`. `hybrid::merge` combines a keyword and a meaning
   result for display.
+- `clock::now_ms()` is the instant recency scores and displayed ages are measured
+  from: `AGREP_NOW_MS` when set to an integer, else the system clock (see
+  [ENGINE.md](ENGINE.md)).
 
 ## Freshness and refresh
 
@@ -84,9 +87,6 @@ visible prose, visible tool and source-error counts.
   `commit_ms`, `total_ms`, and per-adapter maps). File sources parse while earlier ones
   are written, so `parse_ms` is discovery plus the writer's waits for a parse and
   `write_ms` excludes those waits.
-- `Explorer::with_freshness` takes a closure that completes ingestion before each
-  index-reading request and returns whether sources were checked; `agrep serve` and
-  `agrep ui` pass the command line's own freshness path.
 
 ## Profiling
 

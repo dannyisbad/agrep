@@ -5,6 +5,7 @@
 //! string or text-block content, not a command/system wrapper.
 
 mod discovery;
+pub mod launch;
 mod notifications;
 mod parse;
 mod project;

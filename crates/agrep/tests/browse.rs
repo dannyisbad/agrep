@@ -285,6 +285,25 @@ fn diagnostics_are_read_only_and_prove_index_and_absence() {
     let ambiguous = run(&t, &["why", "root-alpha", "--json"]);
     assert_eq!(ambiguous.status.code(), Some(2));
     assert_eq!(records(&ambiguous)[0]["verdict"], "ambiguous");
+    // QA finding 12: each candidate reads `agent · project  id  «first line»`, as 0.4.9's
+    // why (py/why.py:451-462) and resume list them, not as a bare session id.
+    let text = String::from_utf8(run(&t, &["why", "root-alpha"]).stdout).unwrap();
+    let candidates: Vec<_> = text.lines().filter(|l| l.starts_with("  ")).collect();
+    assert!(candidates.len() > 1, "{text}");
+    for (line, record) in candidates
+        .iter()
+        .zip(records(&ambiguous)[0]["candidates"].as_array().unwrap())
+    {
+        assert_eq!(
+            *line,
+            format!(
+                "  pi · {}  {}  «{}»",
+                record["project"].as_str().unwrap(),
+                record["session"].as_str().unwrap(),
+                record["first_text"].as_str().unwrap()
+            )
+        );
+    }
     let absent = run(&t, &["why", "missing-session", "--json"]);
     assert_eq!(absent.status.code(), Some(1));
     assert_eq!(records(&absent)[0]["verdict"], "not-indexed");
@@ -446,7 +465,22 @@ fn doctor_reports_and_fixes_source_parse_errors() {
                 && s["last_error"].is_string()
         }));
     let out = ok(run(&t, &["doctor"]));
-    assert!(String::from_utf8_lossy(&out.stdout).starts_with("doctor: action needed\n"));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.starts_with("doctor: action needed\n"));
+    // QA finding 9: doctor counted the failure without naming it.
+    assert!(text.contains("\nsources: failed - 1 failed to read; their last good rows stay searchable - each is read again once it changes\n"), "{text}");
+    assert!(
+        text.contains(&format!("\nsource failed: {}: ", bad.display())),
+        "{text}"
+    );
+    // Only sources with a problem are listed.
+    assert_eq!(
+        records(&ok(run(&t, &["doctor", "--json"])))[0]["status"]["sources"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
     assert_eq!(run(&t, &["audit"]).status.code(), Some(2));
     assert_eq!(run(&t, &["audit", "--strict"]).status.code(), Some(2));
     fs::remove_file(bad).unwrap();
@@ -649,6 +683,304 @@ fn resume_side_uses_parent_id_origin_cwd_and_native_arguments() {
     );
     assert_eq!(run(&t, &["resume", "root-alpha"]).status.code(), Some(1));
 }
+// 0.4.9 started `agy` in the session's most frequent decoded `Cwd`
+// (py/hookless/native.py:310-335, 1012).
+#[cfg(unix)]
+#[test]
+fn resume_antigravity_starts_agy_in_the_dominant_cwd() {
+    let t = TempDir::new().unwrap();
+    let (other, gamma) = (t.path().join("work other"), t.path().join("work gamma"));
+    for dir in [&other, &gamma] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let id = "44444444-4444-4444-8444-444444444444";
+    let logs = t.path().join(format!(
+        "home/.gemini/antigravity-cli/brain/{id}/.system_generated/logs"
+    ));
+    fs::create_dir_all(&logs).unwrap();
+    let (other, gamma) = (other.to_str().unwrap(), gamma.to_str().unwrap());
+    let encoded = serde_json::to_string(gamma).unwrap();
+    let calls: Vec<Value> = [other, encoded.as_str(), gamma]
+        .iter()
+        .map(|cwd| json!({"name":"run_command","args":{"CommandLine":"ls","Cwd":cwd}}))
+        .collect();
+    let lines = [
+        json!({"type":"USER_INPUT","source":"USER_EXPLICIT","created_at":"2026-01-02T10:00:00Z","content":"<USER_REQUEST>split the parser</USER_REQUEST>"}),
+        json!({"type":"PLANNER_RESPONSE","source":"MODEL","created_at":"2026-01-02T10:00:05Z","content":"Splitting.","tool_calls":calls}),
+    ];
+    fs::write(
+        logs.join("transcript.jsonl"),
+        lines.map(|l| l.to_string() + "\n").concat(),
+    )
+    .unwrap();
+    fake_agent(
+        &t,
+        "agy",
+        "pwd > \"$OUTPUT\"; for a in \"$@\"; do printf '%s\\n' \"$a\" >> \"$OUTPUT\"; done",
+    );
+    ok(launch_cmd(&t).args(["resume", id]).output().unwrap());
+    assert_eq!(
+        fs::read_to_string(t.path().join("argv.txt")).unwrap(),
+        format!(
+            "{}\n--conversation\n{id}\n",
+            Path::new(gamma).canonicalize().unwrap().display()
+        )
+    );
+}
+// Expected directories and notes follow 0.4.9's `resolve_cwd(...) or HOME` and
+// `_remap_dead_cwd` (py/hookless/native.py:345-370, 975-980, 1012).
+#[cfg(unix)]
+#[test]
+fn resume_reanchors_a_missing_cwd_or_falls_back_to_home() {
+    let t = TempDir::new().unwrap();
+    let home = t.path().join("home");
+    for dir in [
+        "code/projects/delta",
+        "work/epsilon",
+        "a/zeta",
+        "b/zeta",
+        "here",
+        ".pi/agent/sessions",
+    ] {
+        fs::create_dir_all(home.join(dir)).unwrap();
+    }
+    let here = home.join("here");
+    let cases = [
+        (
+            "existing",
+            here.to_str().unwrap(),
+            here.clone(),
+            String::new(),
+        ),
+        (
+            "reanchored",
+            "/gone/machine/projects/delta",
+            home.join("code/projects/delta"),
+            format!(
+                "↪ /gone/machine/projects/delta doesn't exist here - re-anchored to {}\n",
+                home.join("code/projects/delta").display()
+            ),
+        ),
+        (
+            "windows",
+            r"C:\Users\example\work\epsilon",
+            home.join("work/epsilon"),
+            format!(
+                "↪ C:\\Users\\example\\work\\epsilon doesn't exist here - re-anchored to {}\n",
+                home.join("work/epsilon").display()
+            ),
+        ),
+        (
+            "ambiguous",
+            "/gone/zeta",
+            home.clone(),
+            "↪ /gone/zeta doesn't exist here and 2 local dirs match its suffix - not guessing\n"
+                .into(),
+        ),
+        (
+            "hidden",
+            "/elsewhere/agent/sessions",
+            home.clone(),
+            String::new(),
+        ),
+        (
+            "unmatched",
+            "/gone/nowhere-eta",
+            home.clone(),
+            String::new(),
+        ),
+    ];
+    for (id, cwd, _, _) in &cases {
+        write_chat(
+            &home.join(format!(".pi/agent/sessions/{id}/2026-01-02_{id}.jsonl")),
+            id,
+            Path::new(cwd),
+            &[("2026-01-02T00:00:00Z", "where am I", "Here.")],
+        );
+    }
+    fake_agent(
+        &t,
+        "pi",
+        "pwd > \"$OUTPUT\"; for a in \"$@\"; do printf '%s\\n' \"$a\" >> \"$OUTPUT\"; done",
+    );
+    ok(run(&t, &["index"]));
+    for (id, _, started, note) in cases {
+        let out = ok(launch_cmd(&t).args(["resume", id]).output().unwrap());
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            format!("{note}↻ resuming pi · {}\n", started.display()),
+            "{id}"
+        );
+        assert_eq!(
+            fs::read_to_string(t.path().join("argv.txt")).unwrap(),
+            format!("{}\n-r\n{id}\n", started.canonicalize().unwrap().display()),
+            "{id}"
+        );
+    }
+    // A launch failure exits 1, as `agrep resume --help` says and 0.4.9 did.
+    fs::write(t.path().join("bin/pi"), "#!/nonexistent/interpreter\n").unwrap();
+    let out = launch_cmd(&t)
+        .args(["resume", "existing"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).ends_with(&format!(
+        "↻ resuming pi · {}\ncouldn't launch pi: No such file or directory (os error 2)\n",
+        here.display()
+    )));
+}
+// 0.4.9 took Codex's cwd from the whole first `session_meta` line
+// (py/hookless/native.py:279-290); real ones carry instructions past 16 KB.
+#[cfg(unix)]
+#[test]
+fn resume_codex_reads_cwd_from_a_long_session_meta_line() {
+    let t = TempDir::new().unwrap();
+    let cwd = t.path().join("codex project");
+    fs::create_dir_all(&cwd).unwrap();
+    let id = "0199aaaa-bbbb-7ccc-8ddd-eeeeffff0000";
+    let path = t.path().join(format!(
+        "home/.codex/sessions/2026/01/02/rollout-2026-01-02T00-00-00-{id}.jsonl"
+    ));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let lines = [
+        json!({"type":"session_meta","timestamp":"2026-01-02T00:00:00Z","payload":{"id":id,"timestamp":"2026-01-02T00:00:00Z","base_instructions":{"text":"x".repeat(20_000)},"cwd":cwd}}),
+        json!({"type":"event_msg","timestamp":"2026-01-02T00:00:01Z","payload":{"type":"user_message","message":"rename the module"}}),
+        json!({"type":"response_item","timestamp":"2026-01-02T00:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"rename the module"}]}}),
+    ];
+    assert!(lines[0].to_string().len() > 16 << 10);
+    fs::write(&path, lines.map(|l| l.to_string() + "\n").concat()).unwrap();
+    fake_agent(
+        &t,
+        "codex",
+        "pwd > \"$OUTPUT\"; for a in \"$@\"; do printf '%s\\n' \"$a\" >> \"$OUTPUT\"; done",
+    );
+    ok(launch_cmd(&t).args(["resume", id]).output().unwrap());
+    assert_eq!(
+        fs::read_to_string(t.path().join("argv.txt")).unwrap(),
+        format!("{}\nresume\n{id}\n", cwd.canonicalize().unwrap().display())
+    );
+}
+#[cfg(unix)]
+fn claude_slug(dir: &Path) -> String {
+    dir.to_str()
+        .unwrap()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+#[cfg(unix)]
+fn write_claude(home: &Path, folder: &str, id: &str, cwds: &[&Path]) -> std::path::PathBuf {
+    let path = home.join(format!(".claude/projects/{folder}/{id}.jsonl"));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let lines: String = cwds
+        .iter()
+        .enumerate()
+        .map(|(n, cwd)| {
+            json!({"type":"user","uuid":format!("u{n}"),"sessionId":id,"cwd":cwd,"timestamp":format!("2026-01-02T00:0{n}:00Z"),"message":{"role":"user","content":format!("prompt {n}")}}).to_string() + "\n"
+        })
+        .collect();
+    fs::write(&path, lines).unwrap();
+    path
+}
+// 0.4.9 resumed Claude from the recorded cwd whose slug names the transcript's project
+// folder, not the first one recorded (py/hookless/native.py:244-276).
+#[cfg(unix)]
+#[test]
+fn resume_claude_starts_in_the_cwd_anchoring_its_project_folder() {
+    let t = TempDir::new().unwrap();
+    let (work, sub) = (t.path().join("work"), t.path().join("work/sub"));
+    fs::create_dir_all(&sub).unwrap();
+    let id = "c1a2b3c4-0000-4000-8000-000000000001";
+    write_claude(
+        &t.path().join("home"),
+        &claude_slug(&work),
+        id,
+        &[&sub, &work],
+    );
+    fake_agent(
+        &t,
+        "claude",
+        "pwd > \"$OUTPUT\"; for a in \"$@\"; do printf '%s\\n' \"$a\" >> \"$OUTPUT\"; done",
+    );
+    let out = ok(launch_cmd(&t).args(["resume", id]).output().unwrap());
+    assert!(String::from_utf8_lossy(&out.stderr)
+        .ends_with(&format!("↻ resuming claude · {}\n", work.display())));
+    assert_eq!(
+        fs::read_to_string(t.path().join("argv.txt")).unwrap(),
+        format!(
+            "{}\n--resume\n{id}\n",
+            work.canonicalize().unwrap().display()
+        )
+    );
+}
+// A re-anchored Claude session's transcript is linked into the new folder's project
+// directory, as 0.4.9 did (py/hookless/native.py:373-476, 1013-1018).
+#[cfg(unix)]
+#[test]
+fn resume_claude_links_its_transcript_into_a_reanchored_folder() {
+    let t = TempDir::new().unwrap();
+    let home = t.path().join("home");
+    let moved = home.join("code/projects/delta");
+    fs::create_dir_all(&moved).unwrap();
+    let id = "c1a2b3c4-0000-4000-8000-000000000002";
+    let gone = Path::new("/gone/machine/projects/delta");
+    let src = write_claude(&home, &claude_slug(gone), id, &[gone]);
+    let folder = home.join(".claude/projects").join(claude_slug(&moved));
+    let dst = folder.join(format!("{id}.jsonl"));
+    fake_agent(
+        &t,
+        "claude",
+        "pwd > \"$OUTPUT\"; for a in \"$@\"; do printf '%s\\n' \"$a\" >> \"$OUTPUT\"; done",
+    );
+    ok(run(&t, &["index"]));
+    let resumed = format!("↻ resuming claude · {}\n", moved.display());
+    let out = ok(launch_cmd(&t).args(["resume", id]).output().unwrap());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "↪ {} doesn't exist here - re-anchored to {}\n↪ linked transcript into {} so claude --resume finds it\n{resumed}",
+            gone.display(),
+            moved.display(),
+            folder.display()
+        )
+    );
+    assert_eq!(fs::read_link(&dst).unwrap(), src);
+    assert_eq!(
+        fs::read_to_string(t.path().join("argv.txt")).unwrap(),
+        format!(
+            "{}\n--resume\n{id}\n",
+            moved.canonicalize().unwrap().display()
+        )
+    );
+    // Its own link is reused and its alias is not indexed or warned about.
+    let out = ok(launch_cmd(&t).args(["resume", id]).output().unwrap());
+    assert!(String::from_utf8_lossy(&out.stderr)
+        .ends_with(&format!("re-anchored to {}\n{resumed}", moved.display())));
+    assert_eq!(fs::read_link(&dst).unwrap(), src);
+    // A different file already there is never overwritten.
+    fs::remove_file(&dst).unwrap();
+    fs::write(&dst, "theirs\n").unwrap();
+    ok(launch_cmd(&t)
+        .args(["resume", "--no-auto", id])
+        .output()
+        .unwrap());
+    assert_eq!(fs::read_to_string(&dst).unwrap(), "theirs\n");
+    // Nor is a link agrep did not make followed or replaced.
+    fs::remove_file(&dst).unwrap();
+    let foreign = t.path().join("foreign.jsonl");
+    fs::write(&foreign, "x\n").unwrap();
+    std::os::unix::fs::symlink(&foreign, &dst).unwrap();
+    let out = launch_cmd(&t)
+        .args(["resume", "--no-auto", id])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).ends_with(&format!(
+        "couldn't prepare Claude resume: unsafe Claude resume destination: {}\n",
+        dst.display()
+    )));
+    assert_eq!(fs::read_link(&dst).unwrap(), foreign);
+}
 #[test]
 fn summary_uses_retained_full_todo_state() {
     let t = fixture();
@@ -697,6 +1029,7 @@ fn run_relays_termination_and_drains_descendants() {
     );
     let mut process = launch_cmd(&t)
         .args(["run", "codex"])
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
@@ -736,7 +1069,10 @@ fn run_relays_termination_and_drains_descendants() {
     use std::os::unix::process::CommandExt;
     fake_agent(&t, "codex", "printf '%s\\n' \"$$\"; kill -STOP $$; exit 0");
     let mut cmd = launch_cmd(&t);
-    cmd.args(["run", "codex"]).stdout(Stdio::piped());
+    // Its own group is never the terminal's foreground, so its input is not the terminal.
+    cmd.args(["run", "codex"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped());
     unsafe {
         cmd.pre_exec(|| {
             if libc::setpgid(0, 0) < 0 {
@@ -777,6 +1113,7 @@ fn run_exits_with_its_agent_when_nothing_is_left_to_drain() {
         fake_agent(&t, "codex", script);
         let mut process = launch_cmd(&t)
             .args(["run", "codex"])
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
@@ -1172,6 +1509,78 @@ fn audit_does_not_collapse_identical_turns() {
 }
 
 #[test]
+fn full_audit_accepts_calls_the_index_hides_by_design() {
+    let t = fixture();
+    let sessions = t.path().join("home/.pi/agent/sessions");
+    let cwd = t.path().join("project alpha");
+    let chat = |id: &str, call: &str, prompt: Option<&str>, output: &str| {
+        let mut lines = vec![json!({"type":"session","id":id,"version":3,"cwd":cwd}).to_string()];
+        let mut parent = Value::Null;
+        if let Some(prompt) = prompt {
+            lines.push(json!({"type":"message","id":"u0","parentId":parent,"timestamp":"2026-01-05T00:00:00Z","message":{"role":"user","content":prompt}}).to_string());
+            parent = json!("u0");
+        }
+        lines.push(json!({"type":"message","id":"a0","parentId":parent,"timestamp":"2026-01-05T00:00:01Z","message":{"role":"assistant","content":[{"type":"toolCall","id":call,"name":"bash","arguments":{"command":"ls"}}]}}).to_string());
+        lines.push(json!({"type":"message","id":"r0","parentId":"a0","timestamp":"2026-01-05T00:00:02Z","message":{"role":"toolResult","toolCallId":call,"content":output}}).to_string());
+        lines.join("\n") + "\n"
+    };
+    // A chat without a turn has its calls searched like any other chat's.
+    fs::create_dir_all(sessions.join("beta")).unwrap();
+    fs::write(
+        sessions.join("beta/2026-01-05_tool-only.jsonl"),
+        chat("tool-only", "only-call", None, "turnless listing"),
+    )
+    .unwrap();
+    // A chat two files hold is searched as one replay: the cut copy of a call stays hidden.
+    for (dir, output) in [("alpha", "listing"), ("beta", "listing continued")] {
+        fs::write(
+            sessions.join(format!("{dir}/2026-01-06_copied.jsonl")),
+            chat("copied", "copied-call", Some("copied prompt"), output),
+        )
+        .unwrap();
+    }
+    ok(run(&t, &["index"]));
+    let audit = records(&ok(run(&t, &["audit", "--full", "--strict", "--json"])));
+    assert_eq!(audit[0]["gaps"], json!(0), "{}", audit[0]["gap_details"]);
+    let c = store::writer(&DataRoot(t.path().join("data"))).unwrap();
+    c.execute("DELETE FROM tools WHERE session='tool-only'", [])
+        .unwrap();
+    drop(c);
+    let out = run(&t, &["audit", "--full", "--strict", "--json"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        records(&out)[0]["gap_details"],
+        json!([{"agent":"pi","session":"tool-only","who":"tool","rows":1,"reason":"parsed row missing from index"}])
+    );
+}
+
+#[test]
+fn full_audit_lists_row_gaps_in_order() {
+    let t = fixture();
+    let c = store::writer(&DataRoot(t.path().join("data"))).unwrap();
+    c.execute("UPDATE prose SET text=CAST(text||' (edited)' AS BLOB)", [])
+        .unwrap();
+    drop(c);
+    let out = run(&t, &["audit", "--full", "--json"]);
+    assert_eq!(out.status.code(), Some(1));
+    let gaps = records(&out)[0]["gap_details"].as_array().unwrap().clone();
+    let missing = |g: &&Value| g["reason"] == "parsed row missing from index";
+    assert_eq!(gaps.iter().filter(missing).count(), 11, "{gaps:?}");
+    assert_eq!(gaps.len(), 22, "{gaps:?}");
+    let mut sorted = gaps.clone();
+    sorted.sort_by_key(|g| {
+        (
+            !missing(&g),
+            g["agent"].to_string(),
+            g["session"].to_string(),
+            g["who"].to_string(),
+            g["rows"].as_u64(),
+        )
+    });
+    assert_eq!(gaps, sorted);
+}
+
+#[test]
 fn status_refuses_unmarked_nonempty_data() {
     let t = TempDir::new().unwrap();
     fs::create_dir(t.path().join("data")).unwrap();
@@ -1343,7 +1752,7 @@ fn run_owns_a_pipeline_agent_and_ends_its_descendants() {
         &t,
         "codex",
         "(trap '' TERM HUP; exec /bin/sleep 60) & printf '%s\\n' \"$!\"; \
-         if (: </dev/tty) 2>/dev/null; then echo terminal; else echo detached; fi",
+         /bin/ps -o tpgid= -p $$",
     );
     let (mut master, mut slave) = (-1, -1);
     assert_eq!(
@@ -1383,7 +1792,7 @@ fn run_owns_a_pipeline_agent_and_ends_its_descendants() {
     drop(cmd);
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
     let descendant: u32 = lines.next().unwrap().unwrap().parse().unwrap();
-    let terminal = lines.next().unwrap().unwrap();
+    let foreground: i32 = lines.next().unwrap().unwrap().trim().parse().unwrap();
     let status = child.wait().unwrap();
     let ended = exit::wait(descendant, std::time::Duration::from_secs(5)).unwrap();
     if !ended {
@@ -1392,101 +1801,156 @@ fn run_owns_a_pipeline_agent_and_ends_its_descendants() {
     drop(master);
     assert!(status.success());
     assert!(ended, "descendant {descendant} outlived agrep run");
-    // As in 0.4.9, a pipeline stage runs detached: the terminal stays with the whole job.
-    assert_eq!(terminal, "detached");
+    // The agent shares the job's terminal, but until it reads or configures it the
+    // terminal stays with the whole job (agrep, the session leader here).
+    assert_eq!(foreground, child.id() as i32);
 }
 
+/// A program running as the session leader of its own pseudo-terminal, which is its
+/// controlling terminal, stdin and stderr; the test types at the terminal and reads it.
 #[cfg(unix)]
-#[test]
-fn run_follows_shell_job_control() {
-    use std::io::{BufRead, Read, Write};
-    use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::{net::UnixStream, process::CommandExt};
-    use std::time::{Duration, Instant};
-    struct Shell {
-        process: std::process::Child,
-        master: Option<fs::File>,
-        seen: Vec<u8>,
-        from: usize,
-    }
-    impl Shell {
-        fn type_line(&mut self, line: &str) {
-            self.press(format!("{line}\n").as_bytes());
-        }
-        fn press(&mut self, keys: &[u8]) {
-            self.master.as_mut().unwrap().write_all(keys).unwrap();
-        }
-        /// Reads the terminal until `needle` appears after the previous match.
-        fn expect(&mut self, needle: &str) {
-            let deadline = Instant::now() + Duration::from_secs(60);
-            let master = self.master.as_mut().unwrap();
-            let at = loop {
-                let unread = &self.seen[self.from..];
-                if let Some(at) = unread
-                    .windows(needle.len())
-                    .position(|w| w == needle.as_bytes())
-                {
-                    break at;
-                }
-                let mut poll = libc::pollfd {
-                    fd: master.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                let left = deadline.saturating_duration_since(Instant::now());
-                let ready = unsafe { libc::poll(&mut poll, 1, left.as_millis() as libc::c_int) };
-                let mut chunk = [0; 4096];
-                let read = if ready > 0 {
-                    master.read(&mut chunk).unwrap_or(0)
-                } else {
-                    0
-                };
-                assert!(
-                    read > 0,
-                    "the terminal never showed {needle:?}: {:?}",
-                    String::from_utf8_lossy(&self.seen)
-                );
-                self.seen.extend_from_slice(&chunk[..read]);
-            };
-            self.from += at + needle.len();
-        }
-    }
-    impl Drop for Shell {
-        fn drop(&mut self) {
-            // Hanging up the terminal ends the shell, which hangs up its jobs.
-            self.master.take();
-            if !exit::wait(self.process.id(), Duration::from_secs(10)).unwrap_or(false) {
-                let _ = self.process.kill();
-            }
-            let _ = self.process.wait();
-        }
-    }
-    let t = fixture();
-    let (mut master, mut slave) = (-1, -1);
-    assert_eq!(
-        unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        },
-        0
-    );
-    for fd in [master, slave] {
+struct Terminal {
+    process: std::process::Child,
+    master: Option<fs::File>,
+    seen: Vec<u8>,
+    from: usize,
+}
+#[cfg(unix)]
+impl Terminal {
+    /// Starts `command`, its stdout the terminal too unless the caller set it, and `gate`
+    /// (if any) as its descriptor 3.
+    fn start(command: &mut Command, gate: Option<std::os::fd::RawFd>, stdout: bool) -> Self {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::process::CommandExt;
+        let (mut master, mut slave) = (-1, -1);
         assert_eq!(
-            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
             0
         );
+        for fd in [master, slave] {
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                0
+            );
+        }
+        let master = unsafe { fs::File::from_raw_fd(master) };
+        let slave = unsafe { fs::File::from_raw_fd(slave) };
+        if stdout {
+            command.stdout(slave.try_clone().unwrap());
+        }
+        command.stdin(slave.try_clone().unwrap()).stderr(slave);
+        unsafe {
+            command.pre_exec(move || {
+                let gate = || match gate {
+                    None => 0,
+                    Some(3) => libc::fcntl(3, libc::F_SETFD, 0),
+                    Some(held) => libc::dup2(held, 3),
+                };
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 || gate() < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        Self {
+            process: command.spawn().unwrap(),
+            master: Some(master),
+            seen: vec![],
+            from: 0,
+        }
     }
-    let master = unsafe { fs::File::from_raw_fd(master) };
-    let slave = unsafe { fs::File::from_raw_fd(slave) };
-    // The agent's gate is descriptor 3 of the shell, and through agrep, of the agent.
-    let (gate, theirs) = UnixStream::pair().unwrap();
-    let held = theirs.as_raw_fd();
-    // An interactive job-control shell on its own terminal; -b reports a stopped job at once.
+    fn type_line(&mut self, line: &str) {
+        self.press(format!("{line}\n").as_bytes());
+    }
+    fn press(&mut self, keys: &[u8]) {
+        use std::io::Write;
+        self.master.as_mut().unwrap().write_all(keys).unwrap();
+    }
+    /// Reads more of the terminal, waiting up to `left`; false once nothing more comes.
+    fn read_more(&mut self, left: std::time::Duration) -> bool {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        let master = self.master.as_mut().unwrap();
+        let mut poll = libc::pollfd {
+            fd: master.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut poll, 1, left.as_millis() as libc::c_int) };
+        let mut chunk = [0; 4096];
+        let read = if ready > 0 {
+            master.read(&mut chunk).unwrap_or(0)
+        } else {
+            0
+        };
+        self.seen.extend_from_slice(&chunk[..read]);
+        read > 0
+    }
+    /// Reads the terminal until every needle appears after the previous match, in any
+    /// order: a shell may report a background job's stop before or after its prompt.
+    fn expect_all(&mut self, needles: &[&str]) {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let end = loop {
+            let unread = &self.seen[self.from..];
+            let ends: Option<Vec<usize>> = needles
+                .iter()
+                .map(|needle| {
+                    unread
+                        .windows(needle.len())
+                        .position(|w| w == needle.as_bytes())
+                        .map(|at| at + needle.len())
+                })
+                .collect();
+            if let Some(ends) = ends {
+                break ends.into_iter().max().unwrap_or(0);
+            }
+            assert!(
+                self.read_more(deadline.saturating_duration_since(Instant::now())),
+                "the terminal never showed {needles:?}: {:?}",
+                String::from_utf8_lossy(&self.seen)
+            );
+        };
+        self.from += end;
+    }
+    /// Reads the terminal until `needle` appears after the previous match.
+    fn expect(&mut self, needle: &str) {
+        self.expect_all(&[needle]);
+    }
+    /// Everything the terminal shows after the previous match until the program exits,
+    /// and its exit status.
+    fn finish(&mut self) -> (String, std::process::ExitStatus) {
+        while self.read_more(std::time::Duration::from_secs(60)) {}
+        let rest = String::from_utf8_lossy(&self.seen[self.from..]).into_owned();
+        (rest, self.process.wait().unwrap())
+    }
+}
+#[cfg(unix)]
+impl Drop for Terminal {
+    fn drop(&mut self) {
+        use std::time::Duration;
+        // Hanging up the terminal ends a shell, which hangs up its jobs.
+        self.master.take();
+        if !exit::wait(self.process.id(), Duration::from_secs(10)).unwrap_or(false) {
+            let _ = self.process.kill();
+        }
+        let _ = self.process.wait();
+    }
+}
+/// An interactive job-control bash on its own terminal, running agrep as `$CLI` with the
+/// fixture's fake agents on PATH; `gate` is descriptor 3 of the shell and, through agrep,
+/// of the agent. -b reports a stopped job at once.
+#[cfg(unix)]
+fn job_shell(t: &TempDir, gate: std::os::fd::RawFd) -> Terminal {
     let mut command = Command::new("/bin/bash");
     command
         .args(["--norc", "--noprofile", "-ib"])
@@ -1497,38 +1961,26 @@ fn run_follows_shell_job_control() {
         .env("PATH", t.path().join("bin"))
         .env("OUTPUT", t.path().join("argv.txt"))
         .env("CLI", support::binary())
-        .env("PS1", "shell> ")
-        .stdin(slave.try_clone().unwrap())
-        .stdout(slave.try_clone().unwrap())
-        .stderr(slave);
-    unsafe {
-        command.pre_exec(move || {
-            let gate = || {
-                if held == 3 {
-                    libc::fcntl(3, libc::F_SETFD, 0)
-                } else {
-                    libc::dup2(held, 3)
-                }
-            };
-            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 || gate() < 0 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
-    }
-    let mut shell = Shell {
-        process: command.spawn().unwrap(),
-        master: Some(master),
-        seen: vec![],
-        from: 0,
-    };
-    drop((command, theirs));
+        .env("PS1", "shell> ");
+    Terminal::start(&mut command, Some(gate), true)
+}
+
+#[cfg(unix)]
+#[test]
+fn run_follows_shell_job_control() {
+    use std::io::{BufRead, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant};
+    let t = fixture();
+    let (gate, theirs) = UnixStream::pair().unwrap();
+    let mut shell = job_shell(&t, theirs.as_raw_fd());
+    drop(theirs);
     // Every job starts in the background: bash 3.2 also hands a foreground job the terminal
     // from the parent after the fork, which can land after agrep lent it to the agent.
     // Input is typed once bash, running `fg`, has printed the job: bash reads no further,
     // so the line waits for the agent.
-    let fg = |shell: &mut Shell| {
+    let fg = |shell: &mut Terminal| {
         shell.type_line("fg; printf 'fg-status:%s\\n' \"$?\"");
         shell.expect("fg-status:%s");
         shell.expect("\"$CLI\" run codex");
@@ -1675,6 +2127,183 @@ fn run_follows_shell_job_control() {
     shell.expect("fg-status:");
 }
 
+/// `agrep run codex | cat` typed at a terminal, with an agent that reads the terminal and
+/// so is lent it. Ctrl-Z stops the agent with its job, and keystrokes typed at the shell
+/// meanwhile reach the shell.
+#[cfg(unix)]
+#[test]
+fn run_suspends_a_pipeline_agent_with_its_job() {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    let t = fixture();
+    let (gate, theirs) = UnixStream::pair().unwrap();
+    let mut shell = job_shell(&t, theirs.as_raw_fd());
+    drop(theirs);
+    // The agent logs and shows each line it reads; `quit` ends it with status 5.
+    fake_agent(
+        &t,
+        "codex",
+        "printf '%s\\n' \"$$\" > \"$OUTPUT.pid\"; echo agent-ready; \
+         while read line; do printf '%s\\n' \"$line\" >> \"$OUTPUT\"; echo \"agent-got:$line\"; \
+         [ \"$line\" = quit ] && exit 5; done",
+    );
+    let agent_state = || {
+        let pid = fs::read_to_string(t.path().join("argv.txt.pid")).unwrap();
+        let state = Command::new("/bin/ps")
+            .args(["-o", "stat=", "-p", pid.trim()])
+            .output()
+            .unwrap();
+        String::from_utf8(state.stdout).unwrap().trim().to_owned()
+    };
+    shell.expect("shell> ");
+    shell.type_line("set -o pipefail");
+    shell.expect("shell> ");
+    shell.type_line("\"$CLI\" run codex | /bin/cat");
+    shell.expect("agent-ready");
+    shell.type_line("first");
+    shell.expect("agent-got:first");
+    shell.press(b"\x1a");
+    shell.expect("Stopped");
+    shell.expect("shell> ");
+    let state = agent_state();
+    assert!(
+        state.starts_with('T'),
+        "Ctrl-Z left the agent running: {state:?}"
+    );
+    shell.type_line("printf 'shell-%s\\n' after-stop");
+    shell.expect("shell-after-stop");
+    shell.expect("shell> ");
+    shell.type_line("fg");
+    shell.expect("run codex | /bin/cat");
+    shell.type_line("second");
+    shell.expect("agent-got:second");
+    // Continued in the background, the agent's read stops it and its job with it, as the
+    // shell's job control stops any background reader of the terminal.
+    shell.press(b"\x1a");
+    shell.expect("Stopped");
+    shell.expect("shell> ");
+    shell.type_line("bg");
+    shell.expect_all(&["Stopped", "shell> "]);
+    let state = agent_state();
+    assert!(
+        state.starts_with('T'),
+        "bg let the agent read the terminal: {state:?}"
+    );
+    shell.type_line("printf 'shell-%s\\n' after-bg");
+    shell.expect("shell-after-bg");
+    shell.expect("shell> ");
+    shell.type_line("fg; printf 'fg-status:%s\\n' \"$?\"");
+    shell.expect("fg-status:%s");
+    shell.expect("run codex | /bin/cat");
+    shell.type_line("quit");
+    shell.expect("fg-status:5");
+    // Started in the background, the agent's first read stops the job.
+    shell.expect("shell> ");
+    shell.type_line("\"$CLI\" run codex | /bin/cat &");
+    shell.expect_all(&["Stopped", "shell> "]);
+    shell.type_line("printf 'shell-%s\\n' after-start");
+    shell.expect("shell-after-start");
+    shell.expect("shell> ");
+    shell.type_line("fg; printf 'fg-status:%s\\n' \"$?\"");
+    shell.expect("fg-status:%s");
+    shell.expect("run codex | /bin/cat");
+    shell.type_line("quit");
+    shell.expect("fg-status:5");
+    assert_eq!(
+        fs::read_to_string(t.path().join("argv.txt")).unwrap(),
+        "first\nsecond\nquit\nquit\n"
+    );
+    // An agent that never touches the terminal is stopped by agrep itself on Ctrl-Z, and
+    // runs on after `bg`.
+    fake_agent(
+        &t,
+        "codex",
+        "printf '%s\\n' \"$$\" > \"$OUTPUT.pid\"; echo agent-ready; read go <&3; \
+         echo agent-done",
+    );
+    shell.expect("shell> ");
+    shell.type_line("\"$CLI\" run codex | /bin/cat");
+    shell.expect("agent-ready");
+    shell.press(b"\x1a");
+    shell.expect("Stopped");
+    shell.expect("shell> ");
+    let state = agent_state();
+    assert!(
+        state.starts_with('T'),
+        "Ctrl-Z left the agent running: {state:?}"
+    );
+    shell.type_line("bg");
+    shell.expect("run codex | /bin/cat &");
+    (&gate).write_all(b"go\n").unwrap();
+    shell.expect("agent-done");
+    shell.expect("Done");
+}
+
+/// 0.4.9's picker (py/resume.py:135-163): a listed number, or a reference resolved among
+/// the picker's candidates; anything else asks again, and an empty answer or the end of
+/// input cancels.
+#[cfg(unix)]
+#[test]
+fn resume_picker_asks_again_and_resolves_among_its_candidates() {
+    use std::process::Stdio;
+    let t = fixture();
+    write_chat(
+        &t.path()
+            .join("home/.pi/agent/sessions/beta/2026-01-04_30000003-beta.jsonl"),
+        "30000003-beta",
+        &t.path().join("project alpha"),
+        &[("2026-01-04T00:00:00Z", "beta design notes", "Noted.")],
+    );
+    ok(run(&t, &["index"]));
+    fake_agent(
+        &t,
+        "pi",
+        "for a in \"$@\"; do printf '%s\\n' \"$a\" >> \"$OUTPUT\"; done",
+    );
+    let picker = |args: &[&str]| {
+        let mut command = launch_cmd(&t);
+        command.args(args).stdout(Stdio::null());
+        Terminal::start(&mut command, None, false)
+    };
+    let prompt = "resume # (enter to cancel): ";
+    let mut ended = picker(&["resume"]);
+    ended.expect(prompt);
+    ended.press(b"\x04");
+    let (rest, status) = ended.finish();
+    assert_eq!(status.code(), Some(0), "{rest:?}");
+    assert!(
+        rest.ends_with('\n'),
+        "Ctrl-D left the prompt line open: {rest:?}"
+    );
+    let mut out_of_range = picker(&["resume"]);
+    out_of_range.expect(prompt);
+    out_of_range.type_line("99");
+    out_of_range.expect("'99' isn't a listed number or a unique reference\r\n");
+    out_of_range.expect(prompt);
+    out_of_range.type_line("");
+    let (rest, status) = out_of_range.finish();
+    assert_eq!(status.code(), Some(0), "{rest:?}");
+    // "design" opens root-alpha-0001 and 30000003-beta, not root-alpha-0002. A number is
+    // a list position only, even where it starts a candidate's id.
+    let mut narrowed = picker(&["resume", "design"]);
+    narrowed.expect(prompt);
+    narrowed.type_line("3");
+    narrowed.expect("'3' isn't a listed number or a unique reference\r\n");
+    narrowed.expect(prompt);
+    narrowed.type_line("root-alpha-0002");
+    narrowed.expect("'root-alpha-0002' isn't a listed number or a unique reference\r\n");
+    narrowed.expect(prompt);
+    narrowed.type_line("beta");
+    let (rest, status) = narrowed.finish();
+    assert_eq!(status.code(), Some(0), "{rest:?}");
+    assert!(rest.contains("↻ resuming pi · "), "{rest:?}");
+    assert_eq!(
+        fs::read_to_string(t.path().join("argv.txt")).unwrap(),
+        "-r\n30000003-beta\n"
+    );
+}
+
 #[test]
 fn why_keeps_its_versioned_envelope_for_corrupt_rows() {
     let t = fixture();
@@ -1703,13 +2332,21 @@ fn resume_chooses_omp_for_windows_origin_paths() {
     let c = store::writer(&DataRoot(t.path().join("data"))).unwrap();
     c.execute("UPDATE sources SET path=?1 WHERE rowid=(SELECT source FROM prose WHERE session='root-alpha-0001' LIMIT 1)",[r"C:\fixture\.omp\agent\sessions\root-alpha-0001.jsonl"]).unwrap();
     drop(c);
-    ok(launch_cmd(&t)
+    let out = ok(launch_cmd(&t)
         .args(["resume", "--no-auto", "root-alpha-0001"])
         .output()
         .unwrap());
     assert_eq!(
         fs::read_to_string(t.path().join("argv.txt")).unwrap(),
         "omp"
+    );
+    // The label names the fork launched, not the family the index files it under.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "↻ resuming omp · {}\n",
+            t.path().join("project alpha").display()
+        )
     );
 }
 

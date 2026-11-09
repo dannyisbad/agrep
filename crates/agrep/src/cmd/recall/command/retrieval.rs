@@ -14,7 +14,7 @@ pub(super) fn collect_handle(
                 return Err(e);
             };
             let reason = render::safe(&failure.to_string());
-            eprintln!("{reason}");
+            agrep_core::errln!("{reason}");
             return Ok(std::ops::ControlFlow::Break(
                 ctx.input.stop("handle", (failure.code, Some(&reason)))?,
             ));
@@ -23,7 +23,7 @@ pub(super) fn collect_handle(
     // 0.4.9 printed each way the served turn differs from the cited one, JSON or not,
     // and carried them as `served` (py/recall.py:1941-1946, 2898-2902).
     for note in &w.notes {
-        eprintln!("{}", note["note"].as_str().unwrap_or_default());
+        agrep_core::errln!("{}", note["note"].as_str().unwrap_or_default());
     }
     state.handle_notes.extend(w.notes.iter().cloned());
     let claim = handles::parse(query)?;
@@ -48,7 +48,7 @@ pub(super) fn collect_handle(
         (r.text.clone(), r.who.clone(), r.ts)
     } else {
         let reason = "handle has no indexed row";
-        eprintln!("{reason}");
+        agrep_core::errln!("{reason}");
         return Ok(std::ops::ControlFlow::Break(
             ctx.input
                 .stop("handle", ("stale-result-handle", Some(reason)))?,
@@ -57,7 +57,7 @@ pub(super) fn collect_handle(
     if ctx.override_filters && state.filter_note.is_none() {
         state.filter_note = Some(handle_filter_note(&ctx.direct_filters, ctx.filters, &w, ts));
         if !ctx.input.a.json {
-            eprintln!("{}", state.filter_note.as_deref().unwrap_or_default());
+            agrep_core::errln!("{}", state.filter_note.as_deref().unwrap_or_default());
         }
     }
     let mut handle = handles::SessionIndex::load(ctx.c)?.mint(&w.session, w.center, &text);

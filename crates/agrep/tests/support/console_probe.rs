@@ -53,9 +53,6 @@ fn main() {
     } else {
         cmd.stdout(Stdio::piped());
     }
-    if command == "serve" || command == "ui" {
-        cmd.args(["--port", "0"]);
-    }
     // The foreground command must opt back in even when its parent ignores
     // Ctrl-C (this attribute is inherited, unlike handler registrations).
     assert_ne!(unsafe { SetConsoleCtrlHandler(None, 1) }, 0);

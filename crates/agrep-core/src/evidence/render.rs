@@ -315,8 +315,9 @@ impl Page<'_> {
         }
         if hidden_tools > 0 {
             parts.push(format!(
-                "{} tool events omitted",
-                surface::number(hidden_tools)
+                "{} tool event{} omitted",
+                surface::number(hidden_tools),
+                if hidden_tools == 1 { "" } else { "s" }
             ));
         }
         if !hidden_markers.is_empty() {
@@ -324,8 +325,9 @@ impl Page<'_> {
         }
         if hidden_prose > 0 {
             parts.push(format!(
-                "{} messages omitted",
-                surface::number(hidden_prose)
+                "{} message{} omitted",
+                surface::number(hidden_prose),
+                if hidden_prose == 1 { "" } else { "s" }
             ));
         }
         if hidden {

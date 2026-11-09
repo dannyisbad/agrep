@@ -127,62 +127,46 @@ fn turnless(tx: &Transaction<'_>, table: &str, column: &str) -> Result<HashSet<(
         .collect::<rusqlite::Result<_>>()?;
     Ok(found)
 }
-/// 0.4.9 searched a chat's tool calls only beside its turns, under its first turn's project
-/// (py/corpusdb.py:2221-2234): a listed chat without a turn has its calls hidden, and a
-/// chat that was turnless when this refresh began shows its calls again once a turn
-/// arrives, one copy per call id as in canonicalize.
+/// 0.4.9 searched a chat's tool calls only beside its turns (py/corpusdb.py:2221-2234); 0.5
+/// searches a turnless chat's calls too, one copy per call as in canonicalize, and bounds it
+/// by their times since it has no turn to bound it. A chat that was turnless when this
+/// refresh began and holds a turn now is bounded by its turns again, and its calls move
+/// under its first turn's project as 0.4.9 filed them.
 pub(super) fn settle_turnless(
     tx: &Transaction<'_>,
     before: &HashSet<(String, String)>,
     affected: &HashSet<(String, String)>,
-    changes: &mut Changes,
     bulk: bool,
 ) -> Result<()> {
-    let hidden = if bulk {
+    let turnless = if bulk {
         turnless(tx, "sessions", "id")?
     } else {
-        let mut hidden = HashSet::new();
+        let mut found = HashSet::new();
         let mut q = tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM sessions WHERE agent=?1 AND id=?2) AND NOT EXISTS(SELECT 1 FROM prose INDEXED BY prose_session WHERE agent=?1 AND session=?2)")?;
         for (agent, session) in affected {
             if q.query_row(params![agent, session], |r| r.get::<_, bool>(0))? {
-                hidden.insert((agent.clone(), session.clone()));
+                found.insert((agent.clone(), session.clone()));
             }
         }
-        hidden
+        found
     };
-    let turned = before
-        .iter()
-        .filter(|s| !hidden.contains(*s))
-        .filter_map(|(agent, session)| {
-            tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM prose p INDEXED BY prose_session WHERE p.session=?2 AND p.agent=?1)")
-                .and_then(|mut q| q.query_row(params![agent, session], |r| r.get::<_, bool>(0)))
-                .map(|turns| turns.then(|| (agent.clone(), session.clone())))
-                .transpose()
-        })
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for ((agent, session), turns) in hidden
-        .iter()
-        .map(|s| (s, false))
-        .chain(turned.iter().map(|s| (s, true)))
-    {
-        let tools:Vec<(i64,i64,bool,String)>=tx.prepare_cached("SELECT t.id,t.position,t.visible,t.extra FROM tools t JOIN sources s ON s.rowid=t.source WHERE t.agent=?1 AND t.session=?2 ORDER BY s.path,t.id")?.query_map(params![agent,session],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
-        let mut seen = HashSet::new();
-        for (id, position, visible, key) in tools {
-            let retained = turns && (key.is_empty() || seen.insert(key));
-            set_visibility(
-                tx,
-                "tools",
-                id,
-                (visible, position),
-                (retained, position),
-                changes,
-                bulk,
-            )?;
+    for (agent, session) in &turnless {
+        // With no request to name it, a turnless chat is titled by its first call.
+        let first: Option<Vec<u8>> = tx.prepare_cached("SELECT b.body FROM event_sessions es JOIN event_rows e ON e.session_key=es.id JOIN tool_blobs b ON b.id=e.blob WHERE es.agent=?1 AND es.session=?2 AND e.active=1 AND e.visible=1 ORDER BY e.position,e.ts,e.call_id LIMIT 1")?.query_row(params![agent, session], |r| r.get(0)).optional()?;
+        let title = match first {
+            Some(body) => session_title(&crate::tool_store::decode(&body)?),
+            None => String::new(),
+        };
+        tx.prepare_cached("UPDATE sessions SET first_ts=coalesce((SELECT min(e.ts) FROM event_sessions es JOIN event_rows e ON e.session_key=es.id WHERE es.agent=?1 AND es.session=?2 AND e.active=1 AND e.visible=1 AND e.blob IS NOT NULL AND e.ts>0),0),last_ts=coalesce((SELECT max(e.ts) FROM event_sessions es JOIN event_rows e ON e.session_key=es.id WHERE es.agent=?1 AND es.session=?2 AND e.active=1 AND e.visible=1 AND e.blob IS NOT NULL AND e.ts>0),0),title=?3 WHERE agent=?1 AND id=?2")?.execute(params![agent, session, title])?;
+    }
+    for (agent, session) in before.iter().filter(|s| !turnless.contains(*s)) {
+        let turns = tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM prose p INDEXED BY prose_session WHERE p.session=?2 AND p.agent=?1)")?.query_row(params![agent, session], |r| r.get::<_, bool>(0))?;
+        if !turns {
+            continue;
         }
-        if turns {
-            tx.prepare_cached("INSERT OR IGNORE INTO symbols(value) SELECT project FROM sessions WHERE agent=?1 AND id=?2")?.execute(params![agent, session])?;
-            tx.prepare_cached("UPDATE event_rows SET project_key=(SELECT y.id FROM symbols y JOIN sessions s ON y.value=s.project WHERE s.agent=?1 AND s.id=?2) WHERE active=1 AND session_key=(SELECT id FROM event_sessions WHERE agent=?1 AND session=?2)")?.execute(params![agent, session])?;
-        }
+        refresh_session_bounds(tx, agent, session)?;
+        tx.prepare_cached("INSERT OR IGNORE INTO symbols(value) SELECT project FROM sessions WHERE agent=?1 AND id=?2")?.execute(params![agent, session])?;
+        tx.prepare_cached("UPDATE event_rows SET project_key=(SELECT y.id FROM symbols y JOIN sessions s ON y.value=s.project WHERE s.agent=?1 AND s.id=?2) WHERE active=1 AND session_key=(SELECT id FROM event_sessions WHERE agent=?1 AND session=?2)")?.execute(params![agent, session])?;
     }
     Ok(())
 }
@@ -238,22 +222,30 @@ pub(super) fn canonicalize(
     Ok(())
 }
 
-type ReplaySelection = (
-    BTreeMap<(i64, String), usize>,
-    Vec<usize>,
-    HashMap<usize, i64>,
-);
-fn replay_order<'a>(
-    pi_order: &'a HashMap<i64, Vec<usize>>,
-    rows: &[ReplayRow],
-    m: &ReplayMessage,
-) -> (&'a [usize], usize) {
-    (
-        pi_order
-            .get(&rows[m.row].source)
-            .map_or(&[usize::MAX][..], |rank| rank.as_slice()),
-        m.row,
-    )
+/// The replay of one chat: per message key its canonical copy, the copies whose reply no
+/// canonical copy holds, and every kept message's position.
+struct ReplaySelection {
+    best: BTreeMap<(i64, String), usize>,
+    chosen: Vec<usize>,
+    surfaced: Vec<usize>,
+    positions: HashMap<usize, i64>,
+}
+/// How copies of one chat break quality ties: pi's discovery order, then source path.
+struct SourceOrder<'a> {
+    pi: &'a HashMap<i64, Vec<usize>>,
+    paths: HashMap<i64, String>,
+}
+impl SourceOrder<'_> {
+    fn key<'s>(&'s self, rows: &[ReplayRow], m: &ReplayMessage) -> (&'s [usize], &'s str, usize) {
+        let source = rows[m.row].source;
+        (
+            self.pi
+                .get(&source)
+                .map_or(&[usize::MAX][..], |rank| rank.as_slice()),
+            self.paths.get(&source).map_or("", String::as_str),
+            m.row,
+        )
+    }
 }
 fn canonicalize_session(
     tx: &Transaction<'_>,
@@ -274,7 +266,17 @@ fn canonicalize_session(
     if agent == "pi" {
         rank_pi_sources(tx, &rows, pi_order, native_order)?;
     }
-    let (best, chosen, positions) = choose_replay(&rows, &messages, agent, pi_order);
+    let order = SourceOrder {
+        pi: pi_order,
+        paths: source_paths(tx, rows.iter().map(|r| r.source))?,
+    };
+    let selection = choose_replay(&rows, &messages, agent, &order);
+    let ReplaySelection {
+        best,
+        chosen,
+        surfaced,
+        positions,
+    } = &selection;
     let mut keep = HashMap::new();
     let mut mapping = HashMap::new();
     let mut paired = HashSet::new();
@@ -287,6 +289,11 @@ fn canonicalize_session(
             paired.insert(rows[i].id);
         }
     }
+    // A surfaced copy's own calls sit beside its reply, not beside the canonical one.
+    for i in surfaced {
+        let r = &rows[messages[*i].row];
+        mapping.insert((r.source, r.turn), positions[i]);
+    }
     for ((source, native), position) in &mapping {
         if bulk && native == position {
             // Fresh event rows already carry their native position.
@@ -295,12 +302,18 @@ fn canonicalize_session(
         }
         tx.prepare_cached("UPDATE event_rows SET position=?4 WHERE source=?1 AND session_key IN (SELECT id FROM event_sessions WHERE session=?2) AND native_turn=?3 AND position IS NOT ?4")?.execute(params![source,session,native,position])?;
     }
-    for i in &chosen {
+    for i in chosen {
         let m = &messages[*i];
         let position = positions[i];
         keep.insert(rows[m.row].id, position);
         if let Some(j) = m.reply {
             keep.insert(rows[j].id, position);
+        }
+    }
+    // The prompt a surfaced copy shares with its canonical copy stays a hidden duplicate.
+    for i in surfaced {
+        if let Some(j) = messages[*i].reply {
+            keep.insert(rows[j].id, positions[i]);
         }
     }
     for r in &rows {
@@ -316,24 +329,162 @@ fn canonicalize_session(
             bulk,
         )?;
     }
-    let tools:Vec<(i64,i64,i64,i64,bool,String)>=tx.prepare("SELECT t.id,t.source,t.turn,t.position,t.visible,t.extra FROM tools t JOIN sources s ON s.rowid=t.source WHERE t.agent=?1 AND t.session=?2 ORDER BY s.path,t.id")?.query_map(params![agent,session],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?.collect::<rusqlite::Result<_>>()?;
-    let mut seen = HashSet::new();
-    for (id, source, turn, old_position, old_visible, key) in tools {
-        let retained = key.is_empty() || seen.insert(key);
-        let position = mapping.get(&(source, turn)).copied().unwrap_or(turn);
+    let tools = tool_copies(tx, agent, session)?;
+    let retained = retained_tool_copies(tx, &tools)?;
+    for t in &tools {
+        let position = mapping.get(&(t.source, t.turn)).copied().unwrap_or(t.turn);
         set_visibility(
             tx,
             "tools",
-            id,
-            (old_visible, old_position),
-            (retained, position),
+            t.id,
+            (t.visible, t.position),
+            (retained.contains(&t.id), position),
             changes,
             bulk,
         )?;
     }
     refresh_session_bounds(tx, agent, session)?;
-    update_replay_metadata(tx, agent, session, &rows, &messages, &chosen, pi_order)?;
+    update_replay_metadata(tx, agent, session, &rows, &messages, chosen, &order)?;
     Ok(())
+}
+
+fn source_paths(
+    tx: &Transaction<'_>,
+    sources: impl Iterator<Item = i64>,
+) -> Result<HashMap<i64, String>> {
+    let mut paths = HashMap::new();
+    let mut q = tx.prepare_cached("SELECT path FROM sources WHERE rowid=?")?;
+    for source in sources {
+        if let std::collections::hash_map::Entry::Vacant(slot) = paths.entry(source) {
+            slot.insert(q.query_row([source], |r| r.get(0))?);
+        }
+    }
+    Ok(paths)
+}
+
+/// One stored copy of a tool call.
+struct ToolCopy {
+    id: i64,
+    source: i64,
+    turn: i64,
+    position: i64,
+    visible: bool,
+    key: String,
+    blob: i64,
+    input_chars: i64,
+    output_chars: i64,
+    input_end: Option<i64>,
+    output_start: Option<i64>,
+}
+
+/// The chat's tool calls, in source path order.
+fn tool_copies(tx: &Transaction<'_>, agent: &str, session: &str) -> Result<Vec<ToolCopy>> {
+    let copies = tx.prepare_cached("SELECT e.tool_id,e.source,e.native_turn,e.position,e.visible,e.call_id,e.blob,e.input_chars,e.output_chars,e.input_end,e.output_start FROM event_sessions es JOIN event_rows e ON e.session_key=es.id JOIN sources s ON s.rowid=e.source WHERE es.agent=?1 AND es.session=?2 AND e.active=1 AND e.blob IS NOT NULL ORDER BY s.path,e.id")?
+        .query_map(params![agent, session], |r| {
+            Ok(ToolCopy {
+                id: r.get(0)?,
+                source: r.get(1)?,
+                turn: r.get(2)?,
+                position: r.get(3)?,
+                visible: r.get(4)?,
+                key: r.get(5)?,
+                blob: r.get(6)?,
+                input_chars: r.get(7)?,
+                output_chars: r.get(8)?,
+                input_end: r.get(9)?,
+                output_start: r.get(10)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(copies)
+}
+
+/// The copies of `tools` search keeps: per call id the most complete copy (a real result over
+/// an elided one, then the longest output, then input, then the first by source path), and
+/// any other copy holding text that copy lacks. A copy whose text a kept one contains is a
+/// duplicate, and so is one whose result a harness elided where a kept copy has the same input.
+fn retained_tool_copies(tx: &Transaction<'_>, tools: &[ToolCopy]) -> Result<HashSet<i64>> {
+    let mut calls: BTreeMap<&str, Vec<&ToolCopy>> = BTreeMap::new();
+    let mut retained = HashSet::new();
+    for t in tools {
+        if t.key.is_empty() {
+            retained.insert(t.id);
+        } else {
+            calls.entry(&t.key).or_default().push(t);
+        }
+    }
+    let mut texts: HashMap<i64, String> = HashMap::new();
+    for copies in calls.values() {
+        if copies.iter().all(|t| t.blob == copies[0].blob) {
+            retained.insert(copies[0].id);
+            continue;
+        }
+        for t in copies {
+            load_blob(tx, &mut texts, t.blob)?;
+        }
+        let rank = |t: &ToolCopy| {
+            let output = call_output(&texts[&t.blob], t.output_start);
+            (!elided(output), t.output_chars, t.input_chars)
+        };
+        let mut canonical = copies[0];
+        for t in &copies[1..] {
+            if rank(t) > rank(canonical) {
+                canonical = t;
+            }
+        }
+        let mut kept = vec![canonical];
+        for t in copies {
+            let text = &texts[&t.blob];
+            let covered = kept.iter().any(|k| {
+                let held = &texts[&k.blob];
+                held.contains(text.as_str())
+                    || (elided(call_output(text, t.output_start))
+                        && call_input(text, t.input_end) == call_input(held, k.input_end))
+            });
+            if !covered {
+                kept.push(t);
+            }
+        }
+        retained.extend(kept.iter().map(|t| t.id));
+    }
+    Ok(retained)
+}
+
+fn load_blob(tx: &Transaction<'_>, texts: &mut HashMap<i64, String>, blob: i64) -> Result<()> {
+    if let std::collections::hash_map::Entry::Vacant(slot) = texts.entry(blob) {
+        let body: Vec<u8> = tx
+            .prepare_cached("SELECT body FROM tool_blobs WHERE id=?")?
+            .query_row([blob], |r| r.get(0))?;
+        slot.insert(crate::tool_store::decode(&body)?);
+    }
+    Ok(())
+}
+
+/// The byte offset of character `n` of `text`, or its end.
+fn char_offset(text: &str, n: Option<i64>) -> Option<usize> {
+    let n = usize::try_from(n?).ok()?;
+    Some(text.char_indices().nth(n).map_or(text.len(), |(at, _)| at))
+}
+
+/// A call's input: its text up to `input_end` characters.
+fn call_input(text: &str, input_end: Option<i64>) -> &str {
+    char_offset(text, input_end).map_or(text, |at| &text[..at])
+}
+
+/// A call's output: its text from `output_start` characters.
+fn call_output(text: &str, output_start: Option<i64>) -> &str {
+    char_offset(text, output_start).map_or("", |at| &text[at..])
+}
+
+/// The placeholder omp writes into a transcript copy in place of a result it dropped from
+/// context: the copy holds no output of its own.
+fn elided(output: &str) -> bool {
+    let output = output.trim();
+    output == "[Uneventful result elided]"
+        || output
+            .strip_prefix("[Stale result elided - ")
+            .and_then(|rest| rest.strip_suffix(" tokens]"))
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn replay_messages(
@@ -443,13 +594,16 @@ fn rank_pi_sources(
     Ok(())
 }
 
+/// Per message key the canonical copy is the most complete (`replay_cmp`), ties going to
+/// the first source in `order`. Another copy is surfaced when its reply holds text that
+/// neither the canonical reply nor an already surfaced one contains: the chats diverged
+/// there, and both continuations stay searchable, each once.
 fn choose_replay(
     rows: &[ReplayRow],
     messages: &[ReplayMessage],
     agent: &str,
-    pi_order: &HashMap<i64, Vec<usize>>,
+    order: &SourceOrder<'_>,
 ) -> ReplaySelection {
-    let source_order = |m: &ReplayMessage| replay_order(pi_order, rows, m);
     let mut best: BTreeMap<(i64, String), usize> = BTreeMap::new();
     for (i, m) in messages.iter().enumerate() {
         let r = &rows[m.row];
@@ -457,28 +611,42 @@ fn choose_replay(
         if best.get(&key).is_none_or(|j| {
             let prior = &messages[*j];
             let quality = replay_cmp(m, prior, rows, agent);
-            quality.is_gt() || (quality.is_eq() && source_order(m) < source_order(prior))
+            quality.is_gt() || (quality.is_eq() && order.key(rows, m) < order.key(rows, prior))
         }) {
             best.insert(key, i);
         }
     }
-    let mut chosen: Vec<usize> = best.values().copied().collect();
-    let collision = chosen
+    let surfaced = surfaced_copies(rows, messages, &best, order);
+    let chosen: Vec<usize> = best.values().copied().collect();
+    let mut placed: Vec<(usize, bool)> = chosen
         .iter()
-        .map(|i| rows[messages[*i].row].turn)
+        .map(|i| (*i, false))
+        .chain(surfaced.iter().map(|i| (*i, true)))
+        .collect();
+    let collision = placed
+        .iter()
+        .map(|(i, _)| rows[messages[*i].row].turn)
         .collect::<HashSet<_>>()
         .len()
-        < chosen.len();
+        < placed.len();
+    let reply = |i: usize| messages[i].reply.map_or("", |j| rows[j].text.as_str());
     if collision {
-        chosen.sort_by_key(|i| {
+        placed.sort_by_key(|(i, surfaced)| {
             let r = &rows[messages[*i].row];
-            (r.ts <= 0, r.ts, r.turn, r.text.as_str())
+            (
+                r.ts <= 0,
+                r.ts,
+                r.turn,
+                r.text.as_str(),
+                *surfaced,
+                reply(*i),
+            )
         });
     }
-    let positions: HashMap<usize, i64> = chosen
+    let positions: HashMap<usize, i64> = placed
         .iter()
         .enumerate()
-        .map(|(n, i)| {
+        .map(|(n, (i, _))| {
             (
                 *i,
                 if collision {
@@ -489,7 +657,53 @@ fn choose_replay(
             )
         })
         .collect();
-    (best, chosen, positions)
+    ReplaySelection {
+        best,
+        chosen,
+        surfaced,
+        positions,
+    }
+}
+
+fn surfaced_copies(
+    rows: &[ReplayRow],
+    messages: &[ReplayMessage],
+    best: &BTreeMap<(i64, String), usize>,
+    order: &SourceOrder<'_>,
+) -> Vec<usize> {
+    let reply = |i: usize| messages[i].reply.map(|j| rows[j].text.as_str());
+    let mut losers: Vec<usize> = (0..messages.len())
+        .filter(|i| {
+            let r = &rows[messages[*i].row];
+            best[&(r.turn, messages[*i].key_text.clone())] != *i && reply(*i).is_some()
+        })
+        .collect();
+    // Longest first, so a cut copy of a surfaced reply is recognized as covered by it.
+    losers.sort_by(|a, b| {
+        let (x, y) = (reply(*a).unwrap_or(""), reply(*b).unwrap_or(""));
+        y.len().cmp(&x.len()).then_with(|| {
+            order
+                .key(rows, &messages[*a])
+                .cmp(&order.key(rows, &messages[*b]))
+        })
+    });
+    let mut surfaced: Vec<usize> = Vec::new();
+    for i in losers {
+        let m = &messages[i];
+        let r = &rows[m.row];
+        let winner = best[&(r.turn, m.key_text.clone())];
+        let text = reply(i).unwrap_or("");
+        let covered = std::iter::once(winner)
+            .chain(surfaced.iter().copied().filter(|j| {
+                let s = &rows[messages[*j].row];
+                (s.turn, &messages[*j].key_text) == (r.turn, &m.key_text)
+            }))
+            .any(|j| reply(j).is_some_and(|held| held.contains(text)));
+        if !covered {
+            surfaced.push(i);
+        }
+    }
+    surfaced
 }
 
 fn update_replay_metadata(
@@ -499,9 +713,9 @@ fn update_replay_metadata(
     rows: &[ReplayRow],
     messages: &[ReplayMessage],
     chosen: &[usize],
-    pi_order: &HashMap<i64, Vec<usize>>,
+    order: &SourceOrder<'_>,
 ) -> Result<()> {
-    let source_order = |m: &ReplayMessage| replay_order(pi_order, rows, m);
+    let source_order = |m: &ReplayMessage| order.key(rows, m);
     if let Some(m) = chosen
         .iter()
         .map(|i| &messages[*i])

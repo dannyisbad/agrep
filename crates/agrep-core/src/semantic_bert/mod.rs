@@ -525,7 +525,7 @@ impl ModernBert {
         }
         for (index, layer) in self.layers.iter().enumerate() {
             if crate::semantic_profile::enabled() {
-                eprintln!("{}", serde_json::json!({"layer":index,"shape":xs.dims()}));
+                crate::errln!("{}", serde_json::json!({"layer":index,"shape":xs.dims()}));
             }
             xs = stage(xs.device(), "layer", || {
                 layer.forward(

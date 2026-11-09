@@ -39,8 +39,14 @@ pub(crate) fn source_order() -> HashMap<PathBuf, usize> {
         .collect()
 }
 
-fn plain_dir(agent: &str, path: &Path) -> bool {
-    match fs::symlink_metadata(path) {
+/// Whether `path` is a directory to walk. Only a session root may be a link, which is followed.
+fn plain_dir(agent: &str, path: &Path, root: bool) -> bool {
+    let found = if root {
+        crate::ingest::registry::root_metadata(path)
+    } else {
+        fs::symlink_metadata(path)
+    };
+    match found {
         Ok(meta) if meta.is_dir() && !metadata_is_link(&meta) => true,
         Ok(meta) if metadata_is_link(&meta) => {
             crate::ingest::warn_source_skip(agent, path, "symlink sources are not followed");
@@ -98,7 +104,7 @@ fn slug_files(agent: &str, slug: &Path, files: &mut Vec<PathBuf>) {
         }
     }
     for child in nested {
-        if plain_dir(agent, &child) {
+        if plain_dir(agent, &child, false) {
             slug_files(agent, &child, files);
         }
     }
@@ -106,7 +112,7 @@ fn slug_files(agent: &str, slug: &Path, files: &mut Vec<PathBuf>) {
 
 pub(crate) fn session_files(agent: &str, root: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = Vec::new();
-    if !plain_dir(agent, root) {
+    if !plain_dir(agent, root, true) {
         return files;
     }
     let slugs = match fs::read_dir(root) {
@@ -127,7 +133,7 @@ pub(crate) fn session_files(agent: &str, root: &Path) -> Vec<PathBuf> {
         let path = slug.path();
         match plain_entry_metadata(&slug) {
             Ok(Some(meta)) if meta.is_dir() => {
-                if plain_dir(agent, &path) {
+                if plain_dir(agent, &path, false) {
                     slug_files(agent, &path, &mut files);
                 }
             }

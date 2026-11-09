@@ -39,7 +39,9 @@ impl Drop for WriterLock {
 impl DataRoot {
     pub fn discover() -> Result<Self> {
         if let Some(p) = std::env::var_os("AGREP_DATA_DIR") {
-            return Ok(Self(p.into()));
+            let p = PathBuf::from(p);
+            note_unwritable(&p);
+            return Ok(Self(p));
         }
         #[cfg(not(target_os = "windows"))]
         let home = std::env::var_os("HOME")
@@ -56,6 +58,7 @@ impl DataRoot {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(home).join(".local/share"))
             .join("agrep/0.5");
+        note_unwritable(&p);
         Ok(Self(p))
     }
     pub fn open(path: impl Into<PathBuf>, initialize: bool) -> Result<Self> {
@@ -88,7 +91,13 @@ impl DataRoot {
         if !initialize || read_only() {
             bail!("index does not exist: {}", self.0.display())
         }
-        private_dir(&self.0)?;
+        if self.0.exists() && !writable(&self.0) {
+            return Err(cannot_build(&self.0));
+        }
+        private_dir(&self.0).map_err(|e| match e.downcast_ref::<std::io::Error>() {
+            Some(io) if io.kind() == std::io::ErrorKind::PermissionDenied => cannot_build(&self.0),
+            _ => e,
+        })?;
         // create_new makes racing initializers converge without replacing a marker.
         match OpenOptions::new()
             .write(true)
@@ -224,9 +233,58 @@ impl DataRoot {
     }
 }
 
+/// Whether this process must not write the data root: `AGREP_DATA_READONLY` is set, or
+/// [`DataRoot::discover`] found an existing root it cannot write ([`unwritable`]).
 pub fn read_only() -> bool {
+    read_only_requested() || unwritable()
+}
+fn read_only_requested() -> bool {
     std::env::var("AGREP_DATA_READONLY")
         .is_ok_and(|v| !v.is_empty() && !matches!(v.as_str(), "0" | "false" | "off"))
+}
+static UNWRITABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The discovered data root holds an index this user may not write, so commands answer
+/// from it as under `AGREP_DATA_READONLY` instead of failing on their first write.
+pub fn unwritable() -> bool {
+    UNWRITABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+fn note_unwritable(root: &Path) {
+    if read_only_requested() || !root.join("FORMAT").is_file() || writable(root) {
+        return;
+    }
+    if !UNWRITABLE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        crate::errln!(
+            "data directory {} isn't writable: answering from its existing index; new \
+             transcripts can't be indexed until it is writable",
+            crate::surface::safe(&root.display().to_string(), false)
+        );
+    }
+}
+/// Whether this user may create files in `root` and write its index. Windows ignores a
+/// directory's read-only attribute, so there only the index file's own attribute counts.
+fn writable(root: &Path) -> bool {
+    let db = root.join("index.db");
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let access = |path: &Path| {
+            std::ffi::CString::new(path.as_os_str().as_bytes())
+                // SAFETY: the pointer is a valid NUL-terminated path for the call's duration.
+                .is_ok_and(|path| unsafe { libc::access(path.as_ptr(), libc::W_OK) } == 0)
+        };
+        access(root) && (!db.exists() || access(&db))
+    }
+    #[cfg(not(unix))]
+    {
+        !fs::metadata(db).is_ok_and(|m| m.permissions().readonly())
+    }
+}
+fn cannot_build(root: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "no index in {}, and agrep may not write there to build one: make the directory \
+         writable, or point AGREP_DATA_DIR at a writable directory",
+        root.display()
+    )
 }
 
 /// Create only the requested directory tree; tighten an existing owned directory.

@@ -79,7 +79,7 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
         if selected.is_empty() {
             meta["hits"] = json!([]);
         }
-        println!("{}", agrep_core::json_output::to_string(&meta)?);
+        agrep_core::outln!("{}", agrep_core::json_output::to_string(&meta)?)?;
     }
     let index = agrep_core::handles::SessionIndex::load(&c)?;
     print_chats(
@@ -97,7 +97,7 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
         },
     )?;
     if !args.json {
-        eprintln!(
+        agrep_core::errln!(
             "showing {} of {}{} matching chat{}, {}{}{}",
             selected.len(),
             total,
@@ -119,7 +119,7 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
                 .unwrap_or_default()
         );
         if let Some(notice) = policy.and_then(|p| p.notice(excluded, "chat")) {
-            eprintln!("{notice}");
+            agrep_core::errln!("{notice}");
         }
         agrep_core::coverage::disclose(&coverage);
         render::note_no_auto(no_auto);
@@ -288,6 +288,15 @@ fn print_chats(
         let hit = hits
             .get(&(s.agent.clone(), s.id.clone()))
             .map(|(_, hit)| hit);
+        // 0.4.9 previewed a content match by its snippet, falling back to the row's text
+        // (py/search.py:8875-8876).
+        let matched_text = hit.map(|hit| {
+            if hit.snippet.is_empty() {
+                hit.text.as_str()
+            } else {
+                hit.snippet.as_str()
+            }
+        });
         let followup = hit
             .map(|hit| short(&hit.handle, &s.id))
             .or_else(|| latest_handle.clone())
@@ -304,7 +313,7 @@ fn print_chats(
             }
             if let Some(hit) = hit {
                 row["match_turn"] = json!(hit.turn);
-                row["match_text"] = json!(h::one_line(&hit.text, 240));
+                row["match_text"] = json!(h::one_line(matched_text.unwrap_or_default(), 240));
                 row["score"] = json!(hit.score);
                 if hit.matched != "phrase" {
                     row["matched"] = json!(hit.matched);
@@ -313,9 +322,9 @@ fn print_chats(
                 row["match_ts"] = json!(hit.ts);
                 row["match_handle"] = json!(short(&hit.handle, &s.id));
             }
-            println!("{}", agrep_core::json_output::to_string(&row)?);
+            agrep_core::outln!("{}", agrep_core::json_output::to_string(&row)?)?;
         } else {
-            println!(
+            agrep_core::outln!(
                 "{} {} {} {} {}t{}  {}{} · agrep around {}",
                 super::paint(&format!("@{}", index.target(&s.id)), color),
                 render::safe(&s.agent),
@@ -324,9 +333,9 @@ fn print_chats(
                 turns,
                 if s.side { " [side chat]" } else { "" },
                 if hit.is_some() { "match: " } else { "" },
-                render::safe(&h::one_line(hit.map_or(&s.title, |h| &h.text), 96)),
+                render::safe(&h::one_line(matched_text.unwrap_or(&s.title), 96)),
                 followup
-            );
+            )?;
         }
     }
     Ok(())

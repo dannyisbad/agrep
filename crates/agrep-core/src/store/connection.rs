@@ -4,28 +4,91 @@ use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
 
 pub fn reader(root: &DataRoot) -> Result<Connection> {
-    let c = {
-        let _span = crate::semantic_profile::span("reader_open");
-        Connection::open_with_flags(
-            root.db(),
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?
+    loop {
+        let c = {
+            let _span = crate::semantic_profile::span("reader_open");
+            match settled_unwritable(root) {
+                Some(uri) => Connection::open_with_flags(
+                    uri,
+                    OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | OpenFlags::SQLITE_OPEN_URI
+                        | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )?,
+                None => Connection::open_with_flags(
+                    root.db(),
+                    OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )?,
+            }
+        };
+        // A read outside the transaction takes the shared lock a WAL connection keeps until
+        // it closes, without starting the snapshot the command's first query starts.
+        c.query_row("PRAGMA schema_version", [], |_| Ok(()))?;
+        if !unmoved(&c) {
+            continue;
+        }
+        {
+            let _span = crate::semantic_profile::span("reader_pragmas");
+            c.execute_batch("PRAGMA query_only=ON; BEGIN;")?;
+        }
+        if crate::semantic_profile::timing_enabled() {
+            // Force the otherwise lazy schema read into its own diagnostic phase.
+            // Ordinary commands still load it with their first real statement.
+            let _span = crate::semantic_profile::span("reader_schema");
+            let _statement = c.prepare("SELECT path FROM sources LIMIT 0")?;
+        }
+        return Ok(c);
+    }
+}
+/// Whether the file `c` has open is still the one at its path. A reindex renames the
+/// rebuilt index over `index.db` only while no connection holds a shared lock on it
+/// (`refresh::rename_unshared`), so a connection asked after a read either holds that lock
+/// on the current file, which keeps it current, or sees its file moved and must reopen it.
+fn unmoved(c: &Connection) -> bool {
+    let mut moved: std::os::raw::c_int = 0;
+    // SAFETY: the handle is open for the call, and HAS_MOVED writes one int.
+    let rc = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            c.handle(),
+            c"main".as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
+            (&mut moved as *mut std::os::raw::c_int).cast(),
+        )
     };
-    {
-        let _span = crate::semantic_profile::span("reader_pragmas");
-        register_functions(&c)?;
-        c.execute_batch("PRAGMA query_only=ON; BEGIN;")?;
+    rc != rusqlite::ffi::SQLITE_OK || moved == 0
+}
+/// A WAL reader must create or map `index.db-shm`, which a directory this user may not write
+/// refuses (SQLITE_READONLY_DIRECTORY). Such a root has no agrep writer, so once its WAL holds
+/// no frames the database file is the whole index and opens as immutable.
+#[cfg(unix)]
+fn settled_unwritable(root: &DataRoot) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
+    let wal = root.path().join("index.db-wal");
+    if !crate::data::unwritable() || wal.metadata().is_ok_and(|m| m.len() > 0) {
+        return None;
     }
-    if crate::semantic_profile::timing_enabled() {
-        // Force the otherwise lazy schema read into its own diagnostic phase.
-        // Ordinary commands still load it with their first real statement.
-        let _span = crate::semantic_profile::span("reader_schema");
-        let _statement = c.prepare("SELECT path FROM sources LIMIT 0")?;
+    let mut uri = String::from("file:");
+    for &b in root.db().as_os_str().as_bytes() {
+        if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
+            uri.push(b as char);
+        } else {
+            uri.push_str(&format!("%{b:02X}"));
+        }
     }
-    Ok(c)
+    uri.push_str("?immutable=1");
+    Some(uri)
+}
+#[cfg(not(unix))]
+fn settled_unwritable(_: &DataRoot) -> Option<String> {
+    None
 }
 pub fn writer(root: &DataRoot) -> Result<Connection> {
-    open_writer(&root.db(), true)
+    // Setting the journal mode reads the file, so a moved file shows here (see `unmoved`).
+    loop {
+        let c = open_writer(&root.db(), true)?;
+        if unmoved(&c) {
+            return Ok(c);
+        }
+    }
 }
 pub(super) fn open_writer(path: &Path, wal: bool) -> Result<Connection> {
     let initialize = path.metadata().map_or(true, |m| m.len() == 0);
@@ -35,22 +98,7 @@ pub(super) fn open_writer(path: &Path, wal: bool) -> Result<Connection> {
     if initialize {
         schema(&c)?;
     }
-    register_functions(&c)?;
     Ok(c)
-}
-fn register_functions(c: &Connection) -> Result<()> {
-    c.create_scalar_function(
-        "project_match",
-        2,
-        rusqlite::functions::FunctionFlags::SQLITE_UTF8
-            | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
-        |ctx| {
-            let value: String = ctx.get(0)?;
-            let pattern: String = ctx.get(1)?;
-            Ok(crate::query::project_ok(&value, &pattern))
-        },
-    )?;
-    Ok(())
 }
 pub(crate) fn schema(c: &Connection) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS sources(path TEXT PRIMARY KEY,agent TEXT NOT NULL,size INTEGER NOT NULL,mtime_ns INTEGER NOT NULL,change_token BLOB NOT NULL,last_error TEXT);

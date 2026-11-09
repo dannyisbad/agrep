@@ -50,6 +50,17 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   counting the rows below it, keeps one vector store whose coverage is `semantic_coverage`,
   and probes the scope for the query's words only when the keyword lane found nothing,
   since a keyword row already proves one occurs.
+- A keyword row whose conversation family a meaning row already leads stays in the
+  merged result, after every other row, where 0.4.9 dropped it as covered: on a history of
+  orchestrators with many subagent chats, one meaning row hid every keyword hit of its
+  family, and neither `--more` nor `-n` could show them. A compact page shows these rows
+  if room is left, otherwise behind `--more`; its floor total counts them, and a page
+  merged with meaning rows offers more whenever the row limit cut a merged row.
+- Notes from omp's advisor sidecars (`__advisor.jsonl`, an automated reviewer watching a
+  session) are left out of the meaning lane: they are not embedded and never return as
+  meaning rows, even with `-s --who subagent`. 0.4.9 embedded them, and their short status
+  notes (`Nothing to flag.`) crowded real answers out of `-s`. Keyword search, `--who
+  subagent`, counts and `around` show them as before.
 - Meaning search answers only from a complete snapshot. 0.4.9 searched the vectors
   already published, even with unembedded rows, and disclosed that gap through
   coverage numbers, partial flags and lines such as `catching up; retry shortly`.
@@ -96,7 +107,11 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   lines, in the order a terminal shows them: 0.4.9 held piped rows in its output buffer
   until it exited, so its notices landed above the rows.
 - Compact pages offer no `agrep --deeper` broader rerun: 0.5 drops the hidden `--deeper`
-  replay; the larger `-n` rerun stays.
+  replay. Instead the last page of a cut search names the larger `-n` rerun itself
+  (`118+ matches (floor; -c exact) · larger page: agrep --classic -n 80 -- deploy`), where
+  0.4.9's last page pointed at `--deeper`.
+- A cut `-l` page's floor says `(a floor, not the total)` without 0.4.9's `-c counts
+  exactly`: `-c` counts rows, not chats, and refuses `-l`.
 - A bad `-E` pattern is reported with 0.5's regex engine's message (`bad regex: Parsing
   error at position 1: Opening parenthesis without closing parenthesis`, also the JSON
   record's `reason`) where 0.4.9 quoted Python's `re` (`missing ), unterminated subpattern
@@ -106,6 +121,37 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   also the JSON record's `reason`, under 0.4.9's codes: 0.5 handles carry a content
   digest, and the message says which part no longer resolves where 0.4.9's said only that
   no session matched.
+- `run` refuses an unknown agent with `unknown agent 'x'; supported for agrep run: …` where
+  0.4.9 said `supported for native resume`: the refusal names the command that was run.
+- A `resume` whose agent fails to start names the system's reason in 0.5's wording
+  (`couldn't launch pi: No such file or directory (os error 2)`) where 0.4.9 quoted Python's
+  (`[Errno 2] No such file or directory: '…'`): 0.5 has no Python.
+- `agrep run` or `resume` piped into another command (`agrep run claude | cat`) now stops
+  its agent when you press Ctrl-Z and starts it again on `fg`, and the keys you type at
+  the shell meanwhile reach the shell. 0.4.9 stopped only itself: it ran the agent cut off
+  from the terminal's job control, so the agent kept running and read those keys. The
+  agent now stays in the terminal's session. The terminal still belongs to the whole
+  pipeline, so a pager reading it is not stopped, until the agent itself reads or sets up
+  the terminal; then agrep hands it the terminal, as for a run without a pipe. In the
+  background (`bg`, or a launch ending in `&`) an agent that reads the terminal stops with
+  its job until `fg`, as any program reading the terminal does; one that never touches the
+  terminal keeps running.
+- The `resume` picker asks again after an answer that is neither a listed number nor a
+  reference to exactly one of its sessions; 0.4.9 printed that message and gave up. A
+  number is always a position in the list: 0.4.9 tried a number outside the list as the
+  start of a session id, so a typo like `0` could resume a session whose id began with 0.
+- `resume` names the program it starts: `↻ resuming omp · …` for an omp session, where
+  0.4.9 said `pi` for both forks.
+- Claude's resume directory comes from the session's plain transcript, the first in path
+  order when several project folders hold one, where 0.4.9 took whichever its directory
+  listing gave first, an earlier resume's link included: the choice no longer depends on
+  listing order. When no transcript records a `cwd`, resume uses the indexed one before
+  falling back to home.
+- `summary` names a `--project` or `--agent` value the index lacks, as search does
+  (`--project x isn't in the index - indexed projects: …`), where 0.4.9's summary printed
+  only its empty table.
+- `around` counts in the singular when one item is hidden (`1 tool event omitted · 1
+  message omitted`) where 0.4.9 wrote `1 tool events omitted · 1 messages omitted`.
 
 ## Caller exclusion, truncation flags and terminal quoting
 
@@ -123,14 +169,24 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
 - `status` prints one line per remaining fact without `[ok ]` markers instead of 0.4.9's
   sectioned doctor report: its other rows (ingest binary, Python, runtime and installed
   build, daemon freshness, search database generation) describe machinery 0.5 removed.
-- The counts line names sessions, prose rows and tool rows where 0.4.9 counted messages per
-  agent: tool rows are searchable.
-- The JSON object is 0.5's own: `version`, `sessions`, `agents`, `last_indexed_age_s` and
-  `freshness` keep their names; 0.4.9's data-dir, index, semantic and instruction keys
-  become `data_root`, `format`, `index`, `semantic` and `integrations`, `messages` and
-  `per_agent` become `prose`, `tools` and `sources`, and 0.5 adds `disk_bytes`,
-  `disk_files`, `archive`, `permissions` and `source_errors`. The
-  daemon, diagnostics-tier, warning and build-identity keys are gone with that machinery.
+- The counts line names sessions, messages and tool rows where 0.4.9 counted messages per
+  agent: tool rows are searchable. A message is 0.4.9's: one user-side prose row with its
+  reply attached, the same count `index` reports and a keyword miss names.
+- The JSON object is 0.5's own, a bounded summary as 0.4.9's was: `version`, `sessions`,
+  `messages`, `agents`, `last_indexed_age_s` and `freshness` keep their names; 0.4.9's
+  data-dir, index, semantic and instruction keys become `data_root`, `format`, `index`,
+  `semantic` and `integrations`, `per_agent` becomes `agents` (each agent's `sessions`,
+  `sources` and `parse_errors`), and 0.5 adds `prose`, `tools`, `disk_bytes`, `disk_files`,
+  `archive`, `permissions` and `source_errors`. No source is listed one by one: `doctor
+  --json` lists the sources whose last read failed. The daemon, diagnostics-tier, warning
+  and build-identity keys are gone with that machinery.
+- `doctor` prints one line per problem with the action that resolves it: a missing index
+  (`agrep index`), each source that failed to read, a corrupt or half-installed model
+  (`agrep setup` reinstalls it), an unwritable data directory. Background embedding logs a
+  model's failed verification once and then leaves those files alone until they change.
+- A data directory this user may not write behaves as under `AGREP_DATA_READONLY`: commands
+  answer from its index with freshness unchecked, after one stderr line naming the directory,
+  and `doctor` names it. Without an index there, the refusal names the directory.
 - A bare `agrep` runs `status` rather than 0.4.9's welcome page of recent chats and example
   commands: one status page serves both, and `agrep chats` lists the recent chats.
 
@@ -138,12 +194,12 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
 
 - 0.4.9 served the last-good index and said it was behind when transcripts had changed.
   0.5 indexes those changes before answering: search in every form, recall, pack, around,
-  chats, summary (including pending), resume, status, postcompact and each explorer
-  request use the completed source census and foreground refresh. This makes a transcript
-  change visible to the next command. There is no behind notice or changed-source count
-  in an answer's freshness record or status. `--more` continues its first frozen page.
-  `--no-auto` keeps 0.4.9's unchecked record; a read-only data root also says `unchecked`
-  because 0.5 skips ingestion when it may not write.
+  chats, summary (including pending), resume, status and postcompact use the completed
+  source census and foreground refresh. This makes a transcript change visible to the next
+  command. There is no behind notice or changed-source count in an answer's freshness
+  record or status. `--more` continues its first frozen page. `--no-auto` keeps 0.4.9's
+  unchecked record; a read-only data root also says `unchecked` because 0.5 skips
+  ingestion when it may not write.
 
 ## Command line and help
 
@@ -155,12 +211,37 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   `; to search for the word "tail": agrep search tail …` hint argparse appended to a
   subcommand's refusal, which only the `unrecognized arguments` refusal of `chats`, `recall`
   and `pack` keeps; and every argument error still exits 2, as 0.4.9's did.
-- `status`, `resume`, `ui` and `serve` also accept `--no-auto`, which 0.4.9 refused with
-  exit 2: in 0.5 each of them checks the agent stores for changes itself, as search does,
-  where 0.4.9 left that to its daemon. `index --semantic` is new: it downloads the model if
-  needed and embeds every row before exiting.
+- `status` and `resume` also accept `--no-auto`, which 0.4.9 refused with exit 2: in 0.5
+  each of them checks the agent stores for changes itself, as search does, where 0.4.9
+  left that to its daemon. `index --semantic` is new: it downloads the model if needed and
+  embeds every row before exiting.
 - search's `--strict-semantic` is gone (exit 2): it was a compatibility alias that changed
   nothing, since `-s` already exits 2 when meaning is unavailable.
+- 0.4.9's browser explorer (`agrep ui` and `agrep serve`) is gone. The terminal commands
+  cover the same ground: `board` and `tail` show live sessions, and search, `around` and
+  `chats` find and read past chats. `agrep ui` and `agrep serve` now search for those
+  words, like any other first word that is not a command.
+- A one-shot `board` (`--once`, `--json`, or not on a terminal) waits up to 10 s for its
+  first live scan by default, where 0.4.9 waited 0.18 s for a daemon that had usually
+  scanned already; 0.5 has no daemon, and a large history takes longer than 0.18 s to scan.
+  `--wait` still sets the bound.
+- `setup` and `index --semantic` show the model download's bytes and percent on a
+  terminal's stderr; elsewhere they stay quiet.
+- `agrep help` prints the top-level help and `agrep help COMMAND` that command's help,
+  without touching the index, where 0.4.9 searched for the word `help` (which on a fresh
+  install first built the whole index). `agrep search help` still searches the word, and
+  anything else after `help` is refused (exit 2) with that search command.
+- `agrep version` on its own prints the version, as `agrep --version` does, where 0.4.9
+  searched for the word (on a fresh install, after building the whole index). With more
+  words (`agrep version bump`) it still searches, and `agrep search version` always does.
+- On a terminal narrower than 60 columns, help puts each option's description on the lines
+  under it and never wraps narrower than 40 columns: clap otherwise kept descriptions
+  beside an option column wider than the terminal, so `search --help` at 40 columns printed
+  one word a line. The live `board` fits its rows to the width, counted in terminal columns
+  (a CJK character or an emoji takes two) and cut between whole characters, so an accent or
+  a joined emoji is never split: a row that does not fit shortens the project and state,
+  marked `…`, so the prompt that tells sessions apart stays visible; a cut line ends in `…`;
+  and the key legend shortens but always lists `q quit`.
 
 ## Index and reindex
 
@@ -171,7 +252,61 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   database instead of those files.
 - `reindex` prints that report under 0.4.9's `=== ingest transcripts ===` stage, without
   its `(rust)` label or its `no new messages since last index` shortcut: 0.5's reindex
-  always reparses every source, so it always has an index to report.
+  always reparses every source, so it always has an index to report. It builds the new
+  index beside the old one, the way a first build does, and then copies it over the old
+  one in one transaction: searches keep answering from the old index meanwhile, a reindex
+  that is stopped partway leaves it as it was, and the result is the size of a first
+  build. So its stderr notice comes before the work, `rebuilding the search db (a rebuild
+  can take a while on a large history) …`, where 0.4.9 printed `refreshing the search db …`
+  after the ingest. Meaning vectors survive it: a row whose text was embedded before the
+  reindex is still covered after it, with or without a model or `embeddings` on.
+- `index --semantic` and `reindex` show the embedding stage on a terminal's stderr as one
+  rewritten line, `embedding messages: 1200 of 137768 rows · 150 rows/s · about 15m 11s
+  left`; 0.4.9's embed stage printed nothing until it finished. `status` says the time
+  left the way `-s` does (`about 15m 19s left`), where 0.4.9 had no estimate; both divide
+  the rows still to cover by the rate rows were covered at over the last minute of the
+  build, rows whose text was already embedded included.
+- An antigravity chat's project comes from its working directory after decoding a
+  double-encoded `Cwd` (a JSON string inside the JSON value), as 0.4.9's resume decoded it,
+  where 0.4.9's index read the still-encoded text: one decoding serves both, so an escaped
+  character such as `\u00e9` names the project as written.
+- Codex rollouts that Codex has compressed (`rollout-*.jsonl.zst`) are indexed like plain
+  ones, where 0.4.9 read only `rollout-*.jsonl` and so missed every compressed chat; on a
+  long-used Codex install that is most of its history. While Codex compresses a chat both
+  copies can exist for a moment: search shows the chat once, and its handles stay the same
+  when the plain copy is deleted. A damaged compressed rollout is listed by `status` and
+  `doctor` as a failed source (`cannot decompress: ...`); other sources are unaffected.
+  `archive` snapshots compressed rollouts as it does plain ones.
+- When several files hold one chat (a resumed or copied transcript), 0.4.9 searched one copy
+  of each turn and of each tool call and hid the rest, even where the hidden copy held more:
+  a tool call's full output beside a copy that elided it, a call or reply only that copy
+  has, a call whose input differs. 0.5 searches every row any copy holds, each once. Of
+  the copies of a call it keeps the most complete (a real result over one omp elided, then
+  the longest output); of a turn, the longest reply as 0.4.9 did, ties going to the first
+  file in path order rather than to the first one indexed. A copy is hidden only when a kept
+  copy contains its text, or when it holds an omp elision placeholder in place of the
+  result of a call a kept copy has with the same input. A reply that differs from the kept
+  one takes its own turn, so the chat's turns are renumbered by time, as 0.4.9 did for
+  copies that disagreed about a prompt.
+- 0.4.9 hid the tool calls of a chat that had no prose turn, such as an omp advisor run
+  that only used tools, and did not list the chat. 0.5 searches those calls, lists the
+  chat (a pi side transcript as a side chat of its parent, under its file's working
+  directory), dates it by its calls and titles it by its first call, and `around --full` shows them on turn 0.
+- Codex chats archived in Codex (moved to `~/.codex/archived_sessions/`, plain or
+  compressed) are indexed, where 0.4.9 read only `~/.codex/sessions/` and so dropped a chat
+  from search once it was archived. A chat keeps its handles when it moves, and is shown
+  once even while a copy sits in both folders.
+- A store root that is itself a symbolic link is followed once, to its own kind: a store
+  directory (`~/.codex/sessions`, `~/.claude/projects`, `~/.pi/agent/sessions` or
+  `~/.omp/agent/sessions`, opencode's or crush's data folder) to a directory, and a store
+  that is one file (the database `OPENCODE_DB` names, kimi's `kimi.json`, crush's
+  `crush.db`, Cursor's `state.vscdb`) to a regular file. Index, search, status, doctor,
+  audit, archive and board read it, and its sources keep their paths through the link.
+  0.4.9 recorded such a root as an `unsupported-link` source-health issue and read nothing
+  from it. Links inside a store are still never followed. A root link that dangles, leads
+  to the wrong kind (a folder link to a file, a database link to a folder), or leads into or
+  around another store root (so that one store would be read twice) is listed by `status`
+  and `doctor` as a failed source naming the reason.
 
 ## Integrations and archive port
 
@@ -179,10 +314,12 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   agrep's to own. Unmarked skills and edited helper files stay protected.
 - Hook registration adds agrep's entry beside a user's own hooks for the same event, where
   0.4.9 registered nothing when a hook it had not installed was there: recovery works
-  without displacing the user's hook. It rewrites only the top-level `hooks` value, in the
-  file's indentation, separators, `\u` escaping and line endings as 0.4.9 detected them,
-  and leaves the rest of the file byte for byte where 0.4.9 re-serialized all of it in that
-  style: the user's other settings keep their exact text.
+  without displacing the user's hook. Setup writes only agrep's entry, plus the `hooks`
+  object or event list when the file lacks one, in the layout of the entries beside it
+  and the file's indentation, `\u` escaping and line endings; remove takes out exactly
+  that entry and any object or list setup added, so setup then remove gives back the file
+  byte for byte. 0.4.9 re-serialized the whole file in the style it detected, the user's
+  own entries and settings included.
 - Consent and completion output omit the dependency, daemon, owner and sentinel stages: those
   stages no longer exist. Invalid settings print `agrep: tools must be on/off` without
   0.4.9's `agrep set:` prefix and its `to search for the word "set": …` hint: one error
@@ -200,11 +337,42 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   and a backup-API snapshot is consistent while the store is in use. A file written while it
   is copied, or a SQLite store a scheduled snapshot finds locked, fails for that pass where
   0.4.9 listed it as deferred: the next pass retries it either way.
+- A failed scheduled capture is tried again after ten minutes, then after twice as long with
+  each further failure, up to a day, where 0.4.9's daemon started a new pass every minute
+  however often it had failed: a lasting fault, such as an unreadable catalog, would
+  otherwise start a failing worker and add a log line on every command. An explicit
+  `agrep archive` always runs, and `status` and `doctor` report the failing passes.
+- Every capture pass checks the stored chunks the catalog relies on, where 0.4.9 trusted
+  them until a restore read them: a chunk whose file is missing, or changed since it was
+  verified and no longer holds its content, is re-stored from a live file that still holds
+  it, and versions no live file can repair are listed by that capture, `archive --status`
+  and `doctor`. A chunk file is fully re-read only when its file changed, so a pass costs one
+  `stat` per chunk. A restore that meets such a chunk says the archived copy is damaged,
+  naming the chunk, the archive directory and the remedy, where 0.4.9 gave the file system's
+  error for a missing chunk and `chunk … corrupt in archive store` for a corrupt one.
+- An unreadable catalog is named, with `agrep archive --purge --yes` as its remedy, by every
+  archive command; the purge replaces it with an empty catalog and deletes every chunk, and
+  `--status` exits 2, as 0.4.9's did for an unreadable manifest.
 - A forced restore into an existing SQLite file writes the archived contents into it through
   the backup API under SQLite's write lock, where 0.4.9 replaced the file and deleted its
   `-wal`, `-shm` and `-journal` files: open connections keep a coherent database instead of
   one swapped beneath them. A restore refuses a destination holding such a file without its
   database, which 0.4.9 deleted: it may hold the only copy of committed writes.
+- A failing or timed-out `post_index` command prints one line on stderr naming its exit
+  status and the file holding its output (`log/post_index.log` in the data directory, kept
+  from the last run), where 0.4.9 wrote only to its own log. As in 0.4.9 the command never
+  fails the index and is stopped after ten minutes; 0.5 stops everything it started too.
+  `off` in any letter case, or a blank value, disables it, where 0.4.9 ran a stored `OFF`.
+  As in 0.4.9, INT, TERM or HUP to agrep while the command runs is passed to the command
+  and everything it started, whatever is left is killed after a second and a half, and
+  agrep then ends by that signal.
+- `agrep remove` leaves alone a known instruction file it has no record of writing when the
+  file is not UTF-8 or its agrep markers are broken, prints one line saying so and still
+  succeeds: the file is the user's own. Every setup and remove error names its file.
+- `agrep set` notes say what the new value changes (`tools = off  (searches leave out tool
+  calls and their output unless you pass --who tool)`), where 0.4.9 printed one fixed note
+  per key; 0.4.9's `embeddings` note claimed `off` blocks model downloads, which only setup
+  makes.
 
 ## Distribution, CI, release and documentation
 

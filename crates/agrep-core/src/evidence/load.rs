@@ -33,8 +33,9 @@ fn load_in(c: &Connection, index: &SessionIndex, request: &Request) -> Result<Wi
         (request.target.clone(), request.turn)
     };
     let session = resolve_session(c, index, &target, claim.as_ref())?;
+    // A chat without a turn is served by its calls alone.
     let (first, last): (Option<i64>, Option<i64>) = c.query_row(
-        "SELECT min(position),max(position) FROM prose WHERE session=? AND visible=1",
+        "SELECT coalesce((SELECT min(position) FROM prose WHERE session=?1 AND visible=1),(SELECT min(position) FROM tools WHERE session=?1 AND visible=1)),coalesce((SELECT max(position) FROM prose WHERE session=?1 AND visible=1),(SELECT max(position) FROM tools WHERE session=?1 AND visible=1))",
         [&session],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
@@ -183,8 +184,9 @@ pub fn load_events(c: &Connection, session: &str, lo: i64, hi: i64) -> Result<Ve
             .unwrap_or_default();
         let raw: Value = serde_json::from_str(&body)?;
         let string = |key: &str| raw[key].as_str().unwrap_or_default().to_owned();
-        // Replay copies of one call share its id; separate identical calls stay separate.
-        if !seen.insert(string("call_id")) {
+        // Replay copies of one call share its id; separate identical calls stay separate,
+        // and so do copies the replay keeps searchable because their texts differ.
+        if !seen.insert((string("call_id"), text.clone())) {
             continue;
         }
         let identity = handles::event_id(session, ts, if text.is_empty() { &body } else { &text });

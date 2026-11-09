@@ -1,15 +1,73 @@
 //! Small output primitives; all byte budgets include the final newline.
+//!
+//! A reader that goes away (`agrep setup | head -1`) ends the output, not the command:
+//! stdout writes drop a broken pipe and the command finishes with its own exit code.
+//! Commands print through these helpers and the `out!`/`outln!`/`errln!` macros, never
+//! `print!`/`println!`/`eprintln!`, whose failed writes panic.
 use anyhow::Result;
+use std::fmt;
 use std::io::{self, Write};
 pub fn write(value: &str) -> Result<()> {
     let mut out = io::stdout().lock();
-    match out.write_all(value.as_bytes()).and_then(|_| out.flush()) {
-        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
-        other => Ok(other?),
-    }
+    Ok(drop_closed(
+        out.write_all(value.as_bytes()).and_then(|_| out.flush()),
+    )?)
 }
 pub fn line(value: &str) -> Result<()> {
     write(&format!("{value}\n"))
+}
+/// `print!` for the `out!` and `outln!` macros.
+pub fn print(args: fmt::Arguments<'_>) -> io::Result<()> {
+    drop_closed(io::stdout().lock().write_fmt(args))
+}
+/// `eprint!` for the `errln!` macro: with stderr gone there is no one left to tell.
+pub fn note(args: fmt::Arguments<'_>) {
+    let _ = io::stderr().lock().write_fmt(args);
+}
+/// The reader of this stream has gone away.
+pub fn closed(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::BrokenPipe
+}
+/// Puts a question to the reader of `out`; false when that reader has gone away, so a
+/// command never waits on the answer to a prompt no one saw.
+pub fn ask(out: &mut impl Write, args: fmt::Arguments<'_>) -> io::Result<bool> {
+    match out.write_fmt(args).and_then(|()| out.flush()) {
+        Err(e) if closed(&e) => Ok(false),
+        other => other.map(|()| true),
+    }
+}
+fn drop_closed(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(e) if closed(&e) => Ok(()),
+        other => other,
+    }
+}
+/// `print!` to stdout that returns `io::Result<()>`, treating a closed reader as success.
+#[macro_export]
+macro_rules! out {
+    ($($arg:tt)*) => {
+        $crate::surface::print(::std::format_args!($($arg)*))
+    };
+}
+/// `println!` to stdout that returns `io::Result<()>`, treating a closed reader as success.
+#[macro_export]
+macro_rules! outln {
+    () => {
+        $crate::surface::print(::std::format_args!("\n"))
+    };
+    ($($arg:tt)*) => {
+        $crate::surface::print(::std::format_args!("{}\n", ::std::format_args!($($arg)*)))
+    };
+}
+/// `eprintln!` that never fails.
+#[macro_export]
+macro_rules! errln {
+    () => {
+        $crate::surface::note(::std::format_args!("\n"))
+    };
+    ($($arg:tt)*) => {
+        $crate::surface::note(::std::format_args!("{}\n", ::std::format_args!($($arg)*)))
+    };
 }
 pub fn prefix(value: &str, bytes: usize) -> &str {
     let mut end = bytes.min(value.len());
@@ -102,6 +160,20 @@ pub fn timestamp(ts: i64) -> String {
         })
         .unwrap_or_default()
 }
+/// 0.4.9's one colour rule (py/console.py:175-191): an explicit `--color always|never`
+/// wins, then a non-empty `NO_COLOR` disables colour, then a non-empty `FORCE_COLOR`
+/// forces it, and otherwise colour follows whether the stream is a terminal.
+pub fn color_enabled(when: &str, terminal: bool) -> bool {
+    let set = |name| std::env::var_os(name).is_some_and(|v| !v.is_empty());
+    color_rule(when, set("NO_COLOR"), set("FORCE_COLOR"), terminal)
+}
+fn color_rule(when: &str, no_color: bool, force_color: bool, terminal: bool) -> bool {
+    match when {
+        "always" => true,
+        "never" => false,
+        _ => !no_color && (force_color || terminal),
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,5 +212,24 @@ mod tests {
     fn bytes_and_terminal() {
         assert_eq!(prefix("é🙂a", 5), "é");
         assert!(clip("é🙂a", 6).len() <= 6);
+    }
+    // 0.4.9's test_color_rule.py cases.
+    #[test]
+    fn explicit_color_then_no_color_then_force_color_then_the_terminal() {
+        for (when, no_color, force_color, terminal, expected) in [
+            ("always", true, false, false, true),
+            ("never", false, true, true, false),
+            ("auto", true, true, true, false),
+            ("auto", true, false, true, false),
+            ("auto", false, true, false, true),
+            ("auto", false, false, true, true),
+            ("auto", false, false, false, false),
+        ] {
+            assert_eq!(
+                color_rule(when, no_color, force_color, terminal),
+                expected,
+                "{when} NO_COLOR={no_color} FORCE_COLOR={force_color} tty={terminal}"
+            );
+        }
     }
 }

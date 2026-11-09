@@ -24,7 +24,11 @@ shapes are looked up with their source-local turn.
 
 `resume` resolves ids, handles, upstream aliases, projects, and opening text. The
 noninteractive ambiguous case lists candidates and exits 1. Interactive selection
-is numbered and bounded by `-n`; `--list` never launches. Side chats walk their
+is numbered and bounded by `-n`: as in 0.4.9 an answer is a listed number or a
+reference resolved among the picker's candidates, but a number is only ever a list
+position (0.4.9 tried an out-of-range one as an id prefix), and anything else asks again
+where 0.4.9 gave up; an empty answer or the end of input cancels. `--list` never launches.
+The launch line names the program started (`↻ resuming omp · DIR`). Side chats walk their
 parent chain with cycle/missing-parent refusal. Native argument tables are:
 
 | Agent | Resume arguments |
@@ -39,14 +43,32 @@ Kimi, Gemini, and crush have no verified native resume/run contract; Cursor and
 Cline are editor-owned. They receive an explicit unsupported answer. Fresh pi
 launches prefer the spelling requested, with the sibling as a PATH fallback.
 
+The agent starts in the session's recorded working directory; Antigravity's is the
+most frequent `Cwd` its tool calls recorded, ties going to the first seen, and Claude's is
+the first recorded `cwd` whose slug names the transcript's project folder (else the first
+recorded). A recorded
+directory missing here re-anchors, as in 0.4.9, to the one existing directory that ends
+with the longest of its path suffixes under home or home's immediate non-hidden
+subdirectories; with no such directory, or several, the agent starts in home. A launch
+failure prints `couldn't launch AGENT: REASON` and exits 1. Claude finds a session only
+under the launch directory's project folder, so when that differs from the transcript's,
+resume links the transcript there (a private copy where links are refused); its own earlier
+link and any plain file already there are left as they are, and anything else there stops
+the resume with exit 1.
+
 `run` and `resume` pass arguments directly to native processes. POSIX launches
-use a private process group. With a terminal on both stdin and stdout the agent
-is lent the terminal's foreground; otherwise it runs in a session of its own, so
-the terminal stays with the caller's pipeline. When `fg` brings a still-running
-background launch forward, the agent gets the terminal the first time it reads or
-configures it, or when agrep is next signalled, where 0.4.9 checked every 50 ms:
-a shell's `fg` sends a running job no signal, and 0.5 waits on the agent instead
-of polling. Launches forward termination
+give the agent a process group of its own in the caller's session. With a terminal
+on both stdin and stdout the agent is lent the terminal's foreground at once;
+otherwise (a pipeline, `agrep run x | less`) the terminal stays with the caller's
+job, so a partner reading /dev/tty is not stopped, until the agent's first read or
+configuration of the terminal stops it with SIGTTIN/SIGTTOU, which lends it the
+terminal from then on. 0.4.9 gave a piped agent a session of its own, out of the
+terminal's job control: Ctrl-Z stopped agrep but not the agent, which went on reading
+the shell's keystrokes. A Ctrl-Z aimed at agrep stops the agent's group first, then
+agrep's job. When `fg` brings a still-running background launch forward, the agent
+gets the terminal the first time it reads or configures it, or when agrep is next
+signalled, where 0.4.9 checked every 50 ms: a shell's `fg` sends a running job no
+signal, and 0.5 waits on the agent instead of polling. Launches forward termination
 signals, return the first signal's conventional exit code, restore terminal
 ownership/attributes, and terminate remaining descendants. Windows binds the
 wrapper and descendants to a kill-on-close Job Object before spawning. A
@@ -70,7 +92,11 @@ exits 0 once its report is complete, whatever it found, 1 when a repair `--fix`
 attempted could not finish (including a corrupt index with no terminal to
 confirm its rebuild), and 2 for invalid options. `audit` independently
 counts visible rows, compares census fingerprints, and `--full` reparses sources
-with the adapters and compares canonical text rather than cached counters.
+with the adapters and compares canonical text rather than cached counters. A row
+the index stores but keeps out of search by design counts as indexed: a copy of a
+row that a chat held by several files shows only once in its canonical replay.
+`--full` lists parsed rows missing from the index first, then indexed rows no source
+holds, each group by agent, session and speaker, so a rerun lists them in the same order.
 As in 0.4.9, gaps exit 1 and `--strict` makes them errors (exit 2); a source that
 fails to parse, unreadable evidence, or no source file to audit exits 2. `why` never
 refreshes and returns the version-1 reference/verdict/exit/summary/candidates/
@@ -85,7 +111,3 @@ links in an agent's store. `doctor --fix` does not download the semantic model a
 per-agent evidence-book table, and a source written since the last refresh is a gap
 where 0.4.9 called it live evidence: 0.5 keeps no evidence book and compares the
 index with the sources themselves.
-The explorer refuses a meaning search with no model installed (`semantic model not
-installed: run agrep setup`, HTTP 400), where 0.4.9's answered it as unavailable and
-its page said to try grep: 0.5 installs the model only through `agrep setup`, and the
-search command's `-s` says the same.

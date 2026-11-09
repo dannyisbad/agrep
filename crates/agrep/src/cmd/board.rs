@@ -37,7 +37,7 @@ fn board(a: crate::Board) -> Result<i32> {
         sort: a.sort,
         limit: a.max,
         json: a.json,
-        wait: a.wait.unwrap_or(0.18),
+        wait: a.wait.unwrap_or(board::WAIT_SECONDS),
         expanded: a.expanded,
     };
     o.validate()?;
@@ -178,7 +178,7 @@ fn snapshot(watcher: &Service, o: &Options) -> Result<i32> {
             board::frame(&snap, o, usize::MAX, o.session.as_deref(), 0, w, h)
         )?;
         if snap.booting {
-            eprintln!("initial live scan is still running; rerun with --wait 5");
+            agrep_core::errln!("initial live scan is still running; rerun with --wait 10");
         }
     }
     Ok(rc)

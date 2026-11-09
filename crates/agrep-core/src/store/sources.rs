@@ -6,8 +6,17 @@ use rayon::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-fn walk(path: &Path, adapter: &dyn Adapter, paths: &mut Vec<PathBuf>) -> Result<()> {
-    let meta = match fs::symlink_metadata(path) {
+/// Only a root may be a link, which is followed to its kind (see `RootKind::of`).
+fn walk(path: &Path, adapter: &dyn Adapter, paths: &mut Vec<PathBuf>, root: bool) -> Result<()> {
+    let found = if root {
+        registry::followed_root(path, || {
+            registry::RootKind::of(adapter.freshness_content(path))
+        })
+        .map(|(_, metadata)| metadata)
+    } else {
+        fs::symlink_metadata(path)
+    };
+    let meta = match found {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.into()),
@@ -27,7 +36,7 @@ fn walk(path: &Path, adapter: &dyn Adapter, paths: &mut Vec<PathBuf>) -> Result<
             let ty = entry.file_type()?;
             let path = entry.path();
             if ty.is_dir() {
-                walk(&path, adapter, paths)?
+                walk(&path, adapter, paths, false)?
             } else if ty.is_file() && adapter.freshness_content(&path) {
                 paths.push(path);
             }
@@ -60,9 +69,14 @@ pub(crate) fn stamp_owned(a: &str, path: PathBuf) -> Option<Stamp> {
 }
 /// Whether an indexed source the census did not stamp is gone: its stat proves it absent, or
 /// a directory stands at its path. Sources are files, so an indexed directory is stale: the
-/// error of a census that could not list it then, or a source a directory replaced.
+/// error of a census that could not list it then, or a source a directory replaced. A link to
+/// a directory is one too: a store root the census follows again, or one that is a root no
+/// longer, such as a crush data root that could not be read once.
 pub(crate) fn gone(path: &Path) -> bool {
     match fs::symlink_metadata(path) {
+        Ok(meta) if registry::metadata_is_link(&meta) => {
+            fs::metadata(path).is_ok_and(|target| target.is_dir())
+        }
         Ok(meta) => meta.is_dir(),
         Err(e) => registry::stat_proves_absent(path, &e),
     }
@@ -74,16 +88,20 @@ fn stamp_meta_owned(a: &str, path: PathBuf, meta: std::io::Result<fs::Metadata>)
     let p = path.as_path();
     let result = (|| -> Result<(u64, i64, SourceToken)> {
         let m = meta?;
-        if registry::metadata_is_link(&m) {
+        let (read, m) = if !registry::metadata_is_link(&m) {
+            (std::borrow::Cow::Borrowed(p), m)
+        } else if registry::is_store_root(p) {
+            registry::root_file(p)?
+        } else {
             anyhow::bail!("source is a symlink")
-        }
-        let mut token = SourceToken::File(registry::metadata_change_token(p, &m)?);
+        };
+        let mut token = SourceToken::File(registry::metadata_change_token(&read, &m)?);
         // A source SQLite WAL is an input too. Reading metadata never opens it writable.
         if p.extension()
             .and_then(|s| s.to_str())
             .is_some_and(|s| matches!(s, "db" | "sqlite" | "sqlite3" | "vscdb"))
         {
-            let wal = PathBuf::from(format!("{}-wal", p.to_string_lossy()));
+            let wal = PathBuf::from(format!("{}-wal", read.to_string_lossy()));
             if let Ok(w) = fs::metadata(&wal) {
                 token = SourceToken::Opaque(format!(
                     "{}:{}:{:?}:{:?}",
@@ -130,7 +148,7 @@ pub fn census() -> Result<Vec<Stamp>> {
             let mut paths = vec![];
             let mut issues = vec![];
             for root in a.freshness_roots() {
-                if let Err(e) = walk(&root, *a, &mut paths) {
+                if let Err(e) = walk(&root, *a, &mut paths, true) {
                     issues.push(Stamp {
                         path: root.to_string_lossy().into(),
                         agent: a.name().into(),

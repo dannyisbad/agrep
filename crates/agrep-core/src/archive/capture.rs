@@ -86,28 +86,34 @@ pub(super) fn capture_one(
     source: &Source,
     stats: &mut Stats,
     scheduled: bool,
+    log: &mut dyn FnMut(&str),
 ) -> Result<()> {
-    let mut file = open_source(&source.path)?;
+    // A root that links to a file is versioned under its own path and read at its target.
+    let read = crate::ingest::registry::source_path(&source.path);
+    let mut file = open_source(&read)?;
     let before = safe_fs::identity(&file.metadata()?);
     let mut header = [0u8; 16];
     let n = file.read(&mut header)?;
     let sqlite = n == 16 && &header == b"SQLite format 3\0";
-    let fingerprint = fingerprint(&file, &source.path, sqlite)?;
-    let previous_fingerprint: Option<String> = archive
+    let fingerprint = fingerprint(&file, &read, sqlite)?;
+    let previous_fingerprint: Option<(i64, String)> = archive
         .db
         .query_row(
-            "SELECT fingerprint FROM versions WHERE path=? ORDER BY id DESC LIMIT 1",
+            "SELECT id,fingerprint FROM versions WHERE path=? ORDER BY id DESC LIMIT 1",
             [source.path.to_string_lossy().as_ref()],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    if previous_fingerprint.as_deref() == Some(fingerprint.as_str()) {
-        stats.unchanged += 1;
-        return Ok(());
+    if let Some((id, _)) = previous_fingerprint.filter(|(_, f)| *f == fingerprint) {
+        // An unchanged file whose stored copy is damaged is read again to re-store it.
+        if !archive.version_damaged(id)? {
+            stats.unchanged += 1;
+            return Ok(());
+        }
     }
     file.seek(SeekFrom::Start(0))?;
     let snapshot = if sqlite {
-        Some(sqlite_snapshot(&source.path, &archive.dir, !scheduled)?)
+        Some(sqlite_snapshot(&read, &archive.dir, !scheduled)?)
     } else {
         None
     };
@@ -128,12 +134,20 @@ pub(super) fn capture_one(
             },
         )
         .optional()?;
+    let repaired = archive.repaired;
     let captured = read_chunks(archive, &mut file, previous.as_ref(), sqlite)?;
     if !sqlite
         && (safe_fs::identity(&file.metadata()?) != before
-            || safe_fs::identity(&fs::metadata(&source.path)?) != before)
+            || safe_fs::identity(&fs::metadata(&read)?) != before)
     {
         bail!("source changed during capture")
+    }
+    if archive.repaired > repaired {
+        log(&format!(
+            "re-stored {} damaged chunk(s) of {}",
+            archive.repaired - repaired,
+            file_name(source)
+        ));
     }
     if captured.size == 0 {
         stats.unchanged += 1;
@@ -148,12 +162,19 @@ pub(super) fn capture_one(
         return Ok(());
     }
     record_version(archive, source, &captured, sqlite, &fingerprint)?;
-    count(stats, source, &captured, previous.as_ref());
+    log(&count(stats, source, &captured, previous.as_ref()));
     Ok(())
+}
+fn file_name(source: &Source) -> std::borrow::Cow<'_, str> {
+    source
+        .path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
 }
 /// Stores the file's content chunk by chunk, checking whether it extends `previous`.
 fn read_chunks(
-    archive: &Archive,
+    archive: &mut Archive,
     file: &mut File,
     previous: Option<&Previous>,
     sqlite: bool,
@@ -177,7 +198,7 @@ fn read_chunks(
                 let identical = hash(&chunk) == *sha;
                 let extends_partial = previous.is_some_and(|p| {
                     p.size % CHUNK as u64 != 0 && chunks.len() + 1 == old_chunks.len()
-                });
+                }) && !archive.damaged.contains(sha);
                 if !identical
                     && !(extends_partial && {
                         let old = archive.load(sha)?;
@@ -246,7 +267,13 @@ fn record_version(
     tx.commit()?;
     Ok(())
 }
-fn count(stats: &mut Stats, source: &Source, captured: &Captured, previous: Option<&Previous>) {
+/// Counts a recorded version and returns its log line.
+fn count(
+    stats: &mut Stats,
+    source: &Source,
+    captured: &Captured,
+    previous: Option<&Previous>,
+) -> String {
     let size = captured.size;
     // 0.4.9 counted an append's new suffix and a full capture's whole file as new content.
     let grown = previous
@@ -259,19 +286,15 @@ fn count(stats: &mut Stats, source: &Source, captured: &Captured, previous: Opti
         stats.full += 1;
         stats.bytes_stored += size;
     }
-    stats.log.push(format!(
+    format!(
         "{} {} ({size} bytes)",
         if grown.is_some() {
             "appended"
         } else {
             "captured"
         },
-        source
-            .path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-    ));
+        file_name(source)
+    )
 }
 
 #[cfg(test)]

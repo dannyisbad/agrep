@@ -59,7 +59,7 @@ pub(crate) fn run(a: Postcompact, no_auto: bool) -> Result<i32> {
                     &format!("{e:#}"),
                 ))?)?
             } else {
-                eprintln!("postcompact unavailable: {e:#}")
+                agrep_core::errln!("postcompact unavailable: {e:#}")
             }
             Ok(2)
         }

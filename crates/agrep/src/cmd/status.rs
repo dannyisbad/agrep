@@ -1,4 +1,4 @@
-use agrep_core::{data::DataRoot, diagnostics, render};
+use agrep_core::{data::DataRoot, diagnostics, render, store};
 use anyhow::Result;
 pub fn run(json: bool, no_auto: bool) -> Result<i32> {
     let root = DataRoot::discover()?;
@@ -18,14 +18,18 @@ pub fn run(json: bool, no_auto: bool) -> Result<i32> {
     if root.db().exists() {
         s["freshness"] = render::freshness(render::checked(no_auto));
     }
+    let failing = agrep_core::archive::failing_captures(&root);
+    if failing > 0 {
+        s["archive"]["failing_captures"] = failing.into();
+    }
     if json {
-        println!("{}", agrep_core::json_output::to_string(&s)?)
+        agrep_core::outln!("{}", agrep_core::json_output::to_string(&s)?)?
     } else {
-        println!(
+        agrep_core::outln!(
             "agrep {} · {}",
             s["version"].as_str().unwrap_or(""),
             root.0.display()
-        );
+        )?;
         if s["index"]["state"] == "ready" {
             let n = &s["index"]["counts"];
             let count = |v: &serde_json::Value| {
@@ -40,72 +44,75 @@ pub fn run(json: bool, no_auto: bool) -> Result<i32> {
                     render::age(s["index"]["last_refresh"].as_i64().unwrap_or(0))
                 ),
             };
-            println!(
-                "{} sessions · {} prose rows · {} tool rows{age}",
+            agrep_core::outln!(
+                "{} sessions · {} messages · {} tool rows{age}",
                 count(&n["sessions"]),
-                count(&n["prose"]),
+                count(&s["messages"]),
                 count(&n["tools"])
-            );
-            println!(
+            )?;
+            agrep_core::outln!(
                 "footprint: {:.1} MiB across {} files",
                 s["disk_bytes"].as_u64().unwrap_or(0) as f64 / (1024. * 1024.),
                 count(&s["disk_files"])
-            );
+            )?;
         } else if s["index"]["state"] == "first build in progress" {
-            println!("first build in progress");
+            agrep_core::outln!("first build in progress")?;
         } else {
-            println!(
+            agrep_core::outln!(
                 "index {} · run agrep index",
                 s["index"]["state"].as_str().unwrap_or("unreadable")
-            );
+            )?;
         }
-        println!("FORMAT: {}", s["format"].as_str().unwrap_or("unreadable"));
+        agrep_core::outln!(
+            "data format: {}",
+            s["format"].as_str().unwrap_or("unreadable")
+        )?;
         if let Some(error) = s["semantic"]["integrity_error"].as_str() {
-            println!(
-                "semantic model failed verification: {}",
+            agrep_core::outln!(
+                "semantic model failed verification: {} - `agrep setup` reinstalls it",
                 render::safe(error)
-            );
+            )?;
         } else if s["semantic"]["model_present"] == true {
-            println!(
+            agrep_core::outln!(
                 "meaning index: {} of {} rows · {} remaining",
                 s["semantic"]["indexed_rows"],
                 s["semantic"]["total_rows"],
                 s["semantic"]["backlog"]
-            );
+            )?;
             if s["semantic"]["state"] == "building" {
-                println!(
-                    "build runs in the background · about {}s left",
-                    s["semantic"]["progress"]["estimated_seconds"]
-                );
+                agrep_core::outln!(
+                    "build runs in the background · about {} left",
+                    agrep_core::semantic::time_left(
+                        s["semantic"]["progress"]["estimated_seconds"]
+                            .as_u64()
+                            .unwrap_or_default()
+                    )
+                )?;
             }
         } else {
-            println!("semantic model not installed: run agrep setup");
+            agrep_core::outln!("semantic model not installed: run agrep setup")?;
         }
-        if let Some(sources) = s["sources"].as_array() {
-            for source in sources {
-                if let Some(error) = source["last_error"].as_str() {
-                    println!(
-                        "source failed: {}: {}",
-                        render::safe(source["path"].as_str().unwrap_or("")),
-                        render::safe(error)
-                    );
-                }
+        if s["index"]["state"] == "ready" {
+            for source in diagnostics::failed_sources(&store::reader(&root)?)? {
+                agrep_core::outln!(
+                    "source failed: {}: {}",
+                    render::safe(source["path"].as_str().unwrap_or("")),
+                    render::safe(source["last_error"].as_str().unwrap_or(""))
+                )?;
             }
         }
         for path in s["permissions"]["exposed"].as_array().into_iter().flatten() {
-            println!(
+            agrep_core::outln!(
                 "directory permissions expose local data: {}",
                 render::safe(path.as_str().unwrap_or(""))
-            );
+            )?;
         }
         let integrations = s["integrations"].as_array().map_or(&[][..], Vec::as_slice);
         if integrations.is_empty() {
-            println!(
-                "instructions: not installed - `agrep setup` teaches your agents to search this history"
-            );
+            agrep_core::outln!("instructions: not installed - `agrep setup` teaches your agents to search this history")?;
         }
         for item in integrations {
-            println!(
+            agrep_core::outln!(
                 "integration {}: {}",
                 if item["present"] == true {
                     "installed"
@@ -113,16 +120,21 @@ pub fn run(json: bool, no_auto: bool) -> Result<i32> {
                     "needs repair"
                 },
                 item["path"].as_str().unwrap_or("")
-            );
+            )?;
         }
-        println!(
-            "archive: {}",
+        let failing = if failing > 0 {
+            format!("; the last {failing} capture pass(es) failed - `agrep doctor` explains")
+        } else {
+            String::new()
+        };
+        agrep_core::outln!(
+            "archive: {}{failing}",
             if s["archive"]["enabled"] == true {
                 "enabled"
             } else {
                 "off"
             }
-        );
+        )?;
     }
     Ok(
         if s["format"] == "unsupported"

@@ -172,7 +172,10 @@ pub(crate) fn scoped<T>(f: impl FnOnce() -> T) -> (T, Vec<Arc<Tally>>) {
     (v, t)
 }
 pub(crate) fn tally() -> Arc<Tally> {
-    let t = Arc::new(Tally::default());
+    adopt(Arc::default())
+}
+/// Count a tally kept apart until its parse proved the source readable.
+pub(crate) fn adopt(t: Arc<Tally>) -> Arc<Tally> {
     SCOPES.with(|s| {
         if let Some(v) = s.borrow_mut().last_mut() {
             v.push(t.clone())
@@ -193,4 +196,8 @@ pub fn diagnostic(message: std::fmt::Arguments<'_>) {
 }
 pub fn take_diagnostics() -> Vec<String> {
     DIAGNOSTICS.with(|d| std::mem::take(&mut *d.borrow_mut()))
+}
+/// Puts back what `take_diagnostics` returned, dropping anything reported since.
+pub(crate) fn restore_diagnostics(kept: Vec<String>) {
+    DIAGNOSTICS.with(|d| *d.borrow_mut() = kept);
 }

@@ -1,6 +1,34 @@
 use agrep_core::{data::DataRoot, diagnostics, history as h, render, store};
 use anyhow::Result;
 use serde_json::{json, Value};
+/// 0.4.9 listed at most this many candidates (py/why.py:42).
+const CANDIDATE_LINES: usize = 20;
+/// 0.4.9's candidate line (py/why.py:403-462): `agent · project  session  «first line»`,
+/// the first line cut to 60 characters.
+fn candidate_label(candidate: &Value) -> String {
+    let text = |key: &str| candidate[key].as_str().unwrap_or("");
+    let or = |fallback, key| {
+        Some(text(key))
+            .filter(|s| !s.is_empty())
+            .unwrap_or(fallback)
+    };
+    let mut label = format!(
+        "{} · {}  {}",
+        or("?", "agent"),
+        or("-", "project"),
+        text("session")
+    );
+    let first = h::one_line(text("first_text"), usize::MAX);
+    if !first.is_empty() {
+        let quoted: String = if first.chars().count() > 60 {
+            first.chars().take(59).chain(['…']).collect()
+        } else {
+            first
+        };
+        label += &format!("  «{quoted}»");
+    }
+    label
+}
 struct Output<'a> {
     reference: &'a str,
     json: bool,
@@ -14,49 +42,51 @@ impl Output<'_> {
         candidates: Value,
         evidence: Value,
         next_action: Option<&str>,
-    ) -> i32 {
+    ) -> Result<i32> {
         let reference = self.reference;
         let json_output = self.json;
         let v = json!({"version":1,"reference":reference,"verdict":verdict,"exit":exit,"summary":summary,"candidates":&candidates,"evidence":&evidence,"next_action":next_action});
         if json_output {
-            println!(
+            agrep_core::outln!(
                 "{}",
                 agrep_core::json_output::to_string(&v).expect("serializing JSON value")
-            )
+            )?
         } else {
-            println!("{}: {}", verdict, render::safe(summary));
+            agrep_core::outln!("{}: {}", verdict, render::safe(summary))?;
             if let Some(action) = next_action {
-                println!("next: {action}")
+                agrep_core::outln!("next: {action}")?
             }
             if let Some(path) = evidence["index"]["path"]
                 .as_str()
                 .or(evidence["index"].as_str())
             {
-                println!("index: {}", render::safe(path));
+                agrep_core::outln!("index: {}", render::safe(path))?;
             }
             for source in evidence["sources"].as_array().into_iter().flatten() {
-                println!(
+                agrep_core::outln!(
                     "source: {}{}",
                     render::safe(source["path"].as_str().unwrap_or("")),
                     source["last_error"]
                         .as_str()
                         .map(|s| format!(" · {}", render::safe(s)))
                         .unwrap_or_default()
-                );
+                )?;
             }
-            for candidate in candidates.as_array().into_iter().flatten() {
-                if let Some(id) = candidate["session"].as_str() {
-                    println!("session: {}", render::safe(id));
-                }
+            let candidates = candidates.as_array().map_or(&[][..], Vec::as_slice);
+            for candidate in candidates.iter().take(CANDIDATE_LINES) {
+                agrep_core::outln!("  {}", render::safe(&candidate_label(candidate)))?;
+            }
+            if candidates.len() > CANDIDATE_LINES {
+                agrep_core::outln!("  … {} more", candidates.len() - CANDIDATE_LINES)?;
             }
         }
-        exit
+        Ok(exit)
     }
 }
 pub fn run(reference: String, json_output: bool) -> Result<i32> {
     match explain(reference.clone(), json_output) {
         Ok(code) => Ok(code),
-        Err(error) => Ok(Output {
+        Err(error) => Output {
             reference: &reference,
             json: json_output,
         }
@@ -67,7 +97,7 @@ pub fn run(reference: String, json_output: bool) -> Result<i32> {
             json!([]),
             json!({"index":DataRoot::discover().ok().map(|root|root.db())}),
             Some("agrep doctor"),
-        )),
+        ),
     }
 }
 fn explain(reference: String, json_output: bool) -> Result<i32> {
@@ -77,14 +107,14 @@ fn explain(reference: String, json_output: bool) -> Result<i32> {
     };
     let root = DataRoot::discover()?;
     if let Err(e) = root.validate(false) {
-        return Ok(out.emit(
+        return out.emit(
             "unprovable",
             2,
             &e.to_string(),
             json!([]),
             json!({"data_root":root.0}),
             Some("agrep doctor"),
-        ));
+        );
     }
     if root.db().exists() {
         let (_, census) = crate::ready(false)?;
@@ -93,28 +123,28 @@ fn explain(reference: String, json_output: bool) -> Result<i32> {
     let c = match store::reader(&root) {
         Ok(c) => c,
         Err(e) => {
-            return Ok(out.emit(
+            return out.emit(
                 "unprovable",
                 2,
                 &e.to_string(),
                 json!([]),
                 json!({"index":root.db()}),
                 Some("agrep doctor"),
-            ))
+            )
         }
     };
     let all = h::sessions(&c)?;
     let (mut matches, _) = match h::resolve_indexed(&c, &all, &reference) {
         Ok(found) => found,
         Err(e) => {
-            return Ok(out.emit(
+            return out.emit(
                 "unprovable",
                 2,
                 &e.to_string(),
                 json!([]),
                 json!({"index":root.db()}),
                 Some("use a session id or a complete handle"),
-            ))
+            )
         }
     };
     let sources = diagnostics::source_rows(&c)?;
@@ -138,14 +168,14 @@ fn explain(reference: String, json_output: bool) -> Result<i32> {
     let mut evidence =
         json!({"index":{"path":root.db(),"served":"index.db"},"sources":matching_sources});
     if matches.len() > 1 {
-        return Ok(out.emit(
+        return out.emit(
             "ambiguous",
             2,
             "multiple indexed sessions match",
             candidates,
             evidence,
             Some("use a full session id"),
-        ));
+        );
     }
     if let Some(s) = matches.first() {
         let mut q=c.prepare("SELECT DISTINCT src.path,src.last_error FROM sources src JOIN (SELECT source FROM prose WHERE session=?1 AND agent=?2 AND visible=1 UNION SELECT source FROM tools WHERE session=?1 AND agent=?2 AND visible=1) p ON p.source=src.rowid")?;
@@ -156,28 +186,28 @@ fn explain(reference: String, json_output: bool) -> Result<i32> {
             .collect::<rusqlite::Result<Vec<_>>>()?);
         let n = h::turn_count(&c, s)?;
         evidence["index"]["turns"] = json!(n);
-        return Ok(out.emit(
+        return out.emit(
             "indexed",
             0,
             "session is indexed and searchable",
             candidates,
             evidence,
             None,
-        ));
+        );
     }
     if matching_sources.iter().any(|s| !s["last_error"].is_null())
         || sources.iter().any(|s| !s["last_error"].is_null())
     {
-        return Ok(out.emit(
+        return out.emit(
             "unprovable",
             2,
             "source read failures prevent proving absence",
             candidates,
             json!({"index":root.db(),"sources":sources}),
             Some("agrep doctor"),
-        ));
+        );
     }
-    Ok(out.emit(
+    out.emit(
         "not-indexed",
         1,
         if !matching_sources.is_empty() {
@@ -188,5 +218,5 @@ fn explain(reference: String, json_output: bool) -> Result<i32> {
         candidates,
         evidence,
         Some("agrep chats"),
-    ))
+    )
 }

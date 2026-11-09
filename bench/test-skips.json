@@ -1,6 +1,34 @@
 {
   "platform_inapplicable": [
     {
+      "test": "crates/agrep-core/src/ingest/registry/store_root.rs::tests::a_linked_root_is_followed_and_a_broken_one_is_an_error_not_an_absence",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Creates directory, file and dangling symlinks with the POSIX symlink API; Windows directory links need elevated or developer-mode privileges."
+    },
+    {
+      "test": "crates/agrep-core/src/ingest/registry/store_root.rs::tests::a_linked_file_root_is_read_at_its_target_and_one_of_another_kind_refused",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Creates file, directory and dangling symlinks with the POSIX symlink API; Windows symbolic links need elevated or developer-mode privileges."
+    },
+    {
+      "test": "crates/agrep/tests/review_fixes.rs::symlinked_store_roots_are_read_and_unreadable_ones_reported",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Creates directory and dangling symlinks with the POSIX symlink API; Windows directory links need elevated or developer-mode privileges."
+    },
+    {
+      "test": "crates/agrep/tests/review_fixes.rs::symlinked_file_store_roots_are_read_and_unreadable_ones_reported",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Creates file, directory and dangling symlinks with the POSIX symlink API; Windows symbolic links need elevated or developer-mode privileges."
+    },
+    {
       "test": "crates/agrep/tests/browse.rs::run_preserves_argv_cwd_status_and_liveness",
       "gates": [
         "cfg(unix)"
@@ -16,6 +44,41 @@
     },
     {
       "test": "crates/agrep/tests/browse.rs::resume_side_uses_parent_id_origin_cwd_and_native_arguments",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Uses POSIX PTYs, termios, signals or executable shell fixtures; Windows console behavior is covered separately."
+    },
+    {
+      "test": "crates/agrep/tests/browse.rs::resume_antigravity_starts_agy_in_the_dominant_cwd",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Uses POSIX PTYs, termios, signals or executable shell fixtures; Windows console behavior is covered separately."
+    },
+    {
+      "test": "crates/agrep/tests/browse.rs::resume_reanchors_a_missing_cwd_or_falls_back_to_home",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Uses POSIX PTYs, termios, signals or executable shell fixtures; Windows console behavior is covered separately."
+    },
+    {
+      "test": "crates/agrep/tests/browse.rs::resume_codex_reads_cwd_from_a_long_session_meta_line",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Uses POSIX PTYs, termios, signals or executable shell fixtures; Windows console behavior is covered separately."
+    },
+    {
+      "test": "crates/agrep/tests/browse.rs::resume_claude_starts_in_the_cwd_anchoring_its_project_folder",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Uses POSIX PTYs, termios, signals or executable shell fixtures; Windows console behavior is covered separately."
+    },
+    {
+      "test": "crates/agrep/tests/browse.rs::resume_claude_links_its_transcript_into_a_reanchored_folder",
       "gates": [
         "cfg(unix)"
       ],
@@ -78,6 +141,20 @@
       "reason": "Drives POSIX job control (background jobs, stops, fg, bg and Ctrl-Z before terminal handoff) through bash on a PTY; Windows consoles have no background jobs or foreground process groups."
     },
     {
+      "test": "crates/agrep/tests/browse.rs::run_suspends_a_pipeline_agent_with_its_job",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Drives POSIX job control of a piped run (Ctrl-Z, fg, bg, background reads) through bash on a PTY; Windows consoles have no background jobs or foreground process groups."
+    },
+    {
+      "test": "crates/agrep/tests/browse.rs::resume_picker_asks_again_and_resolves_among_its_candidates",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Types picker answers and Ctrl-D at a POSIX PTY with an executable shell fixture; Windows console input is not covered by this fixture."
+    },
+    {
       "test": "crates/agrep/tests/worker_pipe.rs::a_spawned_worker_holds_no_pipe_of_the_caller",
       "gates": [
         "cfg(unix)"
@@ -106,14 +183,7 @@
       "reason": "Uses POSIX PTYs, termios, signals or executable shell fixtures; Windows console behavior is covered separately."
     },
     {
-      "test": "crates/agrep/tests/live.rs::pty::ui_serves_while_browser_opener_is_running",
-      "gates": [
-        "cfg(unix)"
-      ],
-      "reason": "POSIX executable opener and loopback server fixture; Windows uses native console tests."
-    },
-    {
-      "test": "crates/agrep/tests/live.rs::pty::tail_serve_and_ui_keep_default_suspension",
+      "test": "crates/agrep/tests/live.rs::pty::tail_keeps_default_suspension",
       "gates": [
         "cfg(unix)"
       ],
@@ -186,9 +256,23 @@
         "cfg(windows)"
       ],
       "reason": "Exercises Windows case-insensitive native path identity while reinstalling and removing integrations; the general setup/remove tests run on every platform."
+    },
+    {
+      "test": "crates/agrep/tests/audit_security.rs::a_signal_that_ends_index_ends_its_post_index_hook",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Sends INT, TERM and HUP and hands the hook an inherited descriptor; Windows has no such signals, and Ctrl-C reaches the hook there because it shares agrep's console."
     }
   ],
   "partial_assertions": [
+    {
+      "test": "crates/agrep/tests/surface.rs::an_unwritable_data_directory_answers_from_its_index",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Windows ignores a directory's read-only attribute, so only POSIX permissions can make a missing index unbuildable; the read-only-index assertions run on every platform."
+    },
     {
       "test": "crates/agrep/tests/integrations_archive.rs::source_links_are_skipped_restore_is_strict_and_instruction_links_work",
       "gates": [
@@ -234,14 +318,6 @@
       "reason": "Uses the native termination signal for each platform; both branches assert the exit."
     },
     {
-      "test": "crates/agrep/tests/live.rs::pty::ui_serves_while_browser_opener_is_running",
-      "gates": [
-        "cfg!(target_os=\"macos\")",
-        "return"
-      ],
-      "reason": "Chooses the platform opener executable name and returns an IO error inside the child pre-exec closure; assertions are shared and the test itself never returns early."
-    },
-    {
       "test": "crates/agrep-core/src/caller.rs::tests::process_publication_rejects_recycled_identity",
       "gates": [
         "cfg(unix)"
@@ -284,6 +360,15 @@
         "cfg(unix)"
       ],
       "reason": "Local-time bounds are pinned with TZ, which the time library reads only on Unix; every usage refusal is asserted on both."
+    },
+    {
+      "test": "crates/agrep-core/src/semantic/post_index.rs::tests::a_command_past_its_limit_is_killed_with_everything_it_started",
+      "gates": [
+        "cfg!(windows)",
+        "cfg(not(windows))",
+        "cfg(windows)"
+      ],
+      "reason": "Each platform starts a background child through its own shell and converts the output pipe with its own handle type; the time-out and process-tree assertions run on both."
     }
   ],
   "reason": "Only these exact platform gates are permitted. The sole runtime exclusion is the registered Metal capability guard at the start of a GPU-only test; no ignored tests or other runtime skips."

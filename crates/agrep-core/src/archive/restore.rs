@@ -1,5 +1,8 @@
 //! Restoring archived versions to their stores or to a chosen directory.
-use super::{catalog::Archive, copy_database, Record};
+use super::{
+    catalog::{Archive, ChunkDamaged},
+    copy_database, Record,
+};
 use crate::{
     data::DataRoot,
     ingest::registry::{path_eq, relative_path, ADAPTERS},
@@ -100,7 +103,7 @@ fn verified_copy(a: &Archive, r: &Record, parent: &Path) -> Result<tempfile::Nam
         temp.write_all(&bytes)?;
     }
     if size != r.size || crate::store::hex_digest(digest.finalize()) != r.sha {
-        bail!("archive aggregate hash mismatch")
+        return Err(ChunkDamaged("its chunks do not add up to the recorded content".into()).into());
     }
     temp.as_file().sync_all()?;
     Ok(temp)
@@ -220,17 +223,21 @@ pub fn restore(
     for (r, dst) in plan {
         match restore_one(&a, &r, &dst, force) {
             Ok(()) => {
-                println!(
+                crate::outln!(
                     "restored {} ({} bytes, sha256 verified: {})",
                     crate::render::safe(&dst.display().to_string()),
                     r.size,
                     r.sha
-                );
+                )?;
                 count += 1;
             }
             Err(e) if e.to_string().starts_with("exists, not overwriting") => {
                 errors.push(e.to_string())
             }
+            Err(e) if e.is::<ChunkDamaged>() => errors.push(format!(
+                "cannot restore {}: its archived copy is damaged: {e}; `agrep archive` re-stores damaged chunks from live files that still hold them, otherwise this version is lost",
+                dst.display()
+            )),
             Err(e) => errors.push(format!("cannot restore {}: {e:#}", dst.display())),
         }
     }

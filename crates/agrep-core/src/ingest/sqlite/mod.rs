@@ -126,23 +126,25 @@ impl std::ops::Deref for ReadOnlyConnection {
 }
 
 /// SQLite resolves only a private COW snapshot on POSIX; Windows holds no-delete source handles.
-/// A path swap therefore cannot turn SQLite's own open into a special-file wait.
+/// A path swap therefore cannot turn SQLite's own open into a special-file wait. A store root
+/// that links to a database is opened at its target (see `registry::source_path`).
 pub(crate) fn open_sqlite_ro(path: &Path) -> Result<ReadOnlyConnection, rusqlite::Error> {
+    let source = crate::ingest::registry::source_path(path);
     #[cfg(not(windows))]
-    let snapshot = snapshot::SqliteSnapshot::create(path)
+    let snapshot = snapshot::SqliteSnapshot::create(&source)
         .map_err(|error| sqlite_open_io_error(path, error))?;
     #[cfg(not(windows))]
     let generation = snapshot.generation.clone();
     #[cfg(not(windows))]
     let database = snapshot.database.clone();
     #[cfg(windows)]
-    let guard = windows::WindowsSqliteGuard::create(path)
+    let guard = windows::WindowsSqliteGuard::create(&source)
         .map_err(|error| sqlite_open_io_error(path, error))?;
     #[cfg(windows)]
     let generation =
-        sqlite_generation_token(path).map_err(|error| sqlite_open_io_error(path, error))?;
+        sqlite_generation_token(&source).map_err(|error| sqlite_open_io_error(path, error))?;
     #[cfg(windows)]
-    let database = path.to_path_buf();
+    let database = source.to_path_buf();
     #[cfg(not(windows))]
     snapshot
         .verify()
@@ -152,7 +154,8 @@ pub(crate) fn open_sqlite_ro(path: &Path) -> Result<ReadOnlyConnection, rusqlite
     snapshot
         .verify()
         .map_err(|error| sqlite_open_io_error(path, error))?;
-    let after = sqlite_generation_token(path).map_err(|error| sqlite_open_io_error(path, error))?;
+    let after =
+        sqlite_generation_token(&source).map_err(|error| sqlite_open_io_error(path, error))?;
     if generation != after {
         return Err(sqlite_open_io_error(
             path,

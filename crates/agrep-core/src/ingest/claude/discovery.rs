@@ -43,7 +43,7 @@ pub(super) fn transcript_files(root: &Path) -> Vec<PathBuf> {
 
 /// The root's listing when it is a plain directory; a missing root is silent.
 fn read_root(root: &Path) -> Option<fs::ReadDir> {
-    match fs::symlink_metadata(root) {
+    match crate::ingest::registry::root_metadata(root) {
         Ok(meta) if meta.is_dir() && !metadata_is_link(&meta) => match fs::read_dir(root) {
             Ok(dirs) => Some(dirs),
             Err(error) => {

@@ -302,13 +302,7 @@ mod tests {
     #[test]
     fn indexed_candidates_resolve_like_every_session() {
         let c = Connection::open_in_memory().unwrap();
-        c.execute_batch(
-            "CREATE TABLE sessions(agent TEXT NOT NULL,id TEXT NOT NULL,project TEXT NOT NULL,cwd TEXT NOT NULL DEFAULT '',parent TEXT NOT NULL,family TEXT NOT NULL,side INTEGER NOT NULL,title TEXT NOT NULL,first_ts INTEGER NOT NULL,last_ts INTEGER NOT NULL,PRIMARY KEY(agent,id)) WITHOUT ROWID;
-             CREATE TABLE sources(path TEXT NOT NULL,agent TEXT NOT NULL);
-             CREATE TABLE reply_shapes(source INTEGER NOT NULL,session TEXT NOT NULL);
-             CREATE TABLE events(source INTEGER NOT NULL,session TEXT NOT NULL);",
-        )
-        .unwrap();
+        crate::store::schema(&c).unwrap();
         let all = ids(7, 60);
         for (i, id) in all.iter().enumerate() {
             for agent in ["pi", "codex"].iter().take(1 + i % 2) {
@@ -325,9 +319,14 @@ mod tests {
                 .unwrap();
             }
         }
-        c.execute("INSERT INTO sources VALUES('/logs/a0b1c2.jsonl','pi')", [])
+        c.execute(
+            "INSERT INTO sources VALUES('/logs/a0b1c2.jsonl','pi',0,0,x'',NULL)",
+            [],
+        )
+        .unwrap();
+        c.execute("INSERT INTO event_sessions VALUES(1,'pi',?1)", [&all[3]])
             .unwrap();
-        c.execute("INSERT INTO events VALUES(1,?1)", [&all[3]])
+        c.execute("INSERT INTO event_rows(id,tool_id,source,session_key,call_id,kind_key,name_key,ts,native_turn,position,input_chars,output_chars,output_bytes,child_session,meta,state,project_key) VALUES(1,1,1,1,'call',0,0,0,0,0,0,0,0,'','','',0)", [])
             .unwrap();
         let index = SessionIndex::load(&c).unwrap();
         let scanned = |value: &str| -> Result<Vec<String>, String> {

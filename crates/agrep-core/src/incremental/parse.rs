@@ -1,4 +1,4 @@
-use super::checkpoint::{read_at, verify_chunks, Checkpoint};
+use super::checkpoint::{line_terminator, read_at, verify_chunks, Checkpoint};
 use super::graph_codec::{bucket, graph};
 use super::references::restore_text;
 use super::stream::{identity, malformed_record, read_jsonl_blocks, JsonlBlock, READ_CHUNK};
@@ -34,18 +34,32 @@ pub fn parse(
         }
     }
     let mut partial_chunk = Vec::new();
+    let mut terminator: &[u8] = b"";
     if let Some(cursor) = &old {
-        let (valid, tail, read) = verify_chunks(&file, cursor)?;
-        bytes_read += read;
-        if valid {
-            partial_chunk = tail;
+        let verified = verify_chunks(&file, cursor)?;
+        bytes_read += verified.read;
+        // A final record parsed before its newline was written: the newline an
+        // append starts with ends that line, and anything else extends it.
+        let closed = if verified.valid && verified.open_line {
+            line_terminator(&file, cursor.offset, meta.len())?
         } else {
-            old = None;
+            Some(&b""[..])
+        };
+        match closed {
+            Some(newline) if verified.valid => {
+                partial_chunk = verified.tail;
+                terminator = newline;
+            }
+            _ => old = None,
         }
     }
-    let start = old.as_ref().map_or(0, |c| c.offset);
-    file.seek(SeekFrom::Start(start))?;
     let mut checkpoint = Checkpoint::new(old.as_ref(), partial_chunk);
+    checkpoint.extend(terminator);
+    bytes_read += terminator.len();
+    let start = old
+        .as_ref()
+        .map_or(0, |c| c.offset + terminator.len() as u64);
+    file.seek(SeekFrom::Start(start))?;
     let mut data = String::new();
     let mut spool = (agent != "pi" && meta.len().saturating_sub(start) > READ_CHUNK as u64)
         .then(tempfile::tempfile)
@@ -128,7 +142,12 @@ pub fn parse(
             Some(input) => ingest::codex::resume_parse(path, input, prior)?,
             None => ingest::codex::resume_parse(path, &data, prior)?,
         },
-        "pi" => ingest::pi::resume_prepared(path, replay.as_deref().unwrap_or(&pi_values), prior)?,
+        "pi" => ingest::pi::resume_prepared(
+            path,
+            replay.as_deref().unwrap_or(&pi_values),
+            records,
+            prior,
+        )?,
         _ => anyhow::bail!("unsupported incremental adapter"),
     };
     if let Some(input) = &input {

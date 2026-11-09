@@ -33,9 +33,10 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
         .filter(|&n| !a.probe && queries.len() > n)
         .map(|n| json!({"requested":n,"raised_to":queries.len()}));
     if let Some(floored) = hits_floored.as_ref().filter(|_| !a.json) {
-        eprintln!(
+        agrep_core::errln!(
             "--hits {} raised to {}: pack reserves one slot per query",
-            floored["requested"], floored["raised_to"]
+            floored["requested"],
+            floored["raised_to"]
         );
     }
     // 0.4.9 kept a lone query's meaning lane off a page too small to hold it beside its
@@ -118,7 +119,7 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
     if state.semantic_runtime {
         if !ctx.input.a.json {
             let meta = semantic_meta(&state.lane_runs, ctx.input.queries.len() > 1, false, false);
-            eprintln!("{}", semantic::unavailable_notice(&meta["semantic_status"]));
+            agrep_core::errln!("{}", semantic::unavailable_notice(&meta["semantic_status"]));
             if !ctx.input.a.probe {
                 return Ok(2);
             }
@@ -217,16 +218,14 @@ fn prepare(
     let stop = |engine: &str, error| input.stop(engine, error);
     if queries.is_empty() || a.query.iter().any(|q| q.trim().is_empty()) {
         let prog = if pack { "pack" } else { "recall" };
-        eprintln!(
-            "query arguments must not be empty (searching the word itself: agrep search \"{prog}\")"
-        );
+        agrep_core::errln!("query arguments must not be empty (searching the word itself: agrep search \"{prog}\")");
         return Ok(std::ops::ControlFlow::Break(stop(
             "query:error",
             ("empty-query", None),
         )?));
     }
     if a.semantic && a.lexical {
-        eprintln!("-s and --lexical are contradictory; pick one");
+        agrep_core::errln!("-s and --lexical are contradictory; pick one");
         return Ok(std::ops::ControlFlow::Break(stop(
             "query:error",
             ("conflicting-modes", None),
@@ -241,7 +240,9 @@ fn prepare(
             .as_deref()
             == Some("tool");
     if a.semantic && who_tool {
-        eprintln!("-s cannot search --who tool: tool rows are not embedded; use --lexical");
+        agrep_core::errln!(
+            "-s cannot search --who tool: tool rows are not embedded; use --lexical"
+        );
         return Ok(std::ops::ControlFlow::Break(stop(
             "query:error",
             ("unsupported-speaker", None),
@@ -261,7 +262,7 @@ fn prepare(
         crate::cmd::usage::refusal(if pack { "agrep pack" } else { "agrep recall" }, e)
     })?;
     if a.semantic && !semantic::installed(&agrep_core::data::DataRoot::discover()?) {
-        eprintln!("semantic model not installed: run agrep setup");
+        agrep_core::errln!("semantic model not installed: run agrep setup");
         return Ok(std::ops::ControlFlow::Break(2));
     }
     let (root, census) = {

@@ -1,3 +1,5 @@
+#[path = "../examples/support/exit.rs"]
+mod exit;
 mod support;
 use agrep_core::{
     archive,
@@ -249,6 +251,66 @@ fn setup_remove_enrollment_and_unrelated_hook_edits() {
     assert!(!f.home.join(".cursor/skills/agrep-recall/SKILL.md").exists());
     assert!(f.root().config().unwrap().enrollment.is_empty());
 }
+// setup then remove gives back each client's settings byte for byte whatever their layout,
+// and setup leaves the user's own hooks for the same event exactly as they were written.
+#[test]
+fn setup_then_remove_restores_hook_settings_byte_for_byte() {
+    let cases = [
+        "{\n  \"model\": \"opus\",\n  \"hooks\": {\n    \"EVENT\": [\n      {\n        \"matcher\": \"manual\",\n        \"hooks\": [{\"type\": \"command\", \"command\": \"echo user\"}]\n      }\n    ]\n  }\n}\n",
+        r#"{"model":"opus","hooks":{"EVENT":[{"matcher":"manual","hooks":[{"type":"command","command":"echo user"}]}]}}"#,
+        "{\"model\": \"opus\", \"hooks\": {\"Stop\": [{\"hooks\": [{\"type\": \"command\", \"command\": \"echo user\"}]}]}}\n",
+        "{\r\n\t\"hooks\": {\r\n\t\t\"EVENT\": [{\"hooks\": [{\"type\": \"command\", \"command\": \"echo user\"}]}],\r\n\t\t\"Stop\": []\r\n\t},\r\n\t\"theme\": \"dark\"\r\n}\r\n",
+        "{\n  \"hooks\": {},\n  \"model\": \"caf\\u00e9\"\n}\n",
+        "{\n    \"hooks\": {\n        \"EVENT\": []\n    }\n}",
+        "{}\n",
+    ];
+    for case in cases {
+        let f = Fixture::new();
+        let mut files = vec![];
+        for (dir, event) in [(".claude", "PreCompact"), (".codex", "SessionStart")] {
+            fs::create_dir_all(f.home.join(dir)).unwrap();
+            let name = if dir == ".claude" {
+                "settings.json"
+            } else {
+                "hooks.json"
+            };
+            let path = f.home.join(dir).join(name);
+            let original = case.replace("EVENT", event);
+            fs::write(&path, &original).unwrap();
+            files.push((path, original));
+        }
+        let args = ["setup", "--yes", "--no-semantic", "--no-archive"];
+        f.ok(&args);
+        let installed: Vec<_> = files.iter().map(|(p, _)| fs::read(p).unwrap()).collect();
+        for ((path, original), now) in files.iter().zip(&installed) {
+            let now = String::from_utf8(now.clone()).unwrap();
+            assert!(now.contains("agrep __hook"), "{now}");
+            serde_json::from_str::<serde_json::Value>(&now).unwrap();
+            if let Some(at) = original.find("echo user") {
+                let start = original[..at].rfind('[').unwrap();
+                let end = at + original[at..].find(']').unwrap() + 1;
+                assert!(
+                    now.contains(&original[start..end]),
+                    "{}: {now}",
+                    path.display()
+                );
+            }
+        }
+        f.ok(&args);
+        for ((path, _), first) in files.iter().zip(&installed) {
+            assert_eq!(&fs::read(path).unwrap(), first, "{}", path.display());
+        }
+        f.ok(&["remove"]);
+        for (path, original) in &files {
+            assert_eq!(
+                fs::read_to_string(path).unwrap(),
+                *original,
+                "{}",
+                path.display()
+            );
+        }
+    }
+}
 #[test]
 fn setup_headless_optouts_readonly_and_user_payload() {
     let f = Fixture::new();
@@ -287,7 +349,7 @@ fn setup_headless_optouts_readonly_and_user_payload() {
     assert_eq!(fs::read_to_string(payload).unwrap(), "user extension");
 }
 #[test]
-fn marker_without_enrollment_removed_and_malformed_marker_refused() {
+fn marker_without_enrollment_removed_and_unreadable_file_left_alone() {
     let f = Fixture::new();
     let p = f.home.join(".codex/AGENTS.md");
     fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -298,9 +360,149 @@ fn marker_without_enrollment_removed_and_malformed_marker_refused() {
     .unwrap();
     f.ok(&["remove"]);
     assert_eq!(fs::read_to_string(&p).unwrap(), "user\ntail\n");
-    fs::write(&p, "user\n<!-- agrep:recall v1 -->\nno end\n").unwrap();
-    assert_eq!(f.cmd(&["remove"]).status.code(), Some(1));
-    assert!(fs::read_to_string(p).unwrap().contains("no end"));
+    // agrep never recorded writing these, so remove reports them and still succeeds.
+    for (bytes, reason) in [
+        (
+            &b"user\n<!-- agrep:recall v1 -->\nno end\n"[..],
+            "unclosed agrep instruction marker",
+        ),
+        (b"user \xff\xfe\n", "instruction file is not UTF-8"),
+    ] {
+        fs::write(&p, bytes).unwrap();
+        for _ in 0..2 {
+            let o = f.ok(&["remove"]);
+            let stdout = String::from_utf8(o.stdout).unwrap();
+            let note = format!(
+                "  left alone (agrep has no record of writing it): {}: {reason}",
+                p.display()
+            );
+            assert_eq!(stdout.matches(&note).count(), 1, "{stdout}");
+            assert!(stdout.contains("agrep integrations removed"), "{stdout}");
+            assert!(
+                o.stderr.is_empty(),
+                "{}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            assert_eq!(fs::read(&p).unwrap(), bytes);
+        }
+    }
+}
+#[test]
+fn setup_errors_name_the_file_to_fix() {
+    let f = Fixture::new();
+    let p = f.home.join(".codex/AGENTS.md");
+    fs::create_dir_all(p.parent().unwrap()).unwrap();
+    for (bytes, reason) in [
+        (&b"user \xff\n"[..], "instruction file is not UTF-8"),
+        (
+            b"<!-- agrep:recall v1 -->\nno end\n",
+            "unclosed agrep instruction marker",
+        ),
+    ] {
+        fs::write(&p, bytes).unwrap();
+        let o = f.cmd(&[
+            "setup",
+            "--yes",
+            "--no-hook",
+            "--no-semantic",
+            "--no-archive",
+        ]);
+        assert_eq!(o.status.code(), Some(1));
+        let stderr = String::from_utf8(o.stderr).unwrap();
+        assert!(
+            stderr.contains(&format!("  ! {}: {reason}", p.display())),
+            "{stderr}"
+        );
+        assert_eq!(fs::read(&p).unwrap(), bytes);
+    }
+}
+#[test]
+fn opencode_instructions_go_where_opencode_reads_them() {
+    let f = Fixture::new();
+    let data = f.home.join(".local/share/opencode");
+    fs::create_dir_all(&data).unwrap();
+    let config = f.home.join(".config/opencode/AGENTS.md");
+    let args = [
+        "setup",
+        "--yes",
+        "--no-hook",
+        "--no-semantic",
+        "--no-archive",
+    ];
+    let o = f.ok(&args);
+    assert!(String::from_utf8(o.stdout)
+        .unwrap()
+        .contains(&format!("  {}\n", config.display())));
+    assert!(fs::read_to_string(&config)
+        .unwrap()
+        .contains("<!-- agrep:recall v1 -->"));
+    assert!(!data.join("AGENTS.md").exists());
+    f.ok(&["remove"]);
+    assert!(!config.exists());
+    // XDG_CONFIG_HOME moves opencode's whole config directory.
+    let xdg = f.home.join("xdg");
+    let moved = xdg.join("opencode/AGENTS.md");
+    let run = |args: &[&str]| {
+        let o = f
+            .command(args)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    };
+    run(&args);
+    assert!(fs::read_to_string(&moved).unwrap().contains("agrep:recall"));
+    assert!(!config.exists() && !data.join("AGENTS.md").exists());
+    run(&["remove"]);
+    assert!(!moved.exists());
+}
+#[test]
+fn opencode_blocks_written_to_its_data_directory_are_cleaned_up() {
+    let f = Fixture::new();
+    let data = f.home.join(".local/share/opencode");
+    fs::create_dir_all(&data).unwrap();
+    let misplaced = data.join("AGENTS.md");
+    let block = "user\n<!-- agrep:recall v1 -->\nold\n<!-- /agrep:recall -->\n";
+    // Without enrollment, remove still takes the block out of the data directory.
+    fs::write(&misplaced, block).unwrap();
+    f.ok(&["remove"]);
+    assert_eq!(fs::read_to_string(&misplaced).unwrap(), "user\n");
+    // An enrolled block there is retired by the next setup.
+    fs::remove_file(&misplaced).unwrap();
+    let root = f.root();
+    let mut c = root.config().unwrap();
+    c.enrollment.push(integrations::Installed {
+        path: misplaced.clone(),
+        kind: integrations::Kind::Block {
+            separator: String::new(),
+            skill: false,
+        },
+        created: true,
+        directories: vec![],
+    });
+    root.save_config(&c).unwrap();
+    fs::write(
+        &misplaced,
+        "<!-- agrep:recall v1 -->\nold\n<!-- /agrep:recall -->\n",
+    )
+    .unwrap();
+    f.ok(&[
+        "setup",
+        "--yes",
+        "--no-hook",
+        "--no-semantic",
+        "--no-archive",
+    ]);
+    assert!(!misplaced.exists());
+    let enrolled: Vec<PathBuf> = f
+        .root()
+        .config()
+        .unwrap()
+        .enrollment
+        .into_iter()
+        .map(|i| i.path)
+        .collect();
+    assert_eq!(enrolled, [f.home.join(".config/opencode/AGENTS.md")]);
 }
 #[test]
 fn settings_validation_and_exact_reference_lines() {
@@ -329,6 +531,41 @@ fn settings_validation_and_exact_reference_lines() {
     }
     f.ok(&["set", "post_index", "off"]);
     assert!(f.root().config().unwrap().post_index.is_none());
+    let refusal = f.cmd(&["set", "post_index", " "]);
+    assert!(String::from_utf8_lossy(&refusal.stderr)
+        .contains("post_index requires a value (any command, or off to disable it)"));
+    for off in ["OFF", "Off"] {
+        f.ok(&["set", "post_index", "echo done"]);
+        let o = f.ok(&["set", "post_index", off]);
+        assert_eq!(
+            String::from_utf8(o.stdout).unwrap(),
+            "post_index = off  (nothing runs after indexing)\n"
+        );
+        assert!(f.root().config().unwrap().post_index.is_none());
+    }
+    // A value stored by hand is read the same way.
+    let root = f.root();
+    let mut c = root.config().unwrap();
+    c.post_index = Some("OFF".into());
+    root.save_config(&c).unwrap();
+    assert!(String::from_utf8(f.ok(&["set"]).stdout)
+        .unwrap()
+        .contains("  post_index = off   (any command, or off)\n"));
+}
+#[test]
+fn every_set_note_says_what_changes() {
+    let f = Fixture::new();
+    let log = f.data.join("log").join("post_index.log");
+    for (args, line) in [
+        (["set", "tools", "off"], "tools = off  (searches leave out tool calls and their output unless you pass --who tool)".to_owned()),
+        (["set", "tools", "on"], "tools = on  (searches include tool calls and their output)".into()),
+        (["set", "embeddings", "off"], "embeddings = off  (agent searches stay keyword-only and new rows are not embedded; -s and index --semantic still work)".into()),
+        (["set", "embeddings", "auto"], "embeddings = auto  (agent searches add meaning results once the model is installed; new rows are embedded in the background)".into()),
+        (["set", "post_index", "true"], format!("post_index = true  (runs after each index that adds or changes rows, for at most 10 minutes; its output goes to {})", log.display())),
+        (["set", "post_index", "off"], "post_index = off  (nothing runs after indexing)".into()),
+    ] {
+        assert_eq!(String::from_utf8(f.ok(&args).stdout).unwrap(), line + "\n");
+    }
 }
 #[test]
 fn archive_exact_plain_append_rewrite_retention_purge() {
@@ -834,6 +1071,256 @@ fn archive_operations_wait_for_concurrent_capture() {
     );
     assert!(!String::from_utf8_lossy(&out.stdout).contains("busy"));
     contender.try_lock().unwrap();
+}
+
+fn text(o: &Output) -> (String, String) {
+    (
+        String::from_utf8_lossy(&o.stdout).into_owned(),
+        String::from_utf8_lossy(&o.stderr).into_owned(),
+    )
+}
+/// The stored chunks of the latest version of the archived file whose path contains `name`.
+fn blobs_of(f: &Fixture, name: &str) -> Vec<PathBuf> {
+    let db = Connection::open(f.data.join("archive/catalog.db")).unwrap();
+    let mut stmt = db
+        .prepare("SELECT sha FROM chunks WHERE version=(SELECT max(id) FROM versions WHERE path LIKE '%' || ? || '%') ORDER BY position")
+        .unwrap();
+    let shas = stmt
+        .query_map([name], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(Result::unwrap);
+    shas.map(|sha| f.data.join(format!("archive/blobs/{sha}.gz")))
+        .collect()
+}
+fn corrupt_in_place(path: &Path) {
+    let mut bytes = fs::read(path).unwrap();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0xff;
+    fs::write(path, bytes).unwrap();
+}
+fn transcript_text(tag: &str) -> Vec<u8> {
+    (0..400)
+        .map(|i| format!("{{\"line\":{i},\"tag\":\"{tag}\"}}\n"))
+        .collect::<String>()
+        .into_bytes()
+}
+
+/// A capture verifies the chunks it relies on: a missing or corrupt chunk of a file whose
+/// live copy is unchanged is re-stored from it, so the file stays restorable.
+#[test]
+fn capture_re_stores_damaged_chunks_of_unchanged_files() {
+    let f = Fixture::new();
+    let content = transcript_text("kept");
+    let p = f.source("rollout-kept.jsonl", &content);
+    f.ok(&["archive"]);
+    let [blob] = &blobs_of(&f, "kept")[..] else {
+        panic!("one chunk expected")
+    };
+    fs::remove_file(blob).unwrap();
+    let (out, err) = text(&f.ok(&["archive"]));
+    assert!(
+        out.contains("1 unchanged") && out.contains(", 1 damaged chunk(s) re-stored in "),
+        "{out}"
+    );
+    assert_eq!(
+        err,
+        "archive: re-stored 1 damaged chunk(s) of rollout-kept.jsonl\n"
+    );
+    assert!(blob.is_file());
+    corrupt_in_place(blob);
+    let (out, _) = text(&f.ok(&["archive"]));
+    assert!(out.contains(", 1 damaged chunk(s) re-stored in "), "{out}");
+    let (out, err) = text(&f.ok(&["archive"]));
+    assert!(!out.contains("re-stored") && err.is_empty(), "{out}{err}");
+    fs::remove_file(&p).unwrap();
+    f.ok(&["restore", "kept"]);
+    assert_eq!(fs::read(&p).unwrap(), content);
+}
+
+/// Chunks no live file holds any more are reported as archive damage, by restore, by
+/// status and by the capture that found them, instead of as the restored file's absence.
+#[test]
+fn lost_chunks_are_reported_as_archive_damage() {
+    let f = Fixture::new();
+    let lost = f.source("rollout-lost.jsonl", &transcript_text("lost"));
+    let corrupt = f.source("rollout-corrupt.jsonl", &transcript_text("corrupt"));
+    f.ok(&["archive"]);
+    fs::remove_file(&blobs_of(&f, "lost")[0]).unwrap();
+    corrupt_in_place(&blobs_of(&f, "corrupt")[0]);
+    fs::remove_file(&lost).unwrap();
+    fs::remove_file(&corrupt).unwrap();
+    let blobs = f.data.join("archive/blobs");
+    let restore = f.cmd(&["restore", "lost"]);
+    let (out, _) = text(&restore);
+    assert_eq!(restore.status.code(), Some(1), "{out}");
+    assert!(
+        out.starts_with(&format!(
+            "cannot restore {}: its archived copy is damaged: chunk ",
+            lost.display()
+        )) && out.contains(&format!(
+            " is missing from {}; `agrep archive` re-stores",
+            blobs.display()
+        )),
+        "{out}"
+    );
+    assert!(!out.contains("No such file"), "{out}");
+    let (out, _) = text(&f.cmd(&["restore", "corrupt"]));
+    assert!(
+        out.contains(&format!(" in {} is corrupt (", blobs.display())),
+        "{out}"
+    );
+    let status = f.cmd(&["archive", "--status"]);
+    let (out, _) = text(&status);
+    assert_eq!(status.status.code(), Some(1), "{out}");
+    assert!(
+        out.contains("archive damaged: 1 version(s) of 1 file(s) cannot be restored"),
+        "{out}"
+    );
+    let capture = f.cmd(&["archive"]);
+    let (out, _) = text(&capture);
+    assert_eq!(capture.status.code(), Some(1), "{out}");
+    assert!(
+        out.contains("archive damaged: 2 version(s) of 2 file(s) cannot be restored")
+            && out.contains(&format!("  {}\n", lost.display()))
+            && out.contains(&format!("  {}\n", corrupt.display())),
+        "{out}"
+    );
+    let (out, _) = text(&f.cmd(&["archive", "--status"]));
+    assert!(
+        out.contains("archive damaged: 2 version(s) of 2 file(s) cannot be restored"),
+        "{out}"
+    );
+    let (out, _) = text(&f.cmd(&["doctor"]));
+    assert!(
+        out.contains("\narchive: failed - 2 archived version(s) of 2 file(s) cannot be restored: their stored chunks are missing or corrupt - `agrep archive` re-stores those that live files still hold\n"),
+        "{out}"
+    );
+}
+
+fn corrupt_catalog(f: &Fixture) {
+    let catalog = f.data.join("archive/catalog.db");
+    for suffix in ["-wal", "-shm"] {
+        let _ = fs::remove_file(format!("{}{suffix}", catalog.display()));
+    }
+    fs::write(&catalog, "not a database ".repeat(40)).unwrap();
+}
+
+/// An unreadable catalog is named once with its remedy by every archive command, and
+/// `--purge --yes` removes it so that captures start over.
+#[test]
+fn a_corrupt_catalog_is_named_and_purge_recovers() {
+    let f = Fixture::new();
+    let p = f.source("rollout-catalog.jsonl", b"catalog");
+    f.ok(&["archive"]);
+    corrupt_catalog(&f);
+    let catalog = f.data.join("archive/catalog.db");
+    let damaged = format!(
+        "archive catalog is damaged: {} (file is not a database); `agrep archive --purge --yes` deletes the archive and the next capture starts a new one\n",
+        catalog.display()
+    );
+    let status = f.cmd(&["archive", "--status"]);
+    assert_eq!(
+        (status.status.code(), text(&status)),
+        (Some(2), (damaged.clone(), String::new()))
+    );
+    for args in [
+        &["archive"][..],
+        &["archive", "--prune"],
+        &["restore", "catalog"],
+    ] {
+        let o = f.cmd(args);
+        assert_eq!(
+            (o.status.code(), text(&o)),
+            (Some(2), (String::new(), format!("agrep: {damaged}"))),
+            "{args:?}"
+        );
+    }
+    let off = f.ok(&["archive", "--off"]);
+    assert_eq!(
+        text(&off).0,
+        format!("archive auto-capture disabled\n{damaged}")
+    );
+    let (out, _) = text(&f.ok(&["archive", "--purge", "--yes"]));
+    assert!(out.starts_with("archive purged: "), "{out}");
+    let purged = archive::status(&f.root()).unwrap();
+    assert_eq!(
+        (&purged["versions"], &purged["stored_bytes"]),
+        (&0.into(), &0.into())
+    );
+    let (out, _) = text(&f.ok(&["archive"]));
+    assert!(out.contains("1 full captures"), "{out}");
+    fs::remove_file(&p).unwrap();
+    f.ok(&["restore", "catalog"]);
+    assert_eq!(fs::read(&p).unwrap(), b"catalog");
+}
+
+/// A scheduled capture that failed is not retried by the next command's worker: the
+/// worker backs off instead of failing, and logging it, on every command.
+#[test]
+fn a_failed_scheduled_capture_backs_off() {
+    let f = Fixture::new();
+    f.source("rollout-backoff.jsonl", b"backoff");
+    f.ok(&["archive", "--on"]);
+    f.ok(&["archive"]);
+    corrupt_catalog(&f);
+    assert!(archive::due(&f.root()).unwrap());
+    let failed = f.cmd(&["__work"]);
+    let (_, err) = text(&failed);
+    assert!(!failed.status.success());
+    assert!(err.contains("archive catalog is damaged"), "{err}");
+    assert!(!archive::due(&f.root()).unwrap());
+    let (out, err) = text(&f.ok(&["__work"]));
+    assert_eq!((out.as_str(), err.as_str()), ("", ""));
+    let (out, _) = text(&f.cmd(&["status"]));
+    assert!(
+        out.contains(
+            "\narchive: enabled; the last 1 capture pass(es) failed - `agrep doctor` explains\n"
+        ),
+        "{out}"
+    );
+    let (out, _) = text(&f.cmd(&["doctor"]));
+    let catalog = f.data.join("archive/catalog.db");
+    assert!(
+        out.starts_with("doctor: action needed\n")
+            && out.contains(&format!(
+                "\narchive: failed - archive catalog is damaged: {} (file is not a database) - `agrep archive --purge --yes` deletes the archive and the next capture starts a new one\n",
+                catalog.display()
+            )),
+        "{out}"
+    );
+    f.ok(&["archive", "--purge", "--yes"]);
+    assert!(archive::due(&f.root()).unwrap());
+    f.ok(&["__work"]);
+    assert_eq!(archive::status(&f.root()).unwrap()["versions"], 1);
+}
+
+/// `index` leaves a due capture to a background worker, as 0.4.9 left it to its daemon,
+/// instead of capturing every store before it exits.
+#[test]
+fn index_leaves_a_due_capture_to_the_worker() {
+    let f = Fixture::new();
+    f.source("rollout-indexed.jsonl", b"indexed");
+    f.ok(&["archive", "--on"]);
+    let index = f
+        .command(&["index"])
+        .env("AGREP_QUERY_TIMING", "1")
+        .output()
+        .unwrap();
+    let (_, err) = text(&index);
+    assert!(index.status.success(), "{err}");
+    assert!(err.contains(r#""archive_due":true"#), "{err}");
+    let workers: Vec<u32> = err
+        .lines()
+        .filter_map(|l| {
+            serde_json::from_str::<serde_json::Value>(l).ok()?["worker_started"]["pid"].as_u64()
+        })
+        .map(|pid| pid as u32)
+        .collect();
+    assert!(!workers.is_empty(), "{err}");
+    for pid in workers {
+        assert!(exit::wait(pid, std::time::Duration::from_secs(120)).unwrap());
+    }
+    assert_eq!(archive::status(&f.root()).unwrap()["versions"], 1);
 }
 
 #[cfg(windows)]

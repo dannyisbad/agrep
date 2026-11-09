@@ -15,6 +15,7 @@ mod change_token;
 mod paths;
 mod plain_file;
 mod secure_read;
+mod store_root;
 mod tokens;
 #[cfg(windows)]
 mod windows_handle;
@@ -33,9 +34,15 @@ pub(crate) use plain_file::secure_read_options;
 pub use plain_file::{metadata_is_link, plain_entry_metadata, plain_metadata, stat_proves_absent};
 #[cfg(not(windows))]
 pub(crate) use secure_read::open_regular_snapshot;
+pub(crate) use secure_read::read_regular_snapshot;
 pub use secure_read::{
     read_bounded_regular_file, read_growing_regular_file, regular_file_edge_snapshot,
     BoundedRegularFileSnapshot, RegularFileEdgeSnapshot,
+};
+pub(crate) use store_root::listing_roots;
+pub use store_root::{
+    followed_root, is_store_root, refused_root_link, root_file, root_metadata, source_path,
+    RootKind,
 };
 pub use tokens::{
     fnv_token, token_fingerprint, TokenAvailability, TokenReadIssue, ATTRIBUTION_ISSUE_KIND,
@@ -121,6 +128,11 @@ pub trait Adapter: Sync {
     fn session_alias(&self, _path: &Path, _session: &str) -> Option<String> {
         None
     }
+    /// The chat a side transcript at `path` hangs off, for a chat whose rows there carry no
+    /// parent of their own (one that yielded tool calls but no turn).
+    fn side_parent(&self, _path: &Path) -> Option<String> {
+        None
+    }
     /// Inputs whose unchanged state permits skipping this adapter altogether. Usually these
     /// are the same as the doctor/audit roots, but an adapter may add attribution metadata
     /// which affects emitted rows without itself being conversation content.
@@ -190,6 +202,14 @@ pub fn session_alias(agent: &str, path: &Path, session: &str) -> Option<String> 
         .iter()
         .find(|adapter| adapter.name() == agent)
         .and_then(|adapter| adapter.session_alias(path, session))
+}
+
+/// [`Adapter::side_parent`] for the adapter that owns `agent`'s rows.
+pub fn side_parent(agent: &str, path: &Path) -> Option<String> {
+    ADAPTERS
+        .iter()
+        .find(|adapter| adapter.name() == agent)
+        .and_then(|adapter| adapter.side_parent(path))
 }
 
 /// [`Adapter::token_prefix`] of `agent`'s store, when it is a `Fingerprint::Token` adapter.

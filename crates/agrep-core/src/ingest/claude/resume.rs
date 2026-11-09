@@ -1,6 +1,6 @@
 //! Resume: the serialized parser state an appended transcript continues from.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use super::parse::parse_data;
@@ -15,10 +15,10 @@ pub(super) struct ClaudeState {
     pub(super) events: Vec<Event>,
     pub(super) order: crate::ingest::ReplyOrder,
     /// tool_use id -> index into `events`, so the later tool_result line can pair up.
-    pub(super) pending: HashMap<String, usize>,
+    pub(super) pending: BTreeMap<String, usize>,
     pub(super) turn: u32,
     pub(super) first_cwd: String,
-    pub(super) project_votes: HashMap<String, usize>,
+    pub(super) project_votes: BTreeMap<String, usize>,
     pub(super) side_parent: Option<String>,
     pub(super) ordinal: usize,
 }

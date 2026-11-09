@@ -35,26 +35,6 @@ fn part_text(part: &Value) -> Option<&str> {
     }
 }
 
-/// A digest of one conversation's stored message rows, None when they cannot all be read.
-pub(super) fn conversation_digest(conn: &Connection, session: &str) -> Option<String> {
-    let mut stmt = conn
-        .prepare("SELECT id, role, parts, model, created_at FROM messages WHERE session_id = ?1 ORDER BY id")
-        .ok()?;
-    let mut rows = stmt.query([session]).ok()?;
-    let mut hash = 0xcbf29ce484222325_u64;
-    while let Some(row) = rows.next().ok()? {
-        for column in 0..5 {
-            let value: rusqlite::types::Value = row.get(column).ok()?;
-            let text = format!("{value:?}\0");
-            for byte in text.bytes() {
-                hash ^= u64::from(byte);
-                hash = hash.wrapping_mul(0x100000001b3);
-            }
-        }
-    }
-    Some(format!("rows:{hash:016x}"))
-}
-
 /// Parse one session's messages into (user turns + replies, events). Tool results pair to
 /// their tool_call by id (they may share a message or arrive in a later one).
 pub(super) fn parse_session(

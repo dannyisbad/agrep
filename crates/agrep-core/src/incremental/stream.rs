@@ -493,3 +493,141 @@ mod large_metadata_tests {
         assert_eq!(cursor.offset, raw.len() as u64);
     }
 }
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+
+    fn cursor(parsed: &super::super::Parsed) -> Cursor {
+        serde_json::from_slice(&lz4_flex::decompress_size_prepended(&parsed.cursor).unwrap())
+            .unwrap()
+    }
+
+    /// A pi record whose tool call has no id, so its event id carries the record's line.
+    fn pi_record(n: usize) -> String {
+        let parent = n
+            .checked_sub(1)
+            .map_or(serde_json::Value::Null, |p| format!("e{p}").into());
+        serde_json::json!({"type":"message","id":format!("e{n}"),"parentId":parent,"message":{"role":"assistant","content":[{"type":"text","text":format!("reply {n}")},{"type":"toolCall","name":"bash","arguments":{"command":format!("echo {n}")}}]}}).to_string()
+    }
+
+    #[test]
+    fn a_record_parsed_before_its_newline_resumes_like_a_fresh_read() {
+        let header = r#"{"type":"session","id":"open-line","cwd":"/work/test"}"#;
+        for newline in ["\n", "\r\n"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("session.jsonl");
+            let written = format!("{header}{newline}{}{newline}{}", pi_record(0), pi_record(1));
+            std::fs::write(&path, &written).unwrap();
+            let first = parse("pi", &path, None, None).unwrap();
+            assert_eq!(cursor(&first).offset, written.len() as u64);
+            let appended = format!("{newline}{}{newline}", pi_record(2));
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(appended.as_bytes()).unwrap();
+            drop(file);
+            let resumed = parse("pi", &path, Some(&first.cursor), None).unwrap();
+            let fresh = parse("pi", &path, None, None).unwrap();
+            assert!(resumed.append, "{newline:?}");
+            // A resumed pass re-emits the calls still waiting for a result.
+            let calls = |parsed: &super::super::Parsed| -> Vec<String> {
+                parsed.events.iter().map(|e| e.call_id.clone()).collect()
+            };
+            assert_eq!(calls(&resumed), calls(&fresh), "{newline:?}");
+            let ordinals = |parsed: &super::super::Parsed| -> Vec<usize> {
+                parsed.nodes.iter().map(|node| node.ordinal).collect()
+            };
+            assert_eq!(ordinals(&resumed), ordinals(&fresh)[2..], "{newline:?}");
+            let (resumed, fresh) = (cursor(&resumed), cursor(&fresh));
+            assert_eq!(
+                (
+                    resumed.offset,
+                    resumed.records,
+                    resumed.first_chunk,
+                    resumed.last_chunk
+                ),
+                (
+                    fresh.offset,
+                    fresh.records,
+                    fresh.first_chunk,
+                    fresh.last_chunk
+                ),
+                "{newline:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_append_that_continues_a_parsed_line_reparses_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let header = r#"{"type":"session","id":"continued","cwd":"/work/test"}"#;
+        std::fs::write(&path, format!("{header}\n{}", pi_record(0))).unwrap();
+        let first = parse("pi", &path, None, None).unwrap();
+        assert_eq!(first.events.len(), 1);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(format!("{}\n{}\n", pi_record(1), pi_record(2)).as_bytes())
+            .unwrap();
+        drop(file);
+        let resumed = parse("pi", &path, Some(&first.cursor), None).unwrap();
+        let fresh = parse("pi", &path, None, None).unwrap();
+        assert!(!resumed.append && resumed.reset_nodes);
+        let calls = |parsed: &super::super::Parsed| -> Vec<String> {
+            parsed.events.iter().map(|e| e.call_id.clone()).collect()
+        };
+        assert_eq!(calls(&resumed), calls(&fresh));
+        assert_eq!(cursor(&resumed).records, cursor(&fresh).records);
+    }
+
+    #[test]
+    fn resume_state_maps_are_written_in_key_order() {
+        let calls: Vec<String> = (0..40)
+            .map(|n| format!("call{:02}", (n * 17) % 40))
+            .collect();
+        let pi = std::iter::once(r#"{"type":"session","id":"order","cwd":"/work/test"}"#.into())
+            .chain(calls.iter().enumerate().map(|(n, id)| {
+                let parent = n
+                    .checked_sub(1)
+                    .map_or(serde_json::Value::Null, |p| format!("a{p}").into());
+                serde_json::json!({"type":"message","id":format!("a{n}"),"parentId":parent,"message":{"role":"assistant","content":[{"type":"toolCall","id":id,"name":"bash","arguments":{}}]}}).to_string()
+            }))
+            .collect::<Vec<String>>();
+        let claude = calls
+            .iter()
+            .enumerate()
+            .map(|(n, id)| {
+                serde_json::json!({"type":"assistant","uuid":format!("a{n}"),"sessionId":"order","cwd":format!("/work/project{}/src", n % 5),"message":{"role":"assistant","content":[{"type":"tool_use","id":id,"name":"Read","input":{"file_path":format!("/work/project{}/src/main.rs", n % 7)}}]}}).to_string()
+            })
+            .collect::<Vec<String>>();
+        let codex = std::iter::once(
+            r#"{"type":"session_meta","payload":{"id":"order","cwd":"/work/test"}}"#.into(),
+        )
+        .chain(calls.iter().map(|id| {
+            serde_json::json!({"type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{}","call_id":id}}).to_string()
+        }))
+        .collect::<Vec<String>>();
+        for (agent, lines, maps) in [
+            ("pi", pi, &["pending"][..]),
+            ("claude", claude, &["pending", "project_votes"][..]),
+            ("codex", codex, &["pending"][..]),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("session.jsonl");
+            std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+            let parsed = parse(agent, &path, None, None).unwrap();
+            let state: serde_json::Value = serde_json::from_str(&cursor(&parsed).state).unwrap();
+            for map in maps {
+                let keys: Vec<&String> = state[*map].as_object().unwrap().keys().collect();
+                let mut sorted = keys.clone();
+                sorted.sort();
+                assert!(keys.len() > 1, "{agent} {map}");
+                assert_eq!(keys, sorted, "{agent} {map}");
+            }
+        }
+    }
+}

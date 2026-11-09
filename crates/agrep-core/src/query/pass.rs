@@ -22,6 +22,9 @@ pub(super) fn search_pass(
     let mut m = cache.matcher(o, c)?;
     m.partial = partial;
     m.phase = phase;
+    // A page's ceiling marks its total a floor on any row it cuts, matching or not.
+    // Without one, a row that cannot match leaves no trace, so plans may skip it.
+    m.plan_anchors = o.exact || o.limit == 0 || o.sort != "score";
     // The tier this pass's rows take; a pass over both tiers is bounded as phrase rows.
     let pass_tier = if partial { 2 } else { u8::from(phase == 2) };
     if partial {
@@ -33,7 +36,7 @@ pub(super) fn search_pass(
             });
         }
     }
-    let now = chrono::Utc::now().timestamp_millis();
+    let now = crate::clock::now_ms();
     let only_tools = o.filters.who.as_deref() == Some("tool");
     let include_tools = o.tools
         && o.filters

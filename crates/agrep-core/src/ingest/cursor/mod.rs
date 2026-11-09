@@ -364,10 +364,14 @@ impl crate::ingest::registry::Adapter for Cursor {
         collect(cache)
     }
     fn store_roots(&self) -> Vec<PathBuf> {
-        user_dir()
-            .map(|u| u.join("globalStorage").join("state.vscdb"))
-            .into_iter()
-            .collect()
+        match user_dir_checked() {
+            Ok(user) => user
+                .map(|u| u.join("globalStorage").join("state.vscdb"))
+                .into_iter()
+                .collect(),
+            // The database that could not be inspected stays a root, so the census says why.
+            Err(error) => vec![error.path],
+        }
     }
     fn archive_roots(&self) -> Vec<PathBuf> {
         user_dir_candidates(&crate::ingest::home())

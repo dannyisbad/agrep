@@ -6,21 +6,25 @@ license.workspace = true
 [dependencies]
 agrep-core = { path = "../agrep-core" }
 clap = { workspace = true }
+# clap's own terminal-width probe (wrap_help), so narrow help layouts match its wrapping.
+terminal_size = "0.4"
 anyhow = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 regex = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 mimalloc = { version = "0.1.52", default-features = false }
+rayon = { workspace = true }
+sha2 = { workspace = true }
 [dev-dependencies]
 flate2 = { workspace = true }
 lz4_flex = "0.11"
 brotli = "8"
 tempfile = "3"
+zstd = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
-sha2 = { workspace = true }
 
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.61", features = [

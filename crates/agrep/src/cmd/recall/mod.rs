@@ -9,10 +9,7 @@ use agrep_core::{
 };
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
-use std::{
-    collections::{BTreeSet, HashMap, HashSet},
-    io::IsTerminal,
-};
+use std::collections::{BTreeSet, HashMap, HashSet};
 /// One chat's evidence: the first hit's head over every window of the chat.
 struct Block {
     hit: Hit,

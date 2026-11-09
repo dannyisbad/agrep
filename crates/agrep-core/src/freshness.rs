@@ -145,11 +145,23 @@ struct Walk<'a> {
     cache_hits: AtomicUsize,
 }
 impl<'a> Walk<'a> {
-    fn visit<'scope>(&'scope self, scope: &rayon::Scope<'scope>, agent: &'static str, path: PathBuf)
-    where
+    fn visit<'scope>(
+        &'scope self,
+        scope: &rayon::Scope<'scope>,
+        agent: &'static str,
+        path: PathBuf,
+        root: bool,
+    ) where
         'a: 'scope,
     {
-        let result = directory(self.cached, agent, &path, &self.listings, &self.cache_hits);
+        let result = directory(
+            self.cached,
+            agent,
+            &path,
+            root,
+            &self.listings,
+            &self.cache_hits,
+        );
         let d = match result {
             Ok(Some(d)) => d,
             Ok(None) => return,
@@ -177,7 +189,7 @@ impl<'a> Walk<'a> {
                 Path::new(&d.path).join(name)
             };
             if self.seen.lock().unwrap().insert(child.clone()) {
-                scope.spawn(move |scope| self.visit(scope, owner, child));
+                scope.spawn(move |scope| self.visit(scope, owner, child, false));
             }
         }
         self.completed.lock().unwrap().push(d);
@@ -206,7 +218,7 @@ fn walk(cached: HashMap<String, Directory>, listing_ms: f64) -> Census {
         STAT_POOL.scope(|scope| {
             for (agent, path) in roots {
                 let walk = &walk;
-                scope.spawn(move |scope| walk.visit(scope, agent, path));
+                scope.spawn(move |scope| walk.visit(scope, agent, path, true));
             }
         });
     }
@@ -266,15 +278,24 @@ fn walk(cached: HashMap<String, Directory>, listing_ms: f64) -> Census {
     }
 }
 /// The current listing of one freshness root or directory: reused while its mtime
-/// is unchanged, otherwise read again.
+/// is unchanged, otherwise read again. Only a root may be a link, which is followed to its
+/// kind (see `RootKind::of`).
 fn directory(
     cached: &HashMap<String, Directory>,
     agent: &str,
     path: &Path,
+    root: bool,
     listings: &std::sync::atomic::AtomicUsize,
     cache_hits: &std::sync::atomic::AtomicUsize,
 ) -> Result<Option<Directory>> {
-    let meta = match fs::symlink_metadata(path) {
+    let a = ADAPTERS.iter().find(|a| a.name() == agent).unwrap();
+    let found = if root {
+        registry::followed_root(path, || registry::RootKind::of(a.freshness_content(path)))
+            .map(|(_, metadata)| metadata)
+    } else {
+        fs::symlink_metadata(path)
+    };
+    let meta = match found {
         Ok(m) => m,
         Err(e) if registry::stat_proves_absent(path, &e) => return Ok(None),
         Err(e) => return Err(e.into()),
@@ -282,7 +303,6 @@ fn directory(
     if registry::metadata_is_link(&meta) {
         return Ok(None);
     }
-    let a = ADAPTERS.iter().find(|a| a.name() == agent).unwrap();
     if meta.is_file() {
         return Ok(Some(Directory {
             path: path.to_string_lossy().into(),

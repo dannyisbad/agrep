@@ -17,6 +17,7 @@ impl Matcher {
         self.tool_terms.clear();
         self.tool_supported.clear();
         self.tool_presence.clear();
+        self.tool_anchors.clear();
         if table == "tools" {
             if self.explicit.is_none() {
                 self.tool_presence = vec![None; self.terms.len()];
@@ -64,6 +65,7 @@ impl Matcher {
                     }
                 } else {
                     df = usize::MAX;
+                    self.anchor_group(c, cache, &variants)?;
                 }
                 ordered.push((df, i, variants));
             }
@@ -142,6 +144,35 @@ impl Matcher {
         self.ordered_terms = ordered.into_iter().map(|v| v.2).collect();
         self.estimated = if indexed { estimate } else { usize::MAX };
         Ok(())
+    }
+    /// Gives each spelling of a group the dictionary cannot expand an expandable anchor;
+    /// the words containing it admit every row the spelling matches. No spelling gets one
+    /// unless all do.
+    fn anchor_group(
+        &mut self,
+        c: &Connection,
+        cache: &mut PlanCache,
+        variants: &[String],
+    ) -> Result<()> {
+        let mut anchors = Vec::with_capacity(variants.len());
+        for variant in variants {
+            let Some((anchor, words)) = anchor(c, cache, variant)? else {
+                return Ok(());
+            };
+            anchors.push((variant.clone(), anchor, words));
+        }
+        for (variant, anchor, words) in anchors {
+            self.tool_terms.insert(anchor.clone(), words);
+            self.tool_anchors.insert(variant, anchor);
+        }
+        Ok(())
+    }
+    /// The anchors of a group's spellings, when every spelling has one.
+    pub(super) fn anchors(&self, group: &[String]) -> Option<Vec<String>> {
+        group
+            .iter()
+            .map(|variant| self.tool_anchors.get(variant).cloned())
+            .collect()
     }
     /// On ASCII rows, the all-terms strength ceiling, with the bridges whose adjacency
     /// would break it: each pair of spellings of two terms, one after the other.
@@ -328,16 +359,35 @@ impl Matcher {
         words.dedup();
         words
     }
+    /// The tool rows' necessary text condition, which takes anchors when plans may read
+    /// only the rows they admit.
     pub(super) fn fts(&self, blocks: Option<&[i64]>) -> Option<String> {
+        self.tool_fts(blocks, self.plan_anchors)
+    }
+    /// Each group the dictionary cannot expand enters through its spellings' anchors
+    /// when `anchored`; without them it is left out.
+    pub(super) fn tool_fts(&self, blocks: Option<&[i64]>, anchored: bool) -> Option<String> {
         let mut clauses = vec![];
         for group in &self.ordered_terms {
-            if group.iter().any(|v| !self.tool_supported.contains(v)) {
+            let anchors = if group.iter().all(|v| self.tool_supported.contains(v)) {
+                None
+            } else if let Some(anchors) = self.anchors(group).filter(|_| anchored) {
+                Some(anchors)
+            } else {
                 if self.partial {
                     return None;
                 }
                 continue;
+            };
+            let mut words = self.group_words(anchors.as_deref().unwrap_or(group), blocks);
+            if let Some(anchors) = anchors
+                .as_ref()
+                .filter(|_| words.is_empty() && blocks.is_none())
+            {
+                // An anchor no dictionary word contains is no token either, so its
+                // clause admits no row.
+                words = anchors.iter().map(String::as_str).collect();
             }
-            let words = self.group_words(group, blocks);
             if words.is_empty() {
                 if self.partial {
                     continue;
@@ -457,4 +507,77 @@ impl Matcher {
         }
         (clauses.len() >= 2).then(|| (clauses.join(" AND "), ordinals))
     }
+}
+/// One spelling's anchor: the spelling itself when the dictionary expands it, or else its
+/// rarest run that a unicode61 token always holds whole. That is an ASCII alphanumeric
+/// run of 3 to 4096 bytes, or a run of two or more characters unicode61 keeps as itself.
+fn anchor(
+    c: &Connection,
+    cache: &mut PlanCache,
+    variant: &str,
+) -> Result<Option<(String, std::sync::Arc<Expansion>)>> {
+    if let Some(words) = cache.words(c, variant)? {
+        return Ok(Some((variant.to_owned(), words)));
+    }
+    let mut rarest: Option<(usize, &str)> = None;
+    for run in variant
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|run| (3..=4096).contains(&run.len()))
+    {
+        // A run occurs in no more rows than its rarest trigram's words.
+        let mut doc = usize::MAX;
+        for gram in run.as_bytes().windows(3) {
+            let gram = std::str::from_utf8(gram).expect("ASCII run");
+            doc = doc.min(cache.trigram_doc(c, gram)?.unwrap_or(0));
+        }
+        if rarest.is_none_or(|(least, _)| doc < least) {
+            rarest = Some((doc, run));
+        }
+    }
+    let mut chosen = match rarest {
+        Some((_, run)) => cache.words(c, run)?.map(|words| (run.to_owned(), words)),
+        None => None,
+    };
+    for run in token_runs(c, variant)? {
+        let words = cache.run_words(c, &run)?;
+        if chosen
+            .as_ref()
+            .is_none_or(|(_, least)| words.doc < least.doc)
+        {
+            chosen = Some((run, words));
+        }
+    }
+    Ok(chosen)
+}
+/// The non-ASCII tokens unicode61 finds in `variant` that it keeps whole as themselves:
+/// wherever the folded text holds `variant`, one indexed token holds each of them.
+fn token_runs(c: &Connection, variant: &str) -> Result<Vec<String>> {
+    if variant.is_ascii() {
+        return Ok(Vec::new());
+    }
+    let tokenizers = crate::tool_index::Tokenizers::new(c)?;
+    let mut tokenizer = tokenizers.tokenizer()?;
+    let mut tokens = Vec::new();
+    tokenizer.tokens(variant, |token| tokens.push(token.to_vec()))?;
+    let mut runs = Vec::new();
+    for token in tokens {
+        let Ok(run) = String::from_utf8(token) else {
+            continue;
+        };
+        // Overlapping windows keep every literal of up to 4 KiB inside one indexed token.
+        if run.is_ascii()
+            || run.len() > 4096
+            || run.chars().nth(1).is_none()
+            || !variant.contains(run.as_str())
+            || runs.contains(&run)
+        {
+            continue;
+        }
+        let mut whole = Vec::new();
+        tokenizer.tokens(&run, |token| whole.push(token.to_vec()))?;
+        if whole == [run.as_bytes()] {
+            runs.push(run);
+        }
+    }
+    Ok(runs)
 }

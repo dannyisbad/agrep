@@ -1,6 +1,6 @@
 //! The resume cursor: parser state carried from one parse of a rollout to the next.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use super::subagent::SubagentContext;
 use super::submissions::Submissions;
@@ -15,7 +15,7 @@ pub(super) struct CodexState {
     pub(super) events: Vec<Event>,
     pub(super) order: crate::ingest::ReplyOrder,
     /// call_id -> index into `events`, so the *_output line can pair up.
-    pub(super) pending: HashMap<String, usize>,
+    pub(super) pending: BTreeMap<String, usize>,
     pub(super) turn: u32,
     pub(super) project: Option<String>,
     pub(super) session: Option<String>,

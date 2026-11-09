@@ -255,11 +255,12 @@ fn full_reindex_clears_vector_references_and_queues_every_visible_row() {
     let out = ok(&t, &["set", "embeddings", "off"]);
     assert_eq!(
         String::from_utf8(out.stdout).unwrap(),
-        "embeddings = off  (off disables model downloads and meaning search)\n"
+        "embeddings = off  (agent searches stay keyword-only and new rows are not embedded; -s and index --semantic still work)\n"
     );
     let root = DataRoot(t.path().join("data"));
     let c = store::writer(&root).unwrap();
-    c.execute_batch("INSERT INTO semantic_refs SELECT id,digest,digest FROM prose; INSERT INTO semantic_blocks VALUES('old',1); INSERT INTO semantic_chunks SELECT digest,0,'old',0 FROM prose LIMIT 1; DELETE FROM semantic_queue;").unwrap();
+    // Real content keys, so the rebuild carries these references and only --full drops them.
+    c.execute_batch("INSERT INTO semantic_refs SELECT id,digest,'text:'||digest FROM prose; INSERT INTO semantic_blocks VALUES('old',1); INSERT INTO semantic_chunks SELECT 'text:'||digest,0,'old',0 FROM prose LIMIT 1; DELETE FROM semantic_queue;").unwrap();
     drop(c);
     let value = statistics(&t, &["reindex", "--full"]);
     assert!(value.get("skipped_lock").is_none());
@@ -405,6 +406,101 @@ fn index_runs_the_post_index_hook_before_it_exits() {
         .unwrap(),
         0
     );
+}
+// A failing hook is reported on its own line; the index it follows still succeeds, and
+// the hook's own output stays in its log.
+#[test]
+fn a_failing_post_index_hook_is_reported_without_failing_the_index() {
+    let t = fixture();
+    ok(
+        &t,
+        &[
+            "set",
+            "post_index",
+            "echo hook-said && echo hook-err 1>&2 && exit 3",
+        ],
+    );
+    fs::write(t.path().join("home/.pi/agent/sessions/project/second.jsonl"),format!("{}\n{}\n",json!({"type":"session","id":"second-session","version":3,"cwd":t.path()}),json!({"type":"message","id":"m2","parentId":null,"timestamp":"2026-10-29T10:02:00Z","message":{"role":"user","content":[{"type":"text","text":"new background input"}]}}))).unwrap();
+    let out = ok(&t, &["index"]);
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    let log = t.path().join("data").join("log").join("post_index.log");
+    let line = format!(
+        "post_index command failed (exit status 3); the index is complete; its output is in {}",
+        log.display()
+    );
+    assert_eq!(stderr.lines().filter(|l| *l == line).count(), 1, "{stderr}");
+    assert!(!(stdout + &stderr).contains("hook-"));
+    let kept = fs::read_to_string(log).unwrap();
+    assert!(
+        kept.contains("hook-said") && kept.contains("hook-err"),
+        "{kept}"
+    );
+}
+// The hook runs in its own process group, which a terminal's Ctrl-C does not reach, so a
+// signal that ends `index` must end the hook too. Each hook holds the pipe on descriptor 3,
+// which reaches end of file only once every hook process has exited; the TERM-ignoring hook
+// ends only through the kill after the grace period.
+#[cfg(unix)]
+#[test]
+fn a_signal_that_ends_index_ends_its_post_index_hook() {
+    use std::io::{BufRead, BufReader, Read};
+    use std::os::{
+        fd::AsRawFd,
+        unix::process::{CommandExt, ExitStatusExt},
+    };
+    let t = fixture();
+    for (n, (signal, hook)) in [
+        (libc::SIGINT, "echo started >&3; sleep 30"),
+        (
+            libc::SIGTERM,
+            "trap '' TERM; echo started >&3; sleep 30 & sleep 30",
+        ),
+        (libc::SIGHUP, "echo started >&3; sleep 30 & sleep 30"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        ok(&t, &["set", "post_index", hook]);
+        fs::write(t.path().join(format!("home/.pi/agent/sessions/project/signal-{n}.jsonl")),format!("{}\n{}\n",json!({"type":"session","id":format!("signal-{n}"),"version":3,"cwd":t.path()}),json!({"type":"message","id":"m2","parentId":null,"timestamp":"2026-10-29T10:02:00Z","message":{"role":"user","content":[{"type":"text","text":"new background input"}]}}))).unwrap();
+        let (read, write) = std::io::pipe().unwrap();
+        let fd = write.as_raw_fd();
+        let mut index = command(&t);
+        index
+            .arg("index")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        unsafe {
+            index.pre_exec(move || {
+                let inherited = if fd == 3 {
+                    libc::fcntl(3, libc::F_SETFD, 0)
+                } else {
+                    libc::dup2(fd, 3)
+                };
+                if inherited < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let mut child = index.spawn().unwrap();
+        drop(write);
+        let mut read = BufReader::new(read);
+        let mut line = String::new();
+        read.read_line(&mut line).unwrap();
+        assert_eq!(line, "started\n", "{hook}");
+        let signalled = std::time::Instant::now();
+        unsafe {
+            libc::kill(child.id() as i32, signal);
+        }
+        assert_eq!(child.wait().unwrap().signal(), Some(signal), "{hook}");
+        read.read_to_end(&mut Vec::new()).unwrap();
+        assert!(
+            signalled.elapsed() < std::time::Duration::from_secs(20),
+            "{hook}"
+        );
+    }
 }
 #[test]
 fn native_resume_rejects_options_and_relative_working_directories() {

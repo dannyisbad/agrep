@@ -77,7 +77,7 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
         && semantic::eligible(&pattern);
     let automatic = wants_meaning && semantic::installed(&root);
     if timing {
-        eprintln!(
+        agrep_core::errln!(
             "{}",
             serde_json::json!({"query_prepare_ms":query_start.elapsed().as_secs_f64()*1000.})
         );
@@ -143,12 +143,12 @@ fn prepare(
     let stop = |error| stopped(s, pattern, request, no_auto, error);
     if pattern.trim().is_empty() {
         // `agrep search` also lands here when a bare `agrep <word>` consumed a command word.
-        eprintln!("empty pattern - add a word or phrase to search (a word that is also a command searches with: agrep search \"search\")");
+        agrep_core::errln!("empty pattern - add a word or phrase to search (a word that is also a command searches with: agrep search \"search\")");
         return Ok(std::ops::ControlFlow::Break(stop(("empty-query", None))?));
     }
     if s.regex {
         if let Some(reason) = agrep_core::query::regex_error(pattern.trim()) {
-            eprintln!("bad regex: {reason}");
+            agrep_core::errln!("bad regex: {reason}");
             return Ok(std::ops::ControlFlow::Break(stop((
                 "invalid-regex",
                 Some(&reason),
@@ -170,7 +170,7 @@ fn prepare(
     let compact_page =
         compact(s.classic) && !(s.json || s.flat || s.chats || s.count || s.count_by_tier);
     if s.semantic && !semantic::installed(&agrep_core::data::DataRoot::discover()?) {
-        eprintln!("semantic model not installed: run agrep setup");
+        agrep_core::errln!("semantic model not installed: run agrep setup");
         return Ok(std::ops::ControlFlow::Break(2));
     }
     let (root, census) = {
@@ -302,7 +302,7 @@ fn retrieve(
         (keyword, None, true)
     };
     if timing {
-        eprintln!("{}", serde_json::json!({"keyword_ms":keyword_ms}));
+        agrep_core::errln!("{}", serde_json::json!({"keyword_ms":keyword_ms}));
     }
     Ok(std::ops::ControlFlow::Continue(Retrieved {
         result,
@@ -352,7 +352,7 @@ fn render_result(
     } = ctx;
     let style_semantic = s.semantic && semantic_coverage.is_some();
     if style_semantic && s.chats && s.sort == "score" {
-        meaning_heads(&mut result.hits, chrono::Utc::now().timestamp_millis());
+        meaning_heads(&mut result.hits, agrep_core::clock::now_ms());
     }
     // 0.4.9's reruns of this search (py/search.py:5926-6036): every filter as one token,
     // then the page's own surface and a page size.
@@ -426,9 +426,7 @@ fn render_result(
     };
     let style = Style {
         json: s.json,
-        flat: s.flat
-            || (!compact_page
-                && !(color == "always" || (color == "auto" && std::io::stdout().is_terminal()))),
+        flat: s.flat || (!compact_page && !super::color_on(color)),
         compact: compact_page,
         count: s.count,
         tiers: s.count_by_tier,
@@ -440,10 +438,11 @@ fn render_result(
         no_auto,
         full_argv: rerun(&["--classic"], 0),
         larger_argv: larger
-            .filter(|_| exhaustible || s.json)
+            // A compact page names the bounded rerun once its rows run out, meaning rows or not.
+            .filter(|_| exhaustible || s.json || compact_page)
             .map(|n| rerun(surface, n)),
         exhaustive_argv: (s.json && exhaustible && s.max != Some(0)).then(|| rerun(surface, 0)),
-        color: color == "always" || (color == "auto" && std::io::stdout().is_terminal()),
+        color: super::color_on(color),
         data_root: Some(root),
         requested: s.max,
         diversify: !s.scope.all_side_chats,
@@ -457,6 +456,7 @@ fn render_result(
             s,
             c,
             f,
+            options,
             pattern,
             no_auto,
             wants_meaning,
@@ -528,6 +528,7 @@ struct Emission<'a> {
     s: &'a Search,
     c: &'a rusqlite::Connection,
     f: &'a agrep_core::query::Filters,
+    options: &'a Options,
     pattern: &'a str,
     no_auto: bool,
     wants_meaning: bool,
@@ -547,6 +548,7 @@ fn emit_result(
         s,
         c,
         f,
+        options,
         pattern,
         no_auto,
         wants_meaning,
@@ -556,7 +558,7 @@ fn emit_result(
         policy,
     } = ctx;
     if let Some(line) = agrep_core::query::meta_notice(result.meta_dropped, result.meta_retained) {
-        eprintln!("{line}");
+        agrep_core::errln!("{line}");
     }
     // 0.4.9's automatic lane answered keyword-only without a model, and said so beside the
     // page or a filtered miss, or as an unfiltered miss's verdict (py/search.py:8063-8104).
@@ -580,7 +582,7 @@ fn emit_result(
         && !filtered
         && excluded.unwrap_or(0) == 0;
     if wants_meaning && !automatic && !keyword_only_miss {
-        eprintln!(
+        agrep_core::errln!(
             "meaning unavailable; keyword-only (semantic model not installed: run agrep setup)"
         );
     }
@@ -607,9 +609,9 @@ fn emit_result(
         // the stale-history hedge outranks the keyword-only tail.
         let n: i64 = c.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
         if n == 0 {
-            eprintln!("no match - nothing is indexed yet");
+            agrep_core::errln!("no match - nothing is indexed yet");
         } else {
-            eprintln!(
+            agrep_core::errln!(
                 "no match across {} session{} - {}",
                 agrep_core::surface::number(n as usize),
                 if n == 1 { "" } else { "s" },
@@ -619,6 +621,29 @@ fn emit_result(
                     "meaning unavailable; keyword-only"
                 }
             );
+        }
+    } else if s.semantic {
+        if result.total == 0 && !s.json && !s.count && !s.count_by_tier {
+            // 0.4.9 asked the keyword lane whether a match exists, unless --chat named one
+            // chat (py/search.py:8105-8119); `-s` answers only from a complete snapshot.
+            let keyword_total = if s.scope.chat.is_none() {
+                let count = Options {
+                    limit: 0,
+                    exact: true,
+                    count_only: true,
+                    count_by_tier: false,
+                    content: false,
+                    ..options.clone()
+                };
+                Some(agrep_core::query::search(c, &count)?.total)
+            } else {
+                None
+            };
+            if let Some(coverage) = semantic_coverage {
+                for line in meaning_miss(keyword_total, pattern, coverage) {
+                    agrep_core::errln!("{line}");
+                }
+            }
         }
     } else if result.total == 0 && !s.json && !s.count && !s.count_by_tier && !empty_dimension {
         // 0.4.9's matcher_empty_line (py/display_policy.py:1358-1370) names the matcher and
@@ -636,7 +661,7 @@ fn emit_result(
         } else {
             ("keyword", "")
         };
-        eprintln!(
+        agrep_core::errln!(
             "{label}: 0 matching rows across {} indexed messages{lever}",
             agrep_core::surface::number(n.max(0) as usize)
         );
@@ -644,10 +669,10 @@ fn emit_result(
     if !s.json {
         agrep_core::coverage::disclose(coverage);
         for line in after_miss {
-            eprintln!("{line}");
+            agrep_core::errln!("{line}");
         }
         if let Some(line) = policy.zip(excluded).and_then(|(p, n)| p.notice(n, "hit")) {
-            eprintln!("{line}");
+            agrep_core::errln!("{line}");
         }
     }
     render::note_no_auto(no_auto && !keyword_only_miss);
@@ -659,6 +684,28 @@ fn emit_result(
         1
     })
 }
+/// 0.4.9's explicit `-s` miss: whether keyword rows match, then the meaning lane's verdict
+/// over the rows it embedded (py/search.py:8105-8125, py/display_policy.py:1332-1339).
+fn meaning_miss(
+    keyword_total: Option<usize>,
+    pattern: &str,
+    coverage: &semantic::Coverage,
+) -> Vec<String> {
+    let keyword = keyword_total.map(|n| match n {
+        0 => "no confident meaning match, and no prose match either".to_owned(),
+        n => format!(
+            "no confident meaning match; {n} prose match(es) exist - {}",
+            agrep_core::surface::shell(&["agrep".into(), pattern.into(), "--lexical".into()])
+        ),
+    });
+    keyword
+        .into_iter()
+        .chain([format!(
+            "semantic: no match among {} embedded rows",
+            coverage.embedded
+        )])
+        .collect()
+}
 pub(crate) fn more(handle: &str) -> Result<i32> {
     let root = agrep_core::data::DataRoot::discover()?;
     root.validate(false)?;
@@ -668,8 +715,9 @@ pub(crate) fn more(handle: &str) -> Result<i32> {
     let page = agrep_core::pages::select(frozen);
     let more = agrep_core::pages::save(&root, &page.remainder)?;
     agrep_core::surface::write(&page.text)?;
-    if more.is_some() || !page.remainder.records.is_empty() {
-        eprintln!(
+    if more.is_some() || !page.remainder.records.is_empty() || page.remainder.larger_argv.is_some()
+    {
+        agrep_core::errln!(
             "{}",
             agrep_core::pages::footer(&page.remainder, more.as_deref())
         );
@@ -687,7 +735,7 @@ fn unavailable(
     freshness: serde_json::Value,
 ) -> Result<i32> {
     if !s.json {
-        eprintln!("{}", semantic::unavailable_notice(&status));
+        agrep_core::errln!("{}", semantic::unavailable_notice(&status));
         return Ok(2);
     }
     let engine = if status["state"] == "query-rejected" {
@@ -817,6 +865,33 @@ mod tests {
                 ("f002", 0.3281),
                 ("f000", 0.2972)
             ]
+        );
+    }
+    // Expected lines are 0.4.9's explicit `-s` miss (py/search.py:8105-8125,
+    // py/display_policy.py:1332-1339).
+    #[test]
+    fn explicit_meaning_miss_names_the_meaning_lane() {
+        let coverage = semantic::Coverage {
+            embedded: 31,
+            total: 31,
+        };
+        assert_eq!(
+            meaning_miss(Some(0), "how did we fix it", &coverage),
+            [
+                "no confident meaning match, and no prose match either",
+                "semantic: no match among 31 embedded rows"
+            ]
+        );
+        assert_eq!(
+            meaning_miss(Some(24), "wedged rows", &coverage),
+            [
+                "no confident meaning match; 24 prose match(es) exist - agrep 'wedged rows' --lexical",
+                "semantic: no match among 31 embedded rows"
+            ]
+        );
+        assert_eq!(
+            meaning_miss(None, "wedged", &coverage),
+            ["semantic: no match among 31 embedded rows"]
         );
     }
 }

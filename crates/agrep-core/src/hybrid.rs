@@ -143,17 +143,23 @@ pub fn merge(
             break;
         }
     }
-    let mut hits = interleave(lexical, meaning, cap, diverse, overlap_at, strong_lexical);
+    let (mut hits, folded) = interleave(lexical, meaning, cap, diverse, overlap_at, strong_lexical);
+    let merged = hits.len();
     hits.truncate(cap);
     if hits.iter().any(|h| h.matched == "semantic") {
         keyword.total = keyword.total.max(hits.len());
         keyword.total_basis = "floor".into();
-        keyword.hybrid_more = Some(lanes_more);
+        // Rows the cap cut from the merged page are more rows the search held.
+        keyword.hybrid_more = Some(lanes_more || merged > hits.len());
+        keyword.hybrid_folded = folded.saturating_sub(merged - hits.len());
     }
     keyword.hits = hits;
     keyword
 }
 
+/// The merged page, and how many of its trailing rows are keyword rows of a family a
+/// meaning row already leads: 0.4.9 dropped those rows; they follow every other row so
+/// they stay reachable.
 fn interleave(
     lexical: Vec<Hit>,
     mut meaning: Vec<Hit>,
@@ -161,29 +167,29 @@ fn interleave(
     diverse: bool,
     overlap_at: Option<usize>,
     strong_lexical: bool,
-) -> Vec<Hit> {
-    let fam = |h: &Hit| family(h, diverse).to_owned();
-    let hits = if lexical.is_empty() {
+) -> (Vec<Hit>, usize) {
+    if lexical.is_empty() {
         meaning.truncate(cap.min(ROWS));
-        meaning
+        (meaning, 0)
     } else if meaning.is_empty() || cap == 1 {
-        lexical
+        (lexical, 0)
     } else if overlap_at.is_some() {
         let used: HashSet<String> = meaning
             .iter()
             .filter(|h| !h.session.is_empty())
-            .map(fam)
+            .map(|h| family(h, diverse).to_owned())
             .collect();
-        meaning.extend(
-            lexical
-                .into_iter()
-                .filter(|h| h.session.is_empty() || !used.contains(family(h, diverse))),
-        );
-        meaning
+        let (other, folded): (Vec<Hit>, Vec<Hit>) = lexical
+            .into_iter()
+            .partition(|h| h.session.is_empty() || !used.contains(family(h, diverse)));
+        let count = folded.len();
+        meaning.extend(other);
+        meaning.extend(folded);
+        (meaning, count)
     } else if !strong_lexical {
         meaning.truncate(meaning.len().min(ROWS).min(cap));
         meaning.extend(lexical);
-        meaning
+        (meaning, 0)
     } else {
         let lead = lexical
             .iter()
@@ -194,9 +200,8 @@ fn interleave(
             .max(1);
         let mut hits = lexical;
         hits.insert(lead.min(hits.len()), meaning.remove(0));
-        hits
-    };
-    hits
+        (hits, 0)
+    }
 }
 
 #[cfg(test)]
@@ -309,5 +314,40 @@ mod tests {
             .map(|i| h(&i.to_string(), "semantic", true))
             .collect();
         assert_eq!(run(vec![], only, 8).len(), 3);
+    }
+    #[test]
+    fn keyword_rows_of_a_family_a_meaning_row_leads_follow_the_page() {
+        // py/search.py:2193-2197 dropped them; every keyword row stays on the merged page.
+        let in_family = |s: &str, family: &str, matched: &str| Hit {
+            family: family.into(),
+            ..h(s, matched, false)
+        };
+        let lanes = |cap: usize| {
+            let mut keyword = results(vec![
+                in_family("a1", "F", "phrase"),
+                in_family("b", "G", "phrase"),
+                in_family("a2", "F", "phrase"),
+            ]);
+            keyword.total = 3;
+            keyword.total_basis = "exact".into();
+            let mut meaning = results(vec![
+                in_family("m", "M", "semantic"),
+                in_family("x", "F", "semantic"),
+            ]);
+            meaning.total = 2;
+            meaning.total_basis = "exact".into();
+            merge(keyword, Some(meaning), cap, true)
+        };
+        let sessions = |r: &Results| r.hits.iter().map(|h| h.session.clone()).collect::<Vec<_>>();
+        let r = lanes(8);
+        assert_eq!(sessions(&r), ["m", "x", "b", "a1", "a2"]);
+        assert_eq!(
+            (r.hybrid_folded, r.hybrid_more, r.total),
+            (2, Some(false), 5)
+        );
+        // A cap that cuts a row says the search held more.
+        let r = lanes(4);
+        assert_eq!(sessions(&r), ["m", "x", "b", "a1"]);
+        assert_eq!((r.hybrid_folded, r.hybrid_more), (1, Some(true)));
     }
 }

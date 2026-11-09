@@ -4,6 +4,7 @@ use std::path::Path;
 
 use serde_json::value::RawValue;
 
+use super::discover::rollout_stem;
 use super::prefilter::{
     canonical_timestamp, fast_class, raw_call_output, FallbackNeedles, FastClass,
 };
@@ -27,19 +28,18 @@ pub(super) fn parse_data(
     previous: Option<CodexState>,
 ) -> (Parsed, CodexState) {
     let mut parser = Parser::new(path, &tally, data, previous);
+    let mut lines = 0;
     for (offset, line) in data.lines().enumerate() {
         parser.line(offset, line.as_ref());
+        lines = offset + 1;
     }
-    parser.finish(data.lines().count())
+    parser.finish(lines)
 }
 
-/// Derive a session id from a `rollout-<ISO>-<uuid>.jsonl` filename (fallback when the
+/// Derive a session id from a `rollout-<ISO>-<uuid>.jsonl[.zst]` filename (fallback when the
 /// `session_meta` line is missing its id).
 fn session_from_filename(path: &Path) -> String {
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default();
+    let stem = rollout_stem(path).unwrap_or_default();
     // The id is the trailing UUID (5 dash-separated groups).
     let parts: Vec<&str> = stem.split('-').collect();
     if parts.len() >= 5 {
@@ -77,10 +77,7 @@ impl<'a> Parser<'a> {
         state.reset = false;
         Self {
             path,
-            source_stem: path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .unwrap_or("rollout"),
+            source_stem: rollout_stem(path).unwrap_or("rollout"),
             tally,
             carried_rows: state.out.len(),
             carried_events: state.events.len(),

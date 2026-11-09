@@ -315,108 +315,32 @@ mod pty {
         term.finish(0);
     }
     #[test]
-    fn ui_serves_while_browser_opener_is_running() {
-        use std::os::unix::{fs::PermissionsExt, net::UnixStream};
+    fn tail_keeps_default_suspension() {
         let t = TempDir::new().unwrap();
         fixture(t.path());
-        let bin = t.path().join("bin");
-        fs::create_dir(&bin).unwrap();
-        // The opener reports its start, then runs until the test closes its end of the pair.
-        let (opener_end, test_end) = UnixStream::pair().unwrap();
-        let held = opener_end.as_raw_fd();
-        let opener = bin.join(if cfg!(target_os = "macos") {
-            "open"
-        } else {
-            "xdg-open"
-        });
-        fs::write(
-            &opener,
-            format!("#!/bin/sh\necho started >&{held}\nread _ <&{held}\n"),
-        )
-        .unwrap();
-        fs::set_permissions(&opener, fs::Permissions::from_mode(0o755)).unwrap();
-        let mut command = cli(t.path(), &t.path().join("data"));
-        command
-            .env("PATH", &bin)
-            .args(["ui", "--port", "0"])
+        let mut child = cli(t.path(), &t.path().join("data"))
+            .env("PATH", "")
+            .arg("tail")
+            .process_group(0)
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        // Only `ui`, and through it the opener, inherit `opener_end`; other copies close on exec.
-        unsafe {
-            command.pre_exec(move || {
-                if libc::fcntl(held, libc::F_SETFD, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let mut child = command.spawn().unwrap();
-        drop(opener_end);
-        let mut reader = BufReader::new(child.stdout.take().unwrap());
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
         let mut line = String::new();
+        let mut reader = BufReader::new(child.stdout.take().unwrap());
         reader.read_line(&mut line).unwrap();
-        let authority = line
-            .split("http://")
-            .nth(1)
-            .unwrap()
-            .split('/')
-            .next()
-            .unwrap();
-        test_end
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        let mut started = String::new();
-        let report = BufReader::new(&test_end).read_line(&mut started);
-        let mut stream = std::net::TcpStream::connect(authority).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        write!(stream, "GET / HTTP/1.1\r\nHost: {authority}\r\n\r\n").unwrap();
-        let mut response = String::new();
-        let result = stream.read_to_string(&mut response);
-        drop(test_end);
+        assert!(!line.is_empty());
         unsafe {
+            libc::kill(child.id() as i32, libc::SIGTSTP);
+        }
+        let stopped = job::stops(child.id(), Duration::from_secs(5));
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGCONT);
             libc::kill(child.id() as i32, libc::SIGINT);
         }
-        child.wait().unwrap();
-        report.unwrap();
-        assert_eq!(started, "started\n");
-        result.unwrap();
-        assert!(response.starts_with("HTTP/1.1 200"));
-    }
-    #[test]
-    fn tail_serve_and_ui_keep_default_suspension() {
-        for args in [
-            &["tail"][..],
-            &["serve", "--port", "0"][..],
-            &["ui", "--port", "0"][..],
-        ] {
-            let t = TempDir::new().unwrap();
-            fixture(t.path());
-            let mut child = cli(t.path(), &t.path().join("data"))
-                .env("PATH", "")
-                .args(args)
-                .process_group(0)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap();
-            let mut line = String::new();
-            let mut reader = BufReader::new(child.stdout.take().unwrap());
-            reader.read_line(&mut line).unwrap();
-            assert!(!line.is_empty());
-            unsafe {
-                libc::kill(child.id() as i32, libc::SIGTSTP);
-            }
-            let stopped = job::stops(child.id(), Duration::from_secs(5));
-            unsafe {
-                libc::kill(child.id() as i32, libc::SIGCONT);
-                libc::kill(child.id() as i32, libc::SIGINT);
-            }
-            let status = child.wait().unwrap();
-            assert!(stopped, "{args:?} did not suspend");
-            assert_eq!(status.code(), Some(130));
-        }
+        let status = child.wait().unwrap();
+        assert!(stopped, "tail did not suspend");
+        assert_eq!(status.code(), Some(130));
     }
     #[test]
     fn signal_and_suspend_restore() {
@@ -523,7 +447,7 @@ fn native_console_ctrl_c_and_break_restore_modes() {
         .status()
         .unwrap()
         .success());
-    for command in ["board", "tail", "serve"] {
+    for command in ["board", "tail"] {
         for control in ["0", "1"] {
             let home = temp.path().join(format!("{command}-{control}"));
             fs::create_dir_all(&home).unwrap();

@@ -212,7 +212,7 @@ pub(super) fn session_files(root: &Path) -> (Vec<PathBuf>, HashSet<PathBuf>) {
 
 /// The store root's listing, when it is a plain directory that can be read.
 fn read_root(root: &Path) -> Option<fs::ReadDir> {
-    match fs::symlink_metadata(root) {
+    match crate::ingest::registry::root_metadata(root) {
         Ok(meta) if meta.is_dir() && !metadata_is_link(&meta) => {}
         Ok(_) => {
             crate::ingest::warn_source_skip("gemini", root, "source root is not a plain directory");

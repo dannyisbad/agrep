@@ -1,7 +1,7 @@
 //! Project and side-session identity: the project a session worked in, voted from its cwds and
 //! tool paths, and the context a transcript's location implies.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use crate::ingest::project_name;
@@ -144,7 +144,7 @@ pub(super) fn primary_project(
     paths: &[String],
     first_cwd: &str,
     fallback: &str,
-    votes: &mut HashMap<String, usize>,
+    votes: &mut BTreeMap<String, usize>,
 ) -> String {
     let mut counts = std::mem::take(votes);
     for (c, n) in cwd_counts {

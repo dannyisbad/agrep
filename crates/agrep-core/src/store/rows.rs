@@ -14,6 +14,7 @@ use rusqlite::OptionalExtension;
 use rusqlite::{params, Transaction};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::path::Path;
 
 fn reply_metadata(m: &crate::model::Message) -> Result<String> {
     let mut value = serde_json::to_value(&*m.reply_shape)?;
@@ -286,11 +287,13 @@ pub(super) fn replace(
     let mut event_writer = crate::tool_store::Writer::default();
     let mut meta: HashMap<&str, (&str, i64, bool, &str)> = HashMap::new();
     let initial_bounds = initial_session_bounds(s, bulk);
+    let directory = source_cwd(&s.key);
     let mut prose = ProseRows {
         keys: &mut keys,
         count: &mut count,
         bulk_rows: &mut bulk_rows,
         meta: &mut meta,
+        directory: &directory,
     };
     prose.write(tx, s, source, changes, bulk)?;
     let message_keys: HashSet<_> = s
@@ -317,6 +320,7 @@ pub(super) fn replace(
         metadata_keys: &mut metadata_keys,
         event_keys: &mut event_keys,
         event_writer: &mut event_writer,
+        directory: &directory,
     }
     .write(tx, s, source, prepared, changes, bulk)?;
     bulk_rows.flush(tx, 0, changes)?;
@@ -390,21 +394,33 @@ fn session(tx: &Transaction<'_>, m: &Message, cwd: &str) -> Result<()> {
         .execute(params![m.agent, m.session.as_ref(), cwd])?;
     Ok(())
 }
+/// The session's working directory from `cwd` or `payload.cwd` in the source's first lines.
+/// Lines are read whole, as 0.4.9 read Codex's `session_meta` line (often over 16 KB), within
+/// one byte budget so a file without line breaks (a database) is never read in full.
 fn source_cwd(path: &str) -> String {
-    use std::io::Read;
+    use std::io::{BufRead, BufReader, Read};
+    const LINES: usize = 8;
     let Ok(file) = fs::File::open(path) else {
         return String::new();
     };
-    let mut bytes = Vec::new();
-    if path.ends_with(".gz") {
-        let _ = flate2::read::GzDecoder::new(file)
-            .take(16384)
-            .read_to_end(&mut bytes);
+    let reader: Box<dyn BufRead> = if path.ends_with(".gz") {
+        Box::new(BufReader::new(flate2::read::GzDecoder::new(file)))
+    } else if path.ends_with(".zst") {
+        let Ok(decoder) = zstd::stream::read::Decoder::new(file) else {
+            return String::new();
+        };
+        Box::new(BufReader::new(decoder))
     } else {
-        let _ = file.take(16384).read_to_end(&mut bytes);
-    }
-    for line in bytes.split(|b| *b == b'\n').take(8) {
-        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) {
+        Box::new(BufReader::new(file))
+    };
+    let mut budget = reader.take(1 << 20);
+    let mut line = Vec::new();
+    for _ in 0..LINES {
+        line.clear();
+        if !matches!(budget.read_until(b'\n', &mut line), Ok(n) if n > 0) {
+            break;
+        }
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&line) {
             for cwd in [v.get("cwd"), v.pointer("/payload/cwd")]
                 .into_iter()
                 .flatten()
@@ -425,12 +441,15 @@ struct ProseRows<'a, 'b> {
     count: &'b mut usize,
     bulk_rows: &'b mut BulkRows,
     meta: &'b mut SessionMeta<'a>,
+    /// The working directory the source's header names, or empty.
+    directory: &'b str,
 }
 struct EventRows<'a> {
     meta: &'a SessionMeta<'a>,
     metadata_keys: &'a mut HashSet<(String, String)>,
     event_keys: &'a mut HashSet<RowKey>,
     event_writer: &'a mut crate::tool_store::Writer,
+    directory: &'a str,
 }
 fn initial_session_bounds(s: &SourceBatch, bulk: bool) -> HashMap<&str, (i64, i64, u32, String)> {
     let mut initial_bounds: HashMap<&str, (i64, i64, u32, String)> = HashMap::new();
@@ -484,6 +503,7 @@ impl<'a> ProseRows<'a, '_> {
             count,
             bulk_rows,
             meta,
+            directory,
         } = self;
         let session_last: HashMap<&str, usize> = s
             .messages
@@ -491,16 +511,18 @@ impl<'a> ProseRows<'a, '_> {
             .enumerate()
             .map(|(i, m)| (m.session.as_ref(), i))
             .collect();
-        let source_directory = source_cwd(&s.key);
         for (message_index, m) in s.messages.iter().enumerate() {
             meta.insert(&m.session, (&m.project, m.ts, m.side, &m.parent));
-            let cwd = if m.project.starts_with('/') || m.project.contains(":\\") {
-                m.project.to_string()
-            } else {
-                source_directory.clone()
-            };
+
             if !bulk || session_last.get(m.session.as_ref()) == Some(&message_index) {
-                session(tx, m, &cwd)?;
+                let cwd = if m.project.starts_with('/') || m.project.contains(":\\") {
+                    m.project.as_ref()
+                } else {
+                    s.cwds
+                        .get(m.session.as_ref())
+                        .map_or(*directory, String::as_str)
+                };
+                session(tx, m, cwd)?;
             }
             if s.append && !m.reply.is_empty() {
                 let prior: Option<String> = tx
@@ -572,7 +594,15 @@ impl EventRows<'_> {
             metadata_keys,
             event_keys,
             event_writer,
+            directory,
         } = self;
+        // A chat this source gives calls but no turn is filed under the source's directory.
+        let fallback = if directory.is_empty() {
+            "unknown"
+        } else {
+            directory
+        };
+        let side_parent = crate::ingest::registry::side_parent(&s.agent, Path::new(&s.key));
         let mut count = 0;
         let mut event_turn: HashMap<&str, i64> = HashMap::new();
         let mut turns: HashMap<&str, Vec<(i64, i64)>> = HashMap::new();
@@ -622,7 +652,7 @@ impl EventRows<'_> {
             let (project, _, _, _) = meta
                 .get(e.session.as_str())
                 .copied()
-                .unwrap_or(("unknown", 0, false, ""));
+                .unwrap_or((fallback, 0, false, ""));
             let turn = e.turn.map(i64::from).unwrap_or_else(|| {
                 turns
                     .get(e.session.as_str())
@@ -676,7 +706,13 @@ impl EventRows<'_> {
                 changes,
             )?;
             if !bulk || !meta.contains_key(e.session.as_str()) {
-                tx.prepare_cached("INSERT INTO sessions(agent,id,project,parent,family,side,title,first_ts,last_ts) VALUES(?1,?2,?3,'',?2,0,'',0,0) ON CONFLICT(agent,id) DO NOTHING")?.execute(params![e.agent,e.session,project])?;
+                let parent = side_parent.as_deref().unwrap_or("");
+                let family = if parent.is_empty() {
+                    &e.session
+                } else {
+                    parent
+                };
+                tx.prepare_cached("INSERT INTO sessions(agent,id,project,parent,family,side,title,first_ts,last_ts) VALUES(?1,?2,?3,?4,?5,?6,'',0,0) ON CONFLICT(agent,id) DO NOTHING")?.execute(params![e.agent,e.session,project,parent,family,!parent.is_empty()])?;
             }
         }
         Ok(count)

@@ -24,7 +24,7 @@ pub fn run(needle: String, to: Option<String>, force: bool) -> Result<i32> {
     root.validate(true)?;
     let (_, errors) = archive::restore(&root, &needle, to.as_deref(), force)?;
     for e in &errors {
-        println!("{}", agrep_core::render::safe(e));
+        agrep_core::outln!("{}", agrep_core::render::safe(e))?;
     }
     Ok(if errors.is_empty() { 0 } else { 1 })
 }

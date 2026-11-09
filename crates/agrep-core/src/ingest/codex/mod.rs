@@ -1,4 +1,6 @@
-//! Codex CLI/Desktop adapter: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
+//! Codex CLI/Desktop adapter: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl, which Codex
+//! later compresses in place to rollout-*.jsonl.zst and moves to ~/.codex/archived_sessions/
+//! when the user archives the chat.
 //! One JSONL file per session. The first line is `session_meta` (gives cwd -> project,
 //! and the session id). Real human turns are `response_item` lines with
 //! payload.type=="message" and payload.role=="user", text in `input_text`/`text` blocks.
@@ -10,8 +12,11 @@
 //! `is_wrapper`/`is_codex_injected` still veto client echoes the log does carry,
 //! such as slash-command markup. Prefer under-including over mislabeling.
 //!
-//! NOTE: only `~/.codex/sessions/` is walked. `~/.codex/.tmp/**` (plugin test fixtures),
-//! `~/.codex/history.jsonl`, and `~/.codex/archived_sessions/` are intentionally not read.
+//! While Codex compresses or archives a rollout two copies may exist; each is a source of
+//! the same session, and the store's canonical replay shows one copy of each turn.
+//!
+//! NOTE: `~/.codex/.tmp/**` (plugin test fixtures) and `~/.codex/history.jsonl` are
+//! intentionally not read.
 
 mod discover;
 mod parser;
@@ -20,6 +25,8 @@ mod records;
 mod state;
 mod subagent;
 mod submissions;
+#[cfg(test)]
+mod tests;
 mod tools;
 
 use std::path::Path;
@@ -56,26 +63,69 @@ pub(crate) fn is_codex_injected(text: &str) -> bool {
 
 /// Parse one whole rollout file.
 fn parse_file(path: &Path) -> (Vec<Message>, Vec<Event>, crate::intake_batch::ReadOutcome) {
+    if discover::is_compressed(path) {
+        return parse_compressed(path);
+    }
     let tally = crate::intake::tally();
-    let data = match crate::ingest::read_lossy(path) {
-        Ok(d) => d,
-        Err(e) => {
-            crate::intake::diagnostic(format_args!(
-                "  ! codex: cannot read {}: {}",
-                crate::ingest::terminal_safe(path.display()),
-                crate::ingest::terminal_safe(&e)
-            ));
-            tally.seen();
-            tally.error(&format!("cannot read: {e}"));
-            return (
-                Vec::new(),
-                Vec::new(),
-                crate::ingest::read_failure_outcome(&e),
-            );
-        }
-    };
+    match crate::ingest::read_lossy(path) {
+        Ok(data) => parser::parse_data(path, tally, &data, None).0,
+        Err(e) => unreadable(path, &tally, &e, crate::ingest::read_failure_outcome(&e)),
+    }
+}
 
-    parser::parse_data(path, tally, &data, None).0
+/// Parse a compressed rollout whole: Codex rewrites rather than appends it, so a change under
+/// the read fails it. Its counts join the audit only once it decoded to the end.
+fn parse_compressed(path: &Path) -> (Vec<Message>, Vec<Event>, crate::intake_batch::ReadOutcome) {
+    let tally = std::sync::Arc::default();
+    let read = crate::ingest::registry::read_regular_snapshot(path, |file| {
+        let text = crate::ingest::jsonl::ZstdText::new(file);
+        let parsed = parser::parse_data(path, std::sync::Arc::clone(&tally), &text, None).0;
+        text.check().map(|()| parsed)
+    })
+    .and_then(|read| {
+        read.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "source does not exist")
+        })
+    });
+    match read {
+        Ok(Ok(parsed)) => {
+            crate::intake::adopt(tally);
+            parsed
+        }
+        // A decoding failure is the file's content, not a race.
+        Ok(Err(e)) => {
+            crate::ingest::note_read_failure(path, format!("cannot decompress: {e}"));
+            unreadable(
+                path,
+                &crate::intake::tally(),
+                &e,
+                crate::intake_batch::ReadOutcome::Skipped,
+            )
+        }
+        Err(e) => unreadable(
+            path,
+            &crate::intake::tally(),
+            &e,
+            crate::ingest::read_failure_outcome(&e),
+        ),
+    }
+}
+
+/// An unreadable file counts as one seen, errored record.
+fn unreadable(
+    path: &Path,
+    tally: &crate::intake::Tally,
+    error: &std::io::Error,
+    outcome: crate::intake_batch::ReadOutcome,
+) -> (Vec<Message>, Vec<Event>, crate::intake_batch::ReadOutcome) {
+    crate::intake::diagnostic(format_args!(
+        "  ! codex: cannot read {}: {}",
+        crate::ingest::terminal_safe(path.display()),
+        crate::ingest::terminal_safe(error)
+    ));
+    tally.seen();
+    tally.error(&format!("cannot read: {error}"));
+    (Vec::new(), Vec::new(), outcome)
 }
 
 /// Parse `data` resuming from the serialized state of the previous parse; returns the

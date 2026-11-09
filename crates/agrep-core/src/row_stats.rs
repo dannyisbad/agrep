@@ -25,14 +25,22 @@ struct Family {
     counts: HashMap<String, [i64; 2]>,
     delta: HashMap<String, [i64; 2]>,
 }
+/// One page's counts, serialized as a JSON object in the slice's (token) order so equal
+/// statistics always store equal bytes.
+struct Page<'a>(&'a [(String, [u32; 2])]);
+impl Serialize for Page<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_map(self.0.iter().map(|(token, n)| (token, n)))
+    }
+}
 fn write_family_page(
     tx: &Transaction<'_>,
     agent: &str,
     family: &str,
     start: &str,
-    counts: &HashMap<String, [u32; 2]>,
+    counts: &[(String, [u32; 2])],
 ) -> Result<()> {
-    let body = lz4_flex::compress_prepend_size(&serde_json::to_vec(counts)?);
+    let body = lz4_flex::compress_prepend_size(&serde_json::to_vec(&Page(counts))?);
     tx.prepare_cached("INSERT INTO family_token_counts VALUES(?1,?2,?3,?4) ON CONFLICT(agent,family,start) DO UPDATE SET body=excluded.body")?.execute(params![agent,family,start,body])?;
     Ok(())
 }
@@ -74,18 +82,18 @@ impl Family {
             }
         }
         for (start, counts) in pages {
-            if counts.len() <= FAMILY_PAGE {
-                write_family_page(tx, agent, family, &start, &counts)?;
+            let mut items: Vec<_> = counts.into_iter().collect();
+            items.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            if items.len() <= FAMILY_PAGE {
+                write_family_page(tx, agent, family, &start, &items)?;
             } else {
-                let mut items: Vec<_> = counts.into_iter().collect();
-                items.sort_unstable_by(|a, b| a.0.cmp(&b.0));
                 for (index, chunk) in items.chunks(FAMILY_PAGE).enumerate() {
                     let lower = if index == 0 {
                         start.as_str()
                     } else {
                         &chunk[0].0
                     };
-                    write_family_page(tx, agent, family, lower, &chunk.iter().cloned().collect())?;
+                    write_family_page(tx, agent, family, lower, chunk)?;
                 }
             }
         }
@@ -508,7 +516,7 @@ fn store_family_bodies(
         items.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         for (index, chunk) in items.chunks(FAMILY_PAGE).enumerate() {
             let lower = if index == 0 { "" } else { &chunk[0].0 };
-            write_family_page(tx, agent, name, lower, &chunk.iter().cloned().collect())?;
+            write_family_page(tx, agent, name, lower, chunk)?;
         }
     }
     Ok(())
@@ -668,6 +676,21 @@ CREATE TABLE term_stats(token TEXT PRIMARY KEY,n INTEGER NOT NULL,s INTEGER NOT 
         (bodies, terms, owners)
     }
 
+    /// Every stored page body is its counts serialized in token order.
+    fn assert_pages_in_token_order(c: &Connection) {
+        let mut q = c.prepare("SELECT body FROM family_token_counts").unwrap();
+        let mut rows = q.query([]).unwrap();
+        let mut pages = 0;
+        while let Some(row) = rows.next().unwrap() {
+            let json =
+                lz4_flex::decompress_size_prepended(&row.get::<_, Vec<u8>>(0).unwrap()).unwrap();
+            let counts: BTreeMap<String, [u32; 2]> = serde_json::from_slice(&json).unwrap();
+            assert_eq!(json, serde_json::to_vec(&counts).unwrap());
+            pages += 1;
+        }
+        assert!(pages > 1);
+    }
+
     #[test]
     fn bulk_statistics_equal_per_row_token_sets_and_refresh_from_them() {
         let mut c = database();
@@ -718,6 +741,7 @@ CREATE TABLE term_stats(token TEXT PRIMARY KEY,n INTEGER NOT NULL,s INTEGER NOT 
             build_in_chunks(&tx, 700).unwrap();
             let built = stored(&tx);
             assert_eq!(built, expected(&tx));
+            assert_pages_in_token_order(&tx);
             assert!(built
                 .0
                 .values()
@@ -748,5 +772,6 @@ CREATE TABLE term_stats(token TEXT PRIMARY KEY,n INTEGER NOT NULL,s INTEGER NOT 
         }
         refresh(&tx).unwrap();
         assert_eq!(stored(&tx), expected(&tx));
+        assert_pages_in_token_order(&tx);
     }
 }

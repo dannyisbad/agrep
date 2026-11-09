@@ -7,7 +7,6 @@ use chrono::{Datelike, TimeZone};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    io::IsTerminal,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -215,12 +214,12 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
         if rows.is_empty() {
             meta["hits"] = json!([])
         }
-        println!("{}", agrep_core::json_output::to_string(&meta)?);
+        agrep_core::outln!("{}", agrep_core::json_output::to_string(&meta)?)?;
         for row in &rows {
-            println!("{}", agrep_core::json_output::to_string(&row)?);
+            agrep_core::outln!("{}", agrep_core::json_output::to_string(&row)?)?;
         }
     } else {
-        print_rows(&rows, mode, group, total, color);
+        print_rows(&rows, mode, group, total, color)?;
         print_footer(
             &args,
             &rows,
@@ -233,8 +232,11 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
                 timezone: &timezone,
             },
         )?;
+        if rows.is_empty() {
+            agrep_core::coverage::disclose(&agrep_core::coverage::dimensions(&c, &filters)?);
+        }
         if let Some(notice) = policy.and_then(|p| p.notice(excluded, "chat")) {
-            eprintln!("{notice}");
+            agrep_core::errln!("{notice}");
         }
         agrep_core::render::note_no_auto(no_auto);
     }
@@ -368,7 +370,7 @@ fn summary_window(args: &Summary) -> Result<SummaryWindow<'_>> {
             "--idle-cap must be a positive duration like 5m, 20m or 1h",
         )
     })?;
-    let now = chrono::Utc::now().timestamp_millis();
+    let now = agrep_core::clock::now_ms();
     let until_arg = args
         .until
         .as_deref()
@@ -558,9 +560,9 @@ fn summarize(
     Ok(SummaryRows { rows, dedup, total })
 }
 
-fn print_rows(rows: &[Value], mode: &str, group: &str, total: i64, color: &str) {
+fn print_rows(rows: &[Value], mode: &str, group: &str, total: i64, color: &str) -> Result<()> {
     // 0.4.9's rendering (py/summary.py:2344-2404).
-    let on = color == "always" || (color == "auto" && std::io::stdout().is_terminal());
+    let on = super::color_on(color);
     let head = |t: &str| {
         if on {
             format!("\x1b[1;36m{t}\x1b[0m")
@@ -586,23 +588,23 @@ fn print_rows(rows: &[Value], mode: &str, group: &str, total: i64, color: &str) 
                     .max(floor)
             };
             let (pw, lw) = (width("period", group.len()), width("project", 7));
-            println!(
+            agrep_core::outln!(
                 "{}",
                 head(&format!(
                     "{group:<pw$}  {:<lw$}  {:>7}  chats",
                     "project", "time"
                 ))
-            );
+            )?;
             for row in rows {
-                println!(
+                agrep_core::outln!(
                     "{:<pw$}  {:<lw$}  {:>7}  {}",
                     text(&row["period"]),
                     render::safe(&text(&row["project"])),
                     text(&row["estimated_active"]),
                     row["chats"]
-                );
+                )?;
             }
-            println!(
+            agrep_core::outln!(
                 "{}",
                 dim(&format!(
                     "{:<pw$}  {:<lw$}  {:>7}",
@@ -610,21 +612,21 @@ fn print_rows(rows: &[Value], mode: &str, group: &str, total: i64, color: &str) 
                     "",
                     label(total)
                 ))
-            );
+            )?;
         }
         "pending" => {
             for item in rows {
-                println!(
+                agrep_core::outln!(
                     "{}  {}",
                     pending_line(item, ""),
                     dim(&render::safe(&text(&item["project"])))
-                );
+                )?;
             }
         }
         "time" => {}
         _ => {
             for entry in rows {
-                println!(
+                agrep_core::outln!(
                     "{}{}",
                     head(&render::safe(&text(&entry["project"]))),
                     dim(&format!(
@@ -634,24 +636,25 @@ fn print_rows(rows: &[Value], mode: &str, group: &str, total: i64, color: &str) 
                         noun(entry["turns"].as_u64().unwrap_or(0) as usize, "turn"),
                         text(&entry["last_age"])
                     ))
-                );
-                println!("  worked on:");
+                )?;
+                agrep_core::outln!("  worked on:")?;
                 for chat in entry["worked_on"].as_array().into_iter().flatten() {
-                    print_chat(chat, &dim);
+                    print_chat(chat, &dim)?;
                 }
                 let open = entry["open"].as_array().map(Vec::as_slice).unwrap_or(&[]);
                 if !open.is_empty() {
-                    println!("  open:");
+                    agrep_core::outln!("  open:")?;
                     for item in open {
-                        println!("{}", pending_line(item, "    "));
+                        agrep_core::outln!("{}", pending_line(item, "    "))?;
                     }
                 }
             }
         }
     }
+    Ok(())
 }
 
-fn print_chat(chat: &Value, dim: &impl Fn(&str) -> String) {
+fn print_chat(chat: &Value, dim: &impl Fn(&str) -> String) -> Result<()> {
     let text = |v: &Value| v.as_str().unwrap_or_default().to_owned();
     let mut marks = String::new();
     if chat["self"] == true {
@@ -677,14 +680,15 @@ fn print_chat(chat: &Value, dim: &impl Fn(&str) -> String) {
         .chars()
         .take(96)
         .collect();
-    println!(
+    agrep_core::outln!(
         "    {} {} {} {}t{marks}  {}",
         render::safe(&text(&chat["session_handle"])),
         render::safe(&text(&chat["agent"])),
         render::age(chat["last_ts"].as_i64().unwrap_or(0)),
         chat["turns"],
         dim(&(first + &tail))
-    );
+    )?;
+    Ok(())
 }
 
 struct Footer<'a> {
@@ -717,28 +721,22 @@ fn print_footer(
         _ => format!("since {since_text}"),
     };
     match window.mode {
-            "time" => eprintln!(
-                "{METRIC} for {} {window_text}, idle cap {}, local time {timezone} · not elapsed span, not billable",
-                noun(family_count, "chat"),
-                args.idle_cap
-            ),
-            "pending" => eprintln!(
-                "{} across {} {window_text}, most confident first",
-                noun(rows.len(), "open item"),
-                noun(family_count, "chat")
-            ),
-            _ => eprintln!(
-                "{}, {} {window_text}, most active first · {METRIC} with a {} idle cap, side chats folded into their family",
-                noun(rows.len(), "project"),
-                noun(family_count, "chat"),
-                args.idle_cap
-            ),
+            "time" => agrep_core::errln!("{METRIC} for {} {window_text}, idle cap {}, local time {timezone} · not elapsed span, not billable",
+            noun(family_count, "chat"),
+            args.idle_cap),
+            "pending" => agrep_core::errln!("{} across {} {window_text}, most confident first",
+            noun(rows.len(), "open item"),
+            noun(family_count, "chat")),
+            _ => agrep_core::errln!("{}, {} {window_text}, most active first · {METRIC} with a {} idle cap, side chats folded into their family",
+            noun(rows.len(), "project"),
+            noun(family_count, "chat"),
+            args.idle_cap),
         }
     if unknown > 0 {
-        eprintln!("{unknown_line}");
+        agrep_core::errln!("{unknown_line}");
     }
     if dedup > 0 {
-        eprintln!(
+        agrep_core::errln!(
             "overlap between chats and their side chats counted once ({} de-duplicated)",
             label(dedup)
         );

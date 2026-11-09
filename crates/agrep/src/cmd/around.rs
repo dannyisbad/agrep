@@ -5,7 +5,6 @@ use agrep_core::{
 };
 use anyhow::Result;
 use serde_json::{json, Value};
-use std::io::IsTerminal;
 /// 0.4.9's unchecked around record (py/around.py:245-251,762-772).
 fn unchecked_record(checked: bool) -> Option<Value> {
     if !checked {
@@ -44,13 +43,13 @@ pub(crate) fn run(mut a: Around, no_auto: bool, color: &str) -> Result<i32> {
                 no_tools: a.no_tools,
                 tool_output: a.tool_output.unwrap_or(0),
                 who: a.who,
-                color: color == "always" || (color == "auto" && std::io::stdout().is_terminal()),
+                color: crate::cmd::color_on(color),
             },
         )?;
         if !a.json {
             for note in &w.notes {
                 if let Some(s) = note["note"].as_str() {
-                    eprintln!("{s}")
+                    agrep_core::errln!("{s}")
                 }
             }
         }
@@ -77,7 +76,10 @@ pub(crate) fn run(mut a: Around, no_auto: bool, color: &str) -> Result<i32> {
                         None
                     };
                     if let Some(cheaper) = cheaper {
-                        eprintln!("large pull: ~{}KB rendered - {cheaper}", text.len() / 1024);
+                        agrep_core::errln!(
+                            "large pull: ~{}KB rendered - {cheaper}",
+                            text.len() / 1024
+                        );
                     }
                 }
                 Ok(0)
@@ -91,9 +93,11 @@ pub(crate) fn run(mut a: Around, no_auto: bool, color: &str) -> Result<i32> {
                     }
                     surface::line(&agrep_core::json_output::to_string(&row)?)?;
                 } else if checked {
-                    eprintln!("{reason}");
+                    agrep_core::errln!("{reason}");
                 } else {
-                    eprintln!("{reason}; automatic freshness checks are disabled by --no-auto");
+                    agrep_core::errln!(
+                        "{reason}; automatic freshness checks are disabled by --no-auto"
+                    );
                 }
                 Ok(if checked { 1 } else { 2 })
             }

@@ -21,7 +21,16 @@ const NO_RESUME: &[(&str, &str)] = &[
         "sessions are editor-owned and have no safe CLI resume command",
     ),
 ];
+const RESUMABLE: [&str; 5] = ["claude", "codex", "opencode", "antigravity", "pi"];
 pub fn capability(agent: &str) -> Result<(&'static str, &'static str)> {
+    resolve(agent, "native resume")
+}
+/// `agrep run`'s check: it launches the agents native resume serves, and an unknown name
+/// is refused for the command it was given to.
+pub fn launchable(agent: &str) -> Result<()> {
+    resolve(agent, "agrep run").map(drop)
+}
+fn resolve(agent: &str, purpose: &str) -> Result<(&'static str, &'static str)> {
     let name = history::normalize_agent(agent);
     match name {
         "claude" => Ok(("claude", "--resume")),
@@ -29,14 +38,13 @@ pub fn capability(agent: &str) -> Result<(&'static str, &'static str)> {
         "opencode" => Ok(("opencode", "--session")),
         "antigravity" => Ok(("agy", "--conversation")),
         "pi" => Ok(("pi", "-r")),
+        _ if NO_RESUME.iter().any(|(known, _)| *known == name) => bail!(
+            "{}",
+            history::capability_error("native resume", name, &RESUMABLE, NO_RESUME)
+        ),
         _ => bail!(
             "{}",
-            history::capability_error(
-                "native resume",
-                name,
-                &["claude", "codex", "opencode", "antigravity", "pi"],
-                NO_RESUME,
-            )
+            history::capability_error(purpose, name, &RESUMABLE, NO_RESUME)
         ),
     }
 }
@@ -78,6 +86,13 @@ pub fn choose_executable(agent: &str, preferred: Option<&str>) -> Result<Option<
         Ok(executable(name))
     }
 }
+/// The agent a launch of `exe` starts: for the pi family, the fork `exe` runs.
+pub fn launched_agent<'a>(agent: &'a str, exe: &'a Path) -> std::borrow::Cow<'a, str> {
+    match exe.file_stem() {
+        Some(fork) if history::normalize_agent(agent) == "pi" => fork.to_string_lossy(),
+        _ => agent.into(),
+    }
+}
 pub fn resume_args(s: &Session) -> Result<Vec<OsString>> {
     if !crate::handles::plain(&s.id) {
         bail!("invalid session id for native resume");
@@ -94,36 +109,18 @@ pub fn resume_args(s: &Session) -> Result<Vec<OsString>> {
     args.push(s.id.clone().into());
     Ok(args)
 }
-/// As in 0.4.9, an interactive agent gets a group of its own in this session and is
-/// lent the terminal. In a pipeline (`agrep run x | less`) the terminal stays with the
-/// whole job, so the agent gets a session of its own and never stops a partner that
-/// reads /dev/tty.
-#[cfg(unix)]
-fn isolate(command: &mut Command, interactive: bool) {
-    use std::os::unix::process::CommandExt;
-    if interactive {
-        command.process_group(0);
-    } else {
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
-}
 pub fn run(exe: &Path, args: &[OsString], cwd: &Path) -> Result<i32> {
     if !cwd.is_dir() {
         bail!("working directory does not exist: {}", cwd.display())
     }
     let mut command = Command::new(exe);
     command.args(args).current_dir(cwd);
+    // The agent owns a group in this session: run can end its descendants, and the
+    // terminal's job control reaches it.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
     #[cfg(unix)]
     let interactive = unsafe { libc::isatty(0) == 1 && libc::isatty(1) == 1 };
-    #[cfg(unix)]
-    isolate(&mut command, interactive);
     #[cfg(windows)]
     windows_job()?;
     #[cfg(windows)]
@@ -220,14 +217,18 @@ mod unix {
     }
     pub struct Signals {
         old: Vec<(i32, libc::sigaction)>,
-        interactive: bool,
+        /// Whether the agent's group is lent the terminal while this process holds it. An
+        /// interactive agent is lent it at once. In a pipeline (`agrep run x | less`) the
+        /// terminal stays with the whole job, so a partner reading /dev/tty is not stopped,
+        /// until the agent itself reads or configures the terminal.
+        wants_terminal: bool,
         termios: Option<libc::termios>,
     }
     impl Signals {
         pub fn install(interactive: bool) -> Result<Self> {
             let mut s = Self {
                 old: vec![],
-                interactive,
+                wants_terminal: interactive,
                 termios: {
                     let mut t = unsafe { std::mem::zeroed() };
                     if unsafe { libc::tcgetattr(0, &mut t) } == 0 {
@@ -243,9 +244,7 @@ mod unix {
                 s.handle(sig, relay as *const () as usize)?;
             }
             s.handle(libc::SIGCONT, wake as *const () as usize)?;
-            if interactive {
-                s.handle(libc::SIGTSTP, suspend as *const () as usize)?;
-            }
+            s.handle(libc::SIGTSTP, suspend as *const () as usize)?;
             Ok(s)
         }
         fn handle(&mut self, sig: i32, action: libc::sighandler_t) -> Result<()> {
@@ -289,7 +288,7 @@ mod unix {
         /// asks again, as 0.4.9's poll did. True when it lent the terminal.
         fn lend(&self, pid: u32) -> bool {
             let group = pid as i32;
-            if !self.interactive
+            if !self.wants_terminal
                 || SUSPEND.load(Ordering::SeqCst)
                 || !holds_terminal()
                 || unsafe { libc::tcsetpgrp(0, group) } != 0
@@ -300,7 +299,7 @@ mod unix {
             true
         }
         fn holds(&self, pid: u32) -> bool {
-            self.interactive && unsafe { libc::tcgetpgrp(0) } == pid as i32
+            self.wants_terminal && unsafe { libc::tcgetpgrp(0) } == pid as i32
         }
         /// Takes the terminal back from the agent's group only: with SIGTTOU ignored, a
         /// background agrep could otherwise take it from the shell.
@@ -345,6 +344,7 @@ mod unix {
                         && libc::WIFSTOPPED(status)
                         && matches!(libc::WSTOPSIG(status), libc::SIGTTIN | libc::SIGTTOU)
                     {
+                        self.wants_terminal = true;
                         if self.lend(pid) {
                             continue;
                         }

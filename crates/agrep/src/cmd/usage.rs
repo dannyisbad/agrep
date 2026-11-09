@@ -169,16 +169,18 @@ pub(crate) fn chat(c: &rusqlite::Connection, value: &str) -> Result<Option<Strin
     ));
     match found.len() {
         1 => return Ok(found.pop()),
-        0 => eprintln!("no session matches {shown} - ids come from `agrep <pattern> --json`."),
+        0 => agrep_core::errln!(
+            "no session matches {shown} - ids come from `agrep <pattern> --json`."
+        ),
         n => {
-            eprintln!("{shown} is ambiguous ({n} sessions):");
+            agrep_core::errln!("{shown} is ambiguous ({n} sessions):");
             let listed = &found[..n.min(10)];
             for session in listed {
-                eprintln!("  {}", safe(session));
+                agrep_core::errln!("  {}", safe(session));
             }
             let among = SessionIndex::from(found.clone());
             let hint: Vec<_> = listed.iter().map(|s| safe(&among.target(s))).collect();
-            eprintln!("add a char: {}", hint.join(" / "));
+            agrep_core::errln!("add a char: {}", hint.join(" / "));
         }
     }
     Ok(None)
@@ -963,7 +965,7 @@ pub(crate) fn bounds(
     since: Option<&str>,
     until: Option<&str>,
 ) -> Result<(Option<i64>, Option<i64>)> {
-    let now = chrono::Utc::now().timestamp_millis();
+    let now = agrep_core::clock::now_ms();
     let since_ms = since.map(|s| date(s, now)).transpose()?;
     let until_ms = until.map(|u| date(u, now)).transpose()?;
     if let (Some(s), Some(s_ms), Some(u), Some(u_ms)) = (since, since_ms, until, until_ms) {

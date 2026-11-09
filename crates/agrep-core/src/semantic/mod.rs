@@ -1,6 +1,7 @@
 //! In-process semantic retrieval and short-lived background queue draining.
 mod background;
 mod budget;
+pub mod post_index;
 mod scan;
 use crate::{
     data::DataRoot,
@@ -12,7 +13,7 @@ use anyhow::{bail, Result};
 pub use background::{
     configure_background, drain, mark_index_changed, post_index, schedule, Drain,
 };
-pub use budget::{build_progress, is_building, BuildProgress};
+pub use budget::{build_progress, is_building, time_left, BuildProgress};
 use budget::{Overlay, QueryCost};
 use rusqlite::Connection;
 use scan::{resolve_scan, VectorScan};
@@ -716,6 +717,125 @@ mod tests {
             .map(|p| p.id)
             .collect();
         assert_eq!(left, [1]);
+    }
+    /// A batch whose text is embedded already covers its rows in wall time too, and the
+    /// drain's rate counts them, since the time left is the queue over that rate.
+    #[test]
+    fn a_drain_rates_every_row_it_covers_over_wall_time() {
+        let (_t, r, _o) = setup();
+        let vectors = |texts: &[String]| {
+            let mut v = vec![0f32; semantic_model::DIM];
+            v[0] = 1.;
+            Ok(vec![v; texts.len()])
+        };
+        insert(&r, 1, "family-1", "alpha");
+        drain_with(&r, Drain::default(), vectors).unwrap();
+        {
+            let c = store::writer(&r).unwrap();
+            c.execute("DELETE FROM state WHERE key='semantic_rows_per_second'", [])
+                .unwrap();
+            c.execute("INSERT INTO sessions(agent,id,project,parent,family,side,title,first_ts,last_ts) VALUES('codex','session-2','alpha','','family-2',0,'',0,0)", []).unwrap();
+            let text = "connection timeout row 1";
+            c.execute("INSERT INTO prose(id,source,agent,session,project,turn,who,model,model_source,ts,text,digest,extra) VALUES(2,1,'codex','session-2','alpha',1,'user','model','observed',2,?,?,'')", params![text.as_bytes(), store::digest(text)]).unwrap();
+        }
+        let mut calls = 0;
+        drain_with(&r, Drain::default(), |texts| {
+            calls += 1;
+            vectors(texts)
+        })
+        .unwrap();
+        assert_eq!(calls, 0);
+        let c = store::reader(&r).unwrap();
+        assert_eq!(coverage(&c).unwrap().embedded, 2);
+        let rate: f64 = c
+            .query_row(
+                "SELECT CAST(value AS REAL) FROM state WHERE key='semantic_rows_per_second'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(rate > 0.);
+    }
+    #[test]
+    fn the_drain_rate_weighs_batches_by_their_time_and_forgets_old_ones() {
+        let mut rate = background::DrainRate::default();
+        assert_eq!(rate.per_second(), None);
+        rate.observe(128, 8.);
+        rate.observe(128, 0.1);
+        let kept = (-0.1f64 / 60.).exp();
+        let expected = (128. * kept + 128.) / (8. * kept + 0.1);
+        assert!((rate.per_second().unwrap() - expected).abs() < 1e-9);
+        let mut rate = background::DrainRate::default();
+        rate.observe(1000, 1.);
+        rate.observe(60, 600.);
+        assert!((rate.per_second().unwrap() - 0.1).abs() < 0.001);
+    }
+    #[test]
+    fn drain_progress_says_rows_rate_and_time_left_as_the_estimate_does() {
+        assert_eq!(time_left(42), "42s");
+        assert_eq!(time_left(919), "15m 19s");
+        assert_eq!(time_left(3900), "1h 5m");
+        assert_eq!(
+            background::progress_line(1200, 137768, 136568, Some(150.)),
+            "embedding messages: 1200 of 137768 rows · 150 rows/s · about 15m 11s left"
+        );
+        assert_eq!(
+            background::progress_line(0, 10, 10, None),
+            "embedding messages: 0 of 10 rows"
+        );
+    }
+    /// An omp advisor sidecar's notes cover their rows without vectors: neither the inline
+    /// overlay nor a drain embeds them, the snapshot is complete, and no meaning hit names them.
+    #[test]
+    fn advisor_sidecar_rows_stay_out_of_the_meaning_lane() {
+        let (_t, r, o) = setup();
+        insert(&r, 1, "root", "alpha");
+        insert(&r, 2, "root", "alpha");
+        {
+            let c = store::writer(&r).unwrap();
+            for (rowid, path) in [
+                (1, "/h/.omp/agent/sessions/-w/2026_s/session-1.jsonl"),
+                (
+                    2,
+                    "/h/.omp/agent/sessions/-w/2026_s/Reviewer/__advisor.jsonl",
+                ),
+            ] {
+                c.execute(
+                    "INSERT INTO sources(rowid,path,agent,size,mtime_ns,change_token) VALUES(?,?,'pi',0,0,x'')",
+                    params![rowid, path],
+                )
+                .unwrap();
+            }
+            c.execute("UPDATE prose SET source=2 WHERE id=2", [])
+                .unwrap();
+        }
+        let c = store::reader(&r).unwrap();
+        let overlay = budget::Overlay::snapshot(&c, &coverage(&c).unwrap()).unwrap();
+        assert_eq!(overlay.texts, ["connection timeout row 1"]);
+        drop(c);
+        let mut embedded = Vec::new();
+        drain_with(&r, Drain::default(), |texts| {
+            embedded.extend_from_slice(texts);
+            let mut v = vec![0f32; semantic_model::DIM];
+            v[0] = 1.;
+            Ok(vec![v; texts.len()])
+        })
+        .unwrap();
+        assert_eq!(embedded, ["connection timeout row 1"]);
+        let c = store::reader(&r).unwrap();
+        assert!(!coverage(&c).unwrap().building());
+        assert!(!semantic_store::pending(&c).unwrap());
+        let mut q = vec![0f32; semantic_model::DIM];
+        q[0] = 1.;
+        let found = search_vector(&r, &c, &o, false, &q).unwrap();
+        assert_eq!(
+            found
+                .hits
+                .iter()
+                .map(|h| h.session.as_str())
+                .collect::<Vec<_>>(),
+            ["session-1"]
+        );
     }
     /// Equal cosines spread through the blocks of a parallel scan resolve to one order on
     /// every search: by cosine, then newest, then session and turn, one row a session.

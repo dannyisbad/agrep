@@ -1,6 +1,7 @@
 use agrep_core::surface::line;
 use agrep_core::{data::DataRoot, semantic, store};
 use anyhow::Result;
+use std::io::IsTerminal;
 use std::time::Instant;
 
 pub(crate) fn run(full: bool, with_semantic: bool) -> Result<i32> {
@@ -15,14 +16,15 @@ pub(crate) fn run(full: bool, with_semantic: bool) -> Result<i32> {
         semantic::mark_index_changed(&root)?;
     }
     if with_semantic {
-        semantic::provision(&root)?;
+        super::setup::download_model(&root)?;
         let drain = semantic::Drain {
             explicit: true,
+            progress: std::io::stderr().is_terminal(),
             ..Default::default()
         };
         super::work::after_index(&root, Some(drain))?;
         let coverage = semantic::coverage(&store::reader(&root)?)?;
-        eprintln!("meaning index ready: {} rows", coverage.total);
+        agrep_core::errln!("meaning index ready: {} rows", coverage.total);
     } else {
         super::work::after_index(&root, None)?;
     }
@@ -44,10 +46,10 @@ pub(crate) fn reindex(full: bool, max_new: Option<i64>) -> Result<i32> {
     let root = DataRoot::discover()?;
     root.validate(true)?;
     line("\n=== ingest transcripts ===")?;
-    let first = !root.db().exists();
     let refresh = store::reindex(&root)?;
     let after = Instant::now();
-    report(&root, &refresh, first)?;
+    // The rebuild announced itself before parsing (store::reindex).
+    report(&root, &refresh, true)?;
     line(&format!("  ({:.1}s)", started.elapsed().as_secs_f64()))?;
     if full {
         semantic::reset(&root)?;
@@ -76,11 +78,12 @@ pub(crate) fn reindex(full: bool, max_new: Option<i64>) -> Result<i32> {
     let limit = max_new.map(|n| n as usize);
     let pending = coverage.total.saturating_sub(coverage.embedded);
     if let Some(n) = limit.filter(|&n| embedding && pending > n) {
-        eprintln!("capping at {n} newest of {pending} pending messages");
+        agrep_core::errln!("capping at {n} newest of {pending} pending messages");
     }
     let stage = Instant::now();
     let drain = semantic::Drain {
         limit,
+        progress: std::io::stderr().is_terminal(),
         ..Default::default()
     };
     super::work::after_index(&root, Some(drain))?;
@@ -102,15 +105,10 @@ fn changed(refresh: &store::Refresh) -> bool {
 /// 0.4.9's index report (crates/agrep-cli/src/main.rs:6245-6251, 7580-7615) with the lines
 /// that describe 0.5's index: its message and session counts, the time the refresh took,
 /// its phases, and the setup pointer while no agent is enrolled. An unchanged pass names
-/// only its census, and ends there.
-fn report(root: &DataRoot, refresh: &store::Refresh, first: bool) -> Result<()> {
+/// only its census, and ends there. `announced` is a build that said so before it started.
+fn report(root: &DataRoot, refresh: &store::Refresh, announced: bool) -> Result<()> {
     let c = store::reader(root)?;
-    // 0.4.9 counted one message record per user-side row, its reply attached.
-    let messages: i64 = c.query_row(
-        "SELECT coalesce((SELECT CAST(value AS INTEGER) FROM state WHERE key='prose_user_count'),0)",
-        [],
-        |r| r.get(0),
-    )?;
+    let messages = agrep_core::diagnostics::messages(&c)?;
     let ms = |v: f64| format!("{v:.0}ms");
     if !changed(refresh) {
         line(&format!(
@@ -136,9 +134,8 @@ fn report(root: &DataRoot, refresh: &store::Refresh, first: bool) -> Result<()> 
     if root.config()?.enrollment.is_empty() {
         line("  next: `agrep setup` - teach your agents to search this history")?;
     }
-    // A first build announced itself before parsing (store::refresh).
-    if !first {
-        eprintln!("refreshing the search db …");
+    if !announced {
+        agrep_core::errln!("refreshing the search db …");
     }
     Ok(())
 }

@@ -134,20 +134,24 @@ pub fn build_progress(c: &Connection, coverage: &Coverage) -> Result<BuildProgre
         estimated_seconds: (remaining as f64 / rate).ceil() as u64,
     })
 }
+/// A duration as the build's estimates say it: `1h 5m`, `15m 19s`, `42s`.
+pub fn time_left(seconds: u64) -> String {
+    if seconds >= 3600 {
+        format!("{}h {}m", seconds / 3600, seconds % 3600 / 60)
+    } else if seconds >= 60 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
 impl std::fmt::Display for BuildProgress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let seconds = self.estimated_seconds;
-        let left = if seconds >= 3600 {
-            format!("{}h {}m", seconds / 3600, seconds % 3600 / 60)
-        } else if seconds >= 60 {
-            format!("{}m {}s", seconds / 60, seconds % 60)
-        } else {
-            format!("{seconds}s")
-        };
         write!(
             f,
-            "the meaning index is still building ({} of {} rows, about {left} left)",
-            self.indexed_rows, self.total_rows
+            "the meaning index is still building ({} of {} rows, about {} left)",
+            self.indexed_rows,
+            self.total_rows,
+            time_left(self.estimated_seconds)
         )
     }
 }

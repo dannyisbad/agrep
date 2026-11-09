@@ -155,6 +155,7 @@ inout 0.1.4 | MIT OR Apache-2.0 | https://github.com/RustCrypto/utils
 is_terminal_polyfill 1.70.2 | MIT OR Apache-2.0 | https://github.com/polyfill-rs/is_terminal_polyfill
 itertools 0.14.0 | MIT OR Apache-2.0 | https://github.com/rust-itertools/itertools
 itoa 1.0.18 | MIT OR Apache-2.0 | https://github.com/dtolnay/itoa
+jobserver 0.1.35 | MIT OR Apache-2.0 | https://github.com/rust-lang/jobserver-rs
 lazy_static 1.5.1 | MIT OR Apache-2.0 | https://github.com/rust-lang-nursery/lazy-static.rs
 libc 0.2.191 | MIT OR Apache-2.0 | https://github.com/rust-lang/libc
 libloading 0.8.9 | ISC | https://github.com/nagisa/rust_libloading/
@@ -300,6 +301,7 @@ unicode-ident 1.0.27 | (MIT OR Apache-2.0) AND Unicode-3.0 | https://github.com/
 unicode-normalization 0.1.24 | MIT/Apache-2.0 | https://github.com/unicode-rs/unicode-normalization
 unicode-normalization-alignments 0.1.12 | MIT/Apache-2.0 | https://github.com/n1t0/unicode-normalization
 unicode-segmentation 1.12.0 | MIT OR Apache-2.0 | https://github.com/unicode-rs/unicode-segmentation
+unicode-width 0.2.2 | MIT OR Apache-2.0 | https://github.com/unicode-rs/unicode-width
 unicode_categories 0.1.1 | MIT OR Apache-2.0 | https://github.com/swgillespie/unicode-categories
 universal-hash 0.5.1 | MIT OR Apache-2.0 | https://github.com/RustCrypto/traits
 untrusted 0.9.0 | ISC | https://github.com/briansmith/untrusted
@@ -313,11 +315,9 @@ webpki-roots 1.0.11 | CDLA-Permissive-2.0 | https://github.com/rustls/webpki-roo
 winapi 0.3.9 | MIT/Apache-2.0 | https://github.com/retep998/winapi-rs
 windows-link 0.2.1 | MIT OR Apache-2.0 | https://github.com/microsoft/windows-rs
 windows-sys 0.52.0 | MIT OR Apache-2.0 | https://github.com/microsoft/windows-rs
-windows-sys 0.59.0 | MIT OR Apache-2.0 | https://github.com/microsoft/windows-rs
 windows-sys 0.61.2 | MIT OR Apache-2.0 | https://github.com/microsoft/windows-rs
 windows-targets 0.52.6 | MIT OR Apache-2.0 | https://github.com/microsoft/windows-rs
 windows_aarch64_msvc 0.52.6 | MIT OR Apache-2.0 | https://github.com/microsoft/windows-rs
-windows_x86_64_msvc 0.52.6 | MIT OR Apache-2.0 | https://github.com/microsoft/windows-rs
 x25519-dalek 2.0.1 | BSD-3-Clause | https://github.com/dalek-cryptography/curve25519-dalek/tree/main/x25519-dalek
 yoke 0.7.5 | Unicode-3.0 | https://github.com/unicode-org/icu4x
 yoke 0.8.4 | Unicode-3.0 | https://github.com/unicode-org/icu4x
@@ -332,6 +332,9 @@ zeroize_derive 1.5.0 | Apache-2.0 OR MIT | https://github.com/RustCrypto/utils
 zip 7.4.0 | MIT | https://github.com/zip-rs/zip2.git
 zlib-rs 0.6.8 | Zlib | https://github.com/trifectatechfoundation/zlib-rs
 zmij 1.0.23 | MIT | https://github.com/dtolnay/zmij
+zstd 0.14.3 | BSD-3-Clause | https://github.com/gyscos/zstd-rs
+zstd-safe 8.2.0 | BSD-3-Clause | https://github.com/gyscos/zstd-rs
+zstd-sys 2.1.2+zstd.1.5.7 | BSD-3-Clause | https://github.com/gyscos/zstd-rs
 
 License texts
 -------------
@@ -1048,6 +1051,7 @@ DEALINGS IN THE SOFTWARE.
 - httparse 1.10.1 (LICENSE-APACHE)
 - indexmap 2.14.2 (LICENSE-APACHE)
 - itertools 0.14.0 (LICENSE-APACHE)
+- jobserver 0.1.35 (LICENSE-APACHE)
 - lazy_static 1.5.1 (LICENSE-APACHE)
 - linux-raw-sys 0.12.1 (LICENSE-APACHE)
 - linux-raw-sys 0.4.15 (LICENSE-APACHE)
@@ -1089,6 +1093,7 @@ DEALINGS IN THE SOFTWARE.
 - unicode-normalization 0.1.24 (LICENSE-APACHE)
 - unicode-normalization-alignments 0.1.12 (LICENSE-APACHE)
 - unicode-segmentation 1.12.0 (LICENSE-APACHE)
+- unicode-width 0.2.2 (LICENSE-APACHE)
 - vcpkg 0.2.15 (LICENSE-APACHE)
 - version_check 0.9.5 (LICENSE-APACHE)
 
@@ -2892,6 +2897,7 @@ SOFTWARE.
 - cc 1.10.0 (LICENSE-MIT)
 - cfg-if 1.0.5 (LICENSE-MIT)
 - find-msvc-tools 0.1.15 (LICENSE-MIT)
+- jobserver 0.1.35 (LICENSE-MIT)
 - pkg-config 0.3.34 (LICENSE-MIT)
 
 Copyright (c) 2014 Alex Crichton
@@ -5565,6 +5571,7 @@ DEALINGS IN THE SOFTWARE.
 - unicode-normalization 0.1.24 (LICENSE-MIT)
 - unicode-normalization-alignments 0.1.12 (LICENSE-MIT)
 - unicode-segmentation 1.12.0 (LICENSE-MIT)
+- unicode-width 0.2.2 (LICENSE-MIT)
 
 Copyright (c) 2015 The Rust Project Developers
 
@@ -10812,11 +10819,9 @@ SOFTWARE.
 [198] Applies to:
 - windows-link 0.2.1 (license-apache-2.0)
 - windows-sys 0.52.0 (license-apache-2.0)
-- windows-sys 0.59.0 (license-apache-2.0)
 - windows-sys 0.61.2 (license-apache-2.0)
 - windows-targets 0.52.6 (license-apache-2.0)
 - windows_aarch64_msvc 0.52.6 (license-apache-2.0)
-- windows_x86_64_msvc 0.52.6 (license-apache-2.0)
 
                                  Apache License
                            Version 2.0, January 2004
@@ -11023,11 +11028,9 @@ SOFTWARE.
 [199] Applies to:
 - windows-link 0.2.1 (license-mit)
 - windows-sys 0.52.0 (license-mit)
-- windows-sys 0.59.0 (license-mit)
 - windows-sys 0.61.2 (license-mit)
 - windows-targets 0.52.6 (license-mit)
 - windows_aarch64_msvc 0.52.6 (license-mit)
-- windows_x86_64_msvc 0.52.6 (license-mit)
 
     MIT License
 
@@ -11512,3 +11515,73 @@ freely, subject to the following restrictions:
    misrepresented as being the original software.
 
 3. This notice may not be removed or altered from any source distribution.
+
+[209] Applies to:
+- zstd 0.14.3 (LICENSE)
+- zstd-safe 8.2.0 (LICENSE)
+- zstd-sys 2.1.2+zstd.1.5.7 (LICENSE)
+
+BSD 3-Clause License
+
+Copyright (c) 2026, Alexandre Bury
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+[210] Applies to:
+- zstd-sys 2.1.2+zstd.1.5.7 (LICENSE.BSD-3-Clause)
+
+The auto-generated bindings are under the 3-clause BSD license:
+
+BSD License
+
+For Zstandard software
+
+Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+ * Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+ * Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+ * Neither the name Facebook, nor Meta, nor the names of its contributors may
+   be used to endorse or promote products derived from this software without
+   specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
