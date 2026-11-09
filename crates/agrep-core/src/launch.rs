@@ -25,9 +25,16 @@ const RESUMABLE: [&str; 5] = ["claude", "codex", "opencode", "antigravity", "pi"
 pub fn capability(agent: &str) -> Result<(&'static str, &'static str)> {
     resolve(agent, "native resume")
 }
-/// `agrep run`'s check: it launches the agents native resume serves, and an unknown name
-/// is refused for the command it was given to.
+/// `agrep run`'s check: it launches the agents native resume serves; any other name is
+/// refused for the command it was given to.
 pub fn launchable(agent: &str) -> Result<()> {
+    let name = history::normalize_agent(agent);
+    if NO_RESUME.iter().any(|(known, _)| *known == name) {
+        bail!(
+            "{name} can't be launched by agrep run; supported for agrep run: {}",
+            RESUMABLE.join(", ")
+        );
+    }
     resolve(agent, "agrep run").map(drop)
 }
 fn resolve(agent: &str, purpose: &str) -> Result<(&'static str, &'static str)> {
@@ -38,10 +45,6 @@ fn resolve(agent: &str, purpose: &str) -> Result<(&'static str, &'static str)> {
         "opencode" => Ok(("opencode", "--session")),
         "antigravity" => Ok(("agy", "--conversation")),
         "pi" => Ok(("pi", "-r")),
-        _ if NO_RESUME.iter().any(|(known, _)| *known == name) => bail!(
-            "{}",
-            history::capability_error("native resume", name, &RESUMABLE, NO_RESUME)
-        ),
         _ => bail!(
             "{}",
             history::capability_error(purpose, name, &RESUMABLE, NO_RESUME)

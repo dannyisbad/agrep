@@ -134,10 +134,19 @@ fn chat_previews_show_the_match() {
 // The last compact page of a cut search names the larger `-n` rerun (PORTING.md).
 #[test]
 fn compact_pages_end_with_the_larger_rerun() {
-    let turns: Vec<String> = (0..9).map(|i| format!("zebrafish note {i}")).collect();
-    let turns: Vec<&str> = turns.iter().map(String::as_str).collect();
-    let sessions: Vec<(String, &[&str])> = (0..6)
-        .map(|n| (format!("/work/p{n}"), turns.as_slice()))
+    // Each chat's turns are its own: the fixture's shared clock would make equal words in
+    // every chat copies of one message, which a page folds.
+    let turns: Vec<Vec<String>> = (0..6)
+        .map(|n| (0..9).map(|i| format!("zebrafish note {n}.{i}")).collect())
+        .collect();
+    let turns: Vec<Vec<&str>> = turns
+        .iter()
+        .map(|t| t.iter().map(String::as_str).collect())
+        .collect();
+    let sessions: Vec<(String, &[&str])> = turns
+        .iter()
+        .enumerate()
+        .map(|(n, t)| (format!("/work/p{n}"), t.as_slice()))
         .collect();
     let sessions: Vec<(&str, &[&str])> = sessions.iter().map(|(p, t)| (p.as_str(), *t)).collect();
     let home = Home::new(&sessions);

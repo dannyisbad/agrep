@@ -2,18 +2,67 @@ use crate::ready;
 use agrep_core::{history as h, ingest::claude::launch as claude, launch, render, store};
 use anyhow::{bail, Result};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     io::{IsTerminal, Write},
     path::{Path, PathBuf},
 };
-fn label(s: &h::Session, color: &str) -> String {
+fn label(s: &h::Session, agent: &str, color: &str) -> String {
     format!(
         "{} · {}  {}  {}",
-        super::paint(&s.agent, color),
+        super::paint(agent, color),
         render::safe(&s.project),
         h::target(&s.id),
         render::safe(&h::one_line(&s.title, 70))
     )
+}
+/// What a resume of a session starts, so the picker names the agent its launch line will.
+struct Launcher<'c> {
+    c: &'c rusqlite::Connection,
+    /// The pi family's executable per fork, looked up on PATH once.
+    forks: HashMap<&'static str, Option<PathBuf>>,
+}
+impl Launcher<'_> {
+    /// The pi-family fork that wrote `s`: omp keeps its sessions under `.omp`.
+    fn fork(&self, s: &h::Session) -> &'static str {
+        let source: String = self
+            .c
+            .prepare_cached("SELECT src.path FROM sources src JOIN prose p ON p.source=src.rowid WHERE p.session=?1 AND p.agent=?2 AND p.visible=1 LIMIT 1")
+            .and_then(|mut q| q.query_row([&s.id, &s.agent], |r| r.get(0)))
+            .unwrap_or_default();
+        if source.replace('\\', "/").contains("/.omp/") {
+            "omp"
+        } else {
+            "pi"
+        }
+    }
+    fn fork_executable(&mut self, s: &h::Session, fork: &'static str) -> Result<Option<PathBuf>> {
+        if let Some(found) = self.forks.get(fork) {
+            return Ok(found.clone());
+        }
+        let found = launch::choose_executable(&s.agent, Some(fork))?;
+        self.forks.insert(fork, found.clone());
+        Ok(found)
+    }
+    fn executable(&mut self, s: &h::Session) -> Result<Option<PathBuf>> {
+        if h::normalize_agent(&s.agent) == "pi" {
+            let fork = self.fork(s);
+            self.fork_executable(s, fork)
+        } else {
+            launch::choose_executable(&s.agent, None)
+        }
+    }
+    /// The agent a resume of `s` starts: for the pi family, the fork found on PATH, else
+    /// the one that wrote it.
+    fn agent(&mut self, s: &h::Session) -> Result<String> {
+        if h::normalize_agent(&s.agent) != "pi" {
+            return Ok(s.agent.clone());
+        }
+        let fork = self.fork(s);
+        Ok(match self.fork_executable(s, fork)? {
+            Some(exe) => launch::launched_agent(&s.agent, &exe).into_owned(),
+            None => fork.into(),
+        })
+    }
 }
 pub fn run(
     reference: Option<String>,
@@ -38,12 +87,16 @@ pub fn run(
         agrep_core::errln!("no matching session; run agrep chats");
         return Ok(if list || reference.is_none() { 2 } else { 1 });
     }
+    let mut launcher = Launcher {
+        c: &c,
+        forks: HashMap::new(),
+    };
     if list {
         if max > 0 {
             selected.truncate(max)
         }
         for s in selected {
-            agrep_core::outln!("{}", label(s, color))?;
+            agrep_core::outln!("{}", label(s, &launcher.agent(s)?, color))?;
         }
         return Ok(0);
     }
@@ -55,7 +108,7 @@ pub fn run(
             n => &selected[..n.min(selected.len())],
         };
         for (n, s) in shown.iter().enumerate() {
-            agrep_core::errln!("{:>2}  {}", n + 1, label(s, color));
+            agrep_core::errln!("{:>2}  {}", n + 1, label(s, &launcher.agent(s)?, color));
         }
         if !human || !std::io::stdin().is_terminal() {
             agrep_core::errln!("pass a unique session reference to resume");
@@ -75,13 +128,7 @@ pub fn run(
     };
     // 0.4.9 printed the refusal as a bare line (py/hookless/native.py:999-1002).
     launch::capability(&chosen.agent).map_err(|e| super::usage::refusal("", e))?;
-    let source:String=c.query_row("SELECT src.path FROM sources src JOIN prose p ON p.source=src.rowid WHERE p.session=?1 AND p.agent=?2 AND p.visible=1 LIMIT 1",[&chosen.id,&chosen.agent],|r|r.get(0)).unwrap_or_default();
-    let preferred = if source.replace('\\', "/").contains("/.omp/") {
-        Some("omp")
-    } else {
-        Some("pi")
-    };
-    let Some(exe) = launch::choose_executable(&chosen.agent, preferred)? else {
+    let Some(exe) = launcher.executable(chosen)? else {
         agrep_core::errln!("the {} CLI is not on PATH", chosen.agent);
         return Ok(127);
     };

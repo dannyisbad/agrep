@@ -171,7 +171,9 @@ fn ciphertext_send_message(name: &str, input: &serde_json::Value) -> bool {
 }
 
 /// A function_call_output's `output`: usually a plain string, which is sometimes itself
-/// JSON `{"output": "...", "metadata": {"exit_code": 0}}`. Returns (text, ok-if-known).
+/// JSON `{"output": "...", "metadata": {"exit_code": 0}}`, or a list of content items
+/// whose text items it newline-joins as 0.4.9 joined message text (py/hookless/live.py:443-447).
+/// Returns (text, ok-if-known).
 pub(super) fn parse_call_output(v: &serde_json::Value) -> (String, usize, usize, Option<bool>) {
     let from_obj = |o: &serde_json::Map<String, serde_json::Value>| {
         let text = o
@@ -206,6 +208,21 @@ pub(super) fn parse_call_output(v: &serde_json::Value) -> (String, usize, usize,
             (text, chars, bytes, ok)
         }
         serde_json::Value::Null => (String::new(), 0, 0, None),
+        serde_json::Value::Array(items) => {
+            let text = items
+                .iter()
+                .filter(|item| {
+                    item.get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|ty| ["input_text", "output_text", "text"].contains(&ty))
+                })
+                .filter_map(|item| item.get("text").and_then(serde_json::Value::as_str))
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let (capped, chars, bytes) = cap_event_output(&text);
+            (capped, chars, bytes, sniff_exit_code(&text))
+        }
         other => {
             let (text, chars, bytes) = cap_event_output(&other.to_string());
             (text, chars, bytes, None)

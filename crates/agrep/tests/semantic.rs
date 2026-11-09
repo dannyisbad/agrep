@@ -37,10 +37,18 @@ fn missing_model_is_one_line_exit_two_and_hybrid_stays_lexical() {
     assert!(!String::from_utf8_lossy(&out.stderr).contains("semantic"));
     assert!(!t.path().join("model").exists());
 }
+/// A measured slow cost refuses a backlog larger than an uncalibrated query prepares
+/// before loading weights: hybrid stays keyword-only and `-s` exits 2 with progress.
 #[test]
-fn measured_query_cost_can_refuse_one_queued_row_before_loading_weights() {
+fn measured_query_cost_refuses_a_large_backlog_before_loading_weights() {
     let t = tempfile::tempdir().unwrap();
-    transcript(&t);
+    let dir = t.path().join(".pi/agent/sessions/fixture");
+    fs::create_dir_all(&dir).unwrap();
+    let mut source = String::from("{\"type\":\"session\",\"id\":\"backlog-fixture\",\"version\":3,\"cwd\":\"/fixture\",\"timestamp\":\"2026-10-29T10:00:00Z\"}\n");
+    for n in 0..40 {
+        source.push_str(&format!("{}\n", serde_json::json!({"type":"message","id":format!("m{n}"),"parentId":if n==0 {None} else {Some(format!("m{}",n-1))},"timestamp":"2026-10-29T10:01:00Z","message":{"role":"user","content":[{"type":"text","text":format!("database migration failure number {n}")}]}})));
+    }
+    fs::write(dir.join("case.jsonl"), source).unwrap();
     assert!(agrep(&t).arg("index").output().unwrap().status.success());
     let root = DataRoot::open(t.path().join("data"), false).unwrap();
     let key = format!(
@@ -85,13 +93,17 @@ fn measured_query_cost_can_refuse_one_queued_row_before_loading_weights() {
     assert!(out.stderr.is_empty());
     let meta: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(meta["error"]["code"], "semantic-unavailable");
-    assert_eq!(meta["semantic"]["progress"]["remaining_rows"], 1);
+    assert_eq!(meta["semantic"]["progress"]["remaining_rows"], 40);
     let out = command()
         .args(["search", "database migration failure"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(0));
-    assert!(out.stderr.is_empty());
+    let notice = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !notice.contains("semantic") && !notice.contains("meaning"),
+        "{notice}"
+    );
     assert!(String::from_utf8_lossy(&out.stdout).contains("database migration failure"));
 }
 #[test]
@@ -149,7 +161,7 @@ fn a_building_meaning_index_never_answers_partially() {
         let out = run(&t, &[command, "-s", "database migration failure"]);
         assert_eq!(out.status.code(), Some(2), "{command}");
         assert!(out.stdout.is_empty());
-        assert_eq!(String::from_utf8_lossy(&out.stderr), "semantic search unavailable: the meaning index is still building (0 of 1024 rows, about 18s left)\n");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "semantic search unavailable: the meaning index is still building (0 of 1,024 rows, estimating time left)\n");
         let out = run(&t, &[command, "-s", "--json", "database migration failure"]);
         assert_eq!(out.status.code(), Some(2), "{command}");
         assert!(out.stderr.is_empty());
@@ -162,7 +174,7 @@ fn a_building_meaning_index_never_answers_partially() {
         };
         assert_eq!(
             status["progress"],
-            serde_json::json!({"indexed_rows":0,"total_rows":1024,"remaining_rows":1024,"estimated_seconds":18})
+            serde_json::json!({"indexed_rows":0,"total_rows":1024,"remaining_rows":1024,"estimated_seconds":null})
         );
         assert!(meta["semantic_coverage"].is_null());
         assert!(meta.get("semantic_partial").is_none());
@@ -172,6 +184,17 @@ fn a_building_meaning_index_never_answers_partially() {
     let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(status["semantic"]["state"], "building");
     assert_eq!(status["semantic"]["progress"]["remaining_rows"], 1024);
+    // QA3 item 5: the time left is estimated only from a rate this machine measured, which a
+    // rebuild keeps.
+    store::writer(&root)
+        .unwrap()
+        .execute(
+            "INSERT INTO state VALUES('semantic_rows_per_second','128') ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [],
+        )
+        .unwrap();
+    let out = run(&t, &["search", "-s", "database migration failure"]);
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "semantic search unavailable: the meaning index is still building (0 of 1,024 rows, about 8s left)\n");
 }
 // Expected lines and fields are agrep 0.4.9's for `-s foo_bar` (py/search.py:7686-7719,
 // py/recall.py:2717-2747).
@@ -606,6 +629,18 @@ fn a_corrupt_model_is_rejected_once_and_named_with_its_fix() {
         status.contains(" - `agrep setup` reinstalls it\n"),
         "{status}"
     );
+    // QA3 item 5: `-s` named the mismatch without the fix.
+    let search = agrep(&t)
+        .args(["search", "-s", "database migration failure"])
+        .output()
+        .unwrap();
+    assert_eq!(search.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&search.stderr);
+    assert!(
+        stderr.starts_with("semantic search unavailable: model SHA-256 mismatch: ")
+            && stderr.ends_with(" - `agrep setup` reinstalls it\n"),
+        "{stderr}"
+    );
     let doctor = String::from_utf8(agrep(&t).arg("doctor").output().unwrap().stdout).unwrap();
     assert!(doctor.starts_with("doctor: action needed\n"), "{doctor}");
     assert!(
@@ -626,7 +661,8 @@ fn a_corrupt_model_is_rejected_once_and_named_with_its_fix() {
     );
 }
 
-// QA finding 9: on a home with no index, doctor said only `action needed`.
+// QA finding 9: on a home with no index, doctor said only `action needed`. QA3 item 5: it did
+// not say the home holds no agent history, and `semantic_model: not_checked` explained nothing.
 #[test]
 fn doctor_names_a_missing_index_and_its_command() {
     let t = tempfile::tempdir().unwrap();
@@ -634,6 +670,13 @@ fn doctor_names_a_missing_index_and_its_command() {
     assert!(out.status.success());
     assert_eq!(
         String::from_utf8(out.stdout).unwrap(),
-        "doctor: action needed\nindex: missing - run `agrep index`\nsemantic_model: not_checked\n"
+        format!(
+            "doctor: action needed\nindex: missing - run `agrep index`\n\
+             agent_history: none found - no supported agent history under {} (looked for claude, \
+             codex, opencode, antigravity, kimi, cline, gemini, crush, cursor and pi stores) - \
+             agrep indexes it once one of these agents records a session\n\
+             semantic_model: not installed - `agrep setup` installs it\n",
+            t.path().display()
+        )
     );
 }

@@ -61,6 +61,32 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   meaning rows, even with `-s --who subagent`. 0.4.9 embedded them, and their short status
   notes (`Nothing to flag.`) crowded real answers out of `-s`. Keyword search, `--who
   subagent`, counts and `around` show them as before.
+- A message that several chats hold as copies (a pi or omp fork copies its parent's
+  history, ids and times included) is one meaning row: the copy from the most recently
+  active chat, marked `also in N forks`, with the other copies under its JSON `forks` and
+  as their own rows in `--flat`. 0.4.9 folded rows only after the page was cut (and only
+  on its compact and grouped pages, as `×N-chats`), so on the owner's history three
+  copies of one turn took three of `-s -n 5`'s five rows and its JSON listed all three.
+  0.5 folds while it ranks, so the page fills with other answers, and it folds only
+  copies of one message (same speaker, text and time), not different chats that typed
+  the same words. `-l` still lists every chat and `-c` counts every chat.
+- Keyword pages fold fork copies by the same rule: a message several chats hold as
+  copies (same agent, speaker, text and time) is one row at its best copy's rank, shown
+  from the most recently active chat and marked `also in N forks` (`(also in N forks)`
+  on a compact row); its JSON row lists the other copies under `forks` and `--flat`
+  prints them right after it. The copies take no row, so the page ranks deeper to fill
+  `-n`, and on keyword and meaning pages alike `shown` and `showing N of M` count them,
+  so a page whose copies it stands for is not cut. 0.4.9 folded keyword rows only on
+  its compact and grouped pages (`×N-chats`, `×N chats`), keeping the best-ranked copy,
+  while `--json` and `--flat` listed every copy at its own rank; it also folded rows of
+  different chats with the same speaker and words (one prompt sent to many subagents)
+  and near-identical successful tool rows of one conversation lineage. 0.5 folds only
+  copies of one message, in every page form, so keyword and meaning pages agree. `-l`
+  lists every chat and `-c` counts every row, as in 0.4.9.
+- `--chat` on a Codex fork child also searches its parent's rows up to the fork. The
+  child's rollout starts by replaying the parent's history, which is indexed once, under
+  the parent; 0.4.9 searched only the child's own rows, so `-c --chat <child>` answered
+  `0` (exit 1) for text the child's file holds. One stderr line names the parent.
 - Meaning search answers only from a complete snapshot. 0.4.9 searched the vectors
   already published, even with unembedded rows, and disclosed that gap through
   coverage numbers, partial flags and lines such as `catching up; retry shortly`.
@@ -184,6 +210,13 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   (`agrep index`), each source that failed to read, a corrupt or half-installed model
   (`agrep setup` reinstalls it), an unwritable data directory. Background embedding logs a
   model's failed verification once and then leaves those files alone until they change.
+- A source that failed to read is listed with its cause alone (`source failed: PATH:
+  permission denied`), and `index` and `reindex` end with one stderr line naming how many
+  failed, the first with its cause, and `agrep doctor` for the rest. 0.4.9's ingest printed
+  a `cannot read` line per file as it went; 0.5 collects the failures and reports them once.
+- On a home where no supported agent keeps a store, `doctor` says so and names the agents it
+  looked for. Its model row reads `present`, `not installed` (`agrep setup` installs it) or
+  `failed`, and it checks an installed model even before the first index.
 - A data directory this user may not write behaves as under `AGREP_DATA_READONLY`: commands
   answer from its index with freshness unchecked, after one stderr line naming the directory,
   and `doctor` names it. Without an index there, the refusal names the directory.
@@ -307,6 +340,12 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   to the wrong kind (a folder link to a file, a database link to a folder), or leads into or
   around another store root (so that one store would be read twice) is listed by `status`
   and `doctor` as a failed source naming the reason.
+- A Codex tool result written as a list of content items (`[{"type":"input_text","text":
+  "Script completed…"}, …]`, as Codex's script tools write it) is indexed as the text of
+  those items, one per line, the way 0.4.9 joined a Codex message's text, where 0.4.9 indexed
+  the list's raw JSON. Search, snippets and the 800-character cap now see the tool's own words
+  instead of the JSON wrapper and its escapes, image items add nothing, and a `Process exited
+  with code N` line in the text sets the call's outcome, as it does for a plain-text result.
 
 ## Integrations and archive port
 
@@ -350,6 +389,14 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   `stat` per chunk. A restore that meets such a chunk says the archived copy is damaged,
   naming the chunk, the archive directory and the remedy, where 0.4.9 gave the file system's
   error for a missing chunk and `chunk … corrupt in archive store` for a corrupt one.
+- `doctor --deep` decompresses and re-hashes every chunk the catalog references, where
+  0.4.9's deep tier validated the archive manifest only: a chunk overwritten in place, which
+  keeps its file's size and date and so passes a capture's `stat` check, is found too. It
+  reports the damaged versions in two groups: those whose content a live file still holds,
+  which `agrep archive` re-stores, and those no live file holds, which are lost, listed by
+  path. It records what it found in the catalog, so `archive --status` and `doctor` report
+  it from then on and the next capture re-reads those chunks; it writes nothing when it
+  finds no damage. Plain `doctor` and `archive --status` read no chunk.
 - An unreadable catalog is named, with `agrep archive --purge --yes` as its remedy, by every
   archive command; the purge replaces it with an empty catalog and deletes every chunk, and
   `--status` exits 2, as 0.4.9's did for an unreadable manifest.

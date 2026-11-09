@@ -106,9 +106,20 @@ fn changed(refresh: &store::Refresh) -> bool {
 /// that describe 0.5's index: its message and session counts, the time the refresh took,
 /// its phases, and the setup pointer while no agent is enrolled. An unchanged pass names
 /// only its census, and ends there. `announced` is a build that said so before it started.
+/// Either way, sources whose last read failed get one line on stderr.
 fn report(root: &DataRoot, refresh: &store::Refresh, announced: bool) -> Result<()> {
     let c = store::reader(root)?;
-    let messages = agrep_core::diagnostics::messages(&c)?;
+    summary(root, &c, refresh, announced)?;
+    failed_sources(&c)
+}
+
+fn summary(
+    root: &DataRoot,
+    c: &rusqlite::Connection,
+    refresh: &store::Refresh,
+    announced: bool,
+) -> Result<()> {
+    let messages = agrep_core::diagnostics::messages(c)?;
     let ms = |v: f64| format!("{v:.0}ms");
     if !changed(refresh) {
         line(&format!(
@@ -136,6 +147,29 @@ fn report(root: &DataRoot, refresh: &store::Refresh, announced: bool) -> Result<
     }
     if !announced {
         agrep_core::errln!("refreshing the search db …");
+    }
+    Ok(())
+}
+
+/// One stderr line for the sources whose last read failed: how many, the first with its
+/// reason, and where the rest are listed.
+fn failed_sources(c: &rusqlite::Connection) -> Result<()> {
+    let failed = agrep_core::diagnostics::failed_sources(c)?;
+    let Some(first) = failed.first() else {
+        return Ok(());
+    };
+    let first = format!(
+        "{}: {}",
+        agrep_core::render::safe(first["path"].as_str().unwrap_or("")),
+        agrep_core::render::safe(first["last_error"].as_str().unwrap_or(""))
+    );
+    if failed.len() == 1 {
+        agrep_core::errln!("1 source failed to read: {first} - it is read again once it changes");
+    } else {
+        agrep_core::errln!(
+            "{} sources failed to read, first {first} - `agrep doctor` lists the rest",
+            agrep_core::surface::number(failed.len())
+        );
     }
     Ok(())
 }

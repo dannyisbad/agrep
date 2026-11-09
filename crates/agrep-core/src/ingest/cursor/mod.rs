@@ -376,7 +376,7 @@ impl crate::ingest::registry::Adapter for Cursor {
     fn archive_roots(&self) -> Vec<PathBuf> {
         user_dir_candidates(&crate::ingest::home())
             .into_iter()
-            .map(|p| p.join("globalStorage/state.vscdb"))
+            .map(|p| p.join("globalStorage").join("state.vscdb"))
             .collect()
     }
     fn freshness_tokens(&self) -> crate::ingest::registry::TokenAvailability {

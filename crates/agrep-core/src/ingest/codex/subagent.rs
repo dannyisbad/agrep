@@ -195,3 +195,55 @@ pub(super) fn subagent_anchor(payload: &Payload<'_>, expected_recipient: &str) -
         None => format!("[subagent {label}] {task}"),
     })
 }
+
+/// The most of a rollout's head `fork_time` reads for its two leading records.
+const HEAD_CAP: u64 = 16 << 20;
+
+/// When the rollout at `path` is a fork child that replays its parent's history: the moment
+/// it forked, its own `session_meta` timestamp. Ingest keeps the replayed history only under
+/// the parent (`SubagentContext`), so the parent's rows up to then are the child's too.
+pub fn fork_time(path: &std::path::Path) -> Option<i64> {
+    let head =
+        crate::ingest::registry::read_regular_snapshot(path, |file| head_records(path, file))
+            .ok()
+            .flatten()
+            .flatten()?;
+    let mut records = head.into_iter();
+    let own = records.next()?;
+    let replayed = records.next();
+    let meta = (own["type"] == "session_meta").then_some(&own["payload"])?;
+    let id = meta["id"].as_str().filter(|id| !id.is_empty())?;
+    let replays = replayed.as_ref().is_some_and(|record| {
+        record["type"] == "session_meta"
+            && record["payload"]["id"]
+                .as_str()
+                .is_some_and(|parent| !parent.is_empty() && parent != id)
+    });
+    let forked = meta["forked_from_id"]
+        .as_str()
+        .is_some_and(|parent| !parent.is_empty());
+    if !(replays || forked) {
+        return None;
+    }
+    let at = crate::ingest::parse_timestamp::rfc3339(
+        meta["timestamp"].as_str().or(own["timestamp"].as_str()),
+    );
+    (at > 0).then_some(at)
+}
+
+/// A rollout's leading records, at most two, up to the first that does not parse.
+fn head_records(path: &std::path::Path, file: &std::fs::File) -> Option<Vec<serde_json::Value>> {
+    use std::io::{BufRead, Read};
+    let reader: Box<dyn Read + '_> = if super::discover::is_compressed(path) {
+        Box::new(zstd::stream::read::Decoder::new(file).ok()?)
+    } else {
+        Box::new(file)
+    };
+    Some(
+        std::io::BufReader::new(reader.take(HEAD_CAP))
+            .lines()
+            .take(2)
+            .map_while(|line| serde_json::from_str(&line.ok()?).ok())
+            .collect(),
+    )
+}

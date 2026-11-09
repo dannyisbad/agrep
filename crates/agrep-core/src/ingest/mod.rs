@@ -24,7 +24,8 @@ mod text;
 
 pub use project::{home, home_leaf, project_name};
 pub(crate) use read_failure::{
-    note_read_failure, read_failure_outcome, take_read_failure, SourceMoved,
+    error_reason, note_io_failure, note_read_failure, read_failure_outcome, take_read_failure,
+    SourceMoved,
 };
 pub use reply::{append_reply, ReplyOrder, AFTER_REPLY_META, REPLY_CAP, REPLY_TAIL_CAP};
 pub use sqlite::JOURNAL_PRESENT;

@@ -44,6 +44,7 @@ pub(super) fn parse_file(path: &Path) -> Parsed {
             ));
             tally.seen();
             tally.error(&format!("cannot read: {e}"));
+            crate::ingest::note_io_failure(path, &e);
             return (
                 Vec::new(),
                 Vec::new(),

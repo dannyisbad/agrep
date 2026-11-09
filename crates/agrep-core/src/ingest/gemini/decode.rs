@@ -34,6 +34,7 @@ fn parse_with_tally(
             ));
             tally.seen();
             tally.error(&format!("cannot read: {e}"));
+            crate::ingest::note_io_failure(path, &e);
             return (
                 Vec::new(),
                 Vec::new(),

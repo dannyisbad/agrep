@@ -90,7 +90,7 @@ pub fn targets_in(
         .map(|v| {
             let path = |key: &str| {
                 let base = if v[key]["base"] == "opencode_data" {
-                    home.join(".local/share/opencode")
+                    home.join(".local").join("share").join("opencode")
                 } else {
                     home.to_path_buf()
                 };
@@ -288,7 +288,7 @@ fn codex_dirs(home: &Path) -> Vec<PathBuf> {
     dirs.into_iter().filter(|p| p.is_dir()).collect()
 }
 fn extension_dirs(home: &Path) -> Vec<PathBuf> {
-    let mut omp = home.join(".omp/agent");
+    let mut omp = home.join(".omp").join("agent");
     if let Some(raw) = std::env::var_os("OMP_PROFILE").or_else(|| std::env::var_os("PI_PROFILE")) {
         let profile = PathBuf::from(raw);
         if profile.components().count() == 1
@@ -297,10 +297,14 @@ fn extension_dirs(home: &Path) -> Vec<PathBuf> {
                 Some(std::path::Component::Normal(_))
             )
         {
-            omp = home.join(".omp/profiles").join(profile).join("agent");
+            omp = home
+                .join(".omp")
+                .join("profiles")
+                .join(profile)
+                .join("agent");
         }
     }
-    [home.join(".pi/agent"), omp]
+    [home.join(".pi").join("agent"), omp]
         .into_iter()
         .filter(|p| p.is_dir())
         .collect()
@@ -308,13 +312,13 @@ fn extension_dirs(home: &Path) -> Vec<PathBuf> {
 pub fn hook_paths(home: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if home.join(".claude").is_dir() {
-        paths.extend([home.join(".claude/settings.json")]);
+        paths.extend([home.join(".claude").join("settings.json")]);
     }
     paths.extend(codex_dirs(home).iter().map(|p| p.join("hooks.json")));
     paths.extend(
         extension_dirs(home)
             .iter()
-            .map(|p| p.join("extensions/agrep-postcompact.ts")),
+            .map(|p| p.join("extensions").join("agrep-postcompact.ts")),
     );
     paths
 }
@@ -429,7 +433,7 @@ fn install_hooks(
     record: &mut impl FnMut(&Path, Result<Installed>) -> Result<()>,
 ) -> Result<()> {
     if home.join(".claude").is_dir() {
-        let path = home.join(".claude/settings.json");
+        let path = home.join(".claude").join("settings.json");
         record(
             &path,
             install_hook(
@@ -451,7 +455,7 @@ fn install_hooks(
         )?;
     }
     for base in extension_dirs(home) {
-        let path = base.join("extensions/agrep-postcompact.ts");
+        let path = base.join("extensions").join("agrep-postcompact.ts");
         record(
             &path,
             install_file(path.clone(), include_bytes!("pi_postcompact.ts"), previous),

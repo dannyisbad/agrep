@@ -41,6 +41,14 @@ the exhaustive keyword rerun as `full_command`; piped text says the same in one
 pages do not suggest more results. `--more` reads frozen rows, rather than silently
 rerunning a query against a changed corpus.
 
+A message that several chats hold as copies (a pi or omp fork copies its parent's
+history, so a fork's copy has the same agent, speaker, text and time) is one row on a
+keyword or meaning page: the copy from the most recently active chat, marked `also in N
+forks`, with the other copies under its JSON `forks` (session and handle) and as rows of
+their own right after it in `--flat`. The copies take no row of the page, so the page
+ranks deeper to fill its rows; `shown` and `showing N of M` count the copies, in the
+unit of `total`. `-l` lists every chat and `-c` counts every row.
+
 Normal commands check source files and answer from a committed snapshot.
 Index-reading commands finish their source census and ingest its changes before querying.
 `postcompact` also refreshes the sessions used to resolve its displayed family root.
@@ -60,6 +68,9 @@ the current window, `--no-self` excludes the known session family, and `--no-sid
 excludes side conversations. Unknown identity is not invented. Project filters
 match exact project/folder names or explicit globs; Board's project filter is a
 substring filter.
+`--chat` on a Codex fork child, whose rollout begins by replaying its parent's history,
+also covers the parent's rows up to the fork, which are indexed once under the parent,
+and says so in one stderr line.
 
 ## Meaning search
 
@@ -76,11 +87,14 @@ There is no `semantic_partial` field or coverage notice.
 
 When the queue exceeds about one second of estimated CPU embedding, automatic
 hybrid quietly returns keyword results. Explicit `-s` exits 2 with
-`semantic search unavailable: the meaning index is still building (N of M rows, about T left)`.
+`semantic search unavailable: the meaning index is still building (N of M rows, about T left)`,
+or `estimating time left` in place of `about T left` until a drain on this machine has
+measured how fast rows embed (a rebuild keeps the rate the index it replaces measured).
 Under `--json`, it returns `error.code: "semantic-unavailable"`, no hits, and
 `progress` in its semantic status: `indexed_rows`, `total_rows`, `remaining_rows`,
-`estimated_seconds`. A build is not a verified zero match. `status` shows this
-progress; setup says the build runs in the background and when meaning joins searches.
+`estimated_seconds` (null while estimating). A build is not a verified zero match. `status`
+shows this progress; setup says the build runs in the background and when meaning joins
+searches.
 
 ## Handles and around
 
@@ -158,8 +172,11 @@ lists no individual source. `doctor --json` is `{"version":1,"status":…,"check
 "repairs":[…],"exit":…}`: its `status` adds `sources`, only the sources whose last read
 failed (path, agent, bytes, mtime, last error, change token); each check has `check`,
 `state` and `detail`, and a problem's check adds `action`, the step that resolves it. The
-text form prints one line per check, then one `source failed: PATH: ERROR` line per failed
-source.
+`semantic_model` check is `present`, `not installed` (`agrep setup` installs it) or
+`failed`; on a home where no supported agent keeps a store, an `agent_history` check
+names the home and the agents looked for. The text form prints one line per check, then
+one `source failed: PATH: ERROR` line per failed source, ERROR being the cause alone
+(`permission denied`).
 
 Setup/remove preserve text outside their owned instruction blocks and remove
 only enrolled integrations or recognizable agrep blocks. Archive restore checks
@@ -172,13 +189,16 @@ unchanged; `reindex --full` also invalidates every vector reference and queues v
 rows for embedding. `index` and `reindex` print 0.4.9's human report
 (message and session counts, the refresh's time and phases, and the setup pointer
 while no agent is enrolled). With `AGREP_QUERY_TIMING` set they also print the
-refresh's statistics as a JSON `{"index": …}` line on stderr.
+refresh's statistics as a JSON `{"index": …}` line on stderr. While any source's last read
+failed, they print one stderr line with the count, the first such source and its reason,
+and, when there are more, `agrep doctor` to list them.
 
 Only a missing model quietly disables automatic meaning retrieval. In automatic hybrid
 retrieval, any failure from an installed model is disclosed once on stderr and written to
 the diagnostic log, and the keyword results stand; recall/pack JSON marks that semantic
 attempt as failed. An explicit `-s` (search, recall, pack) never answers with keyword rows:
 when its lane fails or the meaning policy refuses its query, it prints `semantic search
-unavailable: <reason>`, or under `--json` 0.4.9's record with `error.code`
+unavailable: <reason>` (a model that fails its pinned size or hash adds `` - `agrep setup`
+reinstalls it``), or under `--json` 0.4.9's record with `error.code`
 `semantic-unavailable`, and exits 2. `status` and `doctor` verify installed model files
 against their pinned hashes and unchanged verification stamps.

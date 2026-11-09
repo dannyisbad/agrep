@@ -43,6 +43,7 @@ pub mod clock;
 pub mod coverage;
 pub mod diagnostics;
 pub mod evidence;
+pub mod forks;
 pub mod handles;
 pub mod history;
 mod history_meta;

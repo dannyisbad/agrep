@@ -63,6 +63,7 @@ fn unreadable(agent: &str, path: &Path, tally: &Tally, error: &std::io::Error) -
     ));
     tally.seen();
     tally.error(&format!("cannot read: {error}"));
+    crate::ingest::note_io_failure(path, error);
     // A compressed session's decode and size-limit failures are its content, not a race.
     let outcome = if path.to_string_lossy().ends_with(".jsonl.gz") {
         crate::intake_batch::ReadOutcome::Skipped

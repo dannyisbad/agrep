@@ -28,6 +28,12 @@ pub struct SessionRows {
     pub session: String,
     pub from: Option<i64>,
 }
+/// History a `--chat` fork child inherited: `session`'s rows up to `until` (ms, inclusive).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Inherited {
+    pub session: String,
+    pub until: i64,
+}
 #[derive(Default, Clone, Debug, Serialize, Deserialize)]
 pub struct Filters {
     pub agent: Option<String>,
@@ -39,6 +45,9 @@ pub struct Filters {
     pub no_who: Option<String>,
     pub no_meta: bool,
     pub chat: Option<String>,
+    /// With `chat`, the parent rows that chat inherited (see `crate::forks`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inherited: Vec<Inherited>,
     pub since: Option<i64>,
     pub until: Option<i64>,
     pub no_side: bool,
@@ -94,6 +103,10 @@ pub struct Hit {
     /// than half the query's terms, or a query no word of which the scope holds.
     #[serde(default, skip_serializing_if = "is_false")]
     pub sem_weak: bool,
+    /// A row's copies in other chats (forks sharing its history), newest first; the row
+    /// stands for them on a page.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forks: Vec<Fork>,
     #[serde(skip)]
     pub rowid: i64,
     #[serde(skip)]
@@ -101,6 +114,20 @@ pub struct Hit {
     /// The characters of `text` 0.4.9 placed the hit's match at (`_match_span`).
     #[serde(skip)]
     pub span: Option<(usize, usize)>,
+}
+impl Hit {
+    /// The matching rows a page row stands for: itself and its copies in forks.
+    pub fn rows(&self) -> usize {
+        1 + self.forks.len()
+    }
+}
+/// Another chat's copy of a row: the same speaker, text and time.
+#[derive(Default, Serialize, Deserialize, Clone, Debug)]
+pub struct Fork {
+    pub session: String,
+    pub project: String,
+    pub turn: i64,
+    pub handle: String,
 }
 #[derive(Default, Serialize, Deserialize, Debug)]
 pub struct Results {
@@ -145,7 +172,7 @@ pub struct Timings {
     pub total_ms: f64,
 }
 impl Timings {
-    fn add(&mut self, other: &Self) {
+    pub(crate) fn add(&mut self, other: &Self) {
         self.plan_ms += other.plan_ms;
         self.sqlite_ms += other.sqlite_ms;
         self.hydrate_ms += other.hydrate_ms;

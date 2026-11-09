@@ -181,12 +181,21 @@ pub fn freshness(checked: bool) -> Value {
 /// label, and the empty concept and summary and unknown model source its message lane
 /// reported.
 pub fn hit_value(h: &Hit, now: i64) -> Value {
-    if h.matched == "semantic" {
-        return json!({"session":h.session,"agent":h.agent,"project":h.project,"concept":"","model":h.model,"model_source":"unknown","turn":h.turn,"ts":h.ts,"who":h.who,"sem_score":crate::window::round6(h.score),"score_kind":"cosine","snippet":h.snippet,"summary":"","semantic_source":"message","score":crate::query::meaning_score(h, now),"handle":h.handle,"self":h.self_marker});
-    }
-    let mut value = json!({"session":h.session,"agent":h.agent,"project":h.project,"model":h.model,"model_source":if h.who=="tool"{"tool"}else{&h.model_source},"turn":h.turn,"ts":h.ts,"who":h.who,"snippet":h.snippet,"score":h.score,"handle":h.handle,"self":h.self_marker});
-    if h.matched != "phrase" {
-        value["matched"] = json!(h.matched)
+    let mut value = if h.matched == "semantic" {
+        json!({"session":h.session,"agent":h.agent,"project":h.project,"concept":"","model":h.model,"model_source":"unknown","turn":h.turn,"ts":h.ts,"who":h.who,"sem_score":crate::window::round6(h.score),"score_kind":"cosine","snippet":h.snippet,"summary":"","semantic_source":"message","score":crate::query::meaning_score(h, now),"handle":h.handle,"self":h.self_marker})
+    } else {
+        let mut value = json!({"session":h.session,"agent":h.agent,"project":h.project,"model":h.model,"model_source":if h.who=="tool"{"tool"}else{&h.model_source},"turn":h.turn,"ts":h.ts,"who":h.who,"snippet":h.snippet,"score":h.score,"handle":h.handle,"self":h.self_marker});
+        if h.matched != "phrase" {
+            value["matched"] = json!(h.matched)
+        }
+        value
+    };
+    if !h.forks.is_empty() {
+        value["forks"] = h
+            .forks
+            .iter()
+            .map(|fork| json!({"session":fork.session,"handle":fork.handle}))
+            .collect();
     }
     value
 }
@@ -332,12 +341,24 @@ impl Marks {
         }
     }
 }
+/// How many other chats hold a row's message: `also in 2 forks`.
+fn forks_note(h: &Hit) -> Option<String> {
+    match h.forks.len() {
+        0 => None,
+        1 => Some("also in 1 fork".into()),
+        n => Some(format!("also in {} forks", surface::number(n))),
+    }
+}
+/// The matching rows a page's rows stand for, their fork copies included.
+fn rows_shown(r: &Results) -> usize {
+    r.hits.iter().map(Hit::rows).sum()
+}
 pub fn compact_line(h: &Hit, marks: &Marks) -> String {
-    let quality = if h.matched == "semantic" {
+    let lane = if h.matched == "semantic" {
         if h.sem_weak {
-            "~semantic-weak (meaning match)"
+            "~semantic-weak"
         } else {
-            "~semantic (meaning match)"
+            "~semantic"
         }
     } else if h.matched != "phrase" {
         "~all"
@@ -345,6 +366,13 @@ pub fn compact_line(h: &Hit, marks: &Marks) -> String {
         "~substr"
     } else {
         ""
+    };
+    let quality = match (h.matched == "semantic", forks_note(h)) {
+        (true, Some(note)) => format!("{lane} (meaning match, {note})"),
+        (true, None) => format!("{lane} (meaning match)"),
+        (false, Some(note)) if lane.is_empty() => format!("({note})"),
+        (false, Some(note)) => format!("{lane} ({note})"),
+        (false, None) => lane.into(),
     };
     let snippet = surface::safe(&marks.compact(h), false);
     [
@@ -357,7 +385,7 @@ pub fn compact_line(h: &Hit, marks: &Marks) -> String {
         } else {
             String::new()
         },
-        quality.into(),
+        quality,
         if h.meta_marker {
             "~meta".into()
         } else {
@@ -429,7 +457,7 @@ pub fn emit_semantic(
     coverage: Option<&crate::semantic::Coverage>,
     after: &[String],
 ) -> Result<()> {
-    let truncated = ((!s.count && !s.tiers) && r.hits.len() < r.total) || r.total_basis != "exact";
+    let truncated = ((!s.count && !s.tiers) && rows_shown(r) < r.total) || r.total_basis != "exact";
     let exhaustible = !s.semantic && !r.hits.iter().any(|h| h.matched == "semantic");
     let marks = std::cell::LazyCell::new(|| Marks::new(q, s));
     let mut out = String::new();
@@ -460,21 +488,13 @@ pub fn emit_semantic(
             out += &chat_head(h, n, s.color);
         }
     } else if s.flat {
-        for h in &r.hits {
-            out += &format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\n",
-                safe(&h.session),
-                safe(&h.agent),
-                safe(&project(&h.project)),
-                h.turn,
-                safe(&h.who),
-                if s.color {
-                    marks.paint(h, true)
-                } else {
-                    safe(&h.snippet)
-                }
-            );
-        }
+        out = flat_page(r, |hit| {
+            if s.color {
+                marks.paint(hit, true)
+            } else {
+                safe(&hit.snippet)
+            }
+        });
     } else if s.compact {
         (out, footer) = compact_page(r, q, _f, s, &marks, truncated, exhaustible)?;
     } else {
@@ -494,6 +514,32 @@ pub fn emit_semantic(
         crate::errln!("{}", completeness_line(r, s, exhaustible));
     }
     Ok(())
+}
+/// One tab-separated row per hit: session, agent, project, turn, speaker and snippet. A
+/// machine row list keeps every chat holding a row: a meaning row's forks follow it.
+fn flat_page(r: &Results, snippet: impl Fn(&Hit) -> String) -> String {
+    let mut out = String::new();
+    for h in &r.hits {
+        let snippet = snippet(h);
+        let copies = h
+            .forks
+            .iter()
+            .map(|fork| (&fork.session, &fork.project, fork.turn));
+        for (session, project_name, turn) in
+            std::iter::once((&h.session, &h.project, h.turn)).chain(copies)
+        {
+            out += &format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\n",
+                safe(session),
+                safe(&h.agent),
+                safe(&project(project_name)),
+                turn,
+                safe(&h.who),
+                snippet
+            );
+        }
+    }
+    out
 }
 fn classic_page(r: &Results, paint: impl Fn(&Hit) -> String) -> String {
     let mut out = String::new();
@@ -518,11 +564,14 @@ fn classic_page(r: &Results, paint: impl Fn(&Hit) -> String) -> String {
                 _ => "›",
             };
             out += &format!(
-                "  \x1b[33m{:>4}\x1b[0m \x1b[2m{mark}\x1b[0m {}\x1b[2m{}{}\x1b[0m\n",
+                "  \x1b[33m{:>4}\x1b[0m \x1b[2m{mark}\x1b[0m {}\x1b[2m{}{}{}\x1b[0m\n",
                 h.turn,
                 paint(h),
                 if h.self_marker { " ~self" } else { "" },
-                if h.meta_marker { " ~meta" } else { "" }
+                if h.meta_marker { " ~meta" } else { "" },
+                forks_note(h)
+                    .map(|note| format!(" {note}"))
+                    .unwrap_or_default()
             );
         }
     }
@@ -635,7 +684,7 @@ fn json_lines(
     now: i64,
 ) -> Result<String> {
     let exhaustible = !s.semantic && !r.hits.iter().any(|h| h.matched == "semantic");
-    let mut meta = json!({"kind":"agrep-meta","query":q,"engine":"sqlite","freshness":machine_freshness(s.no_auto),"filter_coverage":s.filter_coverage,"self_exclusion":s.self_exclusion,"completeness":{"shown":r.hits.len(),"total":r.total,"total_basis":r.total_basis,"unit":if s.chats || s.semantic{"chat"}else{"matching row"},"truncated":truncated,"tool_rows":r.tool_rows},"semantic_coverage":null});
+    let mut meta = json!({"kind":"agrep-meta","query":q,"engine":"sqlite","freshness":machine_freshness(s.no_auto),"filter_coverage":s.filter_coverage,"self_exclusion":s.self_exclusion,"completeness":{"shown":rows_shown(r),"total":r.total,"total_basis":r.total_basis,"unit":if s.chats || s.semantic{"chat"}else{"matching row"},"truncated":truncated,"tool_rows":r.tool_rows},"semantic_coverage":null});
     if s.filter_coverage.is_null() {
         meta["filter_coverage"] = json!({"checked":true,"empty_dimensions":[]})
     }
@@ -722,7 +771,7 @@ fn completeness_line(r: &Results, s: &Style, exhaustible: bool) -> String {
     };
     format!(
         "showing {} of {}{} {unit}{}{tool}{basis}{tail}",
-        r.hits.len(),
+        rows_shown(r),
         r.total,
         if exact { "" } else { "+" },
         if r.total == 1 { "" } else { "s" }
@@ -766,6 +815,97 @@ mod tests {
             ..Hit::default()
         };
         assert!(compact_line(&hit, &Marks::new("", &Style::default())).contains("meaning match"));
+    }
+    /// A meaning row standing for its copies in forks says so on the pages people read, and
+    /// the machine row list keeps a row for every chat holding it.
+    #[test]
+    fn a_folded_meaning_row_names_its_forks_and_flat_rows_keep_them() {
+        let fork = |session: &str, turn| crate::query::Fork {
+            session: session.into(),
+            project: "merger".into(),
+            turn,
+            handle: format!("@{session}:{turn}.0000"),
+        };
+        let hit = Hit {
+            matched: "semantic".into(),
+            session: "fork-b".into(),
+            agent: "pi".into(),
+            project: "merger".into(),
+            turn: 4,
+            who: "user".into(),
+            snippet: "dont overfit the prompt".into(),
+            forks: vec![fork("fork-a", 4), fork("root", 3)],
+            ..Hit::default()
+        };
+        let line = compact_line(&hit, &Marks::new("", &Style::default()));
+        assert!(
+            line.contains("~semantic (meaning match, also in 2 forks) "),
+            "{line}"
+        );
+        let one = Hit {
+            forks: vec![fork("root", 3)],
+            ..hit.clone()
+        };
+        let page = |hit: Hit| {
+            let mut r = Results::default();
+            r.hits = vec![hit];
+            r
+        };
+        assert!(classic_page(&page(one), |h| h.snippet.clone()).contains(" also in 1 fork"));
+        let flat = flat_page(&page(hit), |h| h.snippet.clone());
+        assert_eq!(
+            flat,
+            "fork-b\tpi\tmerger\t4\tuser\tdont overfit the prompt\n\
+             fork-a\tpi\tmerger\t4\tuser\tdont overfit the prompt\n\
+             root\tpi\tmerger\t3\tuser\tdont overfit the prompt\n"
+        );
+    }
+    /// A keyword row standing for its fork copies says so beside its match quality, lists
+    /// them in JSON, and the page counts the rows it stands for: nothing is cut.
+    #[test]
+    fn a_folded_keyword_row_names_its_forks_and_counts_them() {
+        let fork = |session: &str| crate::query::Fork {
+            session: session.into(),
+            project: "merger".into(),
+            turn: 4,
+            handle: format!("@{session}:4.0000"),
+        };
+        let hit = Hit {
+            matched: "phrase".into(),
+            session: "fork-b".into(),
+            agent: "pi".into(),
+            project: "merger".into(),
+            turn: 4,
+            who: "user".into(),
+            snippet: "dont overfit the prompt".into(),
+            forks: vec![fork("fork-a"), fork("root")],
+            ..Hit::default()
+        };
+        let marks = Marks::new("", &Style::default());
+        let line = compact_line(&hit, &marks);
+        assert!(line.contains(" (also in 2 forks) dont overfit"), "{line}");
+        let scatter = Hit {
+            matched: "all-terms".into(),
+            forks: vec![fork("root")],
+            ..hit.clone()
+        };
+        let line = compact_line(&scatter, &marks);
+        assert!(
+            line.contains(" ~all (also in 1 fork) dont overfit"),
+            "{line}"
+        );
+        let value = hit_value(&hit, 0);
+        assert_eq!(value["forks"][1]["handle"], "@root:4.0000");
+        assert!(value.get("matched").is_none());
+
+        let mut r = Results::default();
+        r.hits = vec![hit];
+        r.total = 3;
+        r.total_basis = "exact".into();
+        let json = json_lines(&r, "overfit", &Style::default(), None, false, 0).unwrap();
+        let meta: Value = serde_json::from_str(json.lines().next().unwrap()).unwrap();
+        assert_eq!(meta["completeness"]["shown"], 3);
+        assert_eq!(rows_shown(&r), r.total);
     }
     // Expected lines are agrep 0.4.9's `-s "how do we rotate secret credentials" --json` on a
     // six-chat fixture with 24 embedded rows, without the keys PORTING.md lists as not

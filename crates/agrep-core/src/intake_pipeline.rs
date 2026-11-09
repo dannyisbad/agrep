@@ -312,13 +312,15 @@ fn run(
         scope.spawn({
             let budget = budget.clone();
             move || {
+                // A compressed source is parsed, and its rows retained, at its decoded size.
                 let sizes: Vec<_> = pending
-                    .iter()
+                    .par_iter()
                     .map(|source| {
-                        sizes
+                        let stored = sizes
                             .get(source.path.to_string_lossy().as_ref())
                             .copied()
-                            .unwrap_or(0)
+                            .unwrap_or(0);
+                        crate::ingest::jsonl::decoded_len(&source.path, stored)
                     })
                     .collect();
                 let near = before_large(&sizes, budget.limit);

@@ -234,6 +234,7 @@ exit: 0 removed, 1 cleanup incomplete, 2 invalid arguments.";
 
 pub(crate) const ARCHIVE: &str = "examples:
   agrep archive --status  inspect retention and the last capture
+  agrep doctor --deep     also re-hash every stored chunk to find damage
   agrep archive --on      enable automatic source-store captures
   agrep archive           capture changed source stores now
   agrep archive --purge   delete every archived copy (asks first)
@@ -261,7 +262,7 @@ exit: 0 listed or changed, 1 settings could not be changed, 2 invalid arguments.
 pub(crate) const STATUS: &str = "examples:
   agrep status         bounded diagnostic
   agrep status --json  cheap machine summary, one JSON object
-  agrep doctor --deep  index integrity and semantic model checks
+  agrep doctor --deep  index integrity, archive chunk and semantic model checks
 
 exit: 0 diagnostic complete; 2 invalid arguments, or an unsupported or unreadable index.";
 
@@ -269,11 +270,12 @@ pub(crate) const DOCTOR_ABOUT: &str =
     "bounded diagnostic: data, index, semantic model, integrations.
 
 Every row answers what it is and what state it's in. `agrep status` shows the
-same facts; `agrep doctor --deep` adds the index's SQLite integrity check and the
-semantic model check, and `--fix` repairs what is safe to repair.";
+same facts; `agrep doctor --deep` adds the index's SQLite integrity check, a re-hash
+of every archived chunk and the semantic model check, and `--fix` repairs what is
+safe to repair.";
 pub(crate) const DOCTOR: &str = "examples:
   agrep doctor          bounded operational report
-  agrep doctor --deep   index integrity and semantic model checks
+  agrep doctor --deep   index integrity, archive chunk and semantic model checks
   agrep doctor --deep --no-semantic   the same, without the semantic model check
   agrep doctor --fix    refresh sources, repair integrations, rebuild a corrupt index
   agrep doctor --json   machine-readable bounded report

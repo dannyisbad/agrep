@@ -330,6 +330,7 @@ fn parse_source(
                     }
                     Err(e) => {
                         crate::intake::diagnostic(format_args!("source parse failed: {e}"));
+                        crate::ingest::note_read_failure(path, crate::ingest::error_reason(&e));
                         (vec![], vec![], Some(ReadOutcome::Invalid))
                     }
                 }
@@ -350,7 +351,7 @@ fn parse_source(
     {
         Some(
             crate::ingest::take_read_failure(path)
-                .unwrap_or_else(|| format!("source parse incomplete: {}", path.display())),
+                .unwrap_or_else(|| "source parse incomplete".to_owned()),
         )
     } else {
         None

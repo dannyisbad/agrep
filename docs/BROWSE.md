@@ -5,7 +5,14 @@ page. With a pattern it combines metadata matches and the keyword engine's best
 turn per chat. A direct id prefix includes side chats; ordinary listings hide
 them. Each printed row includes its own digest-bound `agrep around` command.
 JSON is one `agrep-meta` envelope and then row-only objects, including on pipes;
-empty output is a single envelope with `hits: []`.
+empty output is a single envelope with `hits: []`. A content match's preview (96
+characters, 240 as JSON `match_text`) starts where the match's snippet does unless a
+later window holds more of the query's distinct words; then it is the window centred on
+them, after `…`. 0.4.9 always cut the snippet's start, so a second word more than a few
+words past the first was never shown. With no matching chat, stderr says `no chats match`,
+adding `; some side chats do (--side shows them)` only when hidden side chats would match,
+where 0.4.9 printed `showing 0 of 0 matching chats, best match first (side chats hidden;
+--side shows them)`; the exit code is unchanged.
 
 `summary`, `summary pending`, and `summary time` read the canonical `visible=1`
 prose, retained reply shapes, and event facts of the families their window admits,
@@ -28,8 +35,11 @@ is numbered and bounded by `-n`: as in 0.4.9 an answer is a listed number or a
 reference resolved among the picker's candidates, but a number is only ever a list
 position (0.4.9 tried an out-of-range one as an id prefix), and anything else asks again
 where 0.4.9 gave up; an empty answer or the end of input cancels. `--list` never launches.
-The launch line names the program started (`↻ resuming omp · DIR`). Side chats walk their
-parent chain with cycle/missing-parent refusal. Native argument tables are:
+The launch line names the program started (`↻ resuming omp · DIR`), and the picker and
+`--list` label each session by that same program, where 0.4.9 labelled every omp session
+`pi`: the fork that wrote it when that one is on PATH, else the sibling that would start.
+Side chats walk their parent chain with cycle/missing-parent refusal. Native argument
+tables are:
 
 | Agent | Resume arguments |
 |---|---|
@@ -40,7 +50,9 @@ parent chain with cycle/missing-parent refusal. Native argument tables are:
 | pi / omp | originating fork, then `-r ID` |
 
 Kimi, Gemini, and crush have no verified native resume/run contract; Cursor and
-Cline are editor-owned. They receive an explicit unsupported answer. Fresh pi
+Cline are editor-owned. They receive an explicit unsupported answer: `resume` gives
+the reason, and `agrep run gemini` says `gemini can't be launched by agrep run` and
+lists the agents it launches (exit 2), where 0.4.9 gave `run` the resume refusal. Fresh pi
 launches prefer the spelling requested, with the sibling as a PATH fallback.
 
 The agent starts in the session's recorded working directory; Antigravity's is the

@@ -150,7 +150,9 @@ How commands use it (`ready` and `finish_census` in `crates/agrep/src/main.rs`):
    source.
    Changed file sources parse ahead in source order within a 512 MiB reservation
    window, including the source being written. Active parses reserve their input
-   size; completed parses return unused credit after conservatively accounting for
+   size, a zstd source the size its frame headers declare (or, undeclared, the most its
+   blocks hold; unreadable, 16 times its stored size); completed parses return unused
+   credit after conservatively accounting for
    retained rows, the compact graph and prepared tool text. A dedicated feeder can
    reuse that credit while the writer is busy, handing a source to a parser only when
    one is free and only while the parsed sources the writer has not yet taken are

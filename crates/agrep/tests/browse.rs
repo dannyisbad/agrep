@@ -4,6 +4,8 @@ mod exit;
 #[cfg(unix)]
 #[path = "support/job.rs"]
 mod job;
+#[path = "support/native.rs"]
+mod native;
 mod support;
 use agrep_core::{data::DataRoot, store};
 use rusqlite::params;
@@ -138,6 +140,59 @@ fn chats_order_side_filter_content_and_envelope() {
             .status
             .code(),
         Some(2)
+    );
+}
+#[test]
+fn chats_without_a_match_say_so_and_name_side_chats_only_when_they_match() {
+    let t = fixture();
+    let stderr = |args: &[&str]| {
+        let out = run(&t, args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        String::from_utf8(out.stderr).unwrap()
+    };
+    assert_eq!(stderr(&["chats", "xyzzyplugh"]), "no chats match\n");
+    // "delegated" is only in the side chat.
+    assert_eq!(
+        stderr(&["chats", "delegated"]),
+        "no chats match; some side chats do (--side shows them)\n"
+    );
+    let shown = ok(run(&t, &["chats", "--side", "delegated"]));
+    assert!(String::from_utf8(shown.stdout)
+        .unwrap()
+        .contains("[side chat]"));
+}
+#[test]
+fn chats_previews_hold_every_query_term_that_fits() {
+    let t = fixture();
+    let prompt = format!(
+        "{}the launchd job {}keeps the sentinel registered {}",
+        "word ".repeat(30),
+        "pad ".repeat(10),
+        "tail ".repeat(30)
+    );
+    write_chat(
+        &t.path()
+            .join("home/.pi/agent/sessions/alpha/2026-01-04_preview-0001.jsonl"),
+        "preview-0001",
+        &t.path().join("project alpha"),
+        &[("2026-01-04T00:00:00Z", &prompt, "Done.")],
+    );
+    let text = String::from_utf8(ok(run(&t, &["chats", "launchd sentinel"])).stdout).unwrap();
+    let line = text.lines().find(|l| l.contains(" match: ")).unwrap();
+    let preview = line
+        .split_once("match: ")
+        .unwrap()
+        .1
+        .split(" · agrep around")
+        .next()
+        .unwrap();
+    assert!(
+        preview.starts_with('…') && preview.chars().count() == 96,
+        "{preview}"
+    );
+    assert!(
+        preview.contains("launchd") && preview.contains("sentinel"),
+        "{preview}"
     );
 }
 #[test]
@@ -448,7 +503,7 @@ fn audit_before_the_first_index_reports_every_source_as_a_gap() {
 #[test]
 fn doctor_reports_and_fixes_source_parse_errors() {
     let t = fixture();
-    let bad = t.path().join("home/.pi/agent/sessions/bad/bad.jsonl");
+    let bad = native::native(&t.path().join("home/.pi/agent/sessions/bad/bad.jsonl"));
     fs::create_dir_all(bad.parent().unwrap()).unwrap();
     fs::write(&bad, "not json\n").unwrap();
     ok(run(&t, &["index"]));
@@ -459,11 +514,7 @@ fn doctor_reports_and_fixes_source_parse_errors() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|s| {
-            // Path equality treats `/` and `\` alike on Windows; the rendered strings differ.
-            s["path"].as_str().map(std::path::Path::new) == Some(bad.as_path())
-                && s["last_error"].is_string()
-        }));
+        .any(|s| s["path"].as_str() == bad.to_str() && s["last_error"].is_string()));
     let out = ok(run(&t, &["doctor"]));
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.starts_with("doctor: action needed\n"));
@@ -496,6 +547,26 @@ fn empty_diagnostics_do_not_create_data_root() {
     let out = run(&t, &["why", "nothing", "--json"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(!t.path().join("data").exists());
+}
+// Windows printed its default data directory as `%LOCALAPPDATA%\agrep/0.5`.
+#[test]
+fn the_default_data_directory_is_spelled_natively() {
+    let t = TempDir::new().unwrap();
+    let out = ok(command(&t, &["status", "--json"])
+        .env_remove("AGREP_DATA_DIR")
+        .env("USERPROFILE", t.path().join("home"))
+        .env("LOCALAPPDATA", t.path().join("local"))
+        .env("XDG_DATA_HOME", t.path().join("xdg"))
+        .output()
+        .unwrap());
+    let records = records(&out);
+    let root = Path::new(records[0]["data_root"].as_str().unwrap());
+    assert_eq!(root.as_os_str(), native::native(root).as_os_str());
+    assert!(
+        root.starts_with(t.path()) && root.ends_with("agrep/0.5"),
+        "{root:?}"
+    );
+    assert!(!root.exists());
 }
 #[test]
 fn native_capabilities_and_opaque_handles() {
@@ -2347,6 +2418,43 @@ fn resume_chooses_omp_for_windows_origin_paths() {
             "↻ resuming omp · {}\n",
             t.path().join("project alpha").display()
         )
+    );
+    // The list and the picker name the same agent the launch line does.
+    let labels = || {
+        let out = launch_cmd(&t)
+            .args(["resume", "--list", "--no-auto"])
+            .output()
+            .unwrap();
+        String::from_utf8(ok(out).stdout).unwrap()
+    };
+    let list = labels();
+    let agent_of = |list: &str, id: &str| {
+        list.lines()
+            .find(|l| l.contains(&format!("@{id} ")))
+            .and_then(|l| l.split(" · ").next())
+            .map(str::to_owned)
+    };
+    assert_eq!(
+        agent_of(&list, "root-alpha-0001").as_deref(),
+        Some("omp"),
+        "{list}"
+    );
+    assert_eq!(
+        agent_of(&list, "root-alpha-0002").as_deref(),
+        Some("pi"),
+        "{list}"
+    );
+    let picker = launch_cmd(&t)
+        .args(["resume", "--no-auto"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&picker.stderr).contains(" 1  pi · "));
+    assert!(String::from_utf8_lossy(&picker.stderr).contains("omp · "));
+    // Without omp on PATH the session resumes in pi, and its label follows.
+    fs::remove_file(t.path().join("bin/omp")).unwrap();
+    assert_eq!(
+        agent_of(&labels(), "root-alpha-0001").as_deref(),
+        Some("pi")
     );
 }
 

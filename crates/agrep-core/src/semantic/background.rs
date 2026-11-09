@@ -105,15 +105,16 @@ pub(super) fn progress_line(
     left: usize,
     rate: Option<f64>,
 ) -> String {
-    let mut line = format!("embedding messages: {covered} of {total} rows");
+    let mut line = format!(
+        "embedding messages: {} of {} rows",
+        crate::surface::number(covered),
+        crate::surface::number(total)
+    );
+    let seconds = rate.map(|rate| (left as f64 / rate).ceil() as u64);
     if let Some(rate) = rate {
-        let seconds = (left as f64 / rate).ceil() as u64;
-        line += &format!(
-            " · {rate:.0} rows/s · about {} left",
-            super::time_left(seconds)
-        );
+        line += &format!(" · {rate:.0} rows/s");
     }
-    line
+    line + " · " + &super::estimate(seconds)
 }
 /// Embeds the queue in bounded batches, each committed before the next. The caller holds
 /// work.lock. Returns whether a background drain stopped for a waiting command.

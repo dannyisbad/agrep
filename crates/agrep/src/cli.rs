@@ -4,6 +4,8 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 #[derive(Parser)]
 #[command(
+    // Usage names `agrep` however it was invoked, `agrep.exe` on Windows included.
+    bin_name = "agrep",
     version,
     about = "agentic grep: find, open, resume and watch your AI agents' work",
     override_usage = help::TOP_USAGE,
@@ -866,6 +868,7 @@ impl Scope {
             no_who: self.no_who.clone(),
             no_meta: self.no_meta,
             chat: self.chat.clone(),
+            inherited: Vec::new(),
             since,
             until,
             no_side: self.no_side,

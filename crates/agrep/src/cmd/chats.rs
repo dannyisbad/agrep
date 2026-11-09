@@ -59,7 +59,7 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
         direct,
     };
     let (hits, exact) = content_hits(&c, &selection, &pattern, tools)?;
-    let (selected, excluded, total) = select_chats(selection, &all, &hits);
+    let (selected, excluded, total) = select_chats(&selection, &all, &hits);
     let checked = agrep_core::render::checked(no_auto);
     let truncated = selected.len() < total || !exact;
     // 0.4.9 named a page cut by -n with its larger rerun (py/search.py:8888-8912).
@@ -94,30 +94,43 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
             tools,
             apply_self,
             direct,
+            terms: &preview_terms(&pattern),
         },
     )?;
     if !args.json {
-        agrep_core::errln!(
-            "showing {} of {}{} matching chat{}, {}{}{}",
-            selected.len(),
-            total,
-            if exact { "" } else { "+" },
-            if total == 1 { "" } else { "s" },
-            if pattern.is_empty() || direct {
-                "newest first"
-            } else {
-                "best match first"
-            },
-            if !args.side && !direct {
-                " (side chats hidden; --side shows them)"
-            } else {
-                ""
-            },
-            more_command
-                .as_ref()
-                .map(|command| format!(" · larger page: {command}"))
-                .unwrap_or_default()
-        );
+        if selected.is_empty() && total == 0 && exact {
+            let side = filters.no_side && side_chats_match(&c, &selection, &all, &pattern, tools)?;
+            agrep_core::errln!(
+                "no chats match{}",
+                if side {
+                    "; some side chats do (--side shows them)"
+                } else {
+                    ""
+                }
+            );
+        } else {
+            agrep_core::errln!(
+                "showing {} of {}{} matching chat{}, {}{}{}",
+                selected.len(),
+                total,
+                if exact { "" } else { "+" },
+                if total == 1 { "" } else { "s" },
+                if pattern.is_empty() || direct {
+                    "newest first"
+                } else {
+                    "best match first"
+                },
+                if !args.side && !direct {
+                    " (side chats hidden; --side shows them)"
+                } else {
+                    ""
+                },
+                more_command
+                    .as_ref()
+                    .map(|command| format!(" · larger page: {command}"))
+                    .unwrap_or_default()
+            );
+        }
         if let Some(notice) = policy.and_then(|p| p.notice(excluded, "chat")) {
             agrep_core::errln!("{notice}");
         }
@@ -143,7 +156,7 @@ struct Selection<'a> {
     direct: bool,
 }
 fn select_chats<'a>(
-    ctx: Selection<'_>,
+    ctx: &Selection<'_>,
     all: &'a [h::Session],
     hits: &Hits,
 ) -> (Vec<&'a h::Session>, usize, usize) {
@@ -212,6 +225,103 @@ fn select_chats<'a>(
     (selected, excluded, total)
 }
 
+/// Whether a page that found nothing would find side chats, so it names --side only then.
+fn side_chats_match(
+    c: &rusqlite::Connection,
+    ctx: &Selection<'_>,
+    all: &[h::Session],
+    pattern: &str,
+    tools: bool,
+) -> Result<bool> {
+    let mut filters = ctx.filters.clone();
+    filters.no_side = false;
+    let ctx = Selection {
+        filters: &filters,
+        ..*ctx
+    };
+    let (hits, _) = content_hits(c, &ctx, pattern, tools)?;
+    Ok(select_chats(&ctx, all, &hits).0.iter().any(|s| s.side))
+}
+
+fn preview_terms(pattern: &str) -> Vec<String> {
+    let mut terms: Vec<String> = Vec::new();
+    for token in agrep_core::boundary_rank::query_tokens(pattern) {
+        let term = token.to_lowercase();
+        if !terms.contains(&term) {
+            terms.push(term);
+        }
+    }
+    terms
+}
+
+/// A one-line preview of at most `max` characters: the start of `text`, unless a later
+/// window holds more of the query's distinct `terms`; then the window centred on the
+/// terms it holds, after a cut marker.
+fn preview(text: &str, terms: &[String], max: usize) -> String {
+    let line: Vec<char> = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .collect();
+    let head = || line.iter().take(max).collect::<String>();
+    if line.len() <= max || max < 2 || terms.is_empty() {
+        return head();
+    }
+    // Each term occurrence as (term, first char, end char) of `line`; the first few per
+    // term suffice, and keep a long row text without a snippet cheap.
+    let mut lower = String::new();
+    let mut char_at = Vec::new();
+    for (i, c) in line.iter().enumerate() {
+        for folded in c.to_lowercase() {
+            lower.push(folded);
+            char_at.resize(lower.len(), i);
+        }
+    }
+    let occurrences: Vec<(usize, usize, usize)> = terms
+        .iter()
+        .enumerate()
+        .flat_map(|(t, term)| {
+            let (lower, char_at) = (&lower, &char_at);
+            lower
+                .match_indices(term.as_str())
+                .take(64)
+                .map(move |(at, m)| (t, char_at[at], char_at[at + m.len() - 1] + 1))
+        })
+        .collect();
+    let held = |start: usize, len: usize| {
+        let mut seen = vec![false; terms.len()];
+        for &(t, a, b) in &occurrences {
+            seen[t] |= start <= a && b <= start + len;
+        }
+        seen.iter().filter(|s| **s).count()
+    };
+    // A moved window spends one character on the cut marker.
+    let len = max - 1;
+    let last = line.len() - len;
+    let (mut best, mut start) = (held(0, max), 0);
+    for &(_, _, b) in &occurrences {
+        let s = b.saturating_sub(len).clamp(1, last);
+        let n = held(s, len);
+        if n > best || (n == best && start > 0 && s < start) {
+            (best, start) = (n, s);
+        }
+    }
+    if start == 0 {
+        return head();
+    }
+    let inside = occurrences
+        .iter()
+        .filter(|&&(_, a, b)| start <= a && b <= start + len);
+    let a = inside.clone().map(|o| o.1).min().unwrap_or(start);
+    let b = inside.map(|o| o.2).max().unwrap_or(start + len);
+    let centred = a.saturating_sub((len - (b - a)) / 2);
+    let start = centred.clamp(b.saturating_sub(len).max(1), a.min(last));
+    std::iter::once('…')
+        .chain(line[start..start + len].iter().copied())
+        .collect()
+}
+
 fn more_command(args: &Chats, filters: &query::Filters, no_auto: bool) -> String {
     let mut argv: Vec<String> = vec!["agrep".into(), "chats".into()];
     if let Some(agent) = &args.scope.agent {
@@ -257,6 +367,8 @@ struct RowStyle<'a> {
     tools: bool,
     apply_self: bool,
     direct: bool,
+    /// The query's distinct terms, lowercased, for choosing preview windows.
+    terms: &'a [String],
 }
 fn print_chats(
     c: &rusqlite::Connection,
@@ -272,6 +384,7 @@ fn print_chats(
         tools,
         apply_self,
         direct,
+        terms,
     } = style;
     // 0.4.9 named each chat by its shortest unique prefix (py/search.py:8862-8866).
     let short = |handle: &str, session: &str| {
@@ -313,7 +426,7 @@ fn print_chats(
             }
             if let Some(hit) = hit {
                 row["match_turn"] = json!(hit.turn);
-                row["match_text"] = json!(h::one_line(matched_text.unwrap_or_default(), 240));
+                row["match_text"] = json!(preview(matched_text.unwrap_or_default(), terms, 240));
                 row["score"] = json!(hit.score);
                 if hit.matched != "phrase" {
                     row["matched"] = json!(hit.matched);
@@ -333,7 +446,10 @@ fn print_chats(
                 turns,
                 if s.side { " [side chat]" } else { "" },
                 if hit.is_some() { "match: " } else { "" },
-                render::safe(&h::one_line(matched_text.unwrap_or(&s.title), 96)),
+                render::safe(&match matched_text {
+                    Some(text) => preview(text, terms, 96),
+                    None => h::one_line(&s.title, 96),
+                }),
                 followup
             )?;
         }

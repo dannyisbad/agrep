@@ -71,6 +71,15 @@ fn load() -> String {
         .map(|v| String::from_utf8_lossy(&v.stdout).trim().to_owned())
         .unwrap_or_default()
 }
+/// A `--json` command states why it failed on stdout, not stderr.
+fn outcome(out: &std::process::Output) -> String {
+    format!(
+        "exit {:?}, stdout {}, stderr {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
 // The previous production path, retained only as the timing comparator.
 fn previous(model: &Embedder, texts: &[String]) -> Result<Vec<Vec<f32>>> {
     let stream = |offset| {
@@ -338,10 +347,7 @@ fn main() -> Result<()> {
                 command_samples.push(json!({"sample":sample,"candidate":bin==&binary,"semantic_only":semantic_only,"covered":false,"wall_ms":wall_ms,"exit":out.status.code(),"found_new":found,"uptime":uptime}));
                 eprintln!("{}", command_samples.last().unwrap());
                 if bin == &binary && (!out.status.success() || !found) {
-                    bail!(
-                        "next-query proof failed: {}",
-                        String::from_utf8_lossy(&out.stderr)
-                    );
+                    bail!("next-query proof failed: {}", outcome(&out));
                 }
             }
         }
@@ -369,7 +375,7 @@ fn main() -> Result<()> {
             command_samples.push(json!({"sample":sample,"candidate":true,"semantic_only":semantic_only,"covered":true,"wall_ms":tick.elapsed().as_secs_f64()*1000.,"exit":out.status.code(),"found_new":found,"uptime":uptime}));
             eprintln!("{}", command_samples.last().unwrap());
             if !out.status.success() || !found {
-                bail!("covered query proof failed");
+                bail!("covered query proof failed: {}", outcome(&out));
             }
         }
     }

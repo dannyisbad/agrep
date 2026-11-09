@@ -72,6 +72,12 @@ none of `--json`, `--flat`, `-l`, `--lexical`, `-w`, `-E`, `-c`, `--count-by-tie
   under `--who subagent`; keyword search finds them as subagent rows.
 - By default one result is kept per conversation family; `--all-side-chats` keeps one
   per session. A meaning row is labeled `meaning match`.
+- Copies of one message in other chats (forks share their parent's history, so a fork's
+  copy has the same speaker, text and time) are one result: the copy in the most
+  recently active chat is shown, marked `also in N forks`, and the others are listed
+  under its JSON `forks` (session and handle) and keep their own rows in `--flat`. The
+  chats it stands for take no other slot on the page; `-l` lists every chat and `-c`
+  counts every chat.
 - `semantic_policy::FLOOR` (0.82) is the lowest cosine that can be shown. Merging
   meaning rows into a keyword page (`hybrid::merge`) takes at most three, needs 0.84
   unless the page has strong keyword evidence, and makes the total a floor; see
@@ -132,9 +138,13 @@ and exits 2. A complete semantic-only search that finds nothing exits 1.
   speedups decay, and stale observations expire. Only single-sequence observations
   update the serial critical path; parallel wall times include waits for other streams.
   An uncalibrated query probes one
-  real chunk and retains its vector before admitting the remaining work. A bounded
-  preflight avoids decoding large rebuild queues. Background bulk embedding never
-  calibrates query admission.
+  real chunk and retains its vector before admitting the remaining work. So does a
+  query whose recorded cost refuses its queued rows: it judges the rest by its own
+  probe, so one slow command cannot refuse every query until its record expires, and
+  a row appended before a query starts is always embedded when it is the only one. A
+  bounded preflight avoids decoding large rebuild queues; it never prepares fewer
+  chunks than an uncalibrated query. Background bulk embedding never calibrates query
+  admission.
 - `status` reports the build counts and remaining time, as `-s` does (`about 15m 19s
   left`). The drain records the rows it covered per second of wall time, rows whose text
   was already embedded included, weighting batches by their time over about the last

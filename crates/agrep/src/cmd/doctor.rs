@@ -1,7 +1,11 @@
 use agrep_core::{data::DataRoot, diagnostics, store};
 use anyhow::Result;
 use serde_json::json;
-use std::io::{IsTerminal, Write};
+use std::{
+    io::{IsTerminal, Write},
+    sync::{Mutex, PoisonError},
+    time::{Duration, Instant},
+};
 pub fn run(deep: bool, fix: bool, no_semantic: bool, json_output: bool) -> Result<i32> {
     let root = DataRoot::discover()?;
     let mut s = diagnostics::status(&root)?;
@@ -112,6 +116,9 @@ pub fn run(deep: bool, fix: bool, no_semantic: bool, json_output: bool) -> Resul
     if let Some(check) = index_check(&s) {
         checks.push(check);
     }
+    if let Some(check) = agent_history_check() {
+        checks.push(check);
+    }
     if s["index"]["state"] == "ready" {
         s["sources"] = json!(diagnostics::failed_sources(&store::reader(&root)?)?);
     }
@@ -124,32 +131,105 @@ pub fn run(deep: bool, fix: bool, no_semantic: bool, json_output: bool) -> Resul
         checks.push(json!({"check":"directory_permissions","state":"failed","detail":s["permissions"]["exposed"]}));
     }
     if !no_semantic {
-        diagnostics::verify_model(&root, &mut s);
-        let incomplete = agrep_core::semantic_model::incomplete(&root);
-        let mut check = json!({"check":"semantic_model","state":"not_checked","detail":s["semantic"]["integrity_error"]});
-        if s["semantic"]["integrity_error"].is_string() || incomplete {
-            check["state"] = json!("failed");
-            check["action"] = json!("`agrep setup` reinstalls it");
-            if incomplete {
-                check["detail"] = json!("a model download or install stopped partway");
-            }
-        } else if deep {
-            check["state"] = json!(if s["semantic"]["model_present"] == true {
-                "present"
-            } else {
-                "not installed"
-            });
-        }
-        checks.push(check);
+        checks.push(model_check(&root, &mut s));
     }
-    match agrep_core::archive::problems(&root) {
-        Ok(problems) => checks.extend(problems.into_iter().map(|(detail, action)| {
-            json!({"check":"archive","state":"failed","detail":detail,"action":action})
-        })),
-        Err(e) => checks.push(json!({"check":"archive","state":"failed","detail":format!("{e:#}"),
-            "action":"`agrep archive --status` shows the archive's state"})),
-    }
+    checks.extend(archive_checks(&root, deep));
     report(&s, &checks, &repaired, repair_failed, json_output)
+}
+/// The archive's problems as check rows. A deep check that takes a while shows on a
+/// terminal's stderr how many stored chunks it has read; elsewhere it stays quiet.
+fn archive_checks(root: &DataRoot, deep: bool) -> Vec<serde_json::Value> {
+    let meter = (deep && std::io::stderr().is_terminal()).then(ChunkMeter::default);
+    let progress = |done: usize, total: usize| {
+        if let Some(meter) = &meter {
+            meter.show(done, total);
+        }
+    };
+    let progress: &agrep_core::archive::ChunkProgress<'_> = &progress;
+    let problems = agrep_core::archive::problems(root, deep.then_some(progress));
+    if let Some(meter) = &meter {
+        meter.finish();
+    }
+    match problems {
+        Ok(problems) => problems.into_iter().map(archive_check).collect(),
+        Err(e) => vec![
+            json!({"check":"archive","state":"failed","detail":format!("{e:#}"),
+            "action":"`agrep archive --status` shows the archive's state"}),
+        ],
+    }
+}
+/// An archive problem as a check row; the files are listed when not all are recoverable.
+fn archive_check(p: agrep_core::archive::Problem) -> serde_json::Value {
+    let mut check = json!({"check":"archive","state":"failed","detail":p.detail});
+    if let Some(action) = p.action {
+        check["action"] = json!(action);
+    }
+    if !p.paths.is_empty() {
+        check["paths"] = json!(p.paths);
+    }
+    check
+}
+/// The line a deep check rewrites while it reads the archive's chunks, as the embedding
+/// and download lines are rewritten.
+struct ChunkMeter {
+    start: Instant,
+    /// When the line was last drawn, the chunks it counted and the total.
+    shown: Mutex<Option<(Instant, usize, usize)>>,
+}
+impl Default for ChunkMeter {
+    fn default() -> Self {
+        Self {
+            start: Instant::now(),
+            shown: Mutex::new(None),
+        }
+    }
+}
+const SHOW_EVERY: Duration = Duration::from_millis(250);
+impl ChunkMeter {
+    /// Called by every reading thread; one that finds another drawing skips its turn. The
+    /// line first appears once a check has run for a moment.
+    fn show(&self, done: usize, total: usize) {
+        let Ok(mut shown) = self.shown.try_lock() else {
+            return;
+        };
+        let now = Instant::now();
+        let last = shown.map_or(self.start, |(at, _, _)| at);
+        if total == 0
+            || now - last < SHOW_EVERY
+            || shown.is_some_and(|(_, counted, _)| done <= counted)
+        {
+            return;
+        }
+        *shown = Some((now, done, total));
+        draw(&chunk_line(done, total, now - self.start));
+    }
+    /// Draws the finished count and ends the line, if it was drawn at all.
+    fn finish(&self) {
+        let shown = *self.shown.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, _, total)) = shown {
+            draw(&chunk_line(total, total, self.start.elapsed()));
+            agrep_core::surface::note(format_args!("\n"));
+        }
+    }
+}
+fn draw(line: &str) {
+    // Erases what is left of a longer earlier line.
+    agrep_core::surface::note(format_args!("\r{line}\x1b[K"));
+}
+/// The chunks read of the total, then the time left once a second of reading measured it.
+fn chunk_line(done: usize, total: usize, elapsed: Duration) -> String {
+    let mut line = format!(
+        "checking archived chunks: {} of {}",
+        agrep_core::surface::number(done),
+        agrep_core::surface::number(total)
+    );
+    if done < total {
+        let seconds = (done > 0 && elapsed >= Duration::from_secs(1))
+            .then(|| ((total - done) as f64 * elapsed.as_secs_f64() / done as f64).ceil() as u64);
+        line += " · ";
+        line += &agrep_core::semantic::estimate(seconds);
+    }
+    line
 }
 /// A missing or unusable index, and what makes it usable.
 fn index_check(s: &serde_json::Value) -> Option<serde_json::Value> {
@@ -166,6 +246,50 @@ fn index_check(s: &serde_json::Value) -> Option<serde_json::Value> {
         _ => "run `agrep index`",
     };
     Some(json!({"check":"index","state":state,"detail":s["index"]["error"],"action":action}))
+}
+
+/// A home where no supported agent keeps its history: the index stays empty, which is no
+/// fault of agrep's, but the reason is not otherwise visible.
+fn agent_history_check() -> Option<serde_json::Value> {
+    use agrep_core::ingest::registry::ADAPTERS;
+    let found = ADAPTERS.iter().any(|adapter| {
+        adapter
+            .store_roots()
+            .iter()
+            .any(|root| std::fs::symlink_metadata(root).is_ok())
+    });
+    if found {
+        return None;
+    }
+    let names: Vec<_> = ADAPTERS.iter().map(|adapter| adapter.name()).collect();
+    let (last, rest) = names.split_last()?;
+    Some(json!({"check":"agent_history","state":"none found",
+        "detail":format!("no supported agent history under {} (looked for {} and {last} stores)",
+            agrep_core::ingest::home().display(), rest.join(", ")),
+        "action":"agrep indexes it once one of these agents records a session"}))
+}
+
+/// The meaning model: failed verification, missing, or verified.
+fn model_check(root: &DataRoot, s: &mut serde_json::Value) -> serde_json::Value {
+    // Without an index `status` leaves the model unexamined; doctor verifies it anyway.
+    if s["semantic"]["model_installed"].is_null() {
+        s["semantic"]["model_installed"] = json!(agrep_core::semantic::installed(root));
+    }
+    diagnostics::verify_model(root, s);
+    if agrep_core::semantic_model::incomplete(root) {
+        return json!({"check":"semantic_model","state":"failed",
+            "detail":"a model download or install stopped partway",
+            "action":"`agrep setup` reinstalls it"});
+    }
+    if let Some(error) = s["semantic"]["integrity_error"].as_str() {
+        return json!({"check":"semantic_model","state":"failed","detail":error,
+            "action":"`agrep setup` reinstalls it"});
+    }
+    if s["semantic"]["model_present"] == true {
+        return json!({"check":"semantic_model","state":"present","detail":null});
+    }
+    json!({"check":"semantic_model","state":"not installed","detail":null,
+        "action":"`agrep setup` installs it"})
 }
 
 fn rebuild(root: &DataRoot, build: impl FnOnce(&DataRoot) -> Result<()>) -> Result<()> {
@@ -258,6 +382,12 @@ fn report(
                 line += &format!(" - {action}");
             }
             agrep_core::outln!("{line}")?;
+            for path in check["paths"].as_array().into_iter().flatten().take(10) {
+                agrep_core::outln!(
+                    "  {}",
+                    agrep_core::render::safe(path.as_str().unwrap_or(""))
+                )?;
+            }
         }
         for source in s["sources"].as_array().into_iter().flatten() {
             agrep_core::outln!(
@@ -287,6 +417,26 @@ fn report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn chunk_line_counts_chunks_and_estimates_once_measured() {
+        let second = Duration::from_secs(1);
+        assert_eq!(
+            chunk_line(0, 26168, Duration::ZERO),
+            "checking archived chunks: 0 of 26,168 · estimating time left"
+        );
+        assert_eq!(
+            chunk_line(500, 26168, second / 2),
+            "checking archived chunks: 500 of 26,168 · estimating time left"
+        );
+        assert_eq!(
+            chunk_line(6542, 26168, 4 * second),
+            "checking archived chunks: 6,542 of 26,168 · about 12s left"
+        );
+        assert_eq!(
+            chunk_line(26168, 26168, 16 * second),
+            "checking archived chunks: 26,168 of 26,168"
+        );
+    }
     #[test]
     fn rebuild_preserves_wal_and_rules_on_every_platform() {
         let t = tempfile::tempdir().unwrap();

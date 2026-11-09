@@ -1,11 +1,14 @@
 #[path = "../examples/support/exit.rs"]
 mod exit;
+#[path = "support/native.rs"]
+mod native;
 mod support;
 use agrep_core::{
     archive,
     data::DataRoot,
     integrations::{self, Target},
 };
+use native::native;
 use rusqlite::Connection;
 use std::{
     fs,
@@ -115,7 +118,7 @@ impl Fixture {
         o
     }
     fn source(&self, name: &str, bytes: &[u8]) -> PathBuf {
-        let p = self.home.join(".codex/sessions/2026/10/30").join(name);
+        let p = native(&self.home.join(".codex/sessions/2026/10/30")).join(name);
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(&p, bytes).unwrap();
         p
@@ -351,7 +354,7 @@ fn setup_headless_optouts_readonly_and_user_payload() {
 #[test]
 fn marker_without_enrollment_removed_and_unreadable_file_left_alone() {
     let f = Fixture::new();
-    let p = f.home.join(".codex/AGENTS.md");
+    let p = native(&f.home.join(".codex/AGENTS.md"));
     fs::create_dir_all(p.parent().unwrap()).unwrap();
     fs::write(
         &p,
@@ -390,7 +393,7 @@ fn marker_without_enrollment_removed_and_unreadable_file_left_alone() {
 #[test]
 fn setup_errors_name_the_file_to_fix() {
     let f = Fixture::new();
-    let p = f.home.join(".codex/AGENTS.md");
+    let p = native(&f.home.join(".codex/AGENTS.md"));
     fs::create_dir_all(p.parent().unwrap()).unwrap();
     for (bytes, reason) in [
         (&b"user \xff\n"[..], "instruction file is not UTF-8"),
@@ -421,7 +424,7 @@ fn opencode_instructions_go_where_opencode_reads_them() {
     let f = Fixture::new();
     let data = f.home.join(".local/share/opencode");
     fs::create_dir_all(&data).unwrap();
-    let config = f.home.join(".config/opencode/AGENTS.md");
+    let config = native(&f.home.join(".config/opencode/AGENTS.md"));
     let args = [
         "setup",
         "--yes",
@@ -633,6 +636,41 @@ fn archive_chunks_dedupe_and_export_tree() {
         fs::read(to.join(p.strip_prefix(&f.home).unwrap())).unwrap(),
         bytes
     );
+}
+#[test]
+fn restore_to_the_current_directory_prints_a_plain_path() {
+    let f = Fixture::new();
+    let p = f.source("rollout-dot.jsonl", b"{}\n");
+    f.ok(&["archive"]);
+    let to = f.home.join("export");
+    fs::create_dir(&to).unwrap();
+    let out = f
+        .command(&["restore", "rollout-dot", "--to", "."])
+        .current_dir(&to)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let printed = stdout
+        .strip_prefix("restored ")
+        .and_then(|rest| rest.split_once(" (3 bytes, "))
+        .map(|(path, _)| PathBuf::from(path))
+        .unwrap_or_else(|| panic!("{stdout}"));
+    // The directory is printed as agrep's working directory reads (macOS resolves the temp
+    // directory's link, Windows keeps its short name), without a `.` and in native spelling.
+    assert!(printed.is_absolute(), "{stdout}");
+    assert_eq!(
+        printed.as_os_str(),
+        native(&printed).as_os_str(),
+        "{stdout}"
+    );
+    assert_eq!(
+        printed.canonicalize().unwrap(),
+        to.canonicalize()
+            .unwrap()
+            .join(p.strip_prefix(&f.home).unwrap())
+    );
+    assert_eq!(fs::read(printed).unwrap(), b"{}\n");
 }
 #[test]
 fn archive_sqlite_wal_backup_force_restore_waits_for_writer() {
@@ -1149,7 +1187,7 @@ fn lost_chunks_are_reported_as_archive_damage() {
     corrupt_in_place(&blobs_of(&f, "corrupt")[0]);
     fs::remove_file(&lost).unwrap();
     fs::remove_file(&corrupt).unwrap();
-    let blobs = f.data.join("archive/blobs");
+    let blobs = native(&f.data.join("archive/blobs"));
     let restore = f.cmd(&["restore", "lost"]);
     let (out, _) = text(&restore);
     assert_eq!(restore.status.code(), Some(1), "{out}");
@@ -1197,6 +1235,114 @@ fn lost_chunks_are_reported_as_archive_damage() {
     );
 }
 
+/// Overwrites bytes inside `path` in place, keeping its size and modification time, as
+/// silent disk damage does.
+fn overwrite_keeping_size_and_mtime(path: &Path) {
+    use std::io::{Seek, SeekFrom, Write};
+    let before = fs::metadata(path).unwrap();
+    let mut bytes = fs::read(path).unwrap();
+    for b in &mut bytes[40..47] {
+        *b ^= 0xff;
+    }
+    let mut file = fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.seek(SeekFrom::Start(40)).unwrap();
+    file.write_all(&bytes[40..47]).unwrap();
+    file.set_modified(before.modified().unwrap()).unwrap();
+    drop(file);
+    let after = fs::metadata(path).unwrap();
+    assert_eq!(
+        (after.len(), after.modified().unwrap()),
+        (before.len(), before.modified().unwrap())
+    );
+}
+
+/// `doctor --deep` decompresses and re-hashes every stored chunk: a chunk overwritten in
+/// place is found though its file looks unchanged. Each damaged version is reported as one
+/// a live file still holds, its own or another the next capture reads, or as lost. The
+/// finding is recorded, so status reports it and the next capture re-stores what it can.
+#[test]
+fn doctor_deep_finds_chunks_corrupted_in_place() {
+    let f = Fixture::new();
+    let kept = f.source("rollout-kept.jsonl", &transcript_text("kept"));
+    let gone = f.source("rollout-gone.jsonl", &transcript_text("gone"));
+    let moved = f.source("rollout-moved.jsonl", &transcript_text("moved"));
+    f.ok(&["archive"]);
+    let deep = ["doctor", "--deep", "--no-semantic"];
+    let (out, _) = text(&f.ok(&deep));
+    assert!(!out.contains("\narchive:"), "{out}");
+    for name in ["kept", "gone", "moved"] {
+        overwrite_keeping_size_and_mtime(&blobs_of(&f, name)[0]);
+    }
+    fs::remove_file(&gone).unwrap();
+    fs::rename(&moved, moved.with_file_name("rollout-moved-later.jsonl")).unwrap();
+    let restorable = "\narchive: failed - 2 archived version(s) of 2 file(s) have missing or corrupt stored chunks that live files still hold - `agrep archive` re-stores them\n";
+    let lost = format!(
+        "\narchive: failed - 1 archived version(s) of 1 file(s) are lost: their stored chunks are missing or corrupt and no live file holds that content any more; the archive's other versions are unaffected\n  {}\n",
+        gone.display()
+    );
+    let (out, _) = text(&f.ok(&deep));
+    assert!(
+        out.starts_with("doctor: action needed\n")
+            && out.contains(restorable)
+            && out.contains(&lost),
+        "{out}"
+    );
+    let json: serde_json::Value = serde_json::from_slice(
+        &f.ok(&["doctor", "--deep", "--no-semantic", "--json"])
+            .stdout,
+    )
+    .unwrap();
+    let archive: Vec<_> = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["check"] == "archive")
+        .collect();
+    assert_eq!(archive.len(), 2, "{json}");
+    assert_eq!(archive[0]["action"], "`agrep archive` re-stores them");
+    assert_eq!(
+        archive[1]["paths"],
+        serde_json::json!([gone.to_string_lossy()])
+    );
+    assert!(archive[1].get("action").is_none(), "{json}");
+    let (out, _) = text(&f.cmd(&["archive", "--status"]));
+    assert!(
+        out.contains("archive damaged: 3 version(s) of 3 file(s) cannot be restored"),
+        "{out}"
+    );
+    let (out, _) = text(&f.cmd(&["archive"]));
+    assert!(out.contains(", 2 damaged chunk(s) re-stored in "), "{out}");
+    let (out, _) = text(&f.ok(&deep));
+    assert!(!out.contains(restorable) && out.contains(&lost), "{out}");
+    let (out, _) = text(&f.ok(&["doctor"]));
+    assert!(
+        out.contains("\narchive: failed - 1 archived version(s) of 1 file(s) cannot be restored: "),
+        "{out}"
+    );
+    fs::remove_file(&kept).unwrap();
+    f.ok(&["restore", "kept"]);
+    assert_eq!(fs::read(&kept).unwrap(), transcript_text("kept"));
+}
+
+/// The chunk count `doctor --deep` rewrites while it reads the archive is for a terminal:
+/// piped, stderr stays empty and stdout holds only the report, however long it reads.
+#[test]
+fn doctor_deep_shows_no_progress_when_piped() {
+    let f = Fixture::new();
+    let line = |i: usize| format!("{{\"line\":{i},\"tag\":\"long archived transcript\"}}\n");
+    let content: String = (0..400_000).map(line).collect();
+    f.source("rollout-long.jsonl", content.as_bytes());
+    f.ok(&["archive"]);
+    assert!(blobs_of(&f, "long").len() > 8);
+    let o = f.ok(&["doctor", "--deep", "--no-semantic"]);
+    let (out, err) = text(&o);
+    assert_eq!(err, "");
+    assert!(!out.contains("checking archived chunks"), "{out}");
+    let o = f.ok(&["doctor", "--deep", "--no-semantic", "--json"]);
+    assert_eq!(text(&o).1, "");
+    serde_json::from_slice::<serde_json::Value>(&o.stdout).unwrap();
+}
+
 fn corrupt_catalog(f: &Fixture) {
     let catalog = f.data.join("archive/catalog.db");
     for suffix in ["-wal", "-shm"] {
@@ -1213,7 +1359,7 @@ fn a_corrupt_catalog_is_named_and_purge_recovers() {
     let p = f.source("rollout-catalog.jsonl", b"catalog");
     f.ok(&["archive"]);
     corrupt_catalog(&f);
-    let catalog = f.data.join("archive/catalog.db");
+    let catalog = native(&f.data.join("archive/catalog.db"));
     let damaged = format!(
         "archive catalog is damaged: {} (file is not a database); `agrep archive --purge --yes` deletes the archive and the next capture starts a new one\n",
         catalog.display()
@@ -1279,7 +1425,7 @@ fn a_failed_scheduled_capture_backs_off() {
         "{out}"
     );
     let (out, _) = text(&f.cmd(&["doctor"]));
-    let catalog = f.data.join("archive/catalog.db");
+    let catalog = native(&f.data.join("archive/catalog.db"));
     assert!(
         out.starts_with("doctor: action needed\n")
             && out.contains(&format!(

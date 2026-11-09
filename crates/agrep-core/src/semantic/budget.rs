@@ -10,9 +10,10 @@ use anyhow::{bail, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 
-const DEFAULT_BUILD_ROWS_PER_SECOND: f64 = 60.;
 const INLINE_SECONDS: f64 = 1.;
 const MIN_INLINE_UNITS: f64 = 0.25;
+/// Queued chunks an uncalibrated query prepares before its probe measures the machine.
+const PROBE_PREPARATION: usize = 32;
 
 #[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub(super) struct QueryCost {
@@ -61,13 +62,16 @@ impl QueryCost {
     pub fn fits(self, units: f64, largest: f64, elapsed: f64) -> bool {
         elapsed + self.seconds(units, largest) <= INLINE_SECONDS * 0.85
     }
+    /// How many queued chunks a query decodes before admission. A recorded cost never bounds
+    /// it below what an uncalibrated query prepares: a refusal records nothing, so a bound
+    /// from one slow observation would otherwise refuse every query until it expires.
     pub fn preparation_limit(cost: Option<Self>) -> usize {
-        cost.map_or(32, |c| {
+        cost.map_or(PROBE_PREPARATION, |c| {
             (((INLINE_SECONDS * 0.85 - c.load).max(0.) * Embedder::inline_streams() as f64
                 / c.cpu_unit
                 / MIN_INLINE_UNITS
                 / 1.5) as usize)
-                .min(4096)
+                .clamp(PROBE_PREPARATION, 4096)
         })
     }
     pub fn observe(root: &DataRoot, load: f64, batch: &semantic_model::InlineBatch) {
@@ -108,12 +112,67 @@ impl QueryCost {
     }
 }
 
+/// The query model as inline admission uses it.
+pub(super) trait InlineModel {
+    /// Seconds since the lane started, model loading included.
+    fn elapsed(&self) -> f64;
+    /// Seconds the model took to load.
+    fn load(&self) -> f64;
+    fn work_units(&self, texts: &[String]) -> Result<f64>;
+    /// Embeds `texts` and records the measurement for later queries.
+    fn embed(&self, texts: &[String]) -> Result<semantic_model::InlineBatch>;
+}
+/// The vectors of a snapshot's queued chunks, or None when they do not fit the inline
+/// budget. A recorded cost that admits them all is trusted. Otherwise the first chunk is
+/// embedded, as an uncalibrated query probes, and the rest is judged by this command's own
+/// measurement: a recorded slowdown is re-measured instead of refusing until it expires.
+pub(super) fn embed_queued(
+    model: &impl InlineModel,
+    queued: &[String],
+    recorded: Option<QueryCost>,
+) -> Result<Option<Vec<Vec<f32>>>> {
+    if queued.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let weights = queued
+        .iter()
+        .map(|text| model.work_units(std::slice::from_ref(text)))
+        .collect::<Result<Vec<_>>>()?;
+    let fits = |cost: QueryCost, weights: &[f64]| {
+        cost.fits(
+            weights.iter().sum(),
+            weights.iter().copied().fold(0., f64::max),
+            model.elapsed(),
+        )
+    };
+    if recorded.is_some_and(|cost| fits(cost, &weights)) {
+        return Ok(Some(model.embed(queued)?.vectors));
+    }
+    let probe = model.embed(&queued[..1])?;
+    let measured = QueryCost {
+        load: model.load(),
+        cpu_unit: probe.cpu_unit,
+        span_unit: probe.span_unit,
+        updated: QueryCost::now(),
+    };
+    let mut vectors = probe.vectors;
+    if queued.len() > 1 {
+        if !fits(measured, &weights[1..]) {
+            return Ok(None);
+        }
+        vectors.extend(model.embed(&queued[1..])?.vectors);
+    }
+    Ok(Some(vectors))
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct BuildProgress {
     pub indexed_rows: usize,
     pub total_rows: usize,
     pub remaining_rows: usize,
-    pub estimated_seconds: u64,
+    /// None until a drain on this machine measured how fast rows embed (a rebuild keeps the
+    /// rate the index it replaces measured).
+    pub estimated_seconds: Option<u64>,
 }
 pub fn build_progress(c: &Connection, coverage: &Coverage) -> Result<BuildProgress> {
     let rate = c
@@ -124,18 +183,17 @@ pub fn build_progress(c: &Connection, coverage: &Coverage) -> Result<BuildProgre
         )
         .optional()?
         .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v > 0.)
-        .unwrap_or(DEFAULT_BUILD_ROWS_PER_SECOND);
+        .filter(|v| v.is_finite() && *v > 0.);
     let remaining = coverage.total.saturating_sub(coverage.embedded);
     Ok(BuildProgress {
         indexed_rows: coverage.embedded,
         total_rows: coverage.total,
         remaining_rows: remaining,
-        estimated_seconds: (remaining as f64 / rate).ceil() as u64,
+        estimated_seconds: rate.map(|rate| (remaining as f64 / rate).ceil() as u64),
     })
 }
 /// A duration as the build's estimates say it: `1h 5m`, `15m 19s`, `42s`.
-pub fn time_left(seconds: u64) -> String {
+pub(super) fn time_left(seconds: u64) -> String {
     if seconds >= 3600 {
         format!("{}h {}m", seconds / 3600, seconds % 3600 / 60)
     } else if seconds >= 60 {
@@ -144,14 +202,22 @@ pub fn time_left(seconds: u64) -> String {
         format!("{seconds}s")
     }
 }
+/// A build's time left as `status` and an unavailable `-s` say it: `about 15m 19s left`, or
+/// `estimating time left` while no rate has been measured.
+pub fn estimate(seconds: Option<u64>) -> String {
+    match seconds {
+        Some(seconds) => format!("about {} left", time_left(seconds)),
+        None => "estimating time left".to_owned(),
+    }
+}
 impl std::fmt::Display for BuildProgress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "the meaning index is still building ({} of {} rows, about {} left)",
-            self.indexed_rows,
-            self.total_rows,
-            time_left(self.estimated_seconds)
+            "the meaning index is still building ({} of {} rows, {})",
+            crate::surface::number(self.indexed_rows),
+            crate::surface::number(self.total_rows),
+            estimate(self.estimated_seconds)
         )
     }
 }

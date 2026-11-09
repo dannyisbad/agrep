@@ -283,7 +283,10 @@ A compact page:
 - without `-n`, keeps room on the first page for the two best all-terms rows,
   dropping its last phrase rows if the page would overflow;
 - marks lower-quality rows with `~substr` or `~all`, and meaning rows with
-  `~semantic (meaning match)`.
+  `~semantic (meaning match)`;
+- shows a message that forked chats hold as copies once, from the most recently
+  active chat, marked `(also in N forks)` (`~all (also in N forks)`, `~semantic
+  (meaning match, also in N forks)`); see OUTPUT_CONTRACTS.md.
 
 `agrep --more <handle>` reads the next page from a frozen page kept for five
 minutes; it does not rerun the query. The frozen page keeps the query, the total

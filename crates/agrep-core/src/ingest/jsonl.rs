@@ -1,8 +1,9 @@
 use std::{
     borrow::Cow,
     cell::RefCell,
-    fs::File,
-    io::{self, BufRead, BufReader, Seek, Write},
+    fs::{self, File},
+    io::{self, BufRead, BufReader, Read, Seek, Write},
+    path::Path,
 };
 
 pub(crate) trait Text {
@@ -98,6 +99,87 @@ impl Text for ZstdText<'_> {
             }
         }
     }
+}
+
+/// Above the largest compression ratio of the owner's 1237 Codex rollouts (12.2x, median
+/// 4.8x), for a zstd source whose frames cannot be read without decoding it.
+const UNREAD_ZSTD_RATIO: u64 = 16;
+
+/// The bytes a source decodes to, read from a zstd source's frame headers rather than by
+/// decoding it, and never less than the stored size.
+pub(crate) fn decoded_len(path: &Path, stored: u64) -> u64 {
+    if path.extension().is_none_or(|extension| extension != "zst") {
+        return stored;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    crate::ingest::registry::secure_read_options(&mut options);
+    options
+        .open(path)
+        .ok()
+        .and_then(|file| zstd_content_len(file, stored).ok().flatten())
+        .unwrap_or(stored.saturating_mul(UNREAD_ZSTD_RATIO))
+        .max(stored)
+}
+
+/// Each frame's declared content size, or for a frame that declares none the most its blocks
+/// can hold; None when `stored` bytes are not a sequence of zstd frames. Block headers are
+/// read in passing through a large buffer, since one read per header costs more than the bytes.
+fn zstd_content_len(file: impl Read + Seek, stored: u64) -> io::Result<Option<u64>> {
+    const BLOCK_MAX: u64 = 128 << 10;
+    let mut file = BufReader::with_capacity(256 << 10, file);
+    let mut position = 0;
+    let mut read = |at: u64, bytes: &mut [u8]| {
+        file.seek_relative(i64::try_from(at - position).map_err(io::Error::other)?)?;
+        file.read_exact(bytes)?;
+        position = at + bytes.len() as u64;
+        io::Result::Ok(())
+    };
+    let (mut at, mut total) = (0u64, 0u64);
+    while at < stored {
+        let mut word = [0; 4];
+        read(at, &mut word)?;
+        let magic = u32::from_le_bytes(word);
+        if magic & 0xFFFF_FFF0 == 0x184D_2A50 {
+            read(at + 4, &mut word)?;
+            at += 8 + u64::from(u32::from_le_bytes(word));
+            continue;
+        }
+        if magic != 0xFD2F_B528 {
+            return Ok(None);
+        }
+        let mut descriptor = [0; 1];
+        read(at + 4, &mut descriptor)?;
+        let descriptor = descriptor[0];
+        let single_segment = descriptor & 0x20 != 0;
+        let skipped = usize::from(!single_segment) + [0, 1, 2, 4][usize::from(descriptor & 3)];
+        let size_len = [usize::from(single_segment), 2, 4, 8][usize::from(descriptor >> 6)];
+        let mut header = [0; 13];
+        read(at + 5, &mut header[..skipped + size_len])?;
+        let mut size = [0; 8];
+        size[..size_len].copy_from_slice(&header[skipped..skipped + size_len]);
+        let declared =
+            (size_len > 0).then(|| u64::from_le_bytes(size) + if size_len == 2 { 256 } else { 0 });
+        at += 5 + (skipped + size_len) as u64;
+        let mut blocks = 0u64;
+        loop {
+            let mut block = [0; 4];
+            read(at, &mut block[..3])?;
+            let block = u32::from_le_bytes(block);
+            let kind = (block >> 1) & 3;
+            if kind == 3 {
+                return Ok(None);
+            }
+            at += 3 + if kind == 1 { 1 } else { u64::from(block >> 3) };
+            blocks += 1;
+            if block & 1 == 1 {
+                break;
+            }
+        }
+        at += if descriptor & 0x04 != 0 { 4 } else { 0 };
+        total = total.saturating_add(declared.unwrap_or(blocks.saturating_mul(BLOCK_MAX)));
+    }
+    Ok((at == stored).then_some(total))
 }
 
 /// Lines as `str::lines` splits them, decoded like `String::from_utf8_lossy`; a read error
@@ -232,6 +314,40 @@ impl RawRecord {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn zstd_sources_count_their_decoded_size_from_frame_headers() {
+        let text =
+            b"{\"type\":\"response_item\",\"payload\":{\"text\":\"hello\"}}\n".repeat(20_000);
+        let declared = zstd::bulk::compress(&text, 3).unwrap();
+        let streamed = zstd::stream::encode_all(&text[..], 3).unwrap();
+        let size = |bytes: &[u8]| zstd_content_len(io::Cursor::new(bytes), bytes.len() as u64);
+        assert_eq!(size(&declared).unwrap(), Some(text.len() as u64));
+        let bound = size(&streamed).unwrap().unwrap();
+        // Streaming leaves the size undeclared: every block counts as full.
+        assert!(bound > text.len() as u64 && bound <= text.len() as u64 + (128 << 10));
+        let mut frames = declared.clone();
+        frames.extend(0x184D_2A50u32.to_le_bytes());
+        frames.extend(3u32.to_le_bytes());
+        frames.extend(b"pad");
+        frames.extend(&declared);
+        assert_eq!(size(&frames).unwrap(), Some(2 * text.len() as u64));
+        assert_eq!(size(&declared[..declared.len() - 1]).unwrap_or(None), None);
+        assert_eq!(size(&text[..64]).unwrap(), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("rollout.jsonl");
+        let compressed = dir.path().join("rollout.jsonl.zst");
+        let unreadable = dir.path().join("broken.jsonl.zst");
+        std::fs::write(&compressed, &declared).unwrap();
+        std::fs::write(&unreadable, &text[..64]).unwrap();
+        assert_eq!(decoded_len(&plain, 7), 7);
+        assert_eq!(
+            decoded_len(&compressed, declared.len() as u64),
+            text.len() as u64
+        );
+        assert_eq!(decoded_len(&unreadable, 64), 64 * UNREAD_ZSTD_RATIO);
+    }
 
     #[test]
     fn streamed_lossy_utf8_matches_whole_input_at_every_boundary() {

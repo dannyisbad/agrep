@@ -3,6 +3,7 @@ mod capture;
 mod catalog;
 mod discover;
 mod restore;
+mod verify;
 use crate::{data::DataRoot, safe_fs};
 use anyhow::{bail, Result};
 use catalog::Archive;
@@ -101,7 +102,7 @@ fn copy_database(backup: &rusqlite::backup::Backup<'_, '_>, blocking: bool) -> R
     }
 }
 fn catalog_path(root: &DataRoot) -> PathBuf {
-    root.path().join("archive/catalog.db")
+    root.path().join("archive").join("catalog.db")
 }
 
 /// One capture pass; `log` receives a line per source captured, appended, repaired or
@@ -207,7 +208,7 @@ fn last_capture(db: &Connection) -> rusqlite::Result<Option<i64>> {
 }
 /// Present while capture passes fail: their count and when the last one failed.
 fn failure_marker(root: &DataRoot) -> PathBuf {
-    root.path().join("archive/capture.failed")
+    root.path().join("archive").join("capture.failed")
 }
 fn failed_passes(root: &DataRoot) -> Option<(u32, i64)> {
     let text = fs::read_to_string(failure_marker(root)).ok()?;
@@ -218,37 +219,93 @@ fn failed_passes(root: &DataRoot) -> Option<(u32, i64)> {
 pub fn failing_captures(root: &DataRoot) -> u32 {
     failed_passes(root).map_or(0, |(count, _)| count)
 }
-/// What is wrong with the archive, each with the action that resolves it: a damaged
-/// catalog, versions that cannot be restored, failing passes, unreadable sources.
-pub fn problems(root: &DataRoot) -> Result<Vec<(String, String)>> {
+/// Something wrong with the archive: what, the action that resolves it if any, and the
+/// files it concerns when they are not all recoverable.
+#[derive(Debug)]
+pub struct Problem {
+    pub detail: String,
+    pub action: Option<String>,
+    pub paths: Vec<String>,
+}
+impl Problem {
+    fn new(detail: String, action: &str) -> Self {
+        Self {
+            detail,
+            action: Some(action.to_owned()),
+            paths: Vec::new(),
+        }
+    }
+}
+/// Hears, during a deep check, how many of the stored chunks have been read and how many
+/// there are. Chunks are read in parallel, so it is called from several threads.
+pub type ChunkProgress<'a> = dyn Fn(usize, usize) + Sync + 'a;
+/// What is wrong with the archive: a damaged catalog, versions that cannot be restored,
+/// failing passes, unreadable sources. A `deep` check, reporting to its progress,
+/// decompresses and re-hashes every stored chunk instead of trusting the last capture's
+/// findings, and tells versions a capture can re-store from those that are lost.
+pub fn problems(root: &DataRoot, deep: Option<&ChunkProgress<'_>>) -> Result<Vec<Problem>> {
     if !root.path().join("archive").is_dir() {
         return Ok(Vec::new());
     }
     let s = catalog_state(root)?.unwrap_or_default();
     if let Some(damaged) = s["catalog_damaged"].as_str() {
-        return Ok(vec![(damaged.to_owned(), PURGE.to_owned())]);
+        return Ok(vec![Problem::new(damaged.to_owned(), PURGE)]);
     }
-    let mut problems = Vec::new();
-    let versions = s["damaged_versions"].as_u64().unwrap_or(0);
-    if versions > 0 {
-        problems.push((
-            format!("{versions} archived version(s) of {} file(s) cannot be restored: their stored chunks are missing or corrupt", s["damaged_files"]),
-            "`agrep archive` re-stores those that live files still hold".to_owned(),
-        ));
-    }
+    let mut problems = match deep {
+        Some(progress) if !s.is_null() => deep_damage(root, progress)?,
+        _ => damage_problem(&s).into_iter().collect(),
+    };
     let failing = failing_captures(root);
     if failing > 0 {
-        problems.push((
+        problems.push(Problem::new(
             format!("the last {failing} capture pass(es) failed"),
-            "`agrep archive` runs one and shows the error".to_owned(),
+            "`agrep archive` runs one and shows the error",
         ));
     }
     let failed = s["failures"].as_array().map_or(0, Vec::len);
     if failed > 0 {
-        problems.push((
+        problems.push(Problem::new(
             format!("{failed} source path(s) failed in the last capture"),
-            "`agrep archive` retries them and lists those that still fail".to_owned(),
+            "`agrep archive` retries them and lists those that still fail",
         ));
+    }
+    Ok(problems)
+}
+/// The damage the last capture found and the chunks missing now.
+fn damage_problem(s: &serde_json::Value) -> Option<Problem> {
+    let versions = s["damaged_versions"].as_u64().unwrap_or(0);
+    (versions > 0).then(|| Problem::new(
+        format!("{versions} archived version(s) of {} file(s) cannot be restored: their stored chunks are missing or corrupt", s["damaged_files"]),
+        "`agrep archive` re-stores those that live files still hold",
+    ))
+}
+/// The damage found by re-reading every stored chunk.
+fn deep_damage(root: &DataRoot, progress: &ChunkProgress<'_>) -> Result<Vec<Problem>> {
+    let path = catalog_path(root);
+    let found = verify::verify(root, progress).map_err(|e| catalog::classify(&path, e))?;
+    let mut problems = Vec::new();
+    let restorable = found.restorable;
+    if restorable.versions > 0 {
+        problems.push(Problem::new(
+            format!(
+                "{} archived version(s) of {} file(s) have missing or corrupt stored chunks that live files still hold",
+                restorable.versions,
+                restorable.paths.len()
+            ),
+            "`agrep archive` re-stores them",
+        ));
+    }
+    let lost = found.lost;
+    if lost.versions > 0 {
+        problems.push(Problem {
+            detail: format!(
+                "{} archived version(s) of {} file(s) are lost: their stored chunks are missing or corrupt and no live file holds that content any more; the archive's other versions are unaffected",
+                lost.versions,
+                lost.paths.len()
+            ),
+            action: None,
+            paths: lost.paths,
+        });
     }
     Ok(problems)
 }
@@ -318,7 +375,7 @@ pub fn status(root: &DataRoot) -> Result<serde_json::Value> {
     };
     // A capture prunes blobs while this reads them; a blob gone before it is examined is
     // no longer stored.
-    let (stored, _) = crate::diagnostics::disk_usage(&root.path().join("archive/blobs"))?;
+    let (stored, _) = crate::diagnostics::disk_usage(&root.path().join("archive").join("blobs"))?;
     s["enabled"] = policy.enabled.into();
     s["keep"] = policy.keep.into();
     s["stored_bytes"] = stored.into();
@@ -331,7 +388,7 @@ fn catalog_state(root: &DataRoot) -> Result<Option<serde_json::Value>> {
     if !path.exists() {
         return Ok(None);
     }
-    match catalog_status(&path, &root.path().join("archive/blobs")) {
+    match catalog_status(&path, &root.path().join("archive").join("blobs")) {
         Ok(s) => Ok(Some(s)),
         Err(e) => match catalog::classify(&path, e).downcast::<CatalogDamaged>() {
             Ok(damaged) => Ok(Some(

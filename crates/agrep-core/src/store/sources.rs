@@ -137,7 +137,9 @@ fn stamp_meta_owned(a: &str, path: PathBuf, meta: std::io::Result<fs::Metadata>)
             size: 0,
             mtime_ns: 0,
             token: SourceToken::default(),
-            error: Some(e.to_string()),
+            // Windows opens a source to stamp it, so a locked or denied file fails here, not
+            // in its read: it is named by its cause as a failed read is.
+            error: Some(crate::ingest::error_reason(&e)),
         },
     }
 }
@@ -177,4 +179,17 @@ pub fn census() -> Result<Vec<Stamp>> {
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out.dedup_by(|a, b| a.path == b.path);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_source_that_cannot_be_stamped_is_named_by_its_cause() {
+        // Error 2 is a missing file on every platform; its text carries ` (os error 2)`.
+        let missing = std::io::Error::from_raw_os_error(2);
+        let stamp = super::stamp_meta("pi", std::path::Path::new("source.jsonl"), Err(missing));
+        let error = stamp.error.unwrap();
+        assert!(!error.contains("os error"), "{error}");
+        assert!(error.starts_with(char::is_lowercase), "{error}");
+    }
 }

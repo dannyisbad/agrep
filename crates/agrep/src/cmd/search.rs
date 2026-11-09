@@ -56,6 +56,7 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
         let Some(session) = super::usage::chat(&c, chat)? else {
             return stop(("chat-unresolved", None));
         };
+        f.inherited = agrep_core::forks::inherited(&c, &session)?;
         f.chat = Some(session);
     }
     if !s.json && !s.scope.include_self && (s.scope.no_self || identity.agent_context) {
@@ -237,14 +238,25 @@ fn retrieve(
         Default::default()
     } else {
         let _span = agrep_core::semantic_profile::span("keyword");
-        caller::search_with(
-            c,
-            options,
-            caller,
-            include_self,
-            s.scope.no_self,
-            &mut plans,
-        )?
+        let mut search = |limit| {
+            caller::search_with(
+                c,
+                &Options {
+                    limit,
+                    ..options.clone()
+                },
+                caller,
+                include_self,
+                s.scope.no_self,
+                &mut plans,
+            )
+        };
+        // A chat listing names every chat and a count counts every row; pages fold copies.
+        if s.chats || s.count || s.count_by_tier {
+            search(options.limit)?
+        } else {
+            agrep_core::forks::keyword_page(c, options.limit, search)?
+        }
     };
     if timing {
         agrep_core::semantic_profile::event(serde_json::json!({
@@ -668,6 +680,13 @@ fn emit_result(
     }
     if !s.json {
         agrep_core::coverage::disclose(coverage);
+        if let Some(line) = f
+            .chat
+            .as_deref()
+            .and_then(|chat| agrep_core::forks::notice(chat, &f.inherited))
+        {
+            agrep_core::errln!("{line}");
+        }
         for line in after_miss {
             agrep_core::errln!("{line}");
         }

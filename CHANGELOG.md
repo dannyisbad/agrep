@@ -29,6 +29,10 @@
   rows and stay reachable through `--more` and `-n`. Notes from omp's automated
   advisor sidecars are left out of meaning search (keyword search still finds
   them), so they no longer crowd out real answers.
+- Keyword and meaning search show a message that forked chats share once, from the
+  most recently active fork, marked `also in N forks`, so fork copies no longer fill a
+  page; `--json` lists the other copies. `--chat` on a Codex fork child also searches
+  the history it inherited from its parent, up to the fork.
 - `agrep help` and `agrep help COMMAND` print help instead of searching for the
   word "help"; `agrep search help` still searches it. `agrep version` prints the
   version.
@@ -46,12 +50,22 @@
   one from the live store that still holds it. Restore, `archive --status`,
   `status` and `doctor` name archive damage and the command that resolves it; a
   damaged catalog can always be purged, and a failing background capture waits
-  longer after each failure instead of retrying on every command.
+  longer after each failure instead of retrying on every command. `doctor --deep`
+  re-reads and re-hashes every stored chunk, so damage that left a chunk file's
+  size and date alone is found too, and says which damaged versions `agrep archive`
+  can re-store from a live file and which are lost. On a terminal it shows how many
+  chunks it has checked and the time left.
 - Ctrl-Z on a piped `agrep run` or `resume` (`agrep run claude | cat`) stops the
   agent too, so the shell gets your keys back; `fg` resumes it. Like any program,
   an agent that reads the terminal stops when its job is in the background. The
   `resume` picker asks again after an answer it can't use, and `resume` says
-  `↻ resuming omp` when it starts omp.
+  `↻ resuming omp` when it starts omp; the picker and `--list` label such a session
+  `omp` too. `agrep run gemini` (or cursor, cline, kimi, crush) says agrep run
+  can't launch it and lists the agents it can.
+- `chats` previews show as many of the query's words as fit, and `chats` with no
+  match says `no chats match`, naming `--side` only when side chats would match.
+- Codex tool results written as a list of text items are indexed as their text,
+  not as raw JSON, so search and snippets see the tool's own words.
 - `agrep setup` and `agrep remove` change only agrep's own hook entry in Claude's
   `settings.json` and Codex's `hooks.json`: other hooks and settings keep their exact
   text, and remove gives back the file setup found.
@@ -61,6 +75,18 @@
   reindex stopped partway leaves the old index as it was. Meaning vectors survive
   it. `index --semantic` and `reindex` show embedding progress on a terminal, and
   `status` gives the meaning build's time left as `-s` does (`about 15m 19s left`).
+  The time left comes from a rate measured on this machine; until a build has
+  measured one it says `estimating time left`, and row counts carry thousands
+  separators.
+- A transcript agrep cannot read (one made unreadable with `chmod 000`, say) is
+  named once with its cause by `status` and `doctor` (`source failed: PATH:
+  permission denied`), and `agrep index` ends with one stderr line giving how
+  many failed, the first with its cause, and `agrep doctor` for the rest. Its
+  last good rows stay searchable.
+- `doctor` on a home with no supported agent history says so and names the
+  agents it looked for, and its model row reads `present`, `not installed` (with
+  `agrep setup` to install it) or `failed`. `-s` with a model that fails its
+  checksum adds "`agrep setup` reinstalls it", as status and doctor do.
 - Six platform wheels bundle the executable. npm verifies package-pinned hashes
   before caching and executing the matching GitHub release binary.
 - CI runs tests and a blocking full-process performance comparison with agrep

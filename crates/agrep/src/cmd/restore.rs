@@ -8,9 +8,10 @@ pub fn run(needle: String, to: Option<String>, force: bool) -> Result<i32> {
     if to.as_ref().is_some_and(|s| s.trim().is_empty()) {
         bail!("--to must not be blank")
     }
+    // Re-collecting the components drops the `.` a relative `--to .` leaves after joining.
     let to = to.map(|s| {
         let p = PathBuf::from(&s);
-        if s == "~" {
+        let absolute = if s == "~" {
             agrep_core::ingest::home()
         } else if let Some(tail) = s.strip_prefix("~/") {
             agrep_core::ingest::home().join(tail)
@@ -18,7 +19,8 @@ pub fn run(needle: String, to: Option<String>, force: bool) -> Result<i32> {
             p
         } else {
             std::env::current_dir().unwrap_or_default().join(p)
-        }
+        };
+        absolute.components().collect::<PathBuf>()
     });
     let root = DataRoot::discover()?;
     root.validate(true)?;

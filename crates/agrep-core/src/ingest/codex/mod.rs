@@ -34,6 +34,7 @@ use std::path::Path;
 use crate::model::{Event, Message};
 
 pub use discover::{collect, Codex};
+pub use subagent::fork_time;
 
 /// Control-event name for a native compaction moment; it is never a tool call.
 pub const COMPACTED_MARKER: &str = "compacted";
@@ -94,13 +95,14 @@ fn parse_compressed(path: &Path) -> (Vec<Message>, Vec<Event>, crate::intake_bat
         }
         // A decoding failure is the file's content, not a race.
         Ok(Err(e)) => {
-            crate::ingest::note_read_failure(path, format!("cannot decompress: {e}"));
-            unreadable(
+            let parsed = unreadable(
                 path,
                 &crate::intake::tally(),
                 &e,
                 crate::intake_batch::ReadOutcome::Skipped,
-            )
+            );
+            crate::ingest::note_read_failure(path, format!("cannot decompress: {e}"));
+            parsed
         }
         Err(e) => unreadable(
             path,
@@ -125,6 +127,7 @@ fn unreadable(
     ));
     tally.seen();
     tally.error(&format!("cannot read: {error}"));
+    crate::ingest::note_io_failure(path, error);
     (Vec::new(), Vec::new(), outcome)
 }
 

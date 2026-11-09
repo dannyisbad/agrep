@@ -27,7 +27,11 @@ pub(super) fn open_source(path: &Path) -> Result<File> {
     }
     Ok(file)
 }
-fn sqlite_snapshot(path: &Path, dir: &Path, blocking: bool) -> Result<tempfile::NamedTempFile> {
+pub(super) fn sqlite_snapshot(
+    path: &Path,
+    dir: &Path,
+    blocking: bool,
+) -> Result<tempfile::NamedTempFile> {
     if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
         bail!("source is a symbolic link");
     }
@@ -52,8 +56,14 @@ fn sqlite_snapshot(path: &Path, dir: &Path, blocking: bool) -> Result<tempfile::
     destination.close().map_err(|(_, e)| e)?;
     Ok(temp)
 }
+/// Whether the file, read from its start, is a SQLite database.
+pub(super) fn is_sqlite(file: &mut File) -> Result<bool> {
+    let mut header = [0u8; 16];
+    let n = file.read(&mut header)?;
+    Ok(n == 16 && &header == b"SQLite format 3\0")
+}
 /// The file's identity, and for a database its WAL's: unchanged means nothing to read.
-fn fingerprint(file: &File, path: &Path, sqlite: bool) -> Result<String> {
+pub(super) fn fingerprint(file: &File, path: &Path, sqlite: bool) -> Result<String> {
     let mut fingerprint = format!("{:?}", safe_fs::identity(&file.metadata()?));
     if sqlite {
         let wal = PathBuf::from(format!("{}-wal", path.display()));
@@ -92,9 +102,7 @@ pub(super) fn capture_one(
     let read = crate::ingest::registry::source_path(&source.path);
     let mut file = open_source(&read)?;
     let before = safe_fs::identity(&file.metadata()?);
-    let mut header = [0u8; 16];
-    let n = file.read(&mut header)?;
-    let sqlite = n == 16 && &header == b"SQLite format 3\0";
+    let sqlite = is_sqlite(&mut file)?;
     let fingerprint = fingerprint(&file, &read, sqlite)?;
     let previous_fingerprint: Option<(i64, String)> = archive
         .db
@@ -222,7 +230,7 @@ fn read_chunks(
     })
 }
 /// Up to one chunk of the file; empty at its end.
-fn next_chunk(file: &mut File) -> Result<Vec<u8>> {
+pub(super) fn next_chunk(file: &mut File) -> Result<Vec<u8>> {
     let mut chunk = vec![0; CHUNK];
     let mut n = 0;
     while n < CHUNK {

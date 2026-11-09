@@ -52,7 +52,8 @@ impl DataRoot {
         #[cfg(target_os = "windows")]
         let p =
             PathBuf::from(std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA unavailable")?)
-                .join("agrep/0.5");
+                .join("agrep")
+                .join("0.5");
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let p = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)

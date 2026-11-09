@@ -1,3 +1,5 @@
+#[path = "support/native.rs"]
+mod native;
 mod support;
 use agrep_core::{data::DataRoot, store};
 use rusqlite::{Connection, OpenFlags};
@@ -4805,7 +4807,7 @@ fn damaged_compressed_codex_rollouts_are_source_errors_beside_readable_ones() {
     let t = TempDir::new().unwrap();
     let h = t.path().join("h");
     let d = t.path().join("d");
-    let day = h.join(".codex/sessions/2026/06/09");
+    let day = native::native(&h.join(".codex/sessions/2026/06/09"));
     fs::create_dir_all(&day).unwrap();
     let rollout = |session: &str, prompt: &str| codex_rollout(session, "/work/p", prompt, "tool");
     fs::write(
@@ -4854,11 +4856,144 @@ fn damaged_compressed_codex_rollouts_are_source_errors_beside_readable_ones() {
     }
 }
 
+/// Keeps a source unreadable to agrep while it lives: POSIX mode 000, or on Windows a handle
+/// that shares no access, as an exclusive writer's does.
+struct Unreadable {
+    path: PathBuf,
+    #[cfg(windows)]
+    _held: fs::File,
+}
+impl Unreadable {
+    #[cfg(unix)]
+    fn hold(path: &Path) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+        Self {
+            path: path.to_owned(),
+        }
+    }
+    #[cfg(windows)]
+    fn hold(path: &Path) -> Self {
+        use std::os::windows::fs::OpenOptionsExt;
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(path)
+            .unwrap();
+        Self {
+            path: path.to_owned(),
+            _held: held,
+        }
+    }
+    /// The cause agrep names: the system's read error without its code or full stop, as
+    /// prose (`permission denied` for `Permission denied (os error 13)`).
+    fn cause(&self) -> String {
+        let error = fs::read(&self.path).unwrap_err().to_string();
+        let text = error.split(" (os error ").next().unwrap();
+        let mut chars = text.trim_end_matches('.').chars();
+        chars.next().unwrap().to_lowercase().chain(chars).collect()
+    }
+}
+#[cfg(unix)]
+impl Drop for Unreadable {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&self.path, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+}
+
+// QA3 item 3: an unreadable source was recorded as `source parse incomplete: <path>`, so
+// status and doctor printed its path twice and lost the cause, and `index` said nothing.
+#[test]
+fn an_unreadable_source_is_named_once_with_its_cause_for_every_adapter() {
+    let t = TempDir::new().unwrap();
+    let (h, d) = (t.path().join("h"), t.path().join("d"));
+    fixture("pi", &h);
+    fixture("claude", &h);
+    let day = native::native(&h.join(".codex/sessions/2026/06/09"));
+    fs::create_dir_all(&day).unwrap();
+    let plain = day.join("rollout-2026-06-09T10-00-00-plain.jsonl");
+    fs::write(
+        &plain,
+        codex_rollout("plain", "/work/p", "plainprompt", "t"),
+    )
+    .unwrap();
+    let packed = day.join("rollout-2026-06-09T11-00-00-packed.jsonl.zst");
+    let rollout = codex_rollout("packed", "/work/p", "packedprompt", "t");
+    fs::write(&packed, zstd_packed(&rollout)).unwrap();
+    ok(cli(&h, &d, &["index"]));
+    let pi = native::native(&h.join(".pi/agent/sessions/-work-alpha/2026-01-02T03-04-05-000Z_01930000-0000-7000-8000-000000000001.jsonl"));
+    let claude = native::native(&h.join(".claude/projects/proj-alpha/sess-claude-0001.jsonl"));
+    let unreadable = [&claude, &plain, &packed, &pi];
+    let held = unreadable.map(|path| Unreadable::hold(path));
+    let cause = held[0].cause();
+    assert!(held.iter().all(|source| source.cause() == cause));
+    let index = ok(cli(&h, &d, &["index"]));
+    let stderr = String::from_utf8(index.stderr).unwrap();
+    let notes: Vec<_> = stderr
+        .lines()
+        .filter(|l| l.contains("failed to read"))
+        .collect();
+    assert_eq!(
+        notes,
+        [format!(
+            "4 sources failed to read, first {}: {cause} - `agrep doctor` lists the rest",
+            claude.display()
+        )],
+        "{stderr}"
+    );
+    let status = String::from_utf8(ok(cli(&h, &d, &["status"])).stdout).unwrap();
+    let doctor = String::from_utf8(ok(cli(&h, &d, &["doctor"])).stdout).unwrap();
+    for report in [&status, &doctor] {
+        let failed: Vec<_> = report
+            .lines()
+            .filter(|l| l.starts_with("source failed: "))
+            .collect();
+        let expected: Vec<_> = unreadable
+            .iter()
+            .map(|path| format!("source failed: {}: {cause}", path.display()))
+            .collect();
+        assert_eq!(failed, expected, "{report}");
+    }
+    // Search keeps answering from the rows those sources held before.
+    assert_eq!(cli(&h, &d, &["plainprompt", "-c"]).status.code(), Some(0));
+    drop(held);
+    let index = ok(cli(&h, &d, &["index"]));
+    assert!(!String::from_utf8_lossy(&index.stderr).contains("failed to read"));
+    let status = String::from_utf8(ok(cli(&h, &d, &["status"])).stdout).unwrap();
+    assert!(!status.contains("source failed: "), "{status}");
+}
+
+#[test]
+fn index_names_a_single_failed_source_without_pointing_elsewhere() {
+    let t = TempDir::new().unwrap();
+    let (h, d) = (t.path().join("h"), t.path().join("d"));
+    let day = native::native(&h.join(".codex/sessions/2026/06/09"));
+    fs::create_dir_all(&day).unwrap();
+    let garbage = day.join("rollout-2026-06-09T13-00-00-garbage.jsonl.zst");
+    fs::write(&garbage, "not zstd\n").unwrap();
+    let stderr = String::from_utf8(ok(cli(&h, &d, &["index"])).stderr).unwrap();
+    let notes: Vec<_> = stderr
+        .lines()
+        .filter(|l| l.contains("failed to read"))
+        .collect();
+    assert_eq!(notes.len(), 1, "{stderr}");
+    let prefix = format!(
+        "1 source failed to read: {}: cannot decompress: ",
+        garbage.display()
+    );
+    assert!(notes[0].starts_with(&prefix), "{stderr}");
+    assert!(
+        notes[0].ends_with(" - it is read again once it changes"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn full_audit_recounts_compressed_rollouts_and_keeps_damaged_ones_out() {
     let t = TempDir::new().unwrap();
     let (h, d) = (t.path().join("h"), t.path().join("d"));
-    let day = h.join(".codex/sessions/2026/06/09");
+    let day = native::native(&h.join(".codex/sessions/2026/06/09"));
     fs::create_dir_all(&day).unwrap();
     let rollout = |session: &str, prompt: &str| codex_rollout(session, "/work/p", prompt, "tool");
     fs::write(

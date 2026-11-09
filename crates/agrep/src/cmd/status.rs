@@ -32,9 +32,6 @@ pub fn run(json: bool, no_auto: bool) -> Result<i32> {
         )?;
         if s["index"]["state"] == "ready" {
             let n = &s["index"]["counts"];
-            let count = |v: &serde_json::Value| {
-                agrep_core::surface::number(v.as_u64().unwrap_or(0) as usize)
-            };
             // 0.4.9's corpus row: the age of the last refresh, "just now" under a minute.
             let age = match s["last_indexed_age_s"].as_i64() {
                 None => String::new(),
@@ -67,30 +64,8 @@ pub fn run(json: bool, no_auto: bool) -> Result<i32> {
             "data format: {}",
             s["format"].as_str().unwrap_or("unreadable")
         )?;
-        if let Some(error) = s["semantic"]["integrity_error"].as_str() {
-            agrep_core::outln!(
-                "semantic model failed verification: {} - `agrep setup` reinstalls it",
-                render::safe(error)
-            )?;
-        } else if s["semantic"]["model_present"] == true {
-            agrep_core::outln!(
-                "meaning index: {} of {} rows · {} remaining",
-                s["semantic"]["indexed_rows"],
-                s["semantic"]["total_rows"],
-                s["semantic"]["backlog"]
-            )?;
-            if s["semantic"]["state"] == "building" {
-                agrep_core::outln!(
-                    "build runs in the background · about {} left",
-                    agrep_core::semantic::time_left(
-                        s["semantic"]["progress"]["estimated_seconds"]
-                            .as_u64()
-                            .unwrap_or_default()
-                    )
-                )?;
-            }
-        } else {
-            agrep_core::outln!("semantic model not installed: run agrep setup")?;
+        for line in meaning(&s["semantic"]) {
+            agrep_core::outln!("{line}")?;
         }
         if s["index"]["state"] == "ready" {
             for source in diagnostics::failed_sources(&store::reader(&root)?)? {
@@ -146,4 +121,62 @@ pub fn run(json: bool, no_auto: bool) -> Result<i32> {
             0
         },
     )
+}
+
+fn count(v: &serde_json::Value) -> String {
+    agrep_core::surface::number(v.as_u64().unwrap_or(0) as usize)
+}
+
+/// The meaning model's and index's lines.
+fn meaning(semantic: &serde_json::Value) -> Vec<String> {
+    if let Some(error) = semantic["integrity_error"].as_str() {
+        return vec![format!(
+            "semantic model failed verification: {} - `agrep setup` reinstalls it",
+            render::safe(error)
+        )];
+    }
+    if semantic["model_present"] != true {
+        return vec!["semantic model not installed: run agrep setup".into()];
+    }
+    let mut lines = vec![format!(
+        "meaning index: {} of {} rows · {} remaining",
+        count(&semantic["indexed_rows"]),
+        count(&semantic["total_rows"]),
+        count(&semantic["backlog"])
+    )];
+    if semantic["state"] == "building" {
+        lines.push(format!(
+            "build runs in the background · {}",
+            agrep_core::semantic::estimate(semantic["progress"]["estimated_seconds"].as_u64())
+        ));
+    }
+    lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::meaning;
+    use serde_json::json;
+
+    // QA3 item 5: right after a first index the time left came from a guessed rate, and the
+    // row counts had no thousands separators.
+    #[test]
+    fn meaning_rows_use_separators_and_estimate_only_from_a_measured_rate() {
+        let building = |estimated: serde_json::Value| {
+            json!({"model_present":true,"integrity_error":null,"indexed_rows":1200,
+                "total_rows":142780,"backlog":141580,"state":"building",
+                "progress":{"estimated_seconds":estimated}})
+        };
+        assert_eq!(
+            meaning(&building(json!(null))),
+            [
+                "meaning index: 1,200 of 142,780 rows · 141,580 remaining",
+                "build runs in the background · estimating time left"
+            ]
+        );
+        assert_eq!(
+            meaning(&building(json!(590)))[1],
+            "build runs in the background · about 9m 50s left"
+        );
+    }
 }

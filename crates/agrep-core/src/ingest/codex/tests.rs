@@ -101,3 +101,29 @@ fn compressed_rollouts_share_their_plain_stem() {
     }
     assert_eq!(rollout_stem(Path::new("rollout-a.zst")), Some("rollout-a"));
 }
+
+#[test]
+fn list_shaped_call_output_indexes_its_text_items() {
+    let long = "y".repeat(900);
+    let lines = [
+        serde_json::json!({"timestamp":"2026-06-09T10:00:00Z","type":"session_meta","payload":{"cwd":"/work/list"}}),
+        serde_json::json!({"timestamp":"2026-06-09T10:00:01Z","type":"response_item","payload":{"type":"function_call","name":"js","call_id":"list-call","arguments":"{}"}}),
+        serde_json::json!({"timestamp":"2026-06-09T10:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"list-call","output":[{"type":"input_text","text":"Script completed\nOutput:\n"},{"type":"input_image","image_url":"data:image/png;base64,AAAA"},{"type":"input_text","text":""},{"type":"input_text","text":format!("Process exited with code 0 \"quoted\" {long}")}]}}),
+    ]
+    .map(|line| line.to_string() + "\n")
+    .concat();
+    let dir = tempfile::tempdir().unwrap();
+    let path = write(dir.path(), NAME, lines.as_bytes());
+    let ((_, events, outcome), _) = crate::intake::scoped(|| parse_file(&path));
+    assert_eq!(outcome, ReadOutcome::Complete);
+    let event = events.iter().find(|e| e.call_id == "list-call").unwrap();
+    let full = format!("Script completed\nOutput:\n\nProcess exited with code 0 \"quoted\" {long}");
+    assert_eq!(
+        event.output,
+        crate::ingest::cap_str(&full, crate::ingest::EVENT_CAP)
+    );
+    assert_eq!(
+        (event.output_chars, event.output_bytes, event.ok),
+        (full.chars().count(), full.len(), Some(true))
+    );
+}

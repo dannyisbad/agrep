@@ -41,9 +41,9 @@ pub fn merge(
         return keyword;
     };
     // 0.4.9's `hybrid_more` (py/search.py:7962-7966): a lane held rows it did not return.
-    let lanes_more = [&keyword, &semantic]
-        .iter()
-        .any(|lane| lane.total_basis != "exact" || lane.total > lane.hits.len());
+    let lanes_more = [&keyword, &semantic].iter().any(|lane| {
+        lane.total_basis != "exact" || lane.total > lane.hits.iter().map(Hit::rows).sum()
+    });
     let cap = limit;
     let mut lexical = std::mem::take(&mut keyword.hits);
     if cap == 0 {
@@ -122,10 +122,11 @@ pub fn merge(
         {
             continue;
         }
-        if let Some(at) = lexical
-            .iter()
-            .position(|k| k.session == h.session && k.turn == h.turn)
-        {
+        // Both lanes fold fork copies of a message into one row, so a keyword row holding
+        // another copy of this meaning row's message is the same row.
+        if let Some(at) = lexical.iter().position(|k| {
+            (k.session == h.session && k.turn == h.turn) || crate::forks::same_message(k, &h)
+        }) {
             if !weak_lexical(&lexical[at]) {
                 continue;
             }
@@ -147,7 +148,7 @@ pub fn merge(
     let merged = hits.len();
     hits.truncate(cap);
     if hits.iter().any(|h| h.matched == "semantic") {
-        keyword.total = keyword.total.max(hits.len());
+        keyword.total = keyword.total.max(hits.iter().map(Hit::rows).sum());
         keyword.total_basis = "floor".into();
         // Rows the cap cut from the merged page are more rows the search held.
         keyword.hybrid_more = Some(lanes_more || merged > hits.len());
@@ -349,5 +350,45 @@ mod tests {
         let r = lanes(4);
         assert_eq!(sessions(&r), ["m", "x", "b", "a1"]);
         assert_eq!((r.hybrid_folded, r.hybrid_more), (1, Some(true)));
+    }
+    /// Each lane folds fork copies of a message into one row. A meaning row showing another
+    /// copy of a message a keyword row already stands for is that row, not a second one, and
+    /// a lane whose copies its rows stand for holds no more rows.
+    #[test]
+    fn a_message_both_lanes_folded_shows_once() {
+        let copy = |s: &str, matched: &str| Hit {
+            agent: "pi".into(),
+            ts: 5,
+            text: "keep the prompt general".into(),
+            ..h(s, matched, false)
+        };
+        let fork = |s: &str| crate::query::Fork {
+            session: s.into(),
+            ..Default::default()
+        };
+        let mut keyword = results(vec![
+            Hit {
+                snippet: "…the prompt general".into(),
+                forks: vec![fork("fork-b"), fork("root")],
+                ..copy("fork-a", "phrase")
+            },
+            h("other", "phrase", false),
+        ]);
+        keyword.total = 4;
+        keyword.total_basis = "exact".into();
+        let mut meaning = results(vec![
+            Hit {
+                forks: vec![fork("fork-a"), fork("root")],
+                ..copy("fork-b", "semantic")
+            },
+            h("m", "semantic", false),
+        ]);
+        meaning.total = 4;
+        meaning.total_basis = "exact".into();
+        let r = merge(keyword, Some(meaning), 8, true);
+        let sessions: Vec<_> = r.hits.iter().map(|h| h.session.as_str()).collect();
+        assert_eq!(sessions, ["fork-a", "other", "m"]);
+        assert_eq!(r.hybrid_more, Some(false));
+        assert_eq!(r.total, 5);
     }
 }

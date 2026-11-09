@@ -1,14 +1,13 @@
 //! Scanning q8 vector blocks for candidates, then resolving them to filtered rows.
-use super::budget::Overlay;
+use super::{budget::Overlay, page::Page};
 use crate::{
     query::{self, Hit, Options, Results},
     semantic_policy, semantic_store, store,
 };
-use anyhow::{bail, Result};
+use anyhow::Result;
 use rusqlite::{params, Connection};
 use std::{
-    cmp::Ordering as Order,
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -98,8 +97,9 @@ impl VectorScan {
         })
     }
 }
-fn read_hit(r: &rusqlite::Row<'_>) -> rusqlite::Result<Hit> {
-    Ok(Hit {
+/// A resolved row, and when its chat was last active.
+fn read_hit(r: &rusqlite::Row<'_>) -> rusqlite::Result<(Hit, i64)> {
+    let hit = Hit {
         rowid: r.get(0)?,
         session: r.get(1)?,
         agent: r.get(2)?,
@@ -121,93 +121,8 @@ fn read_hit(r: &rusqlite::Row<'_>) -> rusqlite::Result<Hit> {
         score: 0.,
         matched: "semantic".into(),
         ..Default::default()
-    })
-}
-/// The page order for `sort`, with a total tie-break.
-fn order(sort: &str, a: &Hit, b: &Hit) -> Order {
-    let order = match sort {
-        "time" => b.ts.cmp(&a.ts).then(b.score.total_cmp(&a.score)),
-        "position" => a
-            .session
-            .cmp(&b.session)
-            .then(a.turn.cmp(&b.turn))
-            .then(b.score.total_cmp(&a.score)),
-        _ => b
-            .score
-            .total_cmp(&a.score)
-            .then(b.ts.cmp(&a.ts))
-            .then(a.session.cmp(&b.session))
-            .then(a.turn.cmp(&b.turn)),
     };
-    order
-        .then(a.agent.cmp(&b.agent))
-        .then(a.session.cmp(&b.session))
-        .then(a.turn.cmp(&b.turn))
-        .then(a.who.cmp(&b.who))
-        .then(a.rowid.cmp(&b.rowid))
-}
-/// The retained page: the best row of each session (or family), one past the limit.
-struct Page<'a> {
-    hits: Vec<Hit>,
-    groups: HashSet<(String, String)>,
-    want: usize,
-    sort: &'a str,
-    family_diverse: bool,
-}
-impl Page<'_> {
-    /// A full score-ordered page holds one row past the limit, the score to beat.
-    fn full(&self) -> bool {
-        self.sort == "score" && self.hits.len() > self.want
-    }
-    fn offer(&mut self, mut h: Hit) -> Result<()> {
-        let family_diverse = self.family_diverse;
-        let group = (
-            h.agent.clone(),
-            if family_diverse && !h.family.is_empty() {
-                h.family.clone()
-            } else {
-                h.session.clone()
-            },
-        );
-        self.groups.insert(group);
-        let same = |old: &Hit| {
-            old.agent == h.agent
-                && (old.session == h.session
-                    || (family_diverse && !h.family.is_empty() && old.family == h.family))
-        };
-        if let Some(at) = self.hits.iter().position(same) {
-            if order(self.sort, &h, &self.hits[at]).is_ge() {
-                return Ok(());
-            }
-            self.hits.remove(at);
-        }
-        if self.hits.len() > self.want && order(self.sort, &h, self.hits.last().unwrap()).is_ge() {
-            return Ok(());
-        }
-        h.handle = format!(
-            "{}:{}.{}",
-            session_target(&h.session)?,
-            h.turn,
-            query::content_digest(&h.text)
-        );
-        // 0.4.9's meaning rows showed their text's first 240 characters with whitespace
-        // runs (Python's, which counts \x1c-\x1f) folded to one space; compact pages
-        // then narrow that around a keyword match.
-        h.snippet = h
-            .text
-            .split(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
-            .filter(|word| !word.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(240)
-            .collect();
-        self.hits.push(h);
-        let sort = self.sort;
-        self.hits.sort_by(|a, b| order(sort, a, b));
-        self.hits.truncate(self.want + 1);
-        Ok(())
-    }
+    Ok((hit, r.get(12)?))
 }
 /// `stop` ends a speculative resolution before its next row lookup.
 pub(super) fn resolve_scan(
@@ -227,22 +142,17 @@ pub(super) fn resolve_scan(
     } = scan;
     let want = if o.limit == 0 { 200 } else { o.limit.min(200) };
     let mut result = Results::default();
-    let mut resolve=c.prepare("SELECT p.id,p.session,p.agent,p.project,p.position,p.who,p.model,p.model_source,p.ts,p.text,s.family,s.side FROM semantic_chunks v JOIN semantic_refs r ON r.content_key=v.content_key JOIN prose p ON p.id=r.row_id AND p.digest=r.digest JOIN sessions s ON s.id=p.session AND s.agent=p.agent WHERE v.block=? AND v.slot=? AND p.visible=1")?;
+    let mut resolve=c.prepare("SELECT p.id,p.session,p.agent,p.project,p.position,p.who,p.model,p.model_source,p.ts,p.text,s.family,s.side,s.last_ts FROM semantic_chunks v JOIN semantic_refs r ON r.content_key=v.content_key JOIN prose p ON p.id=r.row_id AND p.digest=r.digest JOIN sessions s ON s.id=p.session AND s.agent=p.agent WHERE v.block=? AND v.slot=? AND p.visible=1")?;
     let mut resolve_overlay = if overlay.is_empty() {
         None
     } else {
-        Some(c.prepare("SELECT p.id,p.session,p.agent,p.project,p.position,p.who,p.model,p.model_source,p.ts,p.text,s.family,s.side FROM prose p JOIN sessions s ON s.id=p.session AND s.agent=p.agent WHERE p.id=? AND p.visible=1")?)
+        Some(c.prepare("SELECT p.id,p.session,p.agent,p.project,p.position,p.who,p.model,p.model_source,p.ts,p.text,s.family,s.side,s.last_ts FROM prose p JOIN sessions s ON s.id=p.session AND s.agent=p.agent WHERE p.id=? AND p.visible=1")?)
     };
-    let mut page = Page {
-        hits: Vec::new(),
-        groups: HashSet::new(),
-        want,
-        sort: &o.sort,
-        family_diverse,
-    };
+    // A chat listing names every chat, so only row pages fold copies of a row.
+    let mut page = Page::new(want, &o.sort, family_diverse, !o.chats);
     let mut exhausted = true;
     for &(block, slot, upper, score) in candidates {
-        if page.full() && upper < page.hits[want].score as f32 {
+        if page.full() && upper < page.score_to_beat() as f32 {
             exhausted = false;
             break;
         }
@@ -250,7 +160,7 @@ pub(super) fn resolve_scan(
         if (score as f64) < semantic_policy::FLOOR {
             continue;
         }
-        if page.full() && (score as f64) < page.hits[want].score {
+        if page.full() && (score as f64) < page.score_to_beat() {
             // This exact cosine cannot enter the retained page, regardless of
             // metadata filters. Avoid fetching a long source row just to reject it.
             exhausted = false;
@@ -269,7 +179,7 @@ pub(super) fn resolve_scan(
             }
         }
         for row in rows.chain(extra) {
-            let mut h = row?;
+            let (mut h, last) = row?;
             h.score = score as f64;
             h.meta_marker = crate::query::meta_role(&h.who, h.turn);
             if !matches_filters(&h, o)
@@ -277,7 +187,7 @@ pub(super) fn resolve_scan(
             {
                 continue;
             }
-            page.offer(h)?;
+            page.offer(h, last)?;
         }
     }
     if crate::semantic_profile::timing_enabled() {
@@ -287,9 +197,7 @@ pub(super) fn resolve_scan(
         );
     }
     result.total = page.groups.len();
-    let mut hits = page.hits;
-    hits.truncate(want);
-    result.hits = hits;
+    result.hits = page.into_hits();
     result.total_basis = if exhausted { "exact" } else { "floor" }.into();
     result.examined = *total_rows;
     result.blocks = names.len();
@@ -305,10 +213,13 @@ fn matches_filters(h: &Hit, o: &Options) -> bool {
             .agent
             .as_ref()
             .is_some_and(|s| !s.split(',').any(|a| a == h.agent))
-        && !f
-            .chat
-            .as_ref()
-            .is_some_and(|s| !h.session.starts_with(s.trim_start_matches('@')))
+        && !f.chat.as_ref().is_some_and(|s| {
+            !h.session.starts_with(s.trim_start_matches('@'))
+                && !f
+                    .inherited
+                    .iter()
+                    .any(|link| link.session == h.session && h.ts <= link.until)
+        })
         && !f
             .project
             .as_ref()
@@ -338,31 +249,4 @@ fn matches_filters(h: &Hit, o: &Options) -> bool {
                 h.model != *m
             }
         })
-}
-fn session_target(session: &str) -> Result<String> {
-    if (3..=128).contains(&session.len())
-        && session.as_bytes()[0].is_ascii_alphanumeric()
-        && session
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-    {
-        return Ok(format!("@{session}"));
-    }
-    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let (mut token, mut bits, mut available) = (String::new(), 0u32, 0);
-    for b in session.bytes() {
-        bits = (bits << 8) | b as u32;
-        available += 8;
-        while available >= 6 {
-            available -= 6;
-            token.push(A[((bits >> available) & 63) as usize] as char);
-        }
-    }
-    if available != 0 {
-        token.push(A[((bits << (6 - available)) & 63) as usize] as char);
-    }
-    if token.is_empty() || token.len() > 1024 {
-        bail!("session id cannot be encoded safely");
-    }
-    Ok(format!("@~{token}"))
 }

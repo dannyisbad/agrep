@@ -164,6 +164,7 @@ fn session_filters(
             .prepare_cached("SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\'")?
             .query_map([format!("{}%", escape_like(v))], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
+        ids.extend(f.inherited.iter().map(|link| link.session.clone()));
         ids.sort_unstable();
         ids.dedup();
         if ids.is_empty() {
@@ -173,6 +174,11 @@ fn session_filters(
                 "{alias}.session IN (SELECT value FROM json_each(?))"
             ));
             values.push(Value::Text(serde_json::to_string(&ids)?));
+        }
+        for link in &f.inherited {
+            clauses.push(format!("NOT ({alias}.session=? AND {alias}.ts>?)"));
+            values.push(Value::Text(link.session.clone()));
+            values.push(Value::Integer(link.until));
         }
     }
     if let Some(rows) = &f.session_rows {

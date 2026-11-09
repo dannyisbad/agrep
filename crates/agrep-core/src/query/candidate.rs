@@ -347,6 +347,7 @@ impl<'a, 'p, 'row, 'stmt> Candidate<'a, 'p, 'row, 'stmt> {
             self_marker,
             meta_marker,
             sem_weak: false,
+            forks: Vec::new(),
             rowid: r.get(0)?,
             tier,
             span,

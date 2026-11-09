@@ -2464,7 +2464,9 @@ fn usage_errors_exit_and_read_as_0_4_9() {
         (&["audit", "--agent", "pi", "--agent", "codex"], 2, "agrep audit: --agent may be supplied only once"),
         (&["audit", "--agent", " "], 2, "agrep audit: --agent needs a value (claude, codex, opencode, antigravity, kimi, cline, gemini, crush, cursor, pi) - an empty value would silently match every agent"),
         (&["run", "Claude"], 2, "unknown agent 'Claude'; supported for agrep run: claude, codex, opencode, antigravity, pi"),
-        (&["run", "cursor"], 2, "cursor has no native resume support: sessions are editor-owned and have no safe CLI resume command"),
+        (&["run", "cursor"], 2, "cursor can't be launched by agrep run; supported for agrep run: claude, codex, opencode, antigravity, pi"),
+        (&["run", "Gemini"], 2, "unknown agent 'Gemini'; supported for agrep run: claude, codex, opencode, antigravity, pi"),
+        (&["run", "gemini"], 2, "gemini can't be launched by agrep run; supported for agrep run: claude, codex, opencode, antigravity, pi"),
         (&["around", "@01930000:2.18ba", "--max-chars", "100", "--full"], 2, "agrep around: --max-chars cannot be combined with --full, which uncaps indexed message text; run: agrep around @01930000:2.18ba --full"),
         (&["around", "@01930000:2.18ba", "--max-chars", "4000", "--full"], 2, "agrep around: --max-chars cannot be combined with --full, which uncaps indexed message text; run: agrep around @01930000:2.18ba --full"),
         (&["around", "@01930000:2.18ba", "--tool-output", "100", "--no-tools"], 2, "agrep around: --tool-output cannot be combined with --no-tools, which hides tool-call lines; run: agrep around @01930000:2.18ba --no-tools"),
@@ -3039,6 +3041,8 @@ fn usage_errors_write_0_4_9_json_records() {
 /// then row order. Timestamps in the future hold recency at one, so the clock cannot move a
 /// score. Every eight messages share a time across three sessions whose ids sort against
 /// their files, and the two tool calls of one reply tie on everything but their order.
+/// Each session's words name it: equal words at one time in several chats are copies of one
+/// message, which a page folds.
 #[test]
 fn repeated_runs_print_the_same_bytes_on_every_surface() {
     let t = TempDir::new().unwrap();
@@ -3060,24 +3064,24 @@ fn repeated_runs_print_the_same_bytes_on_every_surface() {
         for n in (0..600).step_by(2) {
             add(
                 n,
-                serde_json::json!({"role":"user","content":format!("zebra crossing check {n}")}),
+                serde_json::json!({"role":"user","content":format!("zebra crossing check {n} in {id}")}),
             );
             if n % 50 != 0 {
                 add(
                     n + 1,
-                    serde_json::json!({"role":"assistant","content":[{"type":"text","text":format!("zebra noted {n}")}]}),
+                    serde_json::json!({"role":"assistant","content":[{"type":"text","text":format!("zebra noted {n} in {id}")}]}),
                 );
                 continue;
             }
-            let call = |file: &str| serde_json::json!({"type":"toolCall","id":format!("{id}-{n}-{file}"),"name":"bash","arguments":{"command":format!("grep zebra src/{file}.rs")}});
+            let call = |file: &str| serde_json::json!({"type":"toolCall","id":format!("{id}-{n}-{file}"),"name":"bash","arguments":{"command":format!("grep zebra src/{file}.rs # {id}")}});
             add(
                 n + 1,
-                serde_json::json!({"role":"assistant","content":[{"type":"text","text":format!("crossing then zebra {n}")},call("a"),call("b")]}),
+                serde_json::json!({"role":"assistant","content":[{"type":"text","text":format!("crossing then zebra {n} in {id}")},call("a"),call("b")]}),
             );
             for file in ["a", "b"] {
                 add(
                     n + 1,
-                    serde_json::json!({"role":"toolResult","toolCallId":format!("{id}-{n}-{file}"),"toolName":"bash","isError":false,"content":[{"type":"text","text":format!("src/{file}.rs:1: zebra")}]}),
+                    serde_json::json!({"role":"toolResult","toolCallId":format!("{id}-{n}-{file}"),"toolName":"bash","isError":false,"content":[{"type":"text","text":format!("src/{file}.rs:1: zebra in {id}")}]}),
                 );
             }
         }
@@ -3254,6 +3258,24 @@ fn argument_errors_name_what_is_missing_or_allowed() {
     assert!(
         recall.contains("Usage: agrep recall <QUERY>..."),
         "{recall}"
+    );
+    // Usage names agrep whatever the executable is called (Windows printed `agrep.exe`).
+    let renamed = t
+        .path()
+        .join(format!("renamed-agrep{}", std::env::consts::EXE_SUFFIX));
+    fs::copy(support::binary(), &renamed).unwrap();
+    // Argument errors end before any setting is read, so only PATH is passed.
+    let o = Command::new(&renamed)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .arg("recall")
+        .output()
+        .unwrap();
+    let renamed_recall = String::from_utf8(o.stderr).unwrap();
+    assert_eq!(o.status.code(), Some(2), "{renamed_recall}");
+    assert!(
+        renamed_recall.contains("\nUsage: agrep recall <QUERY>..."),
+        "{renamed_recall}"
     );
     assert!(stderr(&["doctor", "--no-semantic"]).contains("\n  --deep\n"));
     for (args, values) in [

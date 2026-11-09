@@ -172,6 +172,36 @@ pub(super) struct Archive {
 fn blob_identity(meta: &fs::Metadata) -> String {
     format!("{:?}", safe_fs::identity(meta))
 }
+/// The content of chunk `sha` in `blobs`, or [`ChunkDamaged`] when it is missing or does
+/// not hold that content.
+pub(super) fn load_chunk(blobs: &Path, sha: &str) -> Result<Vec<u8>> {
+    if !valid_hash(sha) {
+        bail!("invalid archive content hash")
+    }
+    let short = &sha[..12];
+    let file = match File::open(blobs.join(format!("{sha}.gz"))) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(
+                ChunkDamaged(format!("chunk {short} is missing from {}", blobs.display())).into(),
+            )
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let corrupt = |cause: &dyn fmt::Display| {
+        ChunkDamaged(format!(
+            "chunk {short} in {} is corrupt ({cause})",
+            blobs.display()
+        ))
+    };
+    let mut decoder = GzDecoder::new(file).take(CHUNK as u64 + 1);
+    let mut bytes = Vec::new();
+    decoder.read_to_end(&mut bytes).map_err(|e| corrupt(&e))?;
+    if bytes.len() > CHUNK || hash(&bytes) != sha {
+        return Err(corrupt(&"content hash mismatch").into());
+    }
+    Ok(bytes)
+}
 impl Archive {
     pub fn open(root: &DataRoot, blocking: bool) -> Result<Option<Self>> {
         Self::open_with(root, blocking, false)
@@ -201,33 +231,7 @@ impl Archive {
         Ok(p)
     }
     pub fn load(&self, sha: &str) -> Result<Vec<u8>> {
-        let path = self.blob(sha)?;
-        let blobs = self.dir.join("blobs");
-        let short = &sha[..12];
-        let file = match File::open(&path) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(ChunkDamaged(format!(
-                    "chunk {short} is missing from {}",
-                    blobs.display()
-                ))
-                .into())
-            }
-            Err(e) => return Err(e.into()),
-        };
-        let corrupt = |cause: &dyn fmt::Display| {
-            ChunkDamaged(format!(
-                "chunk {short} in {} is corrupt ({cause})",
-                blobs.display()
-            ))
-        };
-        let mut decoder = GzDecoder::new(file).take(CHUNK as u64 + 1);
-        let mut bytes = Vec::new();
-        decoder.read_to_end(&mut bytes).map_err(|e| corrupt(&e))?;
-        if bytes.len() > CHUNK || hash(&bytes) != sha {
-            return Err(corrupt(&"content hash mismatch").into());
-        }
-        Ok(bytes)
+        load_chunk(&self.dir.join("blobs"), sha)
     }
     pub fn store(&mut self, data: &[u8]) -> Result<(String, u64)> {
         let sha = hash(data);
@@ -313,6 +317,21 @@ impl Archive {
             let mut insert = tx.prepare("INSERT INTO damaged VALUES(?)")?;
             for sha in &self.damaged {
                 insert.execute([sha])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    /// Records chunks found damaged outside a capture, and forgets that they were verified,
+    /// so that status reports them and the next capture checks and re-stores them.
+    pub fn record_found_damage(&mut self, damaged: &HashSet<String>) -> Result<()> {
+        let tx = self.db.transaction()?;
+        {
+            let mut forget = tx.prepare("DELETE FROM blobs WHERE sha=?")?;
+            let mut record = tx.prepare("INSERT OR IGNORE INTO damaged VALUES(?)")?;
+            for sha in damaged {
+                forget.execute([sha])?;
+                record.execute([sha])?;
             }
         }
         tx.commit()?;

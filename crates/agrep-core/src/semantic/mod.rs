@@ -1,6 +1,7 @@
 //! In-process semantic retrieval and short-lived background queue draining.
 mod background;
 mod budget;
+mod page;
 pub mod post_index;
 mod scan;
 use crate::{
@@ -13,7 +14,7 @@ use anyhow::{bail, Result};
 pub use background::{
     configure_background, drain, mark_index_changed, post_index, schedule, Drain,
 };
-pub use budget::{build_progress, is_building, time_left, BuildProgress};
+pub use budget::{build_progress, estimate, is_building, BuildProgress};
 use budget::{Overlay, QueryCost};
 use rusqlite::Connection;
 use scan::{resolve_scan, VectorScan};
@@ -144,7 +145,7 @@ impl Lane {
     }
 }
 /// The query's vector, and the vectors of the snapshot's queued rows when embedding them
-/// fits the inline budget: the recorded `cost`, or else one measured on the first row.
+/// fits the inline budget.
 fn embed_query(
     root: &DataRoot,
     pattern: String,
@@ -154,45 +155,43 @@ fn embed_query(
 ) -> Result<(Vec<f32>, Vec<Vec<f32>>)> {
     let started = std::time::Instant::now();
     let model = Embedder::query(root);
-    let load_seconds = started.elapsed().as_secs_f64();
+    let load = started.elapsed().as_secs_f64();
     let model = model?;
-    let mut extra = Vec::new();
-    if !queued.is_empty() {
-        let _span = crate::semantic_profile::span("inline_embedding");
-        let measured = if let Some(cost) = cost {
-            cost
-        } else {
-            let batch = model.inline_batch(&queued[..1])?;
-            QueryCost::observe(root, load_seconds, &batch);
-            let measured = QueryCost {
-                load: load_seconds,
-                cpu_unit: batch.cpu_unit,
-                span_unit: batch.span_unit,
-                updated: QueryCost::now(),
-            };
-            extra = batch.vectors;
-            measured
+    let extra = {
+        let _span = (!queued.is_empty()).then(|| crate::semantic_profile::span("inline_embedding"));
+        let inline = QueryModel {
+            root,
+            model: &model,
+            started,
+            load,
         };
-        let remaining = &queued[extra.len()..];
-        if !remaining.is_empty() {
-            let weights = remaining
-                .iter()
-                .map(|text| model.work_units(std::slice::from_ref(text)))
-                .collect::<Result<Vec<_>>>()?;
-            if !measured.fits(
-                weights.iter().sum(),
-                weights.iter().copied().fold(0., f64::max),
-                started.elapsed().as_secs_f64(),
-            ) {
-                return Err(progress.into());
-            }
-            let batch = model.inline_batch(remaining)?;
-            QueryCost::observe(root, load_seconds, &batch);
-            extra.extend(batch.vectors);
-        }
-    }
+        budget::embed_queued(&inline, queued, cost)?.ok_or(progress)?
+    };
     let vector = model.embed(&[pattern])?.remove(0);
     Ok((vector, extra))
+}
+/// The mapped query model, recording each inline measurement for later admissions.
+struct QueryModel<'a> {
+    root: &'a DataRoot,
+    model: &'a Embedder,
+    started: std::time::Instant,
+    load: f64,
+}
+impl budget::InlineModel for QueryModel<'_> {
+    fn elapsed(&self) -> f64 {
+        self.started.elapsed().as_secs_f64()
+    }
+    fn load(&self) -> f64 {
+        self.load
+    }
+    fn work_units(&self, texts: &[String]) -> Result<f64> {
+        self.model.work_units(texts)
+    }
+    fn embed(&self, texts: &[String]) -> Result<semantic_model::InlineBatch> {
+        let batch = self.model.inline_batch(texts)?;
+        QueryCost::observe(self.root, self.load, &batch);
+        Ok(batch)
+    }
 }
 pub fn finish(c: &Connection, work: QueryWork) -> Result<SearchResults> {
     let result = if let Some(lane) = work.lane {
@@ -243,7 +242,11 @@ pub fn failed(error: &anyhow::Error) -> serde_json::Value {
         .chars()
         .take(140)
         .collect();
-    serde_json::json!({"state":"unavailable","eligible":true,"reason":cause.trim(),"min_score":FLOOR,"score_kind":"unavailable","coverage":null,"complete":false,"fallback_recommended":true})
+    let mut reason = cause.trim().to_owned();
+    if error.chain().any(|e| e.is::<semantic_model::Rejected>()) {
+        reason += " - `agrep setup` reinstalls it";
+    }
+    serde_json::json!({"state":"unavailable","eligible":true,"reason":reason,"min_score":FLOOR,"score_kind":"unavailable","coverage":null,"complete":false,"fallback_recommended":true})
 }
 /// 0.4.9's `semantic_unavailable_notice`, the one line an explicit `-s` prints when its
 /// lane did not answer (py/surface_policy.py:2749-2761).
@@ -378,6 +381,103 @@ mod tests {
                 |r| r.get::<_, String>(0)
             )
             .is_err());
+    }
+    /// A model stand-in whose every inline batch measures `unit` seconds per work unit.
+    struct Measured {
+        unit: f64,
+        batches: std::cell::RefCell<Vec<usize>>,
+    }
+    impl budget::InlineModel for Measured {
+        fn elapsed(&self) -> f64 {
+            0.01
+        }
+        fn load(&self) -> f64 {
+            0.01
+        }
+        fn work_units(&self, texts: &[String]) -> Result<f64> {
+            Ok(texts.len() as f64)
+        }
+        fn embed(&self, texts: &[String]) -> Result<semantic_model::InlineBatch> {
+            self.batches.borrow_mut().push(texts.len());
+            Ok(semantic_model::InlineBatch {
+                vectors: vec![vec![0.; semantic_model::DIM]; texts.len()],
+                cpu_unit: self.unit,
+                span_unit: self.unit,
+            })
+        }
+    }
+    fn measured(unit: f64) -> Measured {
+        Measured {
+            unit,
+            batches: Default::default(),
+        }
+    }
+    /// One command slowed by a loaded machine records a cost no row fits. The next query
+    /// must still prepare and embed a row appended before it started, re-measuring the
+    /// machine, rather than refuse every query until the record expires (CI semantic_inline).
+    #[test]
+    fn a_recorded_slowdown_still_embeds_the_rows_queued_before_the_query() {
+        let (_t, r, _o) = setup();
+        insert(&r, 1, "family-1", "alpha");
+        embed(&r);
+        insert(&r, 2, "family-2", "alpha");
+        let stalled = semantic_model::InlineBatch {
+            cpu_unit: 10.,
+            span_unit: 10.,
+            ..Default::default()
+        };
+        QueryCost::observe(&r, 2., &stalled);
+        let c = store::reader(&r).unwrap();
+        let spike = QueryCost::read(&c).unwrap();
+        assert_eq!(spike.load, 2.);
+        let overlay = budget::Overlay::snapshot(&c, &coverage(&c).unwrap()).unwrap();
+        assert_eq!(overlay.texts, ["connection timeout row 2"]);
+
+        let model = measured(0.01);
+        let vectors = budget::embed_queued(&model, &overlay.texts, Some(spike)).unwrap();
+        assert_eq!(vectors.unwrap().len(), 1);
+        assert_eq!(*model.batches.borrow(), [1]);
+
+        let queued = vec!["row".to_owned(); 20];
+        let model = measured(0.01);
+        let vectors = budget::embed_queued(&model, &queued, Some(spike)).unwrap();
+        assert_eq!(vectors.unwrap().len(), 20);
+        assert_eq!(*model.batches.borrow(), [1, 19]);
+    }
+    /// A backlog the probe proves too slow is refused after one chunk, and a recorded cost
+    /// that admits the whole backlog embeds it without a probe.
+    #[test]
+    fn inline_admission_probes_only_when_the_recorded_cost_refuses() {
+        let queued = vec!["row".to_owned(); 20];
+        let model = measured(10.);
+        let spike = QueryCost {
+            load: 2.,
+            cpu_unit: 10.,
+            span_unit: 10.,
+            updated: QueryCost::now(),
+        };
+        assert!(budget::embed_queued(&model, &queued, Some(spike))
+            .unwrap()
+            .is_none());
+        assert_eq!(*model.batches.borrow(), [1]);
+
+        let fast = QueryCost {
+            load: 0.01,
+            cpu_unit: 0.001,
+            span_unit: 0.001,
+            updated: QueryCost::now(),
+        };
+        let model = measured(0.001);
+        let vectors = budget::embed_queued(&model, &queued, Some(fast)).unwrap();
+        assert_eq!(vectors.unwrap().len(), 20);
+        assert_eq!(*model.batches.borrow(), [20]);
+
+        let model = measured(0.001);
+        assert!(budget::embed_queued(&model, &[], Some(spike))
+            .unwrap()
+            .unwrap()
+            .is_empty());
+        assert!(model.batches.borrow().is_empty());
     }
     #[test]
     fn background_cpu_allowance_never_exceeds_half_the_machine() {
@@ -772,16 +872,18 @@ mod tests {
     }
     #[test]
     fn drain_progress_says_rows_rate_and_time_left_as_the_estimate_does() {
-        assert_eq!(time_left(42), "42s");
-        assert_eq!(time_left(919), "15m 19s");
-        assert_eq!(time_left(3900), "1h 5m");
+        assert_eq!(budget::time_left(42), "42s");
+        assert_eq!(budget::time_left(919), "15m 19s");
+        assert_eq!(budget::time_left(3900), "1h 5m");
+        assert_eq!(estimate(None), "estimating time left");
+        assert_eq!(estimate(Some(919)), "about 15m 19s left");
         assert_eq!(
             background::progress_line(1200, 137768, 136568, Some(150.)),
-            "embedding messages: 1200 of 137768 rows · 150 rows/s · about 15m 11s left"
+            "embedding messages: 1,200 of 137,768 rows · 150 rows/s · about 15m 11s left"
         );
         assert_eq!(
             background::progress_line(0, 10, 10, None),
-            "embedding messages: 0 of 10 rows"
+            "embedding messages: 0 of 10 rows · estimating time left"
         );
     }
     /// An omp advisor sidecar's notes cover their rows without vectors: neither the inline
