@@ -155,20 +155,41 @@ pub(crate) fn stopped(
     Ok(())
 }
 
+/// What a `--chat` value searches: one chat, the history it inherited, and the stderr lines
+/// saying what the scope took in.
+pub(crate) struct ChatScope {
+    pub(crate) session: String,
+    pub(crate) inherited: Vec<agrep_core::query::Inherited>,
+    pub(crate) notices: Vec<String>,
+}
+
 /// 0.4.9's `_resolve_chat` (py/search.py:1130-1151): the one session a `--chat` value
-/// names, or `None` once its miss or ambiguity is logged.
-pub(crate) fn chat(c: &rusqlite::Connection, value: &str) -> Result<Option<String>> {
+/// names, or `None` once its miss or ambiguity is logged. A Codex rollout's file id names
+/// where that rollout's rows live.
+pub(crate) fn chat(c: &rusqlite::Connection, value: &str) -> Result<Option<ChatScope>> {
     use agrep_core::{briefing::repr, handles::SessionIndex, render::safe};
-    let mut found = SessionIndex::load(c)?.candidates(c, value)?;
-    let value = value.trim();
     let shown = repr(&safe(
         value
+            .trim()
             .strip_prefix('@')
-            .filter(|_| !agrep_core::handles::is_handle(value))
-            .unwrap_or(value),
+            .filter(|_| !agrep_core::handles::is_handle(value.trim()))
+            .unwrap_or(value.trim()),
     ));
+    let mut rollouts = agrep_core::rollouts::named(c, value)?;
+    if rollouts.len() > 1 {
+        agrep_core::errln!("{shown} is ambiguous ({} rollouts):", rollouts.len());
+        for rollout in rollouts.iter().take(10) {
+            agrep_core::errln!("  {}", safe(&rollout.id));
+        }
+        agrep_core::errln!("add a char");
+        return Ok(None);
+    }
+    if let Some(rollout) = rollouts.pop() {
+        return rollout_scope(c, &safe(value.trim()), rollout);
+    }
+    let mut found = SessionIndex::load(c)?.candidates(c, value)?;
     match found.len() {
-        1 => return Ok(found.pop()),
+        1 => return session_scope(c, found.pop().unwrap_or_default(), Vec::new()).map(Some),
         0 => agrep_core::errln!(
             "no session matches {shown} - ids come from `agrep <pattern> --json`."
         ),
@@ -184,6 +205,82 @@ pub(crate) fn chat(c: &rusqlite::Connection, value: &str) -> Result<Option<Strin
         }
     }
     Ok(None)
+}
+
+/// A chat's scope: its rows and the history it inherited as a fork.
+fn session_scope(
+    c: &rusqlite::Connection,
+    session: String,
+    mut notices: Vec<String>,
+) -> Result<ChatScope> {
+    let inherited = agrep_core::forks::inherited(c, &session)?;
+    notices.extend(agrep_core::forks::notice(&session, &inherited));
+    Ok(ChatScope {
+        session,
+        inherited,
+        notices,
+    })
+}
+
+/// Where the rows of the Codex rollout a `--chat` value named by its file id live.
+fn rollout_scope(
+    c: &rusqlite::Connection,
+    value: &str,
+    rollout: agrep_core::rollouts::Rollout,
+) -> Result<Option<ChatScope>> {
+    use agrep_core::{render::safe, rollouts::Held};
+    let names = format!("--chat {value} names rollout {}", safe(&rollout.id));
+    let empty = |line: String| ChatScope {
+        session: rollout.id.clone(),
+        inherited: Vec::new(),
+        notices: vec![line],
+    };
+    match rollout.held {
+        Held::Chats(chats) => match chats.as_slice() {
+            [chat] => {
+                let line = format!(
+                    "{names}, a file of chat {}: searching that chat",
+                    safe(chat)
+                );
+                session_scope(c, chat.clone(), vec![line]).map(Some)
+            }
+            _ => {
+                let chats: Vec<_> = chats.iter().map(|s| safe(s)).collect();
+                agrep_core::errln!("{names}, whose rows are under several chats:");
+                for chat in &chats {
+                    agrep_core::errln!("  {chat}");
+                }
+                Ok(None)
+            }
+        },
+        Held::Copied(inherited) => {
+            let parents: Vec<_> = inherited.iter().map(|link| safe(&link.session)).collect();
+            let line = format!(
+                "{names}, a fork holding only history it copied from {}: searching that history (up to the fork)",
+                parents.join(", ")
+            );
+            Ok(Some(ChatScope {
+                inherited,
+                ..empty(line)
+            }))
+        }
+        Held::Interrupted(threads) => {
+            let interrupted = format!("{names}, a review interrupted before its result");
+            Ok(Some(match threads.as_slice() {
+                [thread] => {
+                    let line = format!(
+                        "{interrupted}: searching its review thread {}",
+                        safe(thread)
+                    );
+                    session_scope(c, thread.clone(), vec![line])?
+                }
+                _ => empty(format!("{interrupted}: it holds no searchable rows")),
+            }))
+        }
+        Held::Empty(reason) => Ok(Some(empty(format!(
+            "{names}, which holds no searchable rows: {reason}"
+        )))),
+    }
 }
 
 /// One option as a gate addresses it: its spelling, its clap id, and what it prints.

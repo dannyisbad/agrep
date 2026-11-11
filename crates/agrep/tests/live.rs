@@ -85,6 +85,163 @@ fn board_snapshot_and_tail_scoping() {
     }
     assert!(!data.exists(), "live views must never initialize an index");
 }
+/// Codex team-mode children replay their ancestors' metadata and history before their own
+/// turn, and receive their task as an envelope: the board lists each under its direct
+/// parent, with its own words rather than the replayed history's.
+#[test]
+fn board_shows_team_mode_children_under_their_direct_parents() {
+    let t = TempDir::new().unwrap();
+    let home = t.path().join("home");
+    let data = t.path().join("data");
+    let dir = home.join(".codex/sessions/2026/11/10");
+    fs::create_dir_all(&dir).unwrap();
+    let (root, child, grandchild) = (
+        "01a30000-0001-7000-8000-000000000001",
+        "01a30000-0002-7000-8000-000000000002",
+        "01a30000-0003-7000-8000-000000000003",
+    );
+    let now = chrono::Utc::now();
+    let at = |second: i64| (now - chrono::Duration::seconds(30 - second)).to_rfc3339();
+    let record = |second: i64, ty: &str, payload: Value| json!({"timestamp":at(second),"type":ty,"payload":payload});
+    let said = |second: i64, role: &str, body: &str| {
+        let kind = if role == "assistant" {
+            "output_text"
+        } else {
+            "input_text"
+        };
+        record(
+            second,
+            "response_item",
+            json!({"type":"message","role":role,"content":[{"type":kind,"text":body}]}),
+        )
+    };
+    let meta = |id: &str, parent: Option<&str>, path: &str| {
+        let mut payload =
+            json!({"id":id,"cwd":"/work/team","thread_source":"user","source":"exec"});
+        if let Some(parent) = parent {
+            payload = json!({"id":id,"forked_from_id":parent,"parent_thread_id":parent,"cwd":"/work/team","thread_source":"subagent","agent_path":path,"source":{"subagent":{"thread_spawn":{"parent_thread_id":parent,"agent_path":path}}}});
+        }
+        record(0, "session_meta", payload)
+    };
+    let own_turn = |second: i64, turn: &str, from: &str, to: &str, task: &str, done: &str| {
+        let envelope =
+            json!({"author":from,"recipient":to,"content":"","encrypted_content":task}).to_string();
+        vec![
+            record(
+                second,
+                "event_msg",
+                json!({"type":"task_started","turn_id":turn}),
+            ),
+            said(second + 1, "assistant", &envelope),
+            said(second + 2, "assistant", done),
+        ]
+    };
+    let write = |id: &str, records: &[Value]| {
+        let body: String = records.iter().map(|r| format!("{r}\n")).collect();
+        fs::write(
+            dir.join(format!("rollout-2026-11-10T10-00-00-{id}.jsonl")),
+            body,
+        )
+        .unwrap();
+    };
+    let root_turn = vec![
+        said(
+            1,
+            "user",
+            "Two independent parts: spawn sub_alpha, write main_beta",
+        ),
+        record(
+            1,
+            "event_msg",
+            json!({"type":"user_message","message":"Two independent parts: spawn sub_alpha, write main_beta"}),
+        ),
+        said(2, "assistant", "Spawning sub_alpha."),
+    ];
+    write(
+        root,
+        &[vec![meta(root, None, "")], root_turn.clone()].concat(),
+    );
+    let child_turn = own_turn(
+        3,
+        "01a30000-0002-7001-8000-000000000021",
+        "/root",
+        "/root/sub_alpha",
+        "Write sub_alpha.txt containing alpha.",
+        "sub_alpha.txt is written.",
+    );
+    let child_meta = meta(child, Some(root), "/root/sub_alpha");
+    write(
+        child,
+        &[
+            vec![child_meta.clone(), meta(root, None, "")],
+            root_turn.clone(),
+            child_turn.clone(),
+        ]
+        .concat(),
+    );
+    let grandchild_turn = own_turn(
+        6,
+        "01a30000-0003-7001-8000-000000000031",
+        "/root/sub_alpha",
+        "/root/sub_alpha/sub_alpha",
+        "Create the file in the active project root.",
+        "The platform blocked that tool invocation.",
+    );
+    write(
+        grandchild,
+        &[
+            vec![
+                meta(grandchild, Some(child), "/root/sub_alpha/sub_alpha"),
+                child_meta,
+                meta(root, None, ""),
+            ],
+            root_turn,
+            child_turn,
+            grandchild_turn,
+        ]
+        .concat(),
+    );
+    let out = cli(&home, &data)
+        .args(["board", "--json", "--side", "--wait", "5"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let board: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let listed = |id: &str| {
+        board["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["session"] == id)
+            .unwrap_or_else(|| panic!("{id} is not on the board: {board}"))
+            .clone()
+    };
+    let (child, grandchild) = (listed(child), listed(grandchild));
+    assert_eq!(
+        (&child["parent"], &child["side"], &child["title"]),
+        (
+            &json!(root),
+            &json!(true),
+            &json!("sub_alpha.txt is written.")
+        )
+    );
+    assert_eq!(
+        (
+            &grandchild["parent"],
+            &grandchild["side"],
+            &grandchild["title"]
+        ),
+        (
+            &json!("01a30000-0002-7000-8000-000000000002"),
+            &json!(true),
+            &json!("The platform blocked that tool invocation.")
+        )
+    );
+}
 #[test]
 fn ready_precedes_delta_and_filters_events() {
     let t = TempDir::new().unwrap();

@@ -2,12 +2,15 @@ use agrep_core::{archive, data::DataRoot, diagnostics, render, store};
 use anyhow::Result;
 pub fn run(json: bool, no_auto: bool) -> Result<i32> {
     let root = DataRoot::discover()?;
+    root.ensure_readable()?;
     if root.path().join("FORMAT").exists()
         || root.path().is_dir() && std::fs::read_dir(root.path())?.next().is_some()
     {
         root.validate(false)?;
     }
-    let census = if root.db().exists() {
+    // An index this user may not read cannot be refreshed; status reports the fault instead.
+    let readable = root.db().exists() && root.permission_problem().is_none();
+    let census = if readable {
         crate::ready(no_auto)?.1
     } else {
         None
@@ -15,7 +18,7 @@ pub fn run(json: bool, no_auto: bool) -> Result<i32> {
     crate::finish_census(&root, census)?;
     let mut s = diagnostics::status(&root)?;
     diagnostics::verify_model(&root, &mut s);
-    if root.db().exists() {
+    if readable {
         s["freshness"] = render::freshness(render::checked(no_auto));
     }
     archive_health(&root, &mut s);
@@ -51,6 +54,12 @@ pub fn run(json: bool, no_auto: bool) -> Result<i32> {
             )?;
         } else if s["index"]["state"] == "first build in progress" {
             agrep_core::outln!("first build in progress")?;
+        } else if let Some(fault) = s["index"]["permission"].as_object() {
+            agrep_core::outln!(
+                "{}: {}",
+                fault["what"].as_str().unwrap_or(""),
+                fault["fix"].as_str().unwrap_or("")
+            )?;
         } else {
             agrep_core::outln!(
                 "index {} · run agrep index",

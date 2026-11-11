@@ -52,12 +52,14 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
     crate::finish_census(&root, census)?;
     let c = store::reader(&root)?;
     let coverage = agrep_core::coverage::dimensions(&c, &f)?;
+    let mut chat_notices = Vec::new();
     if let Some(chat) = &f.chat {
-        let Some(session) = super::usage::chat(&c, chat)? else {
+        let Some(scope) = super::usage::chat(&c, chat)? else {
             return stop(("chat-unresolved", None));
         };
-        f.inherited = agrep_core::forks::inherited(&c, &session)?;
-        f.chat = Some(session);
+        f.inherited = scope.inherited;
+        f.chat = Some(scope.session);
+        chat_notices = scope.notices;
     }
     if !s.json && !s.scope.include_self && (s.scope.no_self || identity.agent_context) {
         identity.disclose(s.scope.no_self, false);
@@ -131,6 +133,7 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
             wants_meaning,
             automatic,
             coverage,
+            chat_notices: &chat_notices,
         },
         result,
         semantic_coverage,
@@ -359,6 +362,8 @@ struct RenderRequest<'a> {
     wants_meaning: bool,
     automatic: bool,
     coverage: serde_json::Value,
+    /// What the `--chat` scope took in (`usage::ChatScope`).
+    chat_notices: &'a [String],
 }
 fn render_result(
     ctx: RenderRequest<'_>,
@@ -382,6 +387,7 @@ fn render_result(
         wants_meaning,
         automatic,
         coverage,
+        chat_notices,
     } = ctx;
     let style_semantic = s.semantic && semantic_coverage.is_some();
     if style_semantic && s.chats && s.sort == "score" {
@@ -496,6 +502,7 @@ fn render_result(
             automatic,
             excluded,
             coverage: &coverage,
+            chat_notices,
             policy,
         },
         &result,
@@ -568,6 +575,7 @@ struct Emission<'a> {
     automatic: bool,
     excluded: Option<usize>,
     coverage: &'a serde_json::Value,
+    chat_notices: &'a [String],
     policy: Option<caller::Policy<'a>>,
 }
 fn emit_result(
@@ -588,6 +596,7 @@ fn emit_result(
         automatic,
         excluded,
         coverage,
+        chat_notices,
         policy,
     } = ctx;
     if let Some(line) = agrep_core::query::meta_notice(result.meta_dropped, result.meta_retained) {
@@ -701,11 +710,7 @@ fn emit_result(
     }
     if !s.json {
         agrep_core::coverage::disclose(coverage);
-        if let Some(line) = f
-            .chat
-            .as_deref()
-            .and_then(|chat| agrep_core::forks::notice(chat, &f.inherited))
-        {
+        for line in chat_notices {
             agrep_core::errln!("{line}");
         }
         for line in after_miss {

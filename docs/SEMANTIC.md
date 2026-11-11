@@ -69,7 +69,8 @@ none of `--json`, `--flat`, `-l`, `--lexical`, `-w`, `-E`, `-c`, `--count-by-tie
   them. Filters and caller exclusion apply as in the keyword lane. Notes from omp's
   advisor sidecars (files named `__advisor.jsonl`: an automated reviewer's status notes
   on a session it watches) are never embedded, so they never return as meaning rows, even
-  under `--who subagent`; keyword search finds them as subagent rows.
+  under `--who subagent`; keyword search finds them as subagent rows. A Codex guardian's
+  verdicts (rows labeled `[guardian verdict]`) are left out the same way.
 - By default one result is kept per conversation family; `--all-side-chats` keeps one
   per session. A meaning row is labeled `meaning match`.
 - Copies of one message in other chats (forks share their parent's history, so a fork's

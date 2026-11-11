@@ -70,6 +70,24 @@ pub(super) struct Payload<'a> {
     pub(super) status: Option<Cow<'a, str>>,
     #[serde(borrow)]
     pub(super) action: Option<&'a RawValue>,
+    // item_completed events: the thread the item belongs to, and the item.
+    #[serde(borrow)]
+    pub(super) thread_id: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    pub(super) item: Option<Item<'a>>,
+}
+
+/// An `item_completed` event's item the parser reads: Codex opening its review mode
+/// (`EnteredReviewMode`, with the hint Codex shows for it) or a message a thread received
+/// (`UserMessage`).
+#[derive(Deserialize)]
+pub(super) struct Item<'a> {
+    #[serde(rename = "type", borrow)]
+    pub(super) ty: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    pub(super) content: Option<Vec<Block<'a>>>,
+    #[serde(borrow)]
+    pub(super) user_facing_hint: Option<Cow<'a, str>>,
 }
 
 #[derive(Deserialize)]

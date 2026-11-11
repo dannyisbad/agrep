@@ -109,7 +109,8 @@ impl Submissions {
         self.texts.is_empty() && self.desktop.is_empty()
     }
 
-    /// Legacy submissions allow appended paste markers; Desktop requires matching thread, turn and text.
+    /// Both schemas allow markers appended to the submitted text (pasted images); Desktop
+    /// text must also come from the same thread and turn.
     pub(super) fn attests(&self, text: &str, session: Option<&str>, turn_id: Option<&str>) -> bool {
         let text = text.trim();
         let after = self.texts.partition_point(|s| s.as_str() <= text);
@@ -119,11 +120,13 @@ impl Submissions {
         let (Some(session), Some(turn_id)) = (session, turn_id) else {
             return false;
         };
-        self.desktop
-            .binary_search_by(|(thread, turn, submitted)| {
-                (thread.as_str(), turn.as_str(), submitted.as_str()).cmp(&(session, turn_id, text))
-            })
-            .is_ok()
+        let from = self.desktop.partition_point(|(thread, turn, _)| {
+            (thread.as_str(), turn.as_str()) < (session, turn_id)
+        });
+        self.desktop[from..]
+            .iter()
+            .take_while(|(thread, turn, _)| thread == session && turn == turn_id)
+            .any(|(_, _, submitted)| text.starts_with(submitted.as_str()))
     }
 }
 

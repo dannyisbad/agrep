@@ -134,6 +134,10 @@ fn explain(reference: String, json_output: bool) -> Result<i32> {
         }
     };
     let all = h::sessions(&c)?;
+    let named = agrep_core::rollouts::named(&c, &reference)?;
+    if !named.is_empty() {
+        return rollout(&out, &c, &all, &named, root.db());
+    }
     let (mut matches, _) = match h::resolve_indexed(&c, &all, &reference) {
         Ok(found) => found,
         Err(e) => {
@@ -219,4 +223,107 @@ fn explain(reference: String, json_output: bool) -> Result<i32> {
         evidence,
         Some("agrep chats"),
     )
+}
+/// A reference naming Codex rollouts by their file id: where their rows live, or why the
+/// file holds none.
+fn rollout(
+    out: &Output<'_>,
+    c: &rusqlite::Connection,
+    all: &[h::Session],
+    named: &[agrep_core::rollouts::Rollout],
+    index: std::path::PathBuf,
+) -> Result<i32> {
+    use agrep_core::rollouts::Held;
+    let [rollout] = named else {
+        let ids: Vec<_> = named.iter().map(|rollout| rollout.id.as_str()).collect();
+        return out.emit(
+            "ambiguous",
+            2,
+            "multiple Codex rollout files match",
+            json!([]),
+            json!({"index":{"path":index,"served":"index.db"},"rollouts":ids}),
+            Some("use a full rollout id"),
+        );
+    };
+    let sources: Vec<_> = diagnostics::source_rows(c)?
+        .into_iter()
+        .filter(|s| {
+            s["path"]
+                .as_str()
+                .is_some_and(|path| rollout.paths.iter().any(|p| p == path))
+        })
+        .collect();
+    let evidence = json!({"index":{"path":index,"served":"index.db"},"sources":&sources});
+    if sources.iter().any(|s| !s["last_error"].is_null()) {
+        return out.emit(
+            "unprovable",
+            2,
+            "the rollout's file failed to read",
+            json!([]),
+            evidence,
+            Some("agrep doctor"),
+        );
+    }
+    let chats = |ids: &[String]| {
+        json!(all
+            .iter()
+            .filter(|s| s.agent == "codex" && ids.contains(&s.id))
+            .collect::<Vec<_>>())
+    };
+    let id = &rollout.id;
+    match &rollout.held {
+        Held::Chats(ids) => out.emit(
+            "indexed",
+            0,
+            &format!(
+                "rollout {id} is a file of chat {}, indexed and searchable",
+                ids.join(", ")
+            ),
+            chats(ids),
+            evidence,
+            None,
+        ),
+        Held::Copied(inherited) => {
+            let parents: Vec<_> = inherited.iter().map(|link| link.session.clone()).collect();
+            out.emit(
+                "indexed",
+                0,
+                &format!(
+                    "rollout {id} is a fork holding only history it copied from {}, indexed there up to the fork",
+                    parents.join(", ")
+                ),
+                chats(&parents),
+                evidence,
+                None,
+            )
+        }
+        Held::Interrupted(threads) => {
+            let mut summary = format!(
+                "rollout {id} holds no searchable rows: a review interrupted before its result"
+            );
+            if !threads.is_empty() {
+                summary += &format!("; its review thread {} is indexed", threads.join(", "));
+            }
+            let next = match threads.as_slice() {
+                [thread] => format!("agrep <pattern> --chat {thread}"),
+                _ => "agrep chats".into(),
+            };
+            out.emit(
+                "not-indexed",
+                1,
+                &summary,
+                chats(threads),
+                evidence,
+                Some(&next),
+            )
+        }
+        Held::Empty(reason) => out.emit(
+            "not-indexed",
+            1,
+            &format!("rollout {id} holds no searchable rows: {reason}"),
+            json!([]),
+            evidence,
+            Some("agrep chats"),
+        ),
+    }
 }

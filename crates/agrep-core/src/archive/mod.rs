@@ -105,23 +105,27 @@ fn catalog_path(root: &DataRoot) -> PathBuf {
     root.path().join("archive").join("catalog.db")
 }
 /// Opens the catalog to read it. A WAL database opened read-only creates its `-wal` and
-/// `-shm` files but cannot remove them when it closes, so this opens read-write, never
-/// creating the catalog, and the last connection to close cleans up; SQLite falls back to
-/// read-only by itself when the file is write-protected. In a data directory this user may
-/// not write, a settled catalog opens as immutable, as the index does.
+/// `-shm` files but cannot remove them when it closes, so where agrep may write the data
+/// root this opens read-write, never creating the catalog, and the last connection to close
+/// cleans up; SQLite falls back to read-only by itself when the file is write-protected.
+/// Where it may not ([`crate::data::read_only`]), closing must not checkpoint the catalog:
+/// a settled one in an unwritable directory opens as immutable, as the index does, and any
+/// other opens read-only.
 pub(super) fn read_catalog(path: &Path) -> rusqlite::Result<Connection> {
-    match crate::store::settled_uri(path) {
-        Some(uri) => Connection::open_with_flags(
+    if let Some(uri) = crate::store::settled_uri(path) {
+        return Connection::open_with_flags(
             uri,
             OpenFlags::SQLITE_OPEN_READ_ONLY
                 | OpenFlags::SQLITE_OPEN_URI
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        ),
-        None => Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        ),
+        );
     }
+    let access = if crate::data::read_only() {
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+    } else {
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+    };
+    Connection::open_with_flags(path, access | OpenFlags::SQLITE_OPEN_NO_MUTEX)
 }
 
 /// One capture pass; `log` receives a line per source captured, appended, repaired or

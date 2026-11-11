@@ -60,16 +60,16 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
         .clone()
         .filter(|_| !queries.iter().any(|q| handles::is_handle(q)))
     {
-        let Some(session) = crate::cmd::usage::chat(&c, &chat)? else {
+        let Some(scope) = crate::cmd::usage::chat(&c, &chat)? else {
             return stop("query:error", ("chat-unresolved", None));
         };
-        filters.inherited = agrep_core::forks::inherited(&c, &session)?;
-        if let Some(line) =
-            agrep_core::forks::notice(&session, &filters.inherited).filter(|_| !a.json)
-        {
-            agrep_core::errln!("{line}");
+        if !a.json {
+            for line in &scope.notices {
+                agrep_core::errln!("{line}");
+            }
         }
-        filters.chat = Some(session)
+        filters.inherited = scope.inherited;
+        filters.chat = Some(scope.session)
     }
     let direct_filters: Vec<_> = [
         ("--chat", filters.chat.is_some()),

@@ -969,6 +969,51 @@ mod tests {
             ["session-1"]
         );
     }
+    /// A Codex guardian's verdicts cover their rows without vectors, as an advisor's notes do.
+    #[test]
+    fn guardian_verdict_rows_stay_out_of_the_meaning_lane() {
+        let (_t, r, o) = setup();
+        insert(&r, 1, "root", "alpha");
+        insert(&r, 2, "root", "alpha");
+        {
+            let c = store::writer(&r).unwrap();
+            let verdict = format!(
+                "{}{{\"outcome\":\"allow\",\"rationale\":\"connection timeout row 2\"}}",
+                crate::ingest::codex::GUARDIAN_VERDICT
+            );
+            c.execute(
+                "UPDATE prose SET who='subagent',text=?1,digest=?2 WHERE id=2",
+                params![verdict.as_bytes(), store::digest(&verdict)],
+            )
+            .unwrap();
+        }
+        let c = store::reader(&r).unwrap();
+        let overlay = budget::Overlay::snapshot(&c, &coverage(&c).unwrap()).unwrap();
+        assert_eq!(overlay.texts, ["connection timeout row 1"]);
+        drop(c);
+        let mut embedded = Vec::new();
+        drain_with(&r, Drain::default(), |texts| {
+            embedded.extend_from_slice(texts);
+            let mut v = vec![0f32; semantic_model::DIM];
+            v[0] = 1.;
+            Ok(vec![v; texts.len()])
+        })
+        .unwrap();
+        assert_eq!(embedded, ["connection timeout row 1"]);
+        let c = store::reader(&r).unwrap();
+        assert!(!coverage(&c).unwrap().building());
+        let mut q = vec![0f32; semantic_model::DIM];
+        q[0] = 1.;
+        let found = search_vector(&r, &c, &o, false, &q).unwrap();
+        assert_eq!(
+            found
+                .hits
+                .iter()
+                .map(|h| h.session.as_str())
+                .collect::<Vec<_>>(),
+            ["session-1"]
+        );
+    }
     /// Equal cosines spread through the blocks of a parallel scan resolve to one order on
     /// every search: by cosine, then newest, then session and turn, one row a session.
     #[test]

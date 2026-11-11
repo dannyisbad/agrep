@@ -6,14 +6,19 @@ use serde_json::value::RawValue;
 
 use super::discover::rollout_stem;
 use super::prefilter::{
-    canonical_timestamp, fast_class, raw_call_output, FallbackNeedles, FastClass,
+    canonical_timestamp, fast_class, holds_request, item_type, raw_call_output, FallbackNeedles,
+    FastClass,
 };
 use super::records::{extract_assistant, extract_text, Block, Line, Payload};
+use super::review::Review;
 use super::state::{CodexState, Finished};
-use super::subagent::{delegated_input, is_guardian_source, subagent_anchor, SubagentContext};
+use super::subagent::{
+    delegated_input, envelope_anchor, is_guardian_source, subagent_anchor, SubagentContext,
+};
 use super::submissions::Submissions;
 use super::tools::{call_input, call_status, parse_call_output, web_search_query, CallInput};
-use super::{is_codex_injected, COMPACTED_MARKER};
+use super::voice::Delegation;
+use super::{is_codex_injected, COMPACTED_MARKER, GUARDIAN_VERDICT};
 use crate::ingest::{cap_str_with_chars, is_wrapper, parse_timestamp, project_name, EVENT_CAP};
 use crate::intake::{Skip, Tally};
 use crate::intake_batch::ReadOutcome;
@@ -93,14 +98,6 @@ impl<'a> Parser<'a> {
         if line.is_empty() {
             return;
         }
-        // Guardian rollouts are automatic approval-review control traffic. Once
-        // session_meta proves that subtype, account every remaining record without
-        // parsing or indexing its large echoed parent-history wrapper.
-        if self.state.internal_guardian {
-            self.tally.seen();
-            self.tally.skip(Skip::Sidechain);
-            return;
-        }
         if !self.fast_path(line, record_ordinal) {
             return;
         }
@@ -138,6 +135,13 @@ impl<'a> Parser<'a> {
                 self.fast_meta += 1;
                 return false;
             }
+            FastClass::Item => {
+                if !self.reads_item(item_type(bytes)) {
+                    self.fast_meta += 1;
+                    return false;
+                }
+                self.tally.seen();
+            }
             FastClass::Compact => {
                 self.tally.seen();
                 self.compacted(canonical_timestamp(bytes), record_ordinal);
@@ -148,7 +152,7 @@ impl<'a> Parser<'a> {
                 return false;
             }
             FastClass::Fallback => {
-                if !self.needles.admits(bytes) {
+                if !self.needles.admits(bytes) && !(self.awaits_request() && holds_request(bytes)) {
                     // Non-canonical reasoning/delta records: structural, never message
                     // payloads. The fallback retains compatibility with pretty/reordered JSON.
                     self.fast_non_message += 1;
@@ -158,6 +162,23 @@ impl<'a> Parser<'a> {
             }
         }
         true
+    }
+
+    /// Whether the parser reads an `item_completed` event whose item has this type: review
+    /// mode opening, and while a review awaits it, the request Codex hands the review thread.
+    fn reads_item(&self, item: Option<&[u8]>) -> bool {
+        match item {
+            Some(b"EnteredReviewMode") => true,
+            Some(b"UserMessage") => self.awaits_request(),
+            _ => false,
+        }
+    }
+
+    fn awaits_request(&self) -> bool {
+        self.state
+            .review
+            .as_ref()
+            .is_some_and(Review::awaits_request)
     }
 
     fn record(&mut self, record: &Line<'_>, record_ordinal: usize) {
@@ -232,14 +253,15 @@ impl<'a> Parser<'a> {
         if let Some(id) = meta.id.as_deref().filter(|id| !id.is_empty()) {
             state.session = Some(id.to_string());
         }
-        if meta.thread_source.as_deref() != Some("subagent") {
-            return;
-        }
+        // Codex's automatic approval reviews (`guardian_review` threads, and subagents in
+        // older builds) review another chat's actions: only their verdicts are their own.
         if is_guardian_source(meta.source) {
-            state.internal_guardian = true;
+            state.guardian = Some(meta.parent_thread_id.as_deref().unwrap_or("").to_string());
             return;
         }
-        state.subagent = Some(SubagentContext::from_session_meta(meta));
+        if meta.thread_source.as_deref() == Some("subagent") {
+            state.subagent = Some(SubagentContext::from_session_meta(meta));
+        }
     }
 
     fn event_msg(&mut self, payload: Option<&Payload<'_>>) {
@@ -248,6 +270,34 @@ impl<'a> Parser<'a> {
             (state.subagent.as_mut(), payload, state.session.as_deref())
         {
             ctx.note_event(event, session_id);
+        }
+        if let Some(event) = payload.filter(|_| !self.replaying()) {
+            self.review_item(event);
+        }
+    }
+
+    /// Codex's review mode: its opening starts a review, and the first message another thread
+    /// then receives is the request Codex handed the review thread.
+    fn review_item(&mut self, event: &Payload<'_>) {
+        let Some(item) = event.item.as_ref() else {
+            return;
+        };
+        match item.ty.as_deref() {
+            Some("EnteredReviewMode") => {
+                self.state.review = Some(Review::entered(item.user_facing_hint.as_deref()));
+            }
+            Some("UserMessage")
+                if event
+                    .thread_id
+                    .as_deref()
+                    .is_some_and(|thread| thread != self.session_id()) =>
+            {
+                let request = item.content.as_deref().and_then(extract_text);
+                if let (Some(review), Some(request)) = (self.state.review.as_mut(), request) {
+                    review.requested(&request);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -282,10 +332,16 @@ impl<'a> Parser<'a> {
                 .as_ref()
                 .filter(|ctx| ctx.agent_path.is_none())
             {
-                let label = ctx.prompt_label(message_turn_id);
+                let label = ctx.prompt_label();
                 self.pathless_child_message(payload, timestamp, message_turn_id, label);
                 return;
             }
+        }
+        if payload.ty.as_deref() == Some("message")
+            && payload.role.as_deref() == Some("assistant")
+            && self.envelope(payload, timestamp)
+        {
+            return;
         }
         if self.replaying() {
             self.tally.skip(Skip::Replay);
@@ -327,10 +383,28 @@ impl<'a> Parser<'a> {
         self.push_prompt(timestamp, text);
     }
 
-    /// Legacy/native subagents with no routing path carry a real plaintext task.
-    /// Require its passthrough turn id to match the child-owned task_started marker
-    /// (`label` is `None` until it does); without that proof, keep suppressing the
-    /// inherited parent transcript.
+    /// Codex's team mode also delivers an inbound message as an assistant message carrying
+    /// a JSON envelope addressed to this child: the same handoff as `agent_message`.
+    fn envelope(&mut self, payload: &Payload<'_>, timestamp: Option<&str>) -> bool {
+        let Some(ctx) = self.state.subagent.as_ref() else {
+            return false;
+        };
+        let label = if ctx.started { "message" } else { "task" };
+        let anchor = ctx.agent_path.as_deref().and_then(|agent_path| {
+            let text = extract_assistant(payload.content.as_deref()?)?;
+            envelope_anchor(&text, agent_path, label)
+        });
+        let Some(text) = anchor else {
+            return false;
+        };
+        self.open_child();
+        self.push_prompt(timestamp, text);
+        true
+    }
+
+    /// Legacy/native subagents with no routing path carry a real plaintext task, accepted
+    /// once the child's own turn began (`label` is `None` until then): before that, the
+    /// text is the inherited parent transcript.
     fn pathless_child_message(
         &mut self,
         payload: &Payload<'_>,
@@ -366,8 +440,8 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// The child's own transcript starts at its first proven prompt: everything before it,
-    /// including resumed rows, was the inherited parent replay.
+    /// The child's transcript starts at its first prompt. Unless the child's own turn began
+    /// earlier, everything before it, including resumed rows, was the inherited parent replay.
     fn open_child(&mut self) {
         let state = &mut self.state;
         let Some(ctx) = state.subagent.as_mut() else {
@@ -376,7 +450,11 @@ impl<'a> Parser<'a> {
         if ctx.started {
             return;
         }
+        let own_turn_began = ctx.replay_over();
         ctx.started = true;
+        if own_turn_began {
+            return;
+        }
         state.pending.clear();
         self.tally
             .discard_rows_as_replay(state.out.len().saturating_sub(self.carried_rows) as u64);
@@ -475,7 +553,11 @@ impl<'a> Parser<'a> {
         };
         // Assistant prose -> attach to the user message it answers.
         if payload.role.as_deref() == Some("assistant") {
-            self.attach_reply(blocks);
+            if self.state.guardian.is_some() {
+                self.guardian_verdict(blocks, timestamp);
+                return;
+            }
+            self.attach_reply(blocks, timestamp);
             self.tally.agent_row();
             return;
         }
@@ -484,10 +566,21 @@ impl<'a> Parser<'a> {
             self.tally.skip(Skip::NonHuman);
             return;
         }
+        // A guardian's request is the reviewed chat's history as Codex quoted it.
+        if self.state.guardian.is_some() {
+            self.tally.skip(Skip::Sidechain);
+            return;
+        }
         let Some(text) = extract_text(blocks) else {
             self.tally.skip(Skip::EmptyText);
             return;
         };
+        let session = self.state.session.as_deref();
+        let attested = self.state.submissions.attests(&text, session, turn_id);
+        if let Some(delegation) = Delegation::parse(&text) {
+            self.voice(delegation, attested, timestamp);
+            return;
+        }
         if is_wrapper(&text) || is_codex_injected(&text) {
             self.tally.skip(Skip::Wrapper);
             return;
@@ -495,23 +588,83 @@ impl<'a> Parser<'a> {
         // An absent submission is not evidence of a human turn: a subagent thread
         // logs none because nobody is at the keyboard, and its real inbound work
         // arrives on the handoff paths above.
-        let session = self.state.session.as_deref();
-        if !self.state.submissions.attests(&text, session, turn_id) {
+        if !attested {
             self.tally.skip(Skip::NonHuman);
             return;
         }
         self.push_prompt(timestamp, text);
     }
 
-    fn attach_reply(&mut self, blocks: &[Block<'_>]) {
+    /// A voice session's delegation: a request is the user's turn, and the flush ending the
+    /// session adds what its transcript holds that no request did, the user's words as a turn
+    /// of their own and the voice assistant's as its reply. The flush's own note is Codex's.
+    fn voice(&mut self, delegation: Delegation, attested: bool, timestamp: Option<&str>) {
+        if !attested {
+            let skip = match delegation.request {
+                Some(_) => Skip::NonHuman,
+                None => Skip::Wrapper,
+            };
+            self.tally.skip(skip);
+            return;
+        }
+        let (request, flush) = (delegation.request.clone(), delegation.flush);
+        self.state.transcript.heard(delegation);
+        if let Some(request) = request {
+            self.push_prompt(timestamp, request);
+            return;
+        }
+        if !flush {
+            self.tally.skip(Skip::Wrapper);
+            return;
+        }
+        let (user, assistant) = std::mem::take(&mut self.state.transcript).unheard();
+        if !user.is_empty() {
+            self.push_prompt(timestamp, user.join("\n"));
+        } else if !assistant.is_empty() {
+            self.tally.agent_row();
+        } else {
+            self.tally.skip(Skip::Wrapper);
+        }
+        for said in &assistant {
+            self.reply(said, timestamp);
+        }
+    }
+
+    /// A guardian's verdict is a row of its own, labeled so it stays out of the meaning lane
+    /// (`semantic_store`): keyword search finds it, a meaning search of the reviewed work
+    /// does not drown in approval notes.
+    fn guardian_verdict(&mut self, blocks: &[Block<'_>], timestamp: Option<&str>) {
+        let Some(verdict) = extract_assistant(blocks) else {
+            self.tally.skip(Skip::EmptyText);
+            return;
+        };
+        self.push_prompt(timestamp, format!("{GUARDIAN_VERDICT}{verdict}"));
+    }
+
+    fn attach_reply(&mut self, blocks: &[Block<'_>], timestamp: Option<&str>) {
         let Some(txt) = extract_assistant(blocks) else {
             return;
         };
+        if let Some(review) = self.state.review.take() {
+            self.push_prompt(timestamp, review.label());
+        }
+        self.reply(&txt, timestamp);
+    }
+
+    /// Appends `txt` to the reply of the turn it answers: the last row.
+    fn reply(&mut self, txt: &str, timestamp: Option<&str>) {
+        if self.state.out.is_empty() {
+            // A reply no prompt row precedes (a turn whose request was not typed) is still
+            // the agent's own text.
+            let row = self.row(timestamp, String::new(), self.state.current_model.clone());
+            self.state.out.push(row);
+            self.state.turn += 1;
+        }
         let state = &mut self.state;
         let Some(last) = state.out.last_mut() else {
             return;
         };
-        let chars = crate::ingest::append_reply(last, &txt);
+        let chars = crate::ingest::append_reply(last, txt);
         if chars > 0 {
             state
                 .order
@@ -523,8 +676,10 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// A new prompt row; a review still awaiting its result then has none to come.
     fn push_prompt(&mut self, timestamp: Option<&str>, text: String) {
         self.tally.row();
+        self.state.review = None;
         self.state.order.prompt(&mut self.state.events);
         let row = self.row(timestamp, text, self.state.current_model.clone());
         self.state.out.push(row);
@@ -533,6 +688,9 @@ impl<'a> Parser<'a> {
 
     fn row(&self, timestamp: Option<&str>, text: String, model: String) -> RawMessage {
         let subagent = self.state.subagent.as_ref();
+        let parent = subagent
+            .map(|ctx| ctx.parent_session.clone())
+            .or_else(|| self.state.guardian.clone());
         RawMessage {
             agent: "codex",
             project: self
@@ -547,10 +705,8 @@ impl<'a> Parser<'a> {
             model,
             reply: String::new(),
             reply_chars: 0,
-            side: subagent.is_some(),
-            parent: subagent
-                .map(|ctx| ctx.parent_session.clone())
-                .unwrap_or_default(),
+            side: parent.is_some(),
+            parent: parent.unwrap_or_default(),
             reply_shape: Default::default(),
         }
     }
@@ -600,9 +756,12 @@ impl<'a> Parser<'a> {
             .unwrap_or_else(|| session_from_filename(self.path))
     }
 
-    /// A subagent rollout before its proven boundary is still replaying its parent.
+    /// A subagent rollout before its own turn or first handoff is still replaying its parent.
     fn replaying(&self) -> bool {
-        self.state.subagent.as_ref().is_some_and(|ctx| !ctx.started)
+        self.state
+            .subagent
+            .as_ref()
+            .is_some_and(|ctx| !ctx.replay_over())
     }
 
     fn finish(self, lines: usize) -> (Parsed, CodexState) {

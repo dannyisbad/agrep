@@ -17,6 +17,9 @@ pub(super) enum FastClass {
     CallOutput,
     /// Canonical bookkeeping which the adapter deliberately does not materialize.
     Meta,
+    /// A canonical `item_completed` event: bookkeeping unless its item is one the parser
+    /// reads (`item_type`).
+    Item,
     /// A native Codex context-compaction boundary. Its replacement history stays
     /// opaque; only the timestamped structural boundary becomes a recap row.
     Compact,
@@ -75,13 +78,23 @@ pub(super) fn fast_class(bytes: &[u8]) -> FastClass {
 }
 
 fn event_msg_class(payload: &[u8]) -> FastClass {
-    // task_started supplies the child-owned turn boundary. Every other event_msg
-    // is bookkeeping (including huge duplicated MCP tool outputs).
-    if payload == b"task_started" {
-        FastClass::Parse
-    } else {
-        FastClass::Meta
+    // task_started supplies the child-owned turn boundary and item_completed can open a
+    // review. Every other event_msg is bookkeeping (including huge duplicated MCP tool
+    // outputs).
+    match payload {
+        b"task_started" => FastClass::Parse,
+        b"item_completed" => FastClass::Item,
+        _ => FastClass::Meta,
     }
+}
+
+/// The type of a canonical `item_completed` event's item: the first `"item":{"type":` holds
+/// it, since the payload's own fields before it are short ids.
+pub(super) fn item_type(bytes: &[u8]) -> Option<&[u8]> {
+    const ITEM: &[u8] = b"\"item\":{\"type\":\"";
+    let start = memmem::find(bytes, ITEM)? + ITEM.len();
+    let len = memchr::memchr(b'"', &bytes[start..])?;
+    Some(&bytes[start..start + len])
 }
 
 fn response_item_class(payload: &[u8]) -> FastClass {
@@ -241,10 +254,17 @@ impl<'a> CallOutputFields<'a> {
 /// quoted key needles - see the claude.rs raw_str_value doc): every line kind the parser
 /// consumes is admitted by one of these needles - messages carry `"role":`, tool
 /// calls/outputs carry `"call_id":`, plus the two meta line types (and web_search_call,
-/// whose call_id is not guaranteed). The reasoning items that dominate rollout bytes match
-/// none and are skipped without touching serde; an unquoted-needle false positive just
-/// costs one wasted parse.
-pub(super) struct FallbackNeedles([memmem::Finder<'static>; 8]);
+/// whose call_id is not guaranteed) and review mode's opening. The reasoning items that
+/// dominate rollout bytes match none and are skipped without touching serde; an
+/// unquoted-needle false positive just costs one wasted parse. A review's request is
+/// admitted apart, only while a review awaits it (`holds_request`).
+pub(super) struct FallbackNeedles([memmem::Finder<'static>; 9]);
+
+/// Whether a record's bytes can hold the message Codex hands a review thread: its item type,
+/// as a quoted JSON token.
+pub(super) fn holds_request(bytes: &[u8]) -> bool {
+    memmem::find(bytes, b"\"UserMessage\"").is_some()
+}
 
 impl FallbackNeedles {
     pub(super) fn new() -> Self {
@@ -257,6 +277,7 @@ impl FallbackNeedles {
             memmem::Finder::new(b"agent_message"),
             memmem::Finder::new(b"task_started"),
             memmem::Finder::new(b"compacted"),
+            memmem::Finder::new(b"\"EnteredReviewMode\""),
         ])
     }
 

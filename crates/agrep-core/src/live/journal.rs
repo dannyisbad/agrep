@@ -13,7 +13,6 @@ pub(crate) struct Meta {
     started: bool,
     start_turn: String,
     agent_path: String,
-    replayed: bool,
     guardian: bool,
     seen: std::collections::HashSet<String>,
     announced: std::collections::VecDeque<(String, String)>,
@@ -64,15 +63,20 @@ impl Meta {
         let kind = text(&v["type"]);
         let p = if agent == "codex" { &v["payload"] } else { v };
         if (agent == "codex" && kind == "session_meta") || (agent == "pi" && kind == "session") {
+            let own = !self.initialized;
             if let Some(id) = p["id"].as_str() {
-                if agent == "codex" && self.initialized && self.side && id != self.session {
-                    self.parent = id.into();
-                    self.replayed = true;
-                } else if !self.initialized {
+                if own {
                     self.session = id.into();
+                } else if agent == "codex"
+                    && self.side
+                    && id != self.session
+                    && self.parent.is_empty()
+                {
+                    // A fork child replays its ancestors' metadata, its direct parent's first.
+                    self.parent = id.into();
                 }
             }
-            if agent == "codex" && !self.initialized {
+            if agent == "codex" && own {
                 self.side = p["thread_source"] == "subagent" || p["source"]["subagent"].is_object();
                 self.guardian = p["source"]["subagent"]["other"] == "guardian";
                 self.agent_path = p["agent_path"]
@@ -88,7 +92,7 @@ impl Meta {
                 .or(p["parent_session_id"].as_str())
                 .or(p["parent_thread_id"].as_str())
                 .or(p["source"]["subagent"]["thread_spawn"]["parent_thread_id"].as_str());
-            if let Some(s) = parent {
+            if let Some(s) = parent.filter(|_| own || agent != "codex") {
                 self.parent = s.into();
                 self.side = true;
             }
@@ -370,15 +374,16 @@ fn codex(m: &mut Meta, v: &Value, base: &Value, out: &mut Vec<Value>) {
         _ => {}
     }
 }
-/// A sub-agent rollout replays its parent's history before its own task: records are
-/// held back until the task anchor. Returns whether the record was consumed here.
+/// A sub-agent rollout replays its parent's history before its own: records are held back
+/// until its own first turn starts or its task arrives, as ingest keeps them. Returns
+/// whether the record was consumed here.
 fn codex_side(m: &mut Meta, v: &Value, base: &Value, out: &mut Vec<Value>) -> bool {
     let p = &v["payload"];
     let record = text(&v["type"]);
     let kind = text(&p["type"]);
     if record == "event_msg" && kind == "task_started" {
         let turn = text(&p["turn_id"]);
-        if !m.started && turn.len() == 36 && turn > m.session.as_str() {
+        if !replay_over(m) && crate::ingest::codex::is_uuid_v7_after(turn, &m.session) {
             m.start_turn = turn.into();
         }
         return true;
@@ -398,13 +403,18 @@ fn codex_side(m: &mut Meta, v: &Value, base: &Value, out: &mut Vec<Value>) -> bo
         }
         return true;
     }
-    !m.started
+    !replay_over(m)
+}
+/// Whether the parent replay is behind: the child's own turn began or its task arrived.
+fn replay_over(m: &Meta) -> bool {
+    m.started || !m.start_turn.is_empty()
 }
 /// The task or message a sub-agent received, as its visible user turn.
 fn side_anchor(m: &Meta, p: &Value, record: &str, kind: &str) -> Option<String> {
     if record != "response_item" {
         return None;
     }
+    let label = if m.started { "message" } else { "task" };
     if kind == "agent_message" && !m.agent_path.is_empty() && p["recipient"] == m.agent_path {
         let visible = content(&p["content"]);
         let visible = if visible.is_empty() {
@@ -431,20 +441,19 @@ fn side_anchor(m: &Meta, p: &Value, record: &str, kind: &str) -> Option<String> 
         };
         return Some(format!("[subagent {label}] {body}"));
     }
-    if kind == "message" && p["role"] == "user" && m.agent_path.is_empty() {
+    // Team mode delivers the same handoff as an assistant message holding a JSON envelope.
+    if kind == "message" && p["role"] == "assistant" && !m.agent_path.is_empty() {
+        return crate::ingest::codex::envelope_anchor(
+            &content(&p["content"]),
+            &m.agent_path,
+            label,
+        );
+    }
+    if kind == "message" && p["role"] == "user" && m.agent_path.is_empty() && replay_over(m) {
         let raw = content(&p["content"]);
-        let turn = text(&p["internal_chat_message_metadata_passthrough"]["turn_id"]);
-        let eligible = m.started
-            || (!m.start_turn.is_empty()
-                && if turn.is_empty() {
-                    !m.replayed
-                } else {
-                    turn == m.start_turn
-                });
-        if eligible && !noise(&raw, true) {
-            let label = if m.started { "message" } else { "task" };
-            return Some(format!("[subagent {label}] {raw}"));
-        }
+        let task = crate::ingest::codex::delegated_input(&raw)
+            .or_else(|| (!noise(&raw, true)).then_some(raw))?;
+        return Some(format!("[subagent {label}] {task}"));
     }
     None
 }
@@ -603,6 +612,63 @@ mod fork_tests {
             &json!({"type":"event_msg","payload":{"type":"task_complete"}}),
         );
         assert_eq!(e[0]["type"], "done");
+    }
+    /// A depth-2 team-mode child replays both ancestors' metadata and history: its parent is
+    /// its direct parent, the replay stays hidden, and from its own first turn the envelope
+    /// is its task and its call and reply show, as ingest keeps them.
+    #[test]
+    fn team_child_shows_its_own_turn_under_its_direct_parent() {
+        let (root, parent, child) = (
+            "01a20000-0000-7000-8000-000000000001",
+            "01a20000-0001-7000-8000-000000000002",
+            "01a20000-0002-7000-8000-000000000003",
+        );
+        let said = |text: &str| json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}});
+        let started = |turn: &str| json!({"type":"event_msg","payload":{"type":"task_started","turn_id":turn}});
+        let envelope = json!({"author":"/root/a","recipient":"/root/a/b","content":"","encrypted_content":"Create the file in the project root."}).to_string();
+        let records = [
+            json!({"type":"session_meta","payload":{"id":child,"thread_source":"subagent","parent_thread_id":parent,"agent_path":"/root/a/b"}}),
+            json!({"type":"session_meta","payload":{"id":parent,"thread_source":"subagent","parent_thread_id":root,"agent_path":"/root/a"}}),
+            json!({"type":"session_meta","payload":{"id":root,"thread_source":"user"}}),
+            started("01a20000-0000-7001-8000-000000000004"),
+            said("replayed root reply"),
+            started("01a20000-0001-7001-8000-000000000005"),
+            said("replayed parent reply"),
+            started("01a20000-0002-7001-8000-000000000006"),
+            said(&envelope),
+            json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":"own","name":"apply_patch","input":"*** Update File: x"}}),
+            said("The platform blocked that tool invocation."),
+        ];
+        let mut m = Meta::default();
+        let events: Vec<Value> = records
+            .iter()
+            .flat_map(|record| parse("codex", &mut m, record))
+            .collect();
+        let shown: Vec<_> = events
+            .iter()
+            .map(|e| {
+                let body = e.get("text").or(e.get("name")).unwrap();
+                (
+                    text(&e["type"]).to_owned(),
+                    body.as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                (
+                    "user",
+                    "[subagent task] Create the file in the project root."
+                ),
+                ("tool", "apply_patch"),
+                ("reply", "The platform blocked that tool invocation."),
+            ]
+            .map(|(kind, text)| (kind.to_owned(), text.to_owned()))
+        );
+        assert!(events
+            .iter()
+            .all(|e| e["session"] == child && e["parent"] == parent));
     }
 }
 

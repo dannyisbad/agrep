@@ -104,10 +104,10 @@ pub struct Pending {
     pub chunks: Vec<String>,
 }
 /// The content key of prose row `p`: its preparation variant and raw digest, which bind
-/// every chunk to the source text. An omp advisor sidecar's notes (automated reviewer
-/// chatter) key as `none:`, which no vector ever carries, so they cover their row without
-/// joining the meaning lane.
-const CONTENT_KEY: &str = "(CASE WHEN EXISTS(SELECT 1 FROM sources s WHERE s.rowid=p.source AND (substr(s.path,-16) IN ('/__advisor.jsonl','\\__advisor.jsonl') OR substr(s.path,-19) IN ('/__advisor.jsonl.gz','\\__advisor.jsonl.gz'))) THEN 'none:' WHEN p.agent='pi' AND p.who='recap' THEN 'recap:' ELSE 'text:' END)||p.digest";
+/// every chunk to the source text. Automated reviewers' notes, an omp advisor sidecar's and
+/// a Codex guardian's verdicts (`ingest::codex::GUARDIAN_VERDICT`), key as `none:`, which
+/// no vector ever carries, so they cover their row without joining the meaning lane.
+const CONTENT_KEY: &str = "(CASE WHEN EXISTS(SELECT 1 FROM sources s WHERE s.rowid=p.source AND (substr(s.path,-16) IN ('/__advisor.jsonl','\\__advisor.jsonl') OR substr(s.path,-19) IN ('/__advisor.jsonl.gz','\\__advisor.jsonl.gz'))) THEN 'none:' WHEN p.agent='codex' AND p.who!='agent' AND substr(CAST(p.text AS BLOB),1,19)=CAST('[guardian verdict] ' AS BLOB) THEN 'none:' WHEN p.agent='pi' AND p.who='recap' THEN 'recap:' ELSE 'text:' END)||p.digest";
 pub fn batch(c: &Connection, n: usize) -> Result<Vec<Pending>> {
     let mut s = c.prepare(&format!("SELECT p.id,p.digest,p.agent,p.who,p.text,{CONTENT_KEY} FROM semantic_queue q JOIN prose p ON p.id=q.row_id AND p.digest=q.digest WHERE p.visible=1 ORDER BY q.ts DESC,q.row_id DESC LIMIT ?"))?;
     let rows = s.query_map([n], |r| {
@@ -429,6 +429,16 @@ mod tests {
     fn row(root: &DataRoot, text: &str) {
         let c = store::writer(root).unwrap();
         c.execute("INSERT INTO prose(id,source,agent,session,project,turn,who,model,model_source,ts,text,digest,extra) VALUES(1,1,'codex','abc','project',1,'user','',0,5,?,?,'')",params![text.as_bytes(),store::digest(text)]).unwrap();
+    }
+    /// The meaning lane knows a Codex guardian's verdict by the label ingest gives it.
+    #[test]
+    fn a_guardian_verdict_keys_as_none() {
+        let (_t, root) = root();
+        let label = crate::ingest::codex::GUARDIAN_VERDICT;
+        row(&root, &format!("{label}{{\"outcome\":\"allow\"}}"));
+        let pending = batch(&store::reader(&root).unwrap(), 8).unwrap();
+        assert!(pending[0].key.starts_with("none:"), "{}", pending[0].key);
+        assert!(pending[0].chunks.is_empty());
     }
     #[test]
     fn coverage_serializes_only_complete_lanes() {

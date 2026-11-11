@@ -8,6 +8,7 @@ use std::{
 };
 pub fn run(deep: bool, fix: bool, no_semantic: bool, json_output: bool) -> Result<i32> {
     let root = DataRoot::discover()?;
+    root.ensure_readable()?;
     let mut s = diagnostics::status(&root)?;
     let mut checks = vec![];
     let mut repaired = vec![];
@@ -73,7 +74,8 @@ pub fn run(deep: bool, fix: bool, no_semantic: bool, json_output: bool) -> Resul
         }
         s = diagnostics::status(&root)?;
     }
-    let corrupt = s["index"]["state"] == "unreadable"
+    // A permissions fault is not corruption: rebuilding would not make the index readable.
+    let corrupt = (s["index"]["state"] == "unreadable" && s["index"]["permission"].is_null())
         || checks
             .iter()
             .any(|c| c["check"] == "sqlite_integrity" && c["state"] == "failed");
@@ -244,6 +246,11 @@ fn index_check(root: &DataRoot, s: &serde_json::Value) -> Option<serde_json::Val
             "action":"point AGREP_DATA_DIR at a directory this agrep owns"}));
     }
     let state = s["index"]["state"].as_str().unwrap_or("unreadable");
+    if let Some(fault) = s["index"]["permission"].as_object() {
+        return Some(
+            json!({"check":"index","state":state,"detail":fault["what"],"action":fault["fix"]}),
+        );
+    }
     let action = match state {
         "ready" => return None,
         "first build in progress" => "wait for it to finish",

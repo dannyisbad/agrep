@@ -34,6 +34,23 @@ pub(super) fn rollout_stem(path: &Path) -> Option<&str> {
     Path::new(plain.unwrap_or(name)).file_stem()?.to_str()
 }
 
+/// The id ending a rollout's file name: its chat's id, or for a file Codex starts when it
+/// resumes a chat (`rollout-<time>-<chat id>_<file id>`), the file's own.
+pub fn file_id(path: &Path) -> Option<&str> {
+    let stem = rollout_stem(path)?;
+    let id = stem.get(stem.len().checked_sub(36)?..)?;
+    id.bytes()
+        .enumerate()
+        .all(|(i, b)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        })
+        .then_some(id)
+}
+
 /// Recursively collect rollout files under a Codex root (YYYY/MM/DD nesting). Only the root
 /// (`absent_ok`) may be a link, which is followed.
 fn gather(dir: &Path, files: &mut Vec<std::path::PathBuf>, absent_ok: bool) {

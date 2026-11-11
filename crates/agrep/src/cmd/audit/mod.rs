@@ -1,11 +1,13 @@
 mod problems;
 mod reparse;
+mod rollouts;
 mod tally;
 
 use agrep_core::{data::DataRoot, diagnostics, history, ingest::registry::ADAPTERS, store};
 use anyhow::Result;
 use problems::{Problems, Seen};
 use serde_json::json;
+use std::collections::HashSet;
 use tally::Tally;
 
 pub fn run(agents: Vec<String>, json_output: bool, strict: bool, full: bool) -> Result<i32> {
@@ -49,11 +51,12 @@ pub fn run(agents: Vec<String>, json_output: bool, strict: bool, full: bool) -> 
         .transpose()?
         .unwrap_or_default();
     let live = store::census()?;
-    let (mut gaps, mut problems) = source_gaps(&live, &sources, &selected);
+    let (mut gaps, mut problems, current) = source_gaps(&live, &sources, &selected);
     let mut tally = Tally::default();
     // The searchable rows are read before the reparse streams the whole history
     // through the page cache; the few hidden rows need the reparse's chats.
     let counts = indexed_rows(c.as_ref(), full, &selected, &mut tally)?;
+    let mut expected_rows = None;
     if full {
         reparse::reparse(&root, &live, &selected, &mut problems, &mut tally)?;
         if let Some(c) = &c {
@@ -62,6 +65,22 @@ pub fn run(agents: Vec<String>, json_output: bool, strict: bool, full: bool) -> 
             }
         }
         gaps.extend(tally.gaps());
+        let mut expected = tally.expected_rows(None);
+        // Codex rollouts are expected from the audit's own reading of them, not the parser's.
+        if let Some(c) = c.as_ref().filter(|_| selected("codex")) {
+            let rollouts: Vec<_> = live
+                .iter()
+                .filter(|s| s.agent == "codex" && current.contains(s.path.as_str()))
+                .map(|s| rollouts::Rollout {
+                    path: s.path.clone(),
+                    size: s.size,
+                })
+                .collect();
+            let checked = rollouts::check(c, &rollouts, &mut problems)?;
+            expected = tally.expected_rows(Some("codex")) + checked.expected;
+            gaps.extend(checked.gaps);
+        }
+        expected_rows = Some(expected);
     }
     let discovered = live.iter().filter(|s| selected(&s.agent)).count();
     // 0.4.9 certified nothing when no source file was found (py/audit.py:2383-2388).
@@ -77,7 +96,7 @@ pub fn run(agents: Vec<String>, json_output: bool, strict: bool, full: bool) -> 
     } else {
         (0, "clean")
     };
-    let v = json!({"version":1,"full":full,"strict":strict,"agents":agents,"counts":counts,"discovered_sources":discovered,"expected_rows":if full{Some(tally.expected_rows())}else{None},"status":status,"gaps":gaps.len(),"gap_details":gaps,"problem_count":errors.len(),"problems":errors,"exit_code":exit,"index_path":root.db()});
+    let v = json!({"version":1,"full":full,"strict":strict,"agents":agents,"counts":counts,"discovered_sources":discovered,"expected_rows":expected_rows,"status":status,"gaps":gaps.len(),"gap_details":gaps,"problem_count":errors.len(),"problems":errors,"exit_code":exit,"index_path":root.db()});
     report(Report {
         value: &v,
         wanted: &wanted,
@@ -89,13 +108,16 @@ pub fn run(agents: Vec<String>, json_output: bool, strict: bool, full: bool) -> 
     Ok(exit)
 }
 
-fn source_gaps(
-    live: &[store::Stamp],
+/// Gaps between the census and the indexed sources, the sources' problems, and the sources
+/// the index holds as the census found them.
+fn source_gaps<'a>(
+    live: &'a [store::Stamp],
     sources: &[serde_json::Value],
     selected: &impl Fn(&str) -> bool,
-) -> (Vec<serde_json::Value>, Problems) {
+) -> (Vec<serde_json::Value>, Problems, HashSet<&'a str>) {
     let mut gaps = vec![];
     let mut problems = Problems::default();
+    let mut current = HashSet::new();
     for source in live.iter().filter(|s| selected(&s.agent)) {
         if let Some(error) = &source.error {
             problems.source(source.path.as_str(), error.as_str(), Seen::Census);
@@ -103,14 +125,16 @@ fn source_gaps(
         match sources.iter().find(|s| s["path"] == source.path) {
             None => gaps.push(json!({"path":source.path,"reason":"source not indexed"})),
             Some(s) => {
-                if s["bytes"].as_u64() != Some(source.size)
+                let changed = s["bytes"].as_u64() != Some(source.size)
                     || s["mtime_ns"].as_i64() != Some(source.mtime_ns)
-                    || s["change_token"].as_str() != Some(source.token.to_string().as_str())
-                {
+                    || s["change_token"].as_str() != Some(source.token.to_string().as_str());
+                if changed {
                     gaps.push(json!({"path":source.path,"reason":"source changed since refresh"}));
                 }
                 if !s["last_error"].is_null() {
                     problems.source(source.path.as_str(), s["last_error"].clone(), Seen::Stored);
+                } else if !changed && source.error.is_none() {
+                    current.insert(source.path.as_str());
                 }
             }
         }
@@ -136,7 +160,7 @@ fn source_gaps(
             Seen::Stored,
         );
     }
-    (gaps, problems)
+    (gaps, problems, current)
 }
 
 /// Each table's searchable row count; a full audit tallies the rows themselves.

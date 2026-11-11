@@ -99,6 +99,14 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   child's rollout starts by replaying the parent's history, which is indexed once, under
   the parent; 0.4.9 searched only the child's own rows, so `-c --chat <child>` answered
   `0` (exit 1) for text the child's file holds. One stderr line names the parent.
+- `--chat` and `why` accept the id at the end of any Codex rollout's file name, which is what
+  a user copies; 0.4.9 refused every one that was not also a chat's id (`no session
+  matches`, `not-indexed`). For a file Codex started when it resumed a chat
+  (`rollout-…-<chat id>_<file id>.jsonl`) they name that chat; for a fork child holding only
+  history it copied, its parent's history up to the fork; for a review interrupted before
+  its result, its review thread. `--chat` says so in one stderr line. A file that holds
+  nothing searchable resolves too: `why` says why (an empty chat, an interrupted review) and
+  `--chat` finds nothing, exit 1. An id no rollout or chat has is still refused (exit 2).
 - Meaning search answers only from a complete snapshot. 0.4.9 searched the vectors
   already published, even with unembedded rows, and disclosed that gap through
   coverage numbers, partial flags and lines such as `catching up; retry shortly`.
@@ -287,6 +295,9 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   first live scan by default, where 0.4.9 waited 0.18 s for a daemon that had usually
   scanned already; 0.5 has no daemon, and a large history takes longer than 0.18 s to scan.
   `--wait` still sets the bound.
+- `board` and `tail` show a Codex team-mode child's own turn, from its own first turn, under
+  its direct parent, as the index files it; 0.4.9 waited for the older handoff, so it showed
+  nothing of such a child, and named a grandchild's grandparent as its parent.
 - `setup` and `index --semantic` show the model download's bytes and percent on a
   terminal's stderr; elsewhere they stay quiet.
 - `agrep help` prints the top-level help and `agrep help COMMAND` that command's help,
@@ -393,6 +404,34 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   the list's raw JSON. Search, snippets and the 800-character cap now see the tool's own words
   instead of the JSON wrapper and its escapes, image items add nothing, and a `Process exited
   with code N` line in the text sets the call's outcome, as it does for a plain-text result.
+- Codex subagents working in team mode are indexed. Team mode hands a child its task as a
+  JSON envelope in an assistant message; 0.4.9 knew only the older handoff, so it never
+  found where a team-mode child's own work starts after the history it copies from its
+  parent, and dropped every row the child wrote itself. A child's own transcript now starts
+  at its own first turn, its task is its first row (`[subagent task] …`), and it is filed
+  under its direct parent at any depth, where 0.4.9 named a grandchild's grandparent.
+- The result of a Codex review is a row of the chat that ran the review, labeled `[review]`
+  with the first line of the request Codex handed the review thread (else the hint Codex
+  showed for the review), so a chat that holds only a review has a title and a turn. The
+  request in that chat is text Codex writes, not something typed, so 0.4.9 dropped the
+  result with it; the review's own work stays in its review thread, as before, folded into
+  the chat's family, and `summary` counts the review once.
+- What a user says in a Codex voice chat is a row, with Codex's answer as its reply. 0.4.9
+  took the spoken request for text Codex writes and dropped both. Codex hands each request
+  only part of what was said; the rest, and what the voice assistant said, is in the
+  transcript every request and the session's closing flush carry. When the flush ends the
+  session, what the transcript holds that no request does is one more row: the user's words
+  as its text, the voice assistant's as its reply. The note Codex adds to the flush is not
+  a row.
+- A Codex Desktop prompt with pasted images is a row. Codex records the typed text without
+  the images' markers, so 0.4.9, which needed the two to match exactly, dropped the prompt,
+  and its reply joined the turn before.
+- The verdicts of Codex's automatic approval reviews (guardian reviews, in either of their
+  formats) are rows of their own, labeled `[guardian verdict]`, in a side chat of the chat
+  whose action was reviewed; a call the guardian makes is a tool row. 0.4.9 indexed nothing
+  of them. Like an omp advisor's notes they are left out of the meaning lane: keyword
+  search finds them, `-s` does not. The request a guardian answers quotes the reviewed chat
+  and is not a row.
 
 ## Integrations and archive port
 

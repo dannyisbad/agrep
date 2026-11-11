@@ -175,9 +175,14 @@ impl Tally {
         stored.flush(self)
     }
 
-    /// The parsed rows each source should have put in the index.
-    pub(super) fn expected_rows(&self) -> usize {
-        self.rows.values().map(|n| n.most as usize).sum()
+    /// The parsed rows each source should have put in the index, leaving out the chats of
+    /// `without`, the agent the audit expects by its own reading instead.
+    pub(super) fn expected_rows(&self, without: Option<&str>) -> usize {
+        self.rows
+            .iter()
+            .filter(|(key, _)| without != Some(&*self.chats[key.chat as usize].agent))
+            .map(|(_, n)| n.most as usize)
+            .sum()
     }
 
     /// Parsed rows the index lacks copies of, then searchable rows no parsed source holds

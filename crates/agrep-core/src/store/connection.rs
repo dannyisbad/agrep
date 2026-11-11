@@ -3,26 +3,40 @@ use anyhow::Result;
 use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
 
+/// SQLite reports an index this user may not read as a bare "unable to open database file";
+/// the permissions fault, with its fix, is the error worth showing. Checked only on failure.
+fn named<T>(root: &DataRoot, opened: rusqlite::Result<T>) -> Result<T> {
+    opened.map_err(|e| match root.permission_problem() {
+        Some(problem) => problem.into(),
+        None => e.into(),
+    })
+}
 pub fn reader(root: &DataRoot) -> Result<Connection> {
     loop {
         let c = {
             let _span = crate::semantic_profile::span("reader_open");
             match settled_uri(&root.db()) {
-                Some(uri) => Connection::open_with_flags(
-                    uri,
-                    OpenFlags::SQLITE_OPEN_READ_ONLY
-                        | OpenFlags::SQLITE_OPEN_URI
-                        | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                Some(uri) => named(
+                    root,
+                    Connection::open_with_flags(
+                        uri,
+                        OpenFlags::SQLITE_OPEN_READ_ONLY
+                            | OpenFlags::SQLITE_OPEN_URI
+                            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                    ),
                 )?,
-                None => Connection::open_with_flags(
-                    root.db(),
-                    OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                None => named(
+                    root,
+                    Connection::open_with_flags(
+                        root.db(),
+                        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                    ),
                 )?,
             }
         };
         // A read outside the transaction takes the shared lock a WAL connection keeps until
         // it closes, without starting the snapshot the command's first query starts.
-        c.query_row("PRAGMA schema_version", [], |_| Ok(()))?;
+        named(root, c.query_row("PRAGMA schema_version", [], |_| Ok(())))?;
         if !unmoved(&c) {
             continue;
         }
@@ -85,7 +99,10 @@ pub(crate) fn settled_uri(_: &Path) -> Option<String> {
 pub fn writer(root: &DataRoot) -> Result<Connection> {
     // Setting the journal mode reads the file, so a moved file shows here (see `unmoved`).
     loop {
-        let c = open_writer(&root.db(), true)?;
+        let c = open_writer(&root.db(), true).map_err(|e| match root.permission_problem() {
+            Some(problem) => problem.into(),
+            None => e,
+        })?;
         if unmoved(&c) {
             return Ok(c);
         }

@@ -5250,11 +5250,27 @@ fn full_audit_recounts_compressed_rollouts_and_keeps_damaged_ones_out() {
         .unwrap();
     drop(c);
     let damaged = audit(true);
-    assert!(damaged["gap_details"]
+    // The parser's tally and the audit's own reading of the rollout each see the loss.
+    let mut gaps: Vec<_> = damaged["gap_details"]
         .as_array()
         .unwrap()
         .iter()
-        .all(|g| g["session"] == "packed" && g["reason"] == "parsed row missing from index"));
+        .map(|g| {
+            assert_eq!(g["session"], "packed", "{damaged}");
+            (g["who"].as_str().unwrap(), g["reason"].as_str().unwrap())
+        })
+        .collect();
+    gaps.sort_unstable();
+    assert_eq!(
+        gaps,
+        [
+            ("agent", "parsed row missing from index"),
+            ("agent", "rollout row missing from index"),
+            ("user", "parsed row missing from index"),
+            ("user", "rollout row missing from index"),
+        ],
+        "{damaged}"
+    );
 }
 
 #[test]

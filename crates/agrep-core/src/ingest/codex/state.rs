@@ -2,8 +2,10 @@
 
 use std::collections::BTreeMap;
 
+use super::review::Review;
 use super::subagent::SubagentContext;
 use super::submissions::Submissions;
+use super::voice::Transcript;
 use crate::model::{Event, RawMessage};
 
 /// Serialized between incremental parses. While a parse runs it holds every row and event
@@ -21,10 +23,17 @@ pub(super) struct CodexState {
     pub(super) session: Option<String>,
     pub(super) first_meta_seen: bool,
     pub(super) subagent: Option<SubagentContext>,
-    pub(super) internal_guardian: bool,
+    /// For a guardian's review of another chat's actions, that chat's id ("" if unnamed).
+    pub(super) guardian: Option<String>,
     /// The active model, updated by each turn_context line and stamped onto turns.
     pub(super) current_model: String,
     pub(super) submissions: Submissions,
+    /// A review this chat started whose result has not arrived.
+    #[serde(default)]
+    pub(super) review: Option<Review>,
+    /// The voice session under way, until its flush.
+    #[serde(default)]
+    pub(super) transcript: Transcript,
     /// Record ordinal of the parse's first line.
     pub(super) ordinal: usize,
     /// Whether this parse opened a subagent boundary, discarding every earlier row
@@ -54,9 +63,11 @@ impl CodexState {
             session,
             first_meta_seen,
             subagent,
-            internal_guardian,
+            guardian,
             current_model,
             submissions,
+            review,
+            transcript,
             ordinal,
             reset,
         } = self;
@@ -81,9 +92,11 @@ impl CodexState {
             session,
             first_meta_seen,
             subagent,
-            internal_guardian,
+            guardian,
             current_model,
             submissions,
+            review,
+            transcript,
             ordinal: ordinal + lines,
             reset,
         };

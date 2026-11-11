@@ -166,9 +166,11 @@ fn summary_briefs_families_as_0_4_9() {
     )));
     let meta = &rows[0];
     assert_eq!(meta["mode"], "briefing");
+    // 0.4.9 counted 3 side chats; the fourth is the guardian's side chat of @22222222,
+    // which 0.4.9 never indexed (PORTING.md).
     assert_eq!(
         (meta["chats"].as_u64(), meta["side_chats"].as_u64()),
-        (Some(9), Some(3))
+        (Some(9), Some(4))
     );
     assert_eq!(meta["totals_exact"], true);
     assert_eq!(meta["events_unavailable_chats"], 0);
@@ -2892,7 +2894,8 @@ fn chats_without_turns_are_listed_and_searched_by_their_calls() {
 // Expected values are agrep 0.4.9's `chats --side --json` on the codex fixture: a chat's
 // latest handle claimed its last row by turn, then time, then insertion, tool rows
 // included, so a call timed after the reply is the claim (py/search.py:8624-8662). Session
-// prefixes differ by design (PORTING.md), so only the turn and digest are compared.
+// prefixes differ by design (PORTING.md), so only the turn and digest are compared. The
+// guardian's chat is 0.5's alone: 0.4.9 indexed no guardian verdict (PORTING.md).
 #[test]
 fn chats_latest_handle_claims_the_last_row_as_0_4_9() {
     let t = TempDir::new().unwrap();
@@ -2923,6 +2926,7 @@ fn chats_latest_handle_claims_the_last_row_as_0_4_9() {
         ("01990001-0002-7000-8000-000000000002", "0.5a5e"),
         ("01990002-0002-7000-8000-000000000002", "0.ca74"),
         ("01990003-0003-7000-8000-000000000003", "1.b260"),
+        ("01990005-0001-7000-8000-000000000001", "0.4018"),
         ("22222222-2222-4222-8222-222222222222", "1.fc20"),
         ("33333333-3333-4333-8333-333333333333", "1.fadf"),
     ]
@@ -3512,6 +3516,77 @@ fn an_unwritable_data_directory_answers_from_its_index() {
         );
         fs::set_permissions(&empty, fs::Permissions::from_mode(0o700)).unwrap();
     }
+}
+
+// QA5 finding 4: an unreadable data directory gave status and doctor a bare `Permission
+// denied (os error 13)`; an unreadable index was taken for an unwritable directory, and
+// doctor offered to rebuild it. Each now names what is unreadable and the fix.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_data_directory_or_index_is_named_with_its_fix() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_t, h, d) = pi();
+    let mode = |path: &Path, bits: u32| {
+        fs::set_permissions(path, fs::Permissions::from_mode(bits)).unwrap()
+    };
+    mode(&d, 0o000);
+    let folder = format!(
+        "agrep: data directory {} isn't readable: give your user read, write and search \
+         permission on it (chmod u+rwx)\n",
+        d.display()
+    );
+    let outcome = [&["status"][..], &["doctor"], &["retry"], &["chats"]].map(|args| {
+        let o = cli(&h, &d, args, &[]);
+        (args, o.status.code(), String::from_utf8(o.stderr).unwrap())
+    });
+    mode(&d, 0o700);
+    for (args, code, stderr) in outcome {
+        assert_eq!(
+            (code, stderr.as_str()),
+            (Some(2), folder.as_str()),
+            "{args:?}"
+        );
+    }
+    let index = d.join("index.db");
+    mode(&index, 0o000);
+    let message = format!(
+        "index {} isn't readable: give your user read and write permission on it \
+         (chmod u+rw)",
+        index.display()
+    );
+    let status = cli(&h, &d, &["status"], &[]);
+    let doctor = cli(&h, &d, &["doctor", "--fix"], &[]);
+    let search = cli(&h, &d, &["retry"], &[]);
+    mode(&index, 0o600);
+    let (out, err) = (
+        String::from_utf8(status.stdout).unwrap(),
+        String::from_utf8(status.stderr).unwrap(),
+    );
+    assert!(out.contains(&format!("{message}\n")), "{out}");
+    assert!(
+        !err.contains("isn't writable") && !out.contains("run agrep index"),
+        "{out}{err}"
+    );
+    let doctor = String::from_utf8(doctor.stdout).unwrap();
+    assert!(
+        doctor.contains(&format!(
+            "index: unreadable - index {} isn't readable - give your user read and write \
+             permission on it (chmod u+rw)\n",
+            index.display()
+        )),
+        "{doctor}"
+    );
+    assert!(
+        !doctor.contains("rebuild") && !doctor.contains("repair: failed"),
+        "{doctor}"
+    );
+    assert_eq!(search.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8(search.stderr).unwrap(),
+        format!("agrep: {message}\n")
+    );
+    // Readable again, it answers as before.
+    ok(cli(&h, &d, &["retry"], &[]));
 }
 
 // QA findings 10 and 14: `status --json` listed every source (4 MB on the owner's history)

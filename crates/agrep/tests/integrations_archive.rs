@@ -861,6 +861,56 @@ fn status_reads_the_archive_of_an_unwritable_data_directory() {
         json["archive"]
     );
 }
+/// `AGREP_DATA_READONLY` forbids writing the data root even where it is writable: reading
+/// the archive must not checkpoint a catalog whose write-ahead log still holds frames.
+#[test]
+fn a_read_only_data_root_keeps_its_catalog_unchanged() {
+    let f = Fixture::new();
+    f.source("rollout-flagged.jsonl", &transcript_text("flagged"));
+    f.ok(&["archive"]);
+    let catalog = f.data.join("archive/catalog.db");
+    let mut wal = catalog.clone().into_os_string();
+    wal.push("-wal");
+    let wal = PathBuf::from(wal);
+    {
+        // Leaves a frame in the log: this connection closes without checkpointing it.
+        let db = Connection::open(&catalog).unwrap();
+        db.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )
+        .unwrap();
+        db.execute_batch(
+            "PRAGMA wal_autocheckpoint=0; CREATE TABLE probe(x); INSERT INTO probe VALUES(1);",
+        )
+        .unwrap();
+    }
+    let before = (
+        fs::read(&catalog).unwrap(),
+        fs::metadata(&wal).unwrap().len(),
+    );
+    assert!(before.1 > 0, "the probe should leave a frame in the log");
+    for args in [
+        &["status"][..],
+        &["status", "--json"],
+        &["archive", "--status"],
+    ] {
+        let o = f
+            .command(args)
+            .env("AGREP_DATA_READONLY", "1")
+            .output()
+            .unwrap();
+        assert!(o.status.code().is_some(), "{args:?}");
+        let after = (
+            fs::read(&catalog).unwrap(),
+            fs::metadata(&wal).map_or(0, |m| m.len()),
+        );
+        assert!(
+            after == before,
+            "{args:?} changed the catalog of a read-only data root"
+        );
+    }
+}
 #[test]
 fn source_links_are_skipped_restore_is_strict_and_instruction_links_work() {
     #[cfg(unix)]

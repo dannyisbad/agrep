@@ -41,6 +41,11 @@
 - A relative `AGREP_HOME`, `AGREP_DATA_DIR` or `AGREP_MODEL_DIR` becomes a full path
   when agrep starts, so naming the same folder from another working directory no
   longer makes agrep index every transcript again.
+- Every Codex rollout's rows are indexed: team-mode subagents at any depth, review
+  results (titled `[review]` with their request), everything said in voice chats, Desktop
+  prompts with pasted images, and guardian verdicts (keyword search only). `--chat` and
+  `why` accept any rollout's file id, and `audit --full` reads each Codex rollout itself,
+  so a dropped row shows as a gap.
 - `agrep help` and `agrep help COMMAND` print help instead of searching for the
   word "help"; `agrep search help` still searches it. `agrep version` prints the
   version.
@@ -85,6 +90,9 @@
 - Reading the archive (`status`, `archive --status`, `doctor`) no longer leaves the
   catalog's `-wal` and `-shm` files behind, and in a data directory you cannot write,
   `status` reads the archive instead of calling it unreadable.
+- A data directory or index your user may not read is named with the `chmod` that
+  fixes it, by every command; `doctor --fix` no longer offers to rebuild an index whose
+  only fault is its permissions.
 - `agrep setup` and `agrep remove` change only agrep's own hook entry in Claude's
   `settings.json` and Codex's `hooks.json`: other hooks and settings keep their exact
   text, and remove gives back the file setup found.

@@ -56,6 +56,7 @@ pub mod logging;
 pub mod pages;
 pub mod process;
 pub mod recovery;
+pub mod rollouts;
 pub mod semantic;
 #[cfg(target_os = "macos")]
 mod semantic_arena;

@@ -19,29 +19,39 @@
 //! intentionally not read.
 
 mod discover;
+mod holdings;
 mod parser;
 mod prefilter;
 mod records;
+mod review;
 mod state;
 mod subagent;
 mod submissions;
 #[cfg(test)]
 mod tests;
 mod tools;
+mod voice;
 
 use std::path::Path;
 
 use crate::model::{Event, Message};
 
-pub use discover::{collect, Codex};
-pub use subagent::fork_time;
+pub use discover::{collect, file_id, Codex};
+pub use holdings::{holdings, Holdings};
+pub(crate) use subagent::{delegated_input, envelope_anchor, is_uuid_v7_after};
+pub use subagent::{fork_origin, fork_time};
 
 /// Control-event name for a native compaction moment; it is never a tool call.
 pub const COMPACTED_MARKER: &str = "compacted";
 
+/// The label opening a guardian's verdict row. The meaning lane leaves rows with it out
+/// (`semantic_store`), as it does an omp advisor's notes.
+pub const GUARDIAN_VERDICT: &str = "[guardian verdict] ";
+
 /// Codex-specific preambles and system-injected `role:user` notifications that are NOT
-/// something the user typed. Checked in addition to the shared `is_wrapper`.
-pub(crate) fn is_codex_injected(text: &str) -> bool {
+/// something the user typed. Checked in addition to the shared `is_wrapper`; the full audit
+/// excludes the same text from what it expects of a rollout.
+pub fn is_codex_injected(text: &str) -> bool {
     let t = text.trim_start();
     // Injected first-turn preamble (AGENTS.md / environment / instructions blocks).
     t.starts_with("# AGENTS.md")

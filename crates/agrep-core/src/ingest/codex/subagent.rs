@@ -33,9 +33,10 @@ struct ThreadSpawn<'a> {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(super) struct SubagentContext {
     pub(super) agent_path: Option<String>,
+    /// The child's own first turn: whatever follows it is the child's transcript.
     start_turn_id: Option<String>,
-    replayed_parent: bool,
     pub(super) parent_session: String,
+    /// The child's first prompt row exists, so a later prompt is a follow-up message.
     pub(super) started: bool,
 }
 
@@ -64,25 +65,26 @@ impl SubagentContext {
         Self {
             agent_path,
             start_turn_id: None,
-            replayed_parent: false,
             parent_session,
             started: false,
         }
     }
 
-    /// A later `session_meta` with a different id is the replayed parent's.
+    /// A later `session_meta` with a different id is a replayed ancestor's: the first is the
+    /// direct parent's, and a deeper child replays its grandparents' after it.
     pub(super) fn note_session_meta(&mut self, meta_id: Option<&str>, session_id: &str) {
         if let Some(parent_id) = meta_id.filter(|id| !id.is_empty() && *id != session_id) {
-            self.replayed_parent = true;
-            self.parent_session = parent_id.to_string();
+            if self.parent_session.is_empty() {
+                self.parent_session = parent_id.to_string();
+            }
         }
     }
 
-    /// Path-less subagents get their task as a plain role:user message; UUIDv7 turn ids
-    /// survive fork re-timestamping, so the first v7 id newer than the session id marks
-    /// the child-owned task boundary (older v7 replay turns and v4 ids are excluded).
+    /// UUIDv7 turn ids survive fork re-timestamping, so the first `task_started` whose turn
+    /// id is a v7 newer than the session id starts the child's own first turn: the replayed
+    /// parent turns before it are older than the child (and v4 ids prove nothing).
     pub(super) fn note_event(&mut self, event: &Payload<'_>, session_id: &str) {
-        if self.started || event.ty.as_deref() != Some("task_started") {
+        if self.replay_over() || event.ty.as_deref() != Some("task_started") {
             return;
         }
         if let Some(turn_id) = event
@@ -94,15 +96,16 @@ impl SubagentContext {
         }
     }
 
-    /// Label for a path-less child's `role:user` prompt carrying `message_turn_id`, or
-    /// `None` while that message is not proven to be past the task boundary.
-    pub(super) fn prompt_label(&self, message_turn_id: Option<&str>) -> Option<&'static str> {
-        let turn_matches = self.started
-            // both ids present and equal - None == None is absence matching
-            // absence, not proof, and must never open the boundary
-            || (message_turn_id.is_some() && message_turn_id == self.start_turn_id.as_deref())
-            || (message_turn_id.is_none() && !self.replayed_parent && self.start_turn_id.is_some());
-        turn_matches.then_some(if self.started { "message" } else { "task" })
+    /// Whether the inherited parent replay is behind: the child's own turn began, or its
+    /// first handoff arrived.
+    pub(super) fn replay_over(&self) -> bool {
+        self.started || self.start_turn_id.is_some()
+    }
+
+    /// Label for a child's next prompt, or `None` while the parent replay lasts.
+    pub(super) fn prompt_label(&self) -> Option<&'static str> {
+        self.replay_over()
+            .then_some(if self.started { "message" } else { "task" })
     }
 }
 
@@ -117,7 +120,7 @@ pub(super) fn is_guardian_source(raw: Option<&RawValue>) -> bool {
         .is_some_and(|kind| kind == "guardian")
 }
 
-fn is_uuid_v7_after(candidate: &str, earlier: &str) -> bool {
+pub(crate) fn is_uuid_v7_after(candidate: &str, earlier: &str) -> bool {
     fn canonical_v7(s: &str) -> bool {
         let b = s.as_bytes();
         b.len() == 36
@@ -140,7 +143,7 @@ fn header_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
-pub(super) fn delegated_input(text: &str) -> Option<String> {
+pub(crate) fn delegated_input(text: &str) -> Option<String> {
     let text = text.trim_start();
     if !text.starts_with("<codex_delegation") && !text.starts_with("<realtime_delegation") {
         return None;
@@ -151,14 +154,16 @@ pub(super) fn delegated_input(text: &str) -> Option<String> {
     if body.is_empty() {
         return None;
     }
-    // Delegation wrappers XML-escape the task body in older Codex journals.
-    Some(
-        body.replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&quot;", "\"")
-            .replace("&apos;", "'")
-            .replace("&amp;", "&"),
-    )
+    Some(unescape(body))
+}
+
+/// Delegation wrappers XML-escape the text they carry in older Codex journals.
+pub(super) fn unescape(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 /// Turn an inbound Codex team message into a searchable child-turn anchor. Newer
@@ -196,6 +201,53 @@ pub(super) fn subagent_anchor(payload: &Payload<'_>, expected_recipient: &str) -
     })
 }
 
+/// The JSON envelope Codex's team mode writes into a recipient's history as an assistant
+/// message.
+#[derive(Deserialize)]
+struct Envelope<'a> {
+    #[serde(borrow)]
+    author: Cow<'a, str>,
+    #[serde(borrow)]
+    recipient: Cow<'a, str>,
+    #[serde(borrow, default)]
+    content: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    encrypted_content: Option<Cow<'a, str>>,
+}
+
+/// An inbound team message delivered as an envelope: its plaintext body as the child-turn
+/// anchor, else its routing. A ciphertext token holds no whitespace, so an
+/// `encrypted_content` that does is plaintext its provider left unencrypted.
+pub(crate) fn envelope_anchor(text: &str, expected_recipient: &str, label: &str) -> Option<String> {
+    let text = text.trim();
+    if !text.starts_with('{') || !text.contains("\"recipient\"") {
+        return None;
+    }
+    let envelope: Envelope<'_> = serde_json::from_str(text).ok()?;
+    if envelope.recipient != expected_recipient {
+        return None;
+    }
+    let body = envelope
+        .content
+        .as_deref()
+        .map(str::trim)
+        .filter(|body| !body.is_empty())
+        .or_else(|| {
+            envelope
+                .encrypted_content
+                .as_deref()
+                .map(str::trim)
+                .filter(|body| body.contains(char::is_whitespace))
+        });
+    Some(match body {
+        Some(body) => format!("[subagent {label}] {body}"),
+        None => format!(
+            "[subagent {label}] {} (from {})",
+            envelope.recipient, envelope.author
+        ),
+    })
+}
+
 /// The most of a rollout's head `fork_time` reads for its two leading records.
 const HEAD_CAP: u64 = 16 << 20;
 
@@ -203,6 +255,11 @@ const HEAD_CAP: u64 = 16 << 20;
 /// it forked, its own `session_meta` timestamp. Ingest keeps the replayed history only under
 /// the parent (`SubagentContext`), so the parent's rows up to then are the child's too.
 pub fn fork_time(path: &std::path::Path) -> Option<i64> {
+    fork_origin(path).map(|(_, at)| at)
+}
+
+/// [`fork_time`] with the parent whose history the rollout replays.
+pub fn fork_origin(path: &std::path::Path) -> Option<(String, i64)> {
     let head =
         crate::ingest::registry::read_regular_snapshot(path, |file| head_records(path, file))
             .ok()
@@ -213,22 +270,19 @@ pub fn fork_time(path: &std::path::Path) -> Option<i64> {
     let replayed = records.next();
     let meta = (own["type"] == "session_meta").then_some(&own["payload"])?;
     let id = meta["id"].as_str().filter(|id| !id.is_empty())?;
-    let replays = replayed.as_ref().is_some_and(|record| {
-        record["type"] == "session_meta"
-            && record["payload"]["id"]
-                .as_str()
-                .is_some_and(|parent| !parent.is_empty() && parent != id)
-    });
-    let forked = meta["forked_from_id"]
+    let replayed_parent = replayed
+        .as_ref()
+        .filter(|record| record["type"] == "session_meta")
+        .and_then(|record| record["payload"]["id"].as_str())
+        .filter(|parent| !parent.is_empty() && *parent != id);
+    let parent = meta["forked_from_id"]
         .as_str()
-        .is_some_and(|parent| !parent.is_empty());
-    if !(replays || forked) {
-        return None;
-    }
+        .filter(|parent| !parent.is_empty())
+        .or(replayed_parent)?;
     let at = crate::ingest::parse_timestamp::rfc3339(
         meta["timestamp"].as_str().or(own["timestamp"].as_str()),
     );
-    (at > 0).then_some(at)
+    (at > 0).then(|| (parent.to_owned(), at))
 }
 
 /// A rollout's leading records, at most two, up to the first that does not parse.

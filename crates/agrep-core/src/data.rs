@@ -11,6 +11,21 @@ pub const FORMAT: &[u8] = b"agrep-data 9\n";
 const PREVIOUS: &[u8] = b"agrep-data 8\n";
 #[derive(Debug, Clone)]
 pub struct DataRoot(pub PathBuf);
+/// The data root or its index exists but this user may not read it: a permissions fault,
+/// which neither rebuilding nor reindexing repairs.
+#[derive(Debug, Clone)]
+pub struct PermissionProblem {
+    /// What is unreadable, e.g. `index /path/index.db isn't readable`.
+    pub what: String,
+    /// The change that makes it readable again.
+    pub fix: &'static str,
+}
+impl std::fmt::Display for PermissionProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.what, self.fix)
+    }
+}
+impl std::error::Error for PermissionProblem {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -70,6 +85,30 @@ impl DataRoot {
         root.validate(initialize)?;
         Ok(root)
     }
+    /// Why this user may not read the data root or its index, if that is the case.
+    pub fn permission_problem(&self) -> Option<PermissionProblem> {
+        let denied = |e: &std::io::Error| e.kind() == std::io::ErrorKind::PermissionDenied;
+        if fs::read_dir(&self.0).is_err_and(|e| denied(&e)) {
+            return Some(PermissionProblem {
+                what: format!("data directory {} isn't readable", self.0.display()),
+                fix: "give your user read, write and search permission on it (chmod u+rwx)",
+            });
+        }
+        File::open(self.db())
+            .is_err_and(|e| denied(&e))
+            .then(|| PermissionProblem {
+                what: format!("index {} isn't readable", self.db().display()),
+                fix: "give your user read and write permission on it (chmod u+rw)",
+            })
+    }
+    /// Refuses a data root this user may not list, naming it and the fix; an unreadable
+    /// index is left to the commands that open it.
+    pub fn ensure_readable(&self) -> Result<()> {
+        match self.permission_problem() {
+            Some(p) if p.what.starts_with("data directory") => Err(p.into()),
+            _ => Ok(()),
+        }
+    }
     pub fn validate(&self, initialize: bool) -> Result<()> {
         match fs::read(self.0.join("FORMAT")) {
             Ok(v) if v == FORMAT => return self.tighten(),
@@ -80,6 +119,10 @@ impl DataRoot {
             ),
             Ok(_) => bail!("unsupported data format: {}", self.0.display()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                self.ensure_readable()?;
+                return Err(e).with_context(|| format!("data root: {}", self.0.display()));
+            }
             Err(e) => return Err(e).with_context(|| format!("data root: {}", self.0.display())),
         }
         if self.0.exists() && fs::read_dir(&self.0)?.next().is_some() {
@@ -330,7 +373,11 @@ pub fn unwritable() -> bool {
     UNWRITABLE.load(std::sync::atomic::Ordering::Relaxed)
 }
 fn note_unwritable(root: &Path) {
-    if read_only_requested() || !root.join("FORMAT").is_file() || writable(root) {
+    // An index this user may not even read is a permissions fault, which its commands name;
+    // answering "from its existing index" would be untrue.
+    let unreadable = File::open(root.join("index.db"))
+        .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
+    if read_only_requested() || unreadable || !root.join("FORMAT").is_file() || writable(root) {
         return;
     }
     if !UNWRITABLE.swap(true, std::sync::atomic::Ordering::Relaxed) {

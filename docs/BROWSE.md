@@ -104,9 +104,15 @@ exits 0 once its report is complete, whatever it found, 1 when a repair `--fix`
 attempted could not finish (including a corrupt index with no terminal to
 confirm its rebuild), and 2 for invalid options. `audit` independently
 counts visible rows, compares census fingerprints, and `--full` reparses sources
-with the adapters and compares canonical text rather than cached counters. A row
-the index stores but keeps out of search by design counts as indexed: a copy of a
-row that a chat held by several files shows only once in its canonical replay.
+with the adapters and compares canonical text rather than cached counters. For Codex,
+`--full` also reads each rollout itself, sharing none of the parser's rules: every user
+and assistant message and tool call it holds must be in the index, except text Codex
+writes (instructions, context, review requests, the note it adds when a voice session
+ends), history a fork child copies from its parent, messages between agents, the request
+a guardian answers, and reply text past the reply cap; and every word a voice session's
+transcript records must be in a row of the speaker's side. So a row the parser drops is a
+gap. A row the index stores but keeps out of search by design counts as indexed: a copy
+of a row that a chat held by several files shows only once in its canonical replay.
 `--full` lists parsed rows missing from the index first, then indexed rows no source
 holds, each group by agent, session and speaker, so a rerun lists them in the same order.
 As in 0.4.9, gaps exit 1 and `--strict` makes them errors (exit 2); a source that

@@ -120,6 +120,11 @@ pub fn status(root: &DataRoot) -> Result<Value> {
         }
         return Ok(out);
     }
+    if let Some(p) = root.permission_problem() {
+        out["index"] = json!({"state":"unreadable","error":p.to_string(),
+            "permission":{"what":p.what,"fix":p.fix}});
+        return Ok(out);
+    }
     let c = match store::reader(root) {
         Ok(c) => c,
         Err(e) => {

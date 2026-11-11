@@ -277,6 +277,13 @@
         "cfg(unix)"
       ],
       "reason": "Windows ignores a directory's read-only attribute, so only POSIX permissions can make the data directory unwritable; the catalog-read assertions of the writable case run on every platform."
+    },
+    {
+      "test": "crates/agrep/tests/surface.rs::an_unreadable_data_directory_or_index_is_named_with_its_fix",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Uses POSIX modes to make the data directory and index unreadable; Windows exposes only a read-only attribute, which cannot deny reading."
     }
   ],
   "partial_assertions": [
