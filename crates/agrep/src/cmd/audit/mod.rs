@@ -1,8 +1,10 @@
+mod problems;
 mod reparse;
 mod tally;
 
 use agrep_core::{data::DataRoot, diagnostics, history, ingest::registry::ADAPTERS, store};
 use anyhow::Result;
+use problems::{Problems, Seen};
 use serde_json::json;
 use tally::Tally;
 
@@ -47,13 +49,13 @@ pub fn run(agents: Vec<String>, json_output: bool, strict: bool, full: bool) -> 
         .transpose()?
         .unwrap_or_default();
     let live = store::census()?;
-    let (mut gaps, mut errors) = source_gaps(&live, &sources, &selected);
+    let (mut gaps, mut problems) = source_gaps(&live, &sources, &selected);
     let mut tally = Tally::default();
     // The searchable rows are read before the reparse streams the whole history
     // through the page cache; the few hidden rows need the reparse's chats.
     let counts = indexed_rows(c.as_ref(), full, &selected, &mut tally)?;
     if full {
-        reparse::reparse(&root, &live, &selected, &mut errors, &mut tally)?;
+        reparse::reparse(&root, &live, &selected, &mut problems, &mut tally)?;
         if let Some(c) = &c {
             for table in ["prose", "tools"] {
                 tally.add_hidden(c, table, &selected)?;
@@ -63,10 +65,11 @@ pub fn run(agents: Vec<String>, json_output: bool, strict: bool, full: bool) -> 
     }
     let discovered = live.iter().filter(|s| selected(&s.agent)).count();
     // 0.4.9 certified nothing when no source file was found (py/audit.py:2383-2388).
-    let unavailable = discovered == 0 && gaps.is_empty() && errors.is_empty();
+    let unavailable = discovered == 0 && gaps.is_empty() && problems.is_empty();
     if unavailable {
-        errors.push(json!({"path":null,"reason":"no source file census completed; audit cannot certify completeness"}));
+        problems.other(json!({"path":null,"reason":"no source file census completed; audit cannot certify completeness"}));
     }
+    let errors = problems.into_values();
     let (exit, status) = if !errors.is_empty() || (strict && !gaps.is_empty()) {
         (2, "error")
     } else if !gaps.is_empty() {
@@ -90,12 +93,12 @@ fn source_gaps(
     live: &[store::Stamp],
     sources: &[serde_json::Value],
     selected: &impl Fn(&str) -> bool,
-) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+) -> (Vec<serde_json::Value>, Problems) {
     let mut gaps = vec![];
-    let mut errors = vec![];
+    let mut problems = Problems::default();
     for source in live.iter().filter(|s| selected(&s.agent)) {
         if let Some(error) = &source.error {
-            errors.push(json!({"path":source.path,"reason":error}));
+            problems.source(source.path.as_str(), error.as_str(), Seen::Census);
         }
         match sources.iter().find(|s| s["path"] == source.path) {
             None => gaps.push(json!({"path":source.path,"reason":"source not indexed"})),
@@ -107,7 +110,7 @@ fn source_gaps(
                     gaps.push(json!({"path":source.path,"reason":"source changed since refresh"}));
                 }
                 if !s["last_error"].is_null() {
-                    errors.push(json!({"path":source.path,"reason":s["last_error"]}));
+                    problems.source(source.path.as_str(), s["last_error"].clone(), Seen::Stored);
                 }
             }
         }
@@ -127,9 +130,13 @@ fn source_gaps(
             && selected(s["agent"].as_str().unwrap_or(""))
             && !s["last_error"].is_null()
     }) {
-        errors.push(json!({"path":source["path"],"reason":source["last_error"]}));
+        problems.source(
+            source["path"].clone(),
+            source["last_error"].clone(),
+            Seen::Stored,
+        );
     }
-    (gaps, errors)
+    (gaps, problems)
 }
 
 /// Each table's searchable row count; a full audit tallies the rows themselves.

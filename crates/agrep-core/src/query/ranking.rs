@@ -158,4 +158,14 @@ pub(super) fn compare(a: &Hit, b: &Hit, sort: &str, chats: bool) -> std::cmp::Or
         .then(a.who.cmp(&b.who))
         .then(a.rowid.cmp(&b.rowid))
 }
+/// Whether another chat's copy of `row` (the same tier, score and time) can rank below
+/// `last` on a row page: rows equal so far rank by their chat, which a position page
+/// orders first.
+pub fn copy_may_rank_below(row: &Hit, last: &Hit, sort: &str) -> bool {
+    match sort {
+        "time" => row.ts == last.ts,
+        "position" => true,
+        _ => row.tier == last.tier && row.score.total_cmp(&last.score).is_eq() && row.ts == last.ts,
+    }
+}
 pub(super) type BlockBound = (i64, f64, i64, String, i64, i64);

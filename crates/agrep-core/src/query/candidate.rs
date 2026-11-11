@@ -6,6 +6,8 @@ pub(super) struct RowContext<'a, 'p> {
     pub(super) coverage: Option<&'p CoverageBounds>,
     pub(super) admitted: Option<&'p HashMap<i64, Vec<i64>>>,
     pub(super) anchored: Option<&'p HashMap<i64, Vec<i64>>>,
+    /// Rows the symbol index admits; a block it lacks holds none.
+    pub(super) symbols: Option<&'p HashMap<i64, Vec<i64>>>,
     pub(super) occurrences: Option<&'p HashMap<i64, u32>>,
     pub(super) eager_prose: bool,
     pub(super) lazy_identity: bool,
@@ -86,6 +88,15 @@ impl<'a, 'p, 'row, 'stmt> Candidate<'a, 'p, 'row, 'stmt> {
             if admitted
                 .get(&(id / BLOCK))
                 .is_some_and(|ids| ids.binary_search(&id).is_err())
+            {
+                return Ok(());
+            }
+        }
+        if let Some(symbols) = self.ctx.symbols {
+            let id: i64 = r.get(0)?;
+            if symbols
+                .get(&(id / BLOCK))
+                .is_none_or(|ids| ids.binary_search(&id).is_err())
             {
                 return Ok(());
             }
@@ -288,7 +299,6 @@ impl<'a, 'p, 'row, 'stmt> Candidate<'a, 'p, 'row, 'stmt> {
                 return Ok(None);
             }
         }
-        let digest = content_digest(&text);
         // Ranking needs only identity, role and time. Fetch display
         // metadata after matching so losing candidates do not join
         // symbol/blob tables or walk past a large prose BLOB.
@@ -299,24 +309,16 @@ impl<'a, 'p, 'row, 'stmt> Candidate<'a, 'p, 'row, 'stmt> {
             .query_row([r.get::<_, i64>(0)?], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })?;
-        let target = session_target(&session)?;
         let span = scored.span.map(|span| {
             (
                 text[..span.start].chars().count(),
                 text[..span.end].chars().count(),
             )
         });
-        let handle = if extra.is_empty() {
-            format!("{target}:{turn}.{digest}")
-        } else {
-            let (start, end) = span
-                .filter(|(start, end)| end > start)
-                .unwrap_or((0, text.chars().count()));
-            format!(
-                "{target}:{turn}.{digest}~{}:{start}-{end}",
-                crate::handles::event_id(&session, ts, &text),
-            )
-        };
+        // A row repeating a smaller call id's row in its turn hashes its call id too, which
+        // its page names once it is final (`name_repeated_calls`).
+        let event = (!extra.is_empty()).then(|| crate::handles::event_id(&session, ts, &text));
+        let handle = row_handle(&session, turn, &text, span, event.as_deref())?;
         let self_marker = o.filters.caller.as_ref().is_some_and(|caller| {
             caller.agent == identity().map(|i| i.1.as_str()).unwrap_or_default()
                 && caller.session == session
@@ -351,6 +353,7 @@ impl<'a, 'p, 'row, 'stmt> Candidate<'a, 'p, 'row, 'stmt> {
             rowid: r.get(0)?,
             tier,
             span,
+            event,
         };
         Ok(Some(h))
     }

@@ -1838,7 +1838,8 @@ fn tool_block_word_plans_keep_exhaustive_pages() {
 }
 
 // A term with punctuation or an accent reads only the tool rows holding its rarest
-// indexed run, and pages exactly as a read of every row does.
+// indexed run and every symbol gram it holds, and pages exactly as a read of every row
+// does, reading no more than twice the rows its anchor admits.
 #[test]
 fn punctuated_tool_terms_read_only_their_anchor_rows() {
     let t = TempDir::new().unwrap();
@@ -1857,17 +1858,17 @@ fn punctuated_tool_terms_read_only_their_anchor_rows() {
         .collect();
     append_tool_results(&path, "m1", 0, &texts);
     ok(cli(&h, &d, &["index"]));
-    for (pattern, anchored) in [
-        ("\"needle\"", 90),
-        ("needle*", 90),
-        ("café", 30),
-        ("std::sync", 60),
-        ("(needle", 90),
-        ("日本", 60),
+    for (pattern, anchored, admitted) in [
+        ("\"needle\"", 90, 30),
+        ("needle*", 90, 30),
+        ("café", 30, 30),
+        ("std::sync", 60, 30),
+        ("(needle", 90, 30),
+        ("日本", 60, 60),
     ] {
         assert_eq!(
             measured_query(&d, pattern, 0, Some("tool")).examined,
-            anchored,
+            admitted,
             "{pattern}"
         );
         assert!(
@@ -4989,6 +4990,230 @@ fn index_names_a_single_failed_source_without_pointing_elsewhere() {
     );
 }
 
+/// What search and status answer from an index: its counts, every row as `--flat` prints
+/// it (sorted, since rows that tie may rank in either order), and the failed sources.
+fn answers(h: &Path, d: &Path) -> (Value, Vec<String>, Vec<String>) {
+    let counts = status_counts(cli(h, d, &["status", "--json", "--no-auto"]));
+    let all = ok(pinned(h, d, &["-E", ".", "--flat", "-n", "0", "--no-auto"])).stdout;
+    let mut rows: Vec<String> = String::from_utf8(all)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    rows.sort();
+    let status = String::from_utf8(ok(cli(h, d, &["status", "--no-auto"])).stdout).unwrap();
+    let failed = status
+        .lines()
+        .filter(|l| l.starts_with("source failed: "))
+        .map(str::to_owned)
+        .collect();
+    (counts, rows, failed)
+}
+
+// QA4 F3: `reindex` dropped the rows of a source it could not read, which `index` keeps
+// and doctor promises stay searchable.
+#[test]
+fn reindex_keeps_the_rows_index_keeps_of_sources_it_cannot_read() {
+    for name in [
+        "pi",
+        "claude",
+        "codex",
+        "gemini",
+        "opencode",
+        "crush",
+        "cursor",
+        "kimi",
+        "cline",
+        "antigravity",
+    ] {
+        let t = TempDir::new().unwrap();
+        let h = t.path().join("h");
+        let (refreshed, rebuilt) = (t.path().join("refreshed"), t.path().join("rebuilt"));
+        fixture(name, &h);
+        ok(cli(&h, &refreshed, &["index"]));
+        ok(cli(&h, &rebuilt, &["index"]));
+        let readable = answers(&h, &refreshed);
+        assert!(!readable.1.is_empty(), "{name}");
+        let held: Vec<_> = snapshot(&h)
+            .into_keys()
+            .map(|file| Unreadable::hold(&h.join(file)))
+            .collect();
+        ok(cli(&h, &refreshed, &["index"]));
+        ok(cli(&h, &rebuilt, &["reindex"]));
+        let kept = answers(&h, &refreshed);
+        assert_eq!(kept.1, readable.1, "{name}: index keeps every row");
+        assert!(!kept.2.is_empty(), "{name}: the failures are listed");
+        assert_eq!(answers(&h, &rebuilt), kept, "{name}");
+        drop(held);
+        ok(cli(&h, &rebuilt, &["index"]));
+        assert_eq!(
+            answers(&h, &rebuilt),
+            readable,
+            "{name}: read again once readable"
+        );
+        ok(cli(&h, &rebuilt, &["reindex"]));
+        let first = t.path().join("first");
+        ok(cli(&h, &first, &["index"]));
+        assert_eq!(contents(&rebuilt), contents(&first), "{name}");
+    }
+}
+
+#[test]
+fn reindex_drops_deleted_sources_and_keeps_the_last_good_rows_of_damaged_ones() {
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let (refreshed, rebuilt) = (t.path().join("refreshed"), t.path().join("rebuilt"));
+    fixture("pi", &h);
+    fixture("malformed_records", &h);
+    let day = native::native(&h.join(".codex/sessions/2026/06/09"));
+    fs::create_dir_all(&day).unwrap();
+    let deleted = day.join("rollout-2026-06-09T10-00-00-deleted.jsonl");
+    fs::write(
+        &deleted,
+        codex_rollout("deleted", "/work/p", "deletedprompt", "t"),
+    )
+    .unwrap();
+    let packed = day.join("rollout-2026-06-09T11-00-00-packed.jsonl.zst");
+    let whole = zstd_packed(&codex_rollout("packed", "/work/p", "packedprompt", "t"));
+    fs::write(&packed, &whole).unwrap();
+    ok(cli(&h, &refreshed, &["index"]));
+    ok(cli(&h, &rebuilt, &["index"]));
+    fs::remove_file(&deleted).unwrap();
+    fs::write(&packed, &whole[..whole.len() / 2]).unwrap();
+    ok(cli(&h, &refreshed, &["index"]));
+    ok(cli(&h, &rebuilt, &["reindex"]));
+    let (counts, rows, failed) = answers(&h, &rebuilt);
+    assert_eq!((counts, rows, failed.clone()), answers(&h, &refreshed));
+    let count = |pattern: &str| {
+        String::from_utf8(cli(&h, &rebuilt, &[pattern, "-c", "--no-auto"]).stdout).unwrap()
+    };
+    assert_eq!(count("deletedprompt").trim(), "0");
+    // Its prompt and the reply that quotes it.
+    assert_eq!(count("packedprompt").trim(), "2");
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert!(
+        failed[0].starts_with(&format!(
+            "source failed: {}: cannot decompress: ",
+            packed.display()
+        )),
+        "{failed:?}"
+    );
+    fs::write(&packed, &whole).unwrap();
+    ok(cli(&h, &rebuilt, &["reindex"]));
+    let first = t.path().join("first");
+    ok(cli(&h, &first, &["index"]));
+    assert_eq!(contents(&rebuilt), contents(&first));
+}
+
+/// A directory the census cannot list hides whether its sources still exist, so their rows
+/// stay, as an index keeps them. `index`, which reuses the listings it saved, `reindex` and
+/// `audit` name the same folder, the one that cannot be listed, by the same cause, and
+/// `audit` still checks the rest of its store: a folder of folders, a store root, and a
+/// folder of transcripts.
+#[cfg(unix)]
+#[test]
+fn reindex_keeps_the_rows_below_a_directory_it_cannot_list() {
+    use std::os::unix::fs::PermissionsExt;
+    for hidden in [
+        ".codex/sessions/2026/01",
+        ".codex/sessions",
+        ".pi/agent/sessions/-work-alpha",
+    ] {
+        let t = TempDir::new().unwrap();
+        let h = t.path().join("h");
+        let (refreshed, rebuilt) = (t.path().join("refreshed"), t.path().join("rebuilt"));
+        fixture("pi", &h);
+        fixture("codex", &h);
+        ok(cli(&h, &refreshed, &["index"]));
+        ok(cli(&h, &rebuilt, &["index"]));
+        let readable = answers(&h, &refreshed);
+        let hidden = h.join(hidden);
+        fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).unwrap();
+        let notes: Vec<String> = [(&refreshed, "index"), (&rebuilt, "reindex")]
+            .into_iter()
+            .map(|(d, command)| {
+                let stderr = String::from_utf8(ok(cli(&h, d, &[command])).stderr).unwrap();
+                stderr
+                    .lines()
+                    .filter(|l| l.contains("failed to read"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect();
+        let kept = answers(&h, &refreshed);
+        let rebuilt_answers = answers(&h, &rebuilt);
+        let audits: Vec<Value> = [&refreshed, &rebuilt]
+            .into_iter()
+            .map(|d| serde_json::from_slice(&cli(&h, d, &["audit", "--json"]).stdout).unwrap())
+            .collect();
+        fs::set_permissions(&hidden, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(kept.1, readable.1, "{hidden:?}");
+        assert_eq!((&rebuilt_answers.0, &rebuilt_answers.1), (&kept.0, &kept.1));
+        let named = format!("{}: permission denied", hidden.display());
+        assert_eq!(
+            notes,
+            vec![format!("1 source failed to read: {named} - it is read again once it changes"); 2]
+        );
+        for failed in [&kept.2, &rebuilt_answers.2] {
+            assert_eq!(failed, &[format!("source failed: {named}")]);
+        }
+        for audit in &audits {
+            assert_eq!(
+                audit["problems"],
+                serde_json::json!([{"path": hidden, "reason": "permission denied"}]),
+                "{audit}"
+            );
+            for gap in audit["gap_details"].as_array().unwrap() {
+                let path = Path::new(gap["path"].as_str().unwrap());
+                assert!(path.starts_with(&hidden), "{audit}");
+            }
+        }
+    }
+}
+
+/// A relative `AGREP_HOME`, `AGREP_DATA_DIR` or `AGREP_MODEL_DIR` names its folder in full,
+/// from the directory agrep starts in: run from another directory with the same folders,
+/// the census finds every source the index holds unchanged, and status names the same
+/// absolute folders. Each source used to be keyed by the relative path, so it read as new.
+#[test]
+fn relative_path_variables_name_the_same_folders_from_any_directory() {
+    let t = TempDir::new().unwrap();
+    // Links in the folder's path resolve; Windows resolves it lexically, without `\\?\`.
+    let root = if cfg!(windows) {
+        t.path().to_owned()
+    } else {
+        t.path().canonicalize().unwrap()
+    };
+    fixture("pi", &root.join("h"));
+    let below = root.join("sub").join("deeper");
+    fs::create_dir_all(&below).unwrap();
+    let run = |cwd: &Path, up: &str, args: &[&str]| {
+        ok(command(
+            Path::new(&format!("{up}h")),
+            Path::new(&format!("{up}d")),
+            args,
+        )
+        .env("AGREP_MODEL_DIR", format!("{up}m"))
+        .current_dir(cwd)
+        .output()
+        .expect("built agrep executable is required"))
+    };
+    let up = format!("..{0}..{0}", std::path::MAIN_SEPARATOR);
+    run(&root, "", &["index"]);
+    let census: Value = serde_json::from_slice(&run(&below, &up, &["__census"]).stdout).unwrap();
+    assert_eq!(census["changed_sources"], 0, "{census}");
+    let status = |cwd: &Path, up: &str| -> Value {
+        serde_json::from_slice(&run(cwd, up, &["status", "--json"]).stdout).unwrap()
+    };
+    for status in [status(&root, ""), status(&below, &up)] {
+        assert_eq!(status["data_root"], serde_json::json!(root.join("d")));
+        assert_eq!(
+            status["semantic"]["model_path"],
+            serde_json::json!(root.join("m"))
+        );
+    }
+}
+
 #[test]
 fn full_audit_recounts_compressed_rollouts_and_keeps_damaged_ones_out() {
     let t = TempDir::new().unwrap();
@@ -5030,6 +5255,41 @@ fn full_audit_recounts_compressed_rollouts_and_keeps_damaged_ones_out() {
         .unwrap()
         .iter()
         .all(|g| g["session"] == "packed" && g["reason"] == "parsed row missing from index"));
+}
+
+#[test]
+fn full_audit_names_a_damaged_source_once() {
+    let t = TempDir::new().unwrap();
+    let (h, d) = (t.path().join("h"), t.path().join("d"));
+    let day = native::native(&h.join(".codex/sessions/2026/06/09"));
+    fs::create_dir_all(&day).unwrap();
+    let rollout = |session: &str| codex_rollout(session, "/work/p", "once prompt", "tool");
+    let mut damaged = vec![];
+    for name in ["b", "a"] {
+        let whole = zstd_packed(&rollout(name));
+        let path = day.join(format!("rollout-2026-06-09T12-00-00-{name}.jsonl.zst"));
+        fs::write(&path, &whole[..whole.len() / 2]).unwrap();
+        damaged.push(path.to_str().unwrap().to_owned());
+    }
+    damaged.sort();
+    ok(cli(&h, &d, &["index"]));
+    let out = cli(&h, &d, &["audit", "--full", "--json"]);
+    assert_eq!(out.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let paths: Vec<_> = report["problems"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["path"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(paths, damaged, "{report}");
+    assert_eq!(report["problem_count"], 2, "{report}");
+    let out = cli(&h, &d, &["audit", "--full"]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains(" · 2 errors\n"), "{text}");
+    let named = |name: &str| text.lines().filter(|l| l.contains(name)).count();
+    assert_eq!(named("-a.jsonl.zst"), 1, "{text}");
+    assert_eq!(named("-b.jsonl.zst"), 1, "{text}");
 }
 
 #[test]

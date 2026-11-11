@@ -11,6 +11,10 @@ its best-aligned occurrence; for all-terms hits, the earliest of each term's
 best-aligned occurrence; for content-terms hits, the earliest occurrence of any
 content term. Regex and whole-word searches use their first match.
 
+A tool pointer's event selector hashes the session, the call's time and its indexed
+text. Parallel calls of one turn can share all three; each of those after the first by
+call id hashes its call id too, so that a selector names one call.
+
 The four-hex digest checks accidental content drift. It is not cryptographic
 integrity. It binds the reference to indexed text so turn renumbering or a
 prefix collision cannot silently serve a different message.

@@ -1,4 +1,5 @@
 use super::*;
+use crate::handles;
 
 /// The reference codec keeps arbitrary upstream IDs out of shell and handle delimiters.
 pub(super) fn session_target(session: &str) -> Result<String> {
@@ -38,6 +39,54 @@ pub fn content_digest(s: &str) -> String {
         h = (h ^ u16::from(b)).wrapping_mul(0x01b3);
     }
     format!("{h:04x}")
+}
+/// A search row's handle. A tool row's also names its event, and the characters of its
+/// match or else of its whole text.
+pub(super) fn row_handle(
+    session: &str,
+    turn: i64,
+    text: &str,
+    span: Option<(usize, usize)>,
+    event: Option<&str>,
+) -> Result<String> {
+    let target = session_target(session)?;
+    let digest = content_digest(text);
+    Ok(match event {
+        None => format!("{target}:{turn}.{digest}"),
+        Some(event) => {
+            let (start, end) = span
+                .filter(|(start, end)| end > start)
+                .unwrap_or((0, text.chars().count()));
+            format!("{target}:{turn}.{digest}~{event}:{start}-{end}")
+        }
+    })
+}
+/// Gives each tool row of a final page that repeats the time and text of a smaller call
+/// id's row in its turn the selector naming it alone ([`handles::repeated_calls`]).
+/// `checked` keeps what earlier pages found, so a page ranked again reads only its new
+/// rows.
+pub(super) fn name_repeated_calls(
+    c: &Connection,
+    hits: &mut [Hit],
+    checked: &mut HashMap<i64, Option<String>>,
+) -> Result<()> {
+    let unchecked: Vec<i64> = hits
+        .iter()
+        .filter(|h| h.event.is_some() && !checked.contains_key(&h.rowid))
+        .map(|h| h.rowid)
+        .collect();
+    let mut repeated = handles::repeated_calls(c, &unchecked)?;
+    for id in unchecked {
+        checked.entry(id).or_insert_with(|| repeated.remove(&id));
+    }
+    for h in hits.iter_mut().filter(|h| h.event.is_some()) {
+        if let Some(Some(call)) = checked.get(&h.rowid) {
+            let event = handles::repeat_event_id(&h.session, h.ts, &h.text, call);
+            h.handle = row_handle(&h.session, h.turn, &h.text, h.span, Some(&event))?;
+            h.event = Some(event);
+        }
+    }
+    Ok(())
 }
 /// A meaning match's snippet. 0.4.9 served the matched row's text as it is stored
 /// (py/segment_query.py:650, py/search.py:1012), leaving control characters for the

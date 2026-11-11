@@ -141,7 +141,7 @@ impl Writer {
         }
         Ok(())
     }
-    fn symbol(&mut self, tx: &Transaction<'_>, value: &str) -> Result<i64> {
+    pub(crate) fn symbol(&mut self, tx: &Transaction<'_>, value: &str) -> Result<i64> {
         if value.is_empty() {
             return Ok(0);
         }
@@ -165,7 +165,12 @@ impl Writer {
         self.symbols.insert(value.into(), id);
         Ok(id)
     }
-    fn session(&mut self, tx: &Transaction<'_>, agent: &str, session: &str) -> Result<i64> {
+    pub(crate) fn session(
+        &mut self,
+        tx: &Transaction<'_>,
+        agent: &str,
+        session: &str,
+    ) -> Result<i64> {
         let key = (agent.to_string(), session.to_string());
         if let Some(id) = self.sessions.get(&key) {
             return Ok(*id);

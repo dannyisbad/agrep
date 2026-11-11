@@ -45,7 +45,8 @@ The index and configuration live in:
 | Windows | `%LOCALAPPDATA%\agrep\0.5` |
 
 `AGREP_DATA_DIR` overrides that directory. `AGREP_HOME` changes the home used to
-discover agent histories. Source conversations stay in their native stores.
+discover agent histories; a relative value of either is taken from the directory
+agrep starts in. Source conversations stay in their native stores.
 Search reads the committed index and checks for changed sources. Updates are processed
 automatically; `--no-auto` reads without checking. The first index is built inline.
 

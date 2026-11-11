@@ -8,7 +8,7 @@ use super::{
 use crate::data::{self, DataRoot};
 use anyhow::Result;
 use rayon::prelude::*;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::File,
@@ -39,7 +39,7 @@ pub struct Verified {
 pub(super) fn verify(root: &DataRoot, progress: &ChunkProgress<'_>) -> Result<Verified> {
     let catalog = catalog_path(root);
     let blobs = root.path().join("archive").join("blobs");
-    let open = || Connection::open_with_flags(&catalog, OpenFlags::SQLITE_OPEN_READ_ONLY);
+    let open = || super::read_catalog(&catalog);
     let chunks = referenced(&open()?)?;
     let total = chunks.len();
     let checked = AtomicUsize::new(0);

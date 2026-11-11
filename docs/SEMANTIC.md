@@ -74,14 +74,15 @@ none of `--json`, `--flat`, `-l`, `--lexical`, `-w`, `-E`, `-c`, `--count-by-tie
   per session. A meaning row is labeled `meaning match`.
 - Copies of one message in other chats (forks share their parent's history, so a fork's
   copy has the same speaker, text and time) are one result: the copy in the most
-  recently active chat is shown, marked `also in N forks`, and the others are listed
-  under its JSON `forks` (session and handle) and keep their own rows in `--flat`. The
-  chats it stands for take no other slot on the page; `-l` lists every chat and `-c`
+  recently active chat is shown, marked `also in N forks` (at the end of the snippet on a
+  `--flat` row), and the others are listed under its JSON `forks` (session and handle).
+  The chats it stands for take no other slot on the page; `-l` lists every chat and `-c`
   counts every chat.
 - `semantic_policy::FLOOR` (0.82) is the lowest cosine that can be shown. Merging
   meaning rows into a keyword page (`hybrid::merge`) takes at most three, needs 0.84
-  unless the page has strong keyword evidence, and makes the total a floor; see
-  [SEARCH_RANKING.md](SEARCH_RANKING.md).
+  unless the page has strong keyword evidence, and makes the total a floor; a compact
+  page reads the lane at least 40 rows deep whatever `-n` asks, so a smaller `-n` never
+  changes which three; see [SEARCH_RANKING.md](SEARCH_RANKING.md).
 
 Without the model, automatic hybrid quietly stays keyword-only and `status` says so;
 `-s` prints `semantic model not installed: run agrep setup` and exits 2. In automatic
@@ -151,7 +152,8 @@ and exits 2. A complete semantic-only search that finds nothing exits 1.
   minute and leaving out the batch that loaded the model; until a drain has recorded
   one, an initial estimate. `index --semantic` and
   `reindex` rewrite a line on a terminal's stderr with the rows covered, that rate and the
-  time left. This build estimate is separate from the inline CPU budget. Setup
+  time left, and write it every 30 seconds to a stderr that is not a terminal, with the
+  final count at the end. This build estimate is separate from the inline CPU budget. Setup
   explains that the build runs in the background and meaning results join searches
   when the remaining work fits the inline budget.
 - The scan quantizes the query to int8 and takes int8 dot products with SIMD (AVX2 on

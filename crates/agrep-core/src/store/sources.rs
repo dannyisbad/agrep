@@ -6,8 +6,29 @@ use rayon::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Only a root may be a link, which is followed to its kind (see `RootKind::of`).
-fn walk(path: &Path, adapter: &dyn Adapter, paths: &mut Vec<PathBuf>, root: bool) -> Result<()> {
+/// The sources below `path`, a store root or a folder in one, into `paths`. A folder that
+/// cannot be listed is named in `issues` with its cause, as the census names it, and the
+/// walk goes on past it.
+fn walk(
+    path: &Path,
+    adapter: &dyn Adapter,
+    paths: &mut Vec<PathBuf>,
+    issues: &mut Vec<Stamp>,
+    root: bool,
+) {
+    if let Err(error) = list(path, adapter, paths, issues, root) {
+        issues.push(unreadable(adapter.name(), path, &error));
+    }
+}
+/// [`walk`] at one path. Only a root may be a link, which is followed to its kind (see
+/// `RootKind::of`).
+fn list(
+    path: &Path,
+    adapter: &dyn Adapter,
+    paths: &mut Vec<PathBuf>,
+    issues: &mut Vec<Stamp>,
+    root: bool,
+) -> Result<()> {
     let found = if root {
         registry::followed_root(path, || {
             registry::RootKind::of(adapter.freshness_content(path))
@@ -36,13 +57,24 @@ fn walk(path: &Path, adapter: &dyn Adapter, paths: &mut Vec<PathBuf>, root: bool
             let ty = entry.file_type()?;
             let path = entry.path();
             if ty.is_dir() {
-                walk(&path, adapter, paths, false)?
+                walk(&path, adapter, paths, issues, false)
             } else if ty.is_file() && adapter.freshness_content(&path) {
                 paths.push(path);
             }
         }
     }
     Ok(())
+}
+/// A source or store folder that could not be read, named by its cause as a failed read is.
+pub(crate) fn unreadable(agent: &str, path: &Path, error: &anyhow::Error) -> Stamp {
+    Stamp {
+        path: path.to_string_lossy().into_owned(),
+        agent: agent.into(),
+        size: 0,
+        mtime_ns: 0,
+        token: SourceToken::default(),
+        error: Some(crate::ingest::error_reason(error)),
+    }
 }
 fn stamp(a: &str, p: &Path) -> Stamp {
     stamp_meta(a, p, fs::symlink_metadata(p))
@@ -118,29 +150,21 @@ fn stamp_meta_owned(a: &str, path: PathBuf, meta: std::io::Result<fs::Metadata>)
             token,
         ))
     })();
-    let path = path
-        .into_os_string()
-        .into_string()
-        .unwrap_or_else(|s| s.to_string_lossy().into_owned());
     match result {
         Ok((size, mtime_ns, token)) => Stamp {
-            path,
+            path: path
+                .into_os_string()
+                .into_string()
+                .unwrap_or_else(|s| s.to_string_lossy().into_owned()),
             agent: a.into(),
             size,
             mtime_ns,
             token,
             error: None,
         },
-        Err(e) => Stamp {
-            path,
-            agent: a.into(),
-            size: 0,
-            mtime_ns: 0,
-            token: SourceToken::default(),
-            // Windows opens a source to stamp it, so a locked or denied file fails here, not
-            // in its read: it is named by its cause as a failed read is.
-            error: Some(crate::ingest::error_reason(&e)),
-        },
+        // Windows opens a source to stamp it, so a locked or denied file fails here, not in
+        // its read: it is named by its cause as a failed read is.
+        Err(e) => unreadable(a, &path, &e),
     }
 }
 pub fn census() -> Result<Vec<Stamp>> {
@@ -150,16 +174,7 @@ pub fn census() -> Result<Vec<Stamp>> {
             let mut paths = vec![];
             let mut issues = vec![];
             for root in a.freshness_roots() {
-                if let Err(e) = walk(&root, *a, &mut paths, true) {
-                    issues.push(Stamp {
-                        path: root.to_string_lossy().into(),
-                        agent: a.name().into(),
-                        size: 0,
-                        mtime_ns: 0,
-                        token: SourceToken::default(),
-                        error: Some(e.to_string()),
-                    });
-                }
+                walk(&root, *a, &mut paths, &mut issues, true);
             }
             paths.sort();
             paths.dedup();

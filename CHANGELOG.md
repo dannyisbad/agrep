@@ -30,9 +30,17 @@
   advisor sidecars are left out of meaning search (keyword search still finds
   them), so they no longer crowd out real answers.
 - Keyword and meaning search show a message that forked chats share once, from the
-  most recently active fork, marked `also in N forks`, so fork copies no longer fill a
-  page; `--json` lists the other copies. `--chat` on a Codex fork child also searches
-  the history it inherited from its parent, up to the fork.
+  most recently active fork, marked `also in N forks` at every `-n`, so fork copies no
+  longer fill a page; `-n N` prints N rows in every form (a piped or `--flat` row ends
+  with `(also in N forks)`), and `--json` lists the other copies. `--chat` on a Codex
+  fork child also searches the history it inherited from its parent, up to the fork.
+- On an agent's compact page a larger `-n` keeps every row of a smaller one, in the
+  same order, meaning rows included: up to `-n 40`, `-n 5` shows the first five rows
+  of `-n 10`. Before, `-n` changed which rows were merged and ordered, so a meaning
+  row shown at `-n 5` could be gone at `-n 10`.
+- A relative `AGREP_HOME`, `AGREP_DATA_DIR` or `AGREP_MODEL_DIR` becomes a full path
+  when agrep starts, so naming the same folder from another working directory no
+  longer makes agrep index every transcript again.
 - `agrep help` and `agrep help COMMAND` print help instead of searching for the
   word "help"; `agrep search help` still searches it. `agrep version` prints the
   version.
@@ -66,6 +74,17 @@
   match says `no chats match`, naming `--side` only when side chats would match.
 - Codex tool results written as a list of text items are indexed as their text,
   not as raw JSON, so search and snippets see the tool's own words.
+- Tool output is indexed by word, plus a small index of the symbols in it
+  (punctuation, emoji, other scripts), where 0.4.9 indexed every three characters
+  of it: counts and full listings of `C++`, `O(n log n)`, `::` or an emoji, of an
+  `-E` alternation such as `work(tree|flow)s?`, and of `-w` read only the rows that
+  can match.
+- Parallel tool calls that recorded the same input and output at the same moment get
+  a handle each, so `around` opens the call a result named; 0.4.9 gave them one
+  handle, which opened all of them.
+- Reading the archive (`status`, `archive --status`, `doctor`) no longer leaves the
+  catalog's `-wal` and `-shm` files behind, and in a data directory you cannot write,
+  `status` reads the archive instead of calling it unreadable.
 - `agrep setup` and `agrep remove` change only agrep's own hook entry in Claude's
   `settings.json` and Codex's `hooks.json`: other hooks and settings keep their exact
   text, and remove gives back the file setup found.
@@ -73,16 +92,20 @@
   copies it in at the end: it takes about as long as a first build and leaves an
   index of the same size, searches answer from the old index meanwhile, and a
   reindex stopped partway leaves the old index as it was. Meaning vectors survive
-  it. `index --semantic` and `reindex` show embedding progress on a terminal, and
-  `status` gives the meaning build's time left as `-s` does (`about 15m 19s left`).
-  The time left comes from a rate measured on this machine; until a build has
-  measured one it says `estimating time left`, and row counts carry thousands
-  separators.
+  it, and so do the last good rows of a transcript it cannot read, which stays
+  listed as failed, as after `index`. `index --semantic` and `reindex` show
+  embedding progress on a terminal, and a line every 30 seconds on a pipe or in a
+  log, and `status` gives the meaning build's time left as `-s` does (`about 15m
+  19s left`). The time left comes from a rate measured on this machine; until a
+  build has measured one it says `estimating time left`, and row counts carry
+  thousands separators.
 - A transcript agrep cannot read (one made unreadable with `chmod 000`, say) is
   named once with its cause by `status` and `doctor` (`source failed: PATH:
   permission denied`), and `agrep index` ends with one stderr line giving how
   many failed, the first with its cause, and `agrep doctor` for the rest. Its
-  last good rows stay searchable.
+  last good rows stay searchable. A store folder agrep cannot list is named the
+  same way, as that folder, after `index` and `reindex` alike and by `audit`,
+  which now goes on to check the rest of that store.
 - `doctor` on a home with no supported agent history says so and names the
   agents it looked for, and its model row reads `present`, `not installed` (with
   `agrep setup` to install it) or `failed`. `-s` with a model that fails its

@@ -1,5 +1,9 @@
 use super::*;
 
+/// Symbol clauses a tool plan intersects at most: each is a necessary condition, and a
+/// few rare ones bound the rows as well as all of a long query's.
+const SYMBOL_CLAUSES: usize = 8;
+
 impl Matcher {
     pub(super) fn order_for(
         &mut self,
@@ -10,7 +14,7 @@ impl Matcher {
         let groups = if let Some(i) = self.coverage_term {
             vec![self.terms[i].clone()]
         } else if self.explicit.is_some() {
-            self.required.iter().map(|v| vec![v.clone()]).collect()
+            self.required.clone()
         } else {
             self.terms.clone()
         };
@@ -18,6 +22,7 @@ impl Matcher {
         self.tool_supported.clear();
         self.tool_presence.clear();
         self.tool_anchors.clear();
+        self.word_terms.clear();
         if table == "tools" {
             if self.explicit.is_none() {
                 self.tool_presence = vec![None; self.terms.len()];
@@ -57,11 +62,27 @@ impl Matcher {
                     }
                     self.tool_supported.extend(variants.iter().cloned());
                     self.tool_terms.extend(expanded);
-                    indexed = true;
-                    if self.partial {
-                        estimate = estimate.saturating_add(df);
-                    } else {
-                        estimate = estimate.min(df);
+                    let mut anchored_doc = df;
+                    if matches!(self.explicit, Some(Pattern::Word(_))) {
+                        anchored_doc = 0;
+                        for v in &variants {
+                            if let Some(words) = cache.bounded_words(c, v)? {
+                                anchored_doc = anchored_doc.saturating_add(words.doc);
+                                self.word_terms.insert(v.clone(), words);
+                            }
+                        }
+                    }
+                    // A group none of whose words a plan taking anchors reads admits no
+                    // row of such a plan.
+                    let empty = self.plan_anchors && anchored_doc == 0;
+                    if self.paged(&variants) || empty {
+                        let df = if empty { 0 } else { df };
+                        indexed = true;
+                        if self.partial {
+                            estimate = estimate.saturating_add(df);
+                        } else {
+                            estimate = estimate.min(df);
+                        }
                     }
                 } else {
                     df = usize::MAX;
@@ -82,11 +103,18 @@ impl Matcher {
             } else {
                 2
             };
-            let needed: Vec<String> = self
+            // Pages read only the groups `paged` admits; other plans read all of them.
+            let supported =
+                |group: &&Vec<String>| group.iter().all(|v| self.tool_supported.contains(v));
+            let paged = self
                 .ordered_terms
                 .iter()
-                .filter(|group| group.iter().all(|v| self.tool_supported.contains(v)))
-                .take(read)
+                .filter(supported)
+                .filter(|group| self.paged(group))
+                .take(read);
+            let all = self.ordered_terms.iter().filter(supported).take(read);
+            let needed: Vec<String> = paged
+                .chain(all)
                 .flatten()
                 .filter(|v| !self.tool_terms.contains_key(*v))
                 .cloned()
@@ -131,11 +159,13 @@ impl Matcher {
                     }
                     df = df.saturating_add(least);
                 }
-                indexed = true;
-                if self.partial {
-                    estimate = estimate.saturating_add(df);
-                } else {
-                    estimate = estimate.min(df);
+                if self.paged(&variants) || (self.plan_anchors && df == 0) {
+                    indexed = true;
+                    if self.partial {
+                        estimate = estimate.saturating_add(df);
+                    } else {
+                        estimate = estimate.min(df);
+                    }
                 }
             }
             ordered.push((df, i, variants));
@@ -173,6 +203,37 @@ impl Matcher {
             .iter()
             .map(|variant| self.tool_anchors.get(variant).cloned())
             .collect()
+    }
+    /// Whether a page reads the rows `group` admits: every group but a literal set.
+    fn paged(&self, group: &[String]) -> bool {
+        !self.literal_sets.iter().any(|set| set == group)
+    }
+    /// The `tools_sym` expression admitting every tool row this pass can match, from the
+    /// groups the dictionary cannot expand whose every spelling has symbol grams; None
+    /// when there are none. Python's lowercase shortcut for dotted İ matches text the
+    /// case key does not hold, so such queries take none.
+    pub(super) fn symbol_expression(&self) -> Option<String> {
+        if self.partial
+            || self.coverage_term.is_some()
+            || !self.dotted_candidates.is_empty()
+            || self.lowercase_terms.iter().any(|t| t.special)
+        {
+            return None;
+        }
+        let clauses: Vec<String> = self
+            .ordered_terms
+            .iter()
+            .filter(|group| !group.iter().all(|v| self.tool_supported.contains(v)))
+            .filter_map(|group| {
+                let spellings = group
+                    .iter()
+                    .map(|v| crate::tool_symbols::expression(v))
+                    .collect::<Option<Vec<_>>>()?;
+                Some(format!("(({}))", spellings.join(") OR (")))
+            })
+            .take(SYMBOL_CLAUSES)
+            .collect();
+        (!clauses.is_empty()).then(|| clauses.join(" AND "))
     }
     /// On ASCII rows, the all-terms strength ceiling, with the bridges whose adjacency
     /// would break it: each pair of spellings of two terms, one after the other.
@@ -258,7 +319,11 @@ impl Matcher {
     }
     pub(super) fn bound_grams(&self) -> Vec<Vec<Vec<String>>> {
         let ts = if self.explicit.is_some() {
-            self.required.iter().map(|s| vec![s.clone()]).collect()
+            self.required
+                .iter()
+                .filter(|group| self.paged(group))
+                .cloned()
+                .collect()
         } else if self.phase == 1 && !self.partial {
             // Phrase matching uses the literal normalized tokens. Summing a
             // plural/stem alternative can double-count the same occurrence
@@ -293,6 +358,9 @@ impl Matcher {
         }
         let mut out = vec![];
         for group in groups {
+            if !self.plan_anchors && !self.paged(&group) {
+                continue;
+            }
             // A literal phrase cannot use a plural-only variant. In the other
             // tiers a shorter substring already admits every containing variant.
             let terms: Vec<_> = if self.phase == 1
@@ -336,9 +404,17 @@ impl Matcher {
     }
     /// Indexed words for one query group. A block keeps only the words its rows contain.
     pub(super) fn group_words(&self, group: &[String], blocks: Option<&[i64]>) -> Vec<&str> {
+        self.expansion_words(group, blocks, &self.tool_terms)
+    }
+    fn expansion_words<'m>(
+        &'m self,
+        group: &[String],
+        blocks: Option<&[i64]>,
+        expansions: &'m HashMap<String, std::sync::Arc<Expansion>>,
+    ) -> Vec<&'m str> {
         let mut words: Vec<&str> = Vec::new();
         for v in group {
-            let expansion = &self.tool_terms[v];
+            let expansion = expansions.get(v).unwrap_or_else(|| &self.tool_terms[v]);
             match blocks {
                 None => words.extend(expansion.words.iter().map(|w| w.term.as_str())),
                 Some(blocks) => {
@@ -365,10 +441,14 @@ impl Matcher {
         self.tool_fts(blocks, self.plan_anchors)
     }
     /// Each group the dictionary cannot expand enters through its spellings' anchors
-    /// when `anchored`; without them it is left out.
+    /// when `anchored`; without them it is left out. So do literal sets, and `-w` reads
+    /// only its bounded words then.
     pub(super) fn tool_fts(&self, blocks: Option<&[i64]>, anchored: bool) -> Option<String> {
         let mut clauses = vec![];
         for group in &self.ordered_terms {
+            if !anchored && !self.paged(group) {
+                continue;
+            }
             let anchors = if group.iter().all(|v| self.tool_supported.contains(v)) {
                 None
             } else if let Some(anchors) = self.anchors(group).filter(|_| anchored) {
@@ -379,7 +459,13 @@ impl Matcher {
                 }
                 continue;
             };
-            let mut words = self.group_words(anchors.as_deref().unwrap_or(group), blocks);
+            let expansions = if anchored {
+                &self.word_terms
+            } else {
+                &self.tool_terms
+            };
+            let mut words =
+                self.expansion_words(anchors.as_deref().unwrap_or(group), blocks, expansions);
             if let Some(anchors) = anchors
                 .as_ref()
                 .filter(|_| words.is_empty() && blocks.is_none())

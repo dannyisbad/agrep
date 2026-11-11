@@ -116,6 +116,7 @@ mod replay;
 mod rows;
 mod sources;
 mod text;
+mod unread;
 
 pub use bounds::{grams, rebuild_bounds, refresh_phrase_gaps};
 pub(crate) use bounds::{
@@ -124,9 +125,10 @@ pub(crate) use bounds::{
 };
 #[cfg(test)]
 pub(crate) use connection::schema;
+pub(crate) use connection::settled_uri;
 pub use connection::{reader, writer};
 pub use refresh::{refresh, refresh_checked, refresh_session, reindex};
 pub use sources::census;
-pub(crate) use sources::{gone, stamp_owned};
+pub(crate) use sources::{gone, stamp_owned, unreadable};
 pub use text::{decode, digest, encode_tool, joined, normalize};
 pub(crate) use text::{hex_digest, search_fold};

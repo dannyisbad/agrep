@@ -4,7 +4,8 @@ pub fn search(c: &Connection, o: &Options) -> Result<Results> {
     search_with(c, o, &mut Plans::default())
 }
 /// Word expansions, posting estimates and term weights of one pattern and lane set,
-/// kept across searches of that pattern over different scopes.
+/// kept across searches of that pattern over different scopes, and which tool rows of
+/// their pages repeat a smaller call id's row.
 #[derive(Default)]
 pub struct Plans(PlanCache);
 pub fn search_with(c: &Connection, o: &Options, plans: &mut Plans) -> Result<Results> {
@@ -37,6 +38,7 @@ pub fn search_with(c: &Connection, o: &Options, plans: &mut Plans) -> Result<Res
     } else {
         search_unfiltered(c, o, &mut plans.0)?
     };
+    name_repeated_calls(c, &mut result.hits, &mut plans.0.repeated_calls)?;
     result.timings.total_ms = started.elapsed().as_secs_f64() * 1000.;
     Ok(result)
 }
@@ -116,20 +118,7 @@ pub(super) fn search_unfiltered(
         crate::fts_span::install(c)?;
     }
     let mut normalized = o.clone();
-    for text in [
-        &mut normalized.filters.agent,
-        &mut normalized.filters.who,
-        &mut normalized.filters.no_who,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        *text = text
-            .split(',')
-            .map(|part| part.trim().to_ascii_lowercase())
-            .collect::<Vec<_>>()
-            .join(",");
-    }
+    normalize(&mut normalized.filters);
     let o = &normalized;
     let optimized = !o.regex && !o.word && o.limit > 0 && !o.exact && o.sort == "score";
     let mut result = if optimized {

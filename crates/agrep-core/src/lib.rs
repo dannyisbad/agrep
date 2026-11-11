@@ -32,6 +32,7 @@ mod row_stats;
 
 mod tool_index;
 mod tool_store;
+mod tool_symbols;
 
 pub mod fts_segments;
 mod fts_span;

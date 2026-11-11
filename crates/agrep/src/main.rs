@@ -16,6 +16,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 fn main() {
     #[cfg(target_os = "macos")]
     allocator::initialize();
+    agrep_core::data::resolve_path_variables();
     agrep_core::semantic_profile::process_endpoint("process_entry_ns");
     let parse_span = agrep_core::semantic_profile::span("cli_parse");
     let mut args: Vec<_> = std::env::args_os().collect();

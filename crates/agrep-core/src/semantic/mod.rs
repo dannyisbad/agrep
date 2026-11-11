@@ -12,7 +12,7 @@ use crate::{
 };
 use anyhow::{bail, Result};
 pub use background::{
-    configure_background, drain, mark_index_changed, post_index, schedule, Drain,
+    configure_background, drain, mark_index_changed, post_index, schedule, Drain, Progress,
 };
 pub use budget::{build_progress, estimate, is_building, BuildProgress};
 use budget::{Overlay, QueryCost};
@@ -885,6 +885,36 @@ mod tests {
             background::progress_line(0, 10, 10, None),
             "embedding messages: 0 of 10 rows · estimating time left"
         );
+    }
+    // QA4 F8: `reindex --full` with stderr piped said nothing for the 419 s it embedded.
+    #[test]
+    fn a_drain_rewrites_its_line_on_a_terminal_and_elsewhere_writes_one_every_30_seconds() {
+        use background::{Meter, Progress};
+        let start = std::time::Instant::now();
+        let at = |seconds: f64| start + std::time::Duration::from_secs_f64(seconds);
+        let line = || "embedding messages: 1 of 2 rows".to_owned();
+        let own = Some("embedding messages: 1 of 2 rows\n".to_owned());
+        let mut piped = Meter::new(Progress::Periodic, start);
+        assert_eq!(piped.show(at(0.5), line), None);
+        assert_eq!(piped.finish(line), None);
+        assert_eq!(piped.show(at(29.9), line), None);
+        assert_eq!(piped.show(at(30.), line), own);
+        assert_eq!(piped.show(at(59.9), line), None);
+        assert_eq!(piped.show(at(60.), line), own);
+        assert_eq!(piped.finish(line), own);
+        let rewritten = Some("\rembedding messages: 1 of 2 rows\x1b[K".to_owned());
+        let mut terminal = Meter::new(Progress::Rewritten, start);
+        assert_eq!(terminal.finish(line), None);
+        assert_eq!(terminal.show(at(0.1), line), rewritten);
+        assert_eq!(terminal.show(at(0.2), line), None);
+        assert_eq!(terminal.show(at(0.35), line), rewritten);
+        assert_eq!(
+            terminal.finish(line),
+            Some("\rembedding messages: 1 of 2 rows\x1b[K\n".to_owned())
+        );
+        let mut hidden = Meter::new(Progress::Hidden, start);
+        assert_eq!(hidden.show(at(100.), line), None);
+        assert_eq!(hidden.finish(line), None);
     }
     /// An omp advisor sidecar's notes cover their rows without vectors: neither the inline
     /// overlay nor a drain embeds them, the snapshot is complete, and no meaning hit names them.

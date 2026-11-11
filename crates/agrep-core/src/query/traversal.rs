@@ -8,6 +8,10 @@ pub(super) struct Traversal<'a, 'p> {
     /// On a page, the matcher whose plans take anchors, with the rows they admit per
     /// block. A row is checked against it only after the page's ceiling has read it.
     anchored: Option<(Matcher, HashMap<i64, Vec<i64>>)>,
+    /// The tool rows the symbol index admits, by block; a block it lacks holds none.
+    /// Plans that may skip rows read only these, and a page checks its rows against them
+    /// only after its ceiling has read them, as with anchors.
+    symbols: Option<CandidateGroups>,
     order: Vec<BlockBound>,
     position: HashMap<i64, usize>,
     next: usize,
@@ -69,6 +73,25 @@ impl<'a, 'p> Traversal<'a, 'p> {
                 )?;
                 result.timings.sqlite_ms += tick.elapsed().as_secs_f64() * 1000.;
             }
+        }
+        if let Some(symbols) = plan.symbols.as_ref().filter(|_| m.plan_anchors) {
+            ids = Some(match ids.take() {
+                Some(existing) => std::sync::Arc::new(
+                    existing
+                        .iter()
+                        .filter_map(|(block, rows)| {
+                            let admitted = symbols.get(block)?;
+                            let kept: Vec<i64> = rows
+                                .iter()
+                                .copied()
+                                .filter(|id| admitted.binary_search(id).is_ok())
+                                .collect();
+                            (!kept.is_empty()).then_some((*block, kept))
+                        })
+                        .collect(),
+                ),
+                None => symbols.clone(),
+            });
         }
         // A selective scope is still scanned in its own order, so the same rows
         // fill the page and meet the same ceilings; the text index only spares
@@ -139,6 +162,7 @@ impl<'a, 'p> Traversal<'a, 'p> {
             ids,
             admitted,
             anchored,
+            symbols: plan.symbols.clone(),
             order,
             position,
             next,
@@ -239,6 +263,7 @@ impl<'a, 'p> Traversal<'a, 'p> {
                 coverage: self.coverage.as_ref(),
                 admitted: self.admitted.as_ref(),
                 anchored: self.anchored.as_ref().map(|(_, rows)| rows),
+                symbols: self.symbols.as_deref(),
                 occurrences: self.occurrences.as_ref(),
                 eager_prose: query.eager_prose,
                 lazy_identity: query.lazy_identity,
@@ -449,28 +474,44 @@ impl<'a, 'p> Traversal<'a, 'p> {
         Ok(())
     }
 
-    /// The rows of `block` to read when a page reads only those anchors admit: once its
-    /// total is a floor, or while the block's admitted rows cannot fill it. Otherwise its
-    /// ceiling still reads every row, and each is checked after it.
+    /// The rows of `block` to read when a page reads only those anchors and the symbol
+    /// index admit: once its total is a floor, or while the block's admitted rows cannot
+    /// fill it. Otherwise its ceiling still reads every row, and each is checked after it.
     fn narrow_to_anchors(
         &self,
         result: &Results,
         block: i64,
         block_ids: Option<&Vec<i64>>,
     ) -> Option<Vec<i64>> {
-        let anchored = self.anchored.as_ref()?.1.get(&block)?;
+        let anchored = self
+            .anchored
+            .as_ref()
+            .and_then(|(_, rows)| rows.get(&block));
+        let symbols = self
+            .symbols
+            .as_ref()
+            .map(|symbols| symbols.get(&block).map_or(&[][..], Vec::as_slice));
+        let admitted: Vec<i64> = match (anchored, symbols) {
+            (None, None) => return None,
+            (Some(rows), None) => rows.clone(),
+            (None, Some(rows)) => rows.to_vec(),
+            (Some(rows), Some(symbols)) => rows
+                .iter()
+                .copied()
+                .filter(|id| symbols.binary_search(id).is_ok())
+                .collect(),
+        };
         if result.total_basis != "floor"
-            && result.hits.len() + anchored.len() >= self.plan.ctx.o.limit
+            && result.hits.len() + admitted.len() >= self.plan.ctx.o.limit
         {
             return None;
         }
         Some(match block_ids {
-            Some(ids) => anchored
-                .iter()
-                .copied()
+            Some(ids) => admitted
+                .into_iter()
                 .filter(|id| ids.binary_search(id).is_ok())
                 .collect(),
-            None => anchored.clone(),
+            None => admitted,
         })
     }
 

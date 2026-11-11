@@ -114,6 +114,10 @@ pub struct Hit {
     /// The characters of `text` 0.4.9 placed the hit's match at (`_match_span`).
     #[serde(skip)]
     pub span: Option<(usize, usize)>,
+    /// A tool row's event selector: [`crate::handles::event_id`], or once its page is final
+    /// the [`crate::handles::repeat_event_id`] of a row repeating a smaller call id's row.
+    #[serde(skip)]
+    pub event: Option<String>,
 }
 impl Hit {
     /// The matching rows a page row stands for: itself and its copies in forks.
@@ -241,6 +245,11 @@ struct PlanCache {
     words: HashMap<String, Option<std::sync::Arc<Expansion>>>,
     /// Expansions of the non-ASCII runs anchors take (`PlanCache::run_words`).
     runs: HashMap<String, std::sync::Arc<Expansion>>,
+    /// `-w` expansions (`PlanCache::bounded_words`).
+    bounded_words: HashMap<String, Option<std::sync::Arc<Expansion>>>,
+    /// Tool rows `tools_sym` admits per expression (`PlanCache::symbol_rows`): how many
+    /// were read, and all of them unless the read stopped at its cap.
+    symbols: HashMap<String, (usize, Option<CandidateGroups>)>,
     trigram_docs: HashMap<String, Option<usize>>,
     postings: HashMap<(i64, String), Vec<store::Posting>>,
     candidates: HashMap<String, CandidateGroups>,
@@ -252,6 +261,9 @@ struct PlanCache {
     /// The pattern's matcher before any pass adjusts it, keyed by pattern and mode:
     /// compiling its expressions costs more than a pass over a small corpus.
     matcher: Option<((String, bool, bool), Matcher)>,
+    /// Whether each tool row a page held repeats the time and text of a smaller call id's
+    /// row in its turn: its call id if so. A page ranked again reads only its new rows.
+    repeated_calls: HashMap<i64, Option<String>>,
 }
 #[derive(Clone)]
 struct LowercaseTerm {
@@ -287,7 +299,15 @@ struct Matcher {
     explicit_once: bool,
     boundary: PreparedQuery,
     query_chars: usize,
-    required: Vec<String>,
+    /// Per `-E` end, or the `-w` term: folded spellings one of which every match holds.
+    required: Vec<Vec<String>>,
+    /// The required groups the extractor found as several literals. Like anchors, they
+    /// narrow only plans that may skip the rows they rule out: a page reads, and its
+    /// bounds and estimate count, only the groups of single literals.
+    literal_sets: Vec<Vec<String>>,
+    /// For `-w`, the indexed words in which some occurrence of the term has no ASCII
+    /// word character beside it: every match lies in one. Plans taking anchors read them.
+    word_terms: HashMap<String, std::sync::Arc<Expansion>>,
     idf: Vec<f64>,
     tool_terms: HashMap<String, std::sync::Arc<Expansion>>,
     /// Variants the tool dictionary can expand; plans expand only those they read.
@@ -324,6 +344,8 @@ pub use content::coverage;
 use content::RUN_BLOCKS;
 use content::RUN_GAP;
 use content::SCOPE_INDEX_ROWS;
+mod copies;
+pub use copies::Copies;
 mod counts;
 use counts::admit_run;
 use counts::caller_withheld;
@@ -337,9 +359,13 @@ mod evaluate;
 mod filters;
 pub use filters::caller_allows;
 use filters::id_list;
+use filters::normalize;
 use filters::sql_filters;
 mod hit;
 pub use hit::content_digest;
+use hit::name_repeated_calls;
+use hit::row_handle;
+#[cfg(test)]
 use hit::session_target;
 pub use hit::snippet;
 mod pass;
@@ -349,6 +375,7 @@ mod plan;
 mod quick_count;
 mod ranking;
 use ranking::compare;
+pub use ranking::copy_may_rank_below;
 pub use ranking::meaning_score;
 pub use ranking::meta_role;
 use ranking::meta_scale;

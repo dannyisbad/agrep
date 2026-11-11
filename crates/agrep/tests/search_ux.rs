@@ -1,4 +1,7 @@
 //! Search, chats, summary and continuation-page behavior agrep 0.4.9 users relied on.
+#[allow(dead_code)]
+#[path = "../examples/support/corpus.rs"]
+mod corpus;
 mod support;
 use serde_json::{json, Value};
 use std::{
@@ -175,6 +178,57 @@ fn compact_pages_end_with_the_larger_rerun() {
         shown += stdout(&page).lines().count();
     }
     assert_eq!(shown, 40);
+}
+
+// A page at `-n N` is the first rows of the page at any larger `-n`, in order, on the
+// benchmark's mixed workload: chat families of subagents, their ~meta task prompts and tool
+// rows. A compact page ordered only the rows `-n` fetched, so a family's second row could
+// precede another family's first at a small `-n` and fall behind it at a larger one.
+#[test]
+fn every_page_is_the_first_rows_of_a_larger_one() {
+    let t = TempDir::new().unwrap();
+    let (h, d) = (t.path().join("h"), t.path().join("d"));
+    corpus::generate(&h, 8500, false).unwrap();
+    let now = (chrono::Utc::now().timestamp_millis() + 60_000).to_string();
+    let run = |args: &[&str], profile: &str| {
+        let out = command(&h, &d, args, profile)
+            .env("AGREP_NOW_MS", &now)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+        out
+    };
+    run(&["index"], "classic");
+    for query in ["release workflow", "flaky windows cache", "error"] {
+        for (profile, form) in [("compact", None), ("classic", Some("--json"))] {
+            let rows = |n: usize| -> Vec<String> {
+                let n = n.to_string();
+                let mut args = vec![query, "-n", &n, "--no-auto"];
+                args.extend(form);
+                let out = stdout(&run(&args, profile));
+                match form {
+                    Some(_) => out
+                        .lines()
+                        .skip(1)
+                        .map(|l| serde_json::from_str::<Value>(l).unwrap()["handle"].to_string())
+                        .collect(),
+                    None => out
+                        .lines()
+                        .map(|l| l.split(' ').next().unwrap().to_owned())
+                        .collect(),
+                }
+            };
+            let largest = rows(20);
+            assert!(largest.len() > 5, "{query} {form:?}: {largest:?}");
+            for n in 1..20 {
+                assert_eq!(
+                    rows(n),
+                    largest[..n.min(largest.len())],
+                    "{query} {form:?} -n {n}"
+                );
+            }
+        }
+    }
 }
 
 // 0.4.9 answered a pattern without a word with no match, and searched a one-word pattern

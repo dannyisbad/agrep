@@ -104,6 +104,25 @@ fn copy_database(backup: &rusqlite::backup::Backup<'_, '_>, blocking: bool) -> R
 fn catalog_path(root: &DataRoot) -> PathBuf {
     root.path().join("archive").join("catalog.db")
 }
+/// Opens the catalog to read it. A WAL database opened read-only creates its `-wal` and
+/// `-shm` files but cannot remove them when it closes, so this opens read-write, never
+/// creating the catalog, and the last connection to close cleans up; SQLite falls back to
+/// read-only by itself when the file is write-protected. In a data directory this user may
+/// not write, a settled catalog opens as immutable, as the index does.
+pub(super) fn read_catalog(path: &Path) -> rusqlite::Result<Connection> {
+    match crate::store::settled_uri(path) {
+        Some(uri) => Connection::open_with_flags(
+            uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ),
+        None => Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ),
+    }
+}
 
 /// One capture pass; `log` receives a line per source captured, appended, repaired or
 /// failed, as it happens.
@@ -219,6 +238,21 @@ fn failed_passes(root: &DataRoot) -> Option<(u32, i64)> {
 pub fn failing_captures(root: &DataRoot) -> u32 {
     failed_passes(root).map_or(0, |(count, _)| count)
 }
+/// The archived versions, and their files, needing a chunk the last capture or deep check
+/// recorded as damaged. It reads the catalog alone, so that status stays quick: a chunk
+/// lost since is found by the next capture, `archive --status` and `doctor`.
+pub fn recorded_damage(root: &DataRoot) -> Result<(usize, usize)> {
+    let path = catalog_path(root);
+    if !path.exists() {
+        return Ok((0, 0));
+    }
+    let read = || -> Result<(usize, usize)> {
+        let db = read_catalog(&path)?;
+        let (versions, paths) = damage(&db, &recorded_chunks(&db)?)?;
+        Ok((versions, paths.len()))
+    };
+    read().map_err(|e| catalog::classify(&path, e))
+}
 /// Something wrong with the archive: what, the action that resolves it if any, and the
 /// files it concerns when they are not all recoverable.
 #[derive(Debug)]
@@ -271,8 +305,9 @@ pub fn problems(root: &DataRoot, deep: Option<&ChunkProgress<'_>>) -> Result<Vec
     }
     Ok(problems)
 }
-/// The damage the last capture found and the chunks missing now.
-fn damage_problem(s: &serde_json::Value) -> Option<Problem> {
+/// The damage an archive state counts in `damaged_versions` and `damaged_files`: the
+/// catalog's, with the chunks missing now, or status's [`recorded_damage`].
+pub fn damage_problem(s: &serde_json::Value) -> Option<Problem> {
     let versions = s["damaged_versions"].as_u64().unwrap_or(0);
     (versions > 0).then(|| Problem::new(
         format!("{versions} archived version(s) of {} file(s) cannot be restored: their stored chunks are missing or corrupt", s["damaged_files"]),
@@ -336,8 +371,7 @@ pub fn due(root: &DataRoot) -> Result<bool> {
     if !path.exists() {
         return Ok(true);
     }
-    let last = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .and_then(|db| last_capture(&db));
+    let last = read_catalog(&path).and_then(|db| last_capture(&db));
     Ok(match last {
         Ok(last) => now() - last.unwrap_or(0) >= INTERVAL_MS,
         Err(_) => true,
@@ -399,7 +433,7 @@ fn catalog_state(root: &DataRoot) -> Result<Option<serde_json::Value>> {
     }
 }
 fn catalog_status(path: &Path, blobs: &Path) -> Result<serde_json::Value> {
-    let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let db = read_catalog(path)?;
     let (versions, files, size): (u64, u64, u64) = db.query_row(
         "SELECT count(*),count(DISTINCT path),coalesce(sum(size),0) FROM versions",
         [],
@@ -453,18 +487,23 @@ fn damaged_chunks(db: &Connection, blobs: &Path) -> Result<HashSet<String>> {
         let now = referenced(db)?;
         damaged.retain(|sha| now.contains(sha));
     }
+    damaged.extend(recorded_chunks(db)?);
+    Ok(damaged)
+}
+/// The chunks the last capture or deep check recorded as damaged.
+fn recorded_chunks(db: &Connection) -> Result<HashSet<String>> {
     let recorded: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='damaged')",
         [],
         |r| r.get(0),
     )?;
-    if recorded {
-        let mut stmt = db.prepare("SELECT sha FROM damaged")?;
-        for sha in stmt.query_map([], |r| r.get::<_, String>(0))? {
-            damaged.insert(sha?);
-        }
+    if !recorded {
+        return Ok(HashSet::new());
     }
-    Ok(damaged)
+    Ok(db
+        .prepare("SELECT sha FROM damaged")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
 }
 
 #[cfg(test)]

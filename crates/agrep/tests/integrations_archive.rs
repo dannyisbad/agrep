@@ -672,6 +672,31 @@ fn restore_to_the_current_directory_prints_a_plain_path() {
     );
     assert_eq!(fs::read(printed).unwrap(), b"{}\n");
 }
+/// A relative destination may climb out of the working directory: its `..` is the user's
+/// own step, resolved before the check that keeps archived paths below the destination.
+#[test]
+fn restore_to_a_destination_above_the_working_directory() {
+    let f = Fixture::new();
+    let p = f.source("rollout-climb.jsonl", b"{}\n");
+    f.ok(&["archive"]);
+    let sub = f.home.join("work").join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    let out = f
+        .command(&["restore", "rollout-climb", "--to", "../rto/x"])
+        .current_dir(&sub)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(!stdout.contains(".."), "{stdout}");
+    let restored = f
+        .home
+        .join("work")
+        .join("rto")
+        .join("x")
+        .join(p.strip_prefix(&f.home).unwrap());
+    assert_eq!(fs::read(restored).unwrap(), b"{}\n");
+}
 #[test]
 fn archive_sqlite_wal_backup_force_restore_waits_for_writer() {
     let f = Fixture::new();
@@ -780,6 +805,61 @@ fn archive_status_counts_blobs_removed_under_it_as_gone() {
     let after = archive::status(&f.root()).unwrap();
     assert_eq!(after["stored_bytes"], 0);
     assert_eq!(after["versions"], before["versions"]);
+}
+/// Reading the archive leaves its folder as the capture left it: a WAL catalog opened only
+/// to read must not leave its write-ahead log and shared-memory files behind.
+#[test]
+fn reading_the_archive_leaves_no_catalog_files_behind() {
+    let f = Fixture::new();
+    f.source("rollout-read.jsonl", &transcript_text("read"));
+    f.ok(&["archive"]);
+    let leftovers = || -> Vec<String> {
+        fs::read_dir(f.data.join("archive"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("catalog.db-"))
+            .collect()
+    };
+    assert_eq!(leftovers(), Vec::<String>::new(), "after the capture");
+    for args in [
+        &["status"][..],
+        &["status", "--json"],
+        &["archive", "--status"],
+        &["doctor"],
+    ] {
+        f.ok(args);
+        assert_eq!(leftovers(), Vec::<String>::new(), "after {args:?}");
+    }
+}
+/// In a data directory this user may not write, agrep answers read-only: status reads a
+/// settled archive catalog instead of calling it unreadable.
+#[cfg(unix)]
+#[test]
+fn status_reads_the_archive_of_an_unwritable_data_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    f.source("rollout-locked.jsonl", &transcript_text("locked"));
+    f.ok(&["archive"]);
+    let mode = |path: &Path, bits| fs::set_permissions(path, fs::Permissions::from_mode(bits));
+    let dirs = [f.data.clone(), f.data.join("archive")];
+    for d in &dirs {
+        mode(d, 0o555).unwrap();
+    }
+    let status = f.cmd(&["status", "--json"]);
+    for d in &dirs {
+        mode(d, 0o755).unwrap();
+    }
+    let json: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert!(
+        json["archive"]["catalog_error"].is_null(),
+        "{}",
+        json["archive"]
+    );
+    assert!(
+        json["archive"]["present"].as_bool().unwrap(),
+        "{}",
+        json["archive"]
+    );
 }
 #[test]
 fn source_links_are_skipped_restore_is_strict_and_instruction_links_work() {
@@ -1162,7 +1242,7 @@ fn capture_re_stores_damaged_chunks_of_unchanged_files() {
     );
     assert_eq!(
         err,
-        "archive: re-stored 1 damaged chunk(s) of rollout-kept.jsonl\n"
+        format!("archive: re-stored 1 damaged chunk(s) of {}\n", p.display())
     );
     assert!(blob.is_file());
     corrupt_in_place(blob);
@@ -1232,6 +1312,20 @@ fn lost_chunks_are_reported_as_archive_damage() {
     assert!(
         out.contains("\narchive: failed - 2 archived version(s) of 2 file(s) cannot be restored: their stored chunks are missing or corrupt - `agrep archive` re-stores those that live files still hold\n"),
         "{out}"
+    );
+    let (out, _) = text(&f.ok(&["status"]));
+    assert!(
+        out.contains("\narchive: off; 2 archived version(s) of 2 file(s) cannot be restored: their stored chunks are missing or corrupt - `agrep archive` re-stores those that live files still hold\n"),
+        "{out}"
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&f.ok(&["status", "--json"]).stdout).unwrap();
+    assert_eq!(
+        (
+            &json["archive"]["damaged_versions"],
+            &json["archive"]["damaged_files"]
+        ),
+        (&2.into(), &2.into())
     );
 }
 
@@ -1310,6 +1404,11 @@ fn doctor_deep_finds_chunks_corrupted_in_place() {
         out.contains("archive damaged: 3 version(s) of 3 file(s) cannot be restored"),
         "{out}"
     );
+    let damaged = |versions: usize| {
+        format!("\narchive: off; {versions} archived version(s) of {versions} file(s) cannot be restored: their stored chunks are missing or corrupt - `agrep archive` re-stores those that live files still hold\n")
+    };
+    let (out, _) = text(&f.ok(&["status"]));
+    assert!(out.contains(&damaged(3)), "{out}");
     let (out, _) = text(&f.cmd(&["archive"]));
     assert!(out.contains(", 2 damaged chunk(s) re-stored in "), "{out}");
     let (out, _) = text(&f.ok(&deep));
@@ -1319,6 +1418,8 @@ fn doctor_deep_finds_chunks_corrupted_in_place() {
         out.contains("\narchive: failed - 1 archived version(s) of 1 file(s) cannot be restored: "),
         "{out}"
     );
+    let (out, _) = text(&f.ok(&["status"]));
+    assert!(out.contains(&damaged(1)), "{out}");
     fs::remove_file(&kept).unwrap();
     f.ok(&["restore", "kept"]);
     assert_eq!(fs::read(&kept).unwrap(), transcript_text("kept"));
@@ -1417,15 +1518,16 @@ fn a_failed_scheduled_capture_backs_off() {
     assert!(!archive::due(&f.root()).unwrap());
     let (out, err) = text(&f.ok(&["__work"]));
     assert_eq!((out.as_str(), err.as_str()), ("", ""));
+    let catalog = native(&f.data.join("archive/catalog.db"));
     let (out, _) = text(&f.cmd(&["status"]));
     assert!(
-        out.contains(
-            "\narchive: enabled; the last 1 capture pass(es) failed - `agrep doctor` explains\n"
-        ),
+        out.contains(&format!(
+            "\narchive: enabled; the last 1 capture pass(es) failed - `agrep doctor` explains\narchive catalog is damaged: {} (file is not a database); `agrep archive --purge --yes` deletes the archive and the next capture starts a new one\n",
+            catalog.display()
+        )),
         "{out}"
     );
     let (out, _) = text(&f.cmd(&["doctor"]));
-    let catalog = native(&f.data.join("archive/catalog.db"));
     assert!(
         out.starts_with("doctor: action needed\n")
             && out.contains(&format!(

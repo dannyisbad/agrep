@@ -53,6 +53,53 @@ mod handle_tests {
     }
 }
 #[cfg(test)]
+mod repeated_call_tests {
+    use super::*;
+    /// Parallel calls `b` and `a` share their session, turn, time and text. Each page names
+    /// the repeat `b` by a selector of its own; a page ranked again reads only rows the
+    /// pages before it lacked.
+    #[test]
+    fn a_page_ranked_again_reads_only_its_new_rows() {
+        let c = Connection::open_in_memory().unwrap();
+        store::schema(&c).unwrap();
+        c.execute_batch("INSERT INTO event_sessions VALUES(1,'pi','s')")
+            .unwrap();
+        for (id, call) in [(1, "b"), (2, "a")] {
+            c.execute("INSERT INTO event_rows(id,tool_id,source,session_key,call_id,kind_key,name_key,ts,native_turn,position,input_chars,output_chars,output_bytes,child_session,meta,state,project_key,blob) VALUES(?1,?1,1,1,?2,0,0,5,0,0,0,0,0,'','','',0,10)", rusqlite::params![id, call]).unwrap();
+        }
+        let hit = |id| {
+            let event = crate::handles::event_id("s", 5, "same");
+            Hit {
+                rowid: id,
+                session: "s".into(),
+                who: "tool".into(),
+                ts: 5,
+                text: "same".into(),
+                handle: row_handle("s", 0, "same", None, Some(&event)).unwrap(),
+                event: Some(event),
+                ..Hit::default()
+            }
+        };
+        let repeat = crate::handles::repeat_event_id("s", 5, "same", "b");
+        let repeat_handle = row_handle("s", 0, "same", None, Some(&repeat)).unwrap();
+        let mut checked = HashMap::new();
+        let mut page = vec![hit(2)];
+        name_repeated_calls(&c, &mut page, &mut checked).unwrap();
+        assert_eq!(page[0].handle, hit(2).handle);
+        let mut deeper = vec![hit(2), hit(1)];
+        name_repeated_calls(&c, &mut deeper, &mut checked).unwrap();
+        assert_eq!(deeper[0].handle, hit(2).handle);
+        assert_eq!(deeper[1].event.as_deref(), Some(repeat.as_str()));
+        assert_eq!(deeper[1].handle, repeat_handle);
+        // Without the index every read fails.
+        c.execute_batch("DROP INDEX event_position").unwrap();
+        let mut again = vec![hit(1), hit(2)];
+        name_repeated_calls(&c, &mut again, &mut checked).unwrap();
+        assert_eq!(again[0].handle, repeat_handle);
+        assert_eq!(again[1].handle, hit(2).handle);
+    }
+}
+#[cfg(test)]
 mod window_tests {
     use super::*;
     fn evaluate(pattern: &str, text: &str, phase: u8, partial: bool) -> Scored {
@@ -115,12 +162,69 @@ mod window_tests {
 #[cfg(test)]
 mod regex_bound_tests {
     use super::*;
+    fn groups(groups: &[&[&str]], single: bool) -> Vec<(Vec<String>, bool)> {
+        groups
+            .iter()
+            .map(|g| (g.iter().map(|s| s.to_string()).collect(), single))
+            .collect()
+    }
     #[test]
     fn required_literals_come_from_both_ends() {
-        assert_eq!(literal_terms("Release.*workflow"), ["release", "workflow"]);
-        assert_eq!(literal_terms("release"), ["release"]);
-        assert!(literal_terms("release|workflow").is_empty());
+        assert_eq!(
+            literal_terms("Release.*workflow"),
+            groups(&[&["release"], &["workflow"]], true)
+        );
+        assert_eq!(literal_terms("release"), groups(&[&["release"]], true));
         assert!(literal_terms("(?<=a)b").is_empty());
+    }
+    #[test]
+    fn alternations_require_literal_sets() {
+        assert_eq!(
+            literal_terms("release|workflow"),
+            groups(&[&["release", "workflow"]], false)
+        );
+        // A spelling holding another adds nothing to its set.
+        assert_eq!(
+            literal_terms("work(tree|flow)s?"),
+            groups(&[&["workflow", "worktree"]], false)
+        );
+        assert_eq!(
+            literal_terms("colou?r"),
+            groups(&[&["color", "colour"]], false)
+        );
+        assert_eq!(literal_terms("(foo)?bar"), groups(&[&["bar"]], false));
+        // Case variants fold to one spelling, still from several literals.
+        assert_eq!(literal_terms("(?i)ab"), groups(&[&["ab"]], false));
+        assert!(literal_terms("a?").is_empty());
+        let many: Vec<String> = (0..65).map(|i| format!("w{i:02}x")).collect();
+        assert!(literal_terms(&many.join("|")).is_empty());
+    }
+    // The extractor keeps 100 bytes of a literal, cutting this 141-byte sentence inside a
+    // character; a literal holding the cut character's remains admitted no row.
+    #[test]
+    fn literals_cut_by_the_extractor_keep_whole_characters() {
+        let sentence = "吾輩は猫である。名前はまだ無い。どこで生れたかとんと見当がつかぬ。何でも薄暗いじめじめした所で";
+        for text in [
+            sentence.to_owned(),
+            format!("a{}b", "É".repeat(60)),
+            format!("a{}b", "🚀".repeat(30)),
+        ] {
+            let folded = store::search_fold(&text);
+            let found = literal_terms(&text);
+            assert_eq!(found.len(), 2, "{text}");
+            let (prefix, suffix) = (&found[0].0[0], &found[1].0[0]);
+            assert!(found
+                .iter()
+                .all(|(group, single)| group.len() == 1 && *single));
+            assert!(
+                folded.starts_with(prefix.as_str()) && prefix.len() > 96,
+                "{prefix}"
+            );
+            assert!(
+                folded.ends_with(suffix.as_str()) && suffix.len() > 96,
+                "{suffix}"
+            );
+        }
     }
     #[test]
     fn only_a_greedy_dot_run_after_a_nonempty_part_matches_once() {
@@ -450,6 +554,99 @@ mod matcher_cache_tests {
         matcher.plan_anchors = true;
         matcher.order_for(&c, "tools", &mut cache).unwrap();
         assert_eq!(matcher.fts(None).as_deref(), Some("(\"zzq\")"));
+    }
+    fn explicit_matcher(c: &Connection, pattern: &str, word: bool) -> (Matcher, PlanCache) {
+        let o = Options {
+            pattern: pattern.into(),
+            regex: !word,
+            word,
+            sort: "score".into(),
+            limit: 40,
+            exact: false,
+            count_only: false,
+            count_by_tier: false,
+            content: false,
+            chats: false,
+            tools: true,
+            filters: Filters::default(),
+        };
+        let mut cache = PlanCache::default();
+        let matcher = cache.matcher(&o, c).unwrap();
+        (matcher, cache)
+    }
+    // A `-w` match has no word character beside it, so plans that may skip rows read only
+    // the words where the term can stand alone; a page reads every word holding it.
+    #[test]
+    fn word_plans_read_only_words_where_the_term_stands_alone() {
+        let c = Connection::open_in_memory().unwrap();
+        store::schema(&c).unwrap();
+        let blocks = crate::tool_index::encode_blocks(&[0]);
+        for term in [
+            "work",
+            "homework",
+            "worktree",
+            "work2",
+            "éwork",
+            "work日本",
+            "workwork",
+        ] {
+            c.execute(
+                "INSERT INTO tool_words(term,doc,blocks) VALUES(?1,200,?2)",
+                rusqlite::params![term, blocks],
+            )
+            .unwrap();
+        }
+        let (mut matcher, mut cache) = explicit_matcher(&c, "Work", true);
+        matcher.order_for(&c, "tools", &mut cache).unwrap();
+        assert_eq!(
+            matcher.tool_fts(None, false).as_deref(),
+            Some("(\"homework\" OR \"work\" OR \"work2\" OR \"worktree\" OR \"workwork\" OR \"work日本\" OR \"éwork\")")
+        );
+        assert_eq!(
+            matcher.tool_fts(None, true).as_deref(),
+            Some("(\"work\" OR \"work日本\" OR \"éwork\")")
+        );
+        // Where no word lets the term stand alone, such plans read nothing.
+        let (mut matcher, mut cache) = explicit_matcher(&c, "ork", true);
+        matcher.plan_anchors = true;
+        matcher.order_for(&c, "tools", &mut cache).unwrap();
+        assert_eq!(matcher.estimated, 0);
+    }
+    // An alternation's literal set narrows plans that may skip rows; a page's reads, bounds
+    // and estimate keep to the single literals.
+    #[test]
+    fn literal_sets_narrow_only_plans_that_may_skip_rows() {
+        let c = Connection::open_in_memory().unwrap();
+        store::schema(&c).unwrap();
+        let blocks = crate::tool_index::encode_blocks(&[0]);
+        for term in ["worktree", "workflows", "release"] {
+            c.execute(
+                "INSERT INTO tool_words(term,doc,blocks) VALUES(?1,200,?2)",
+                rusqlite::params![term, blocks],
+            )
+            .unwrap();
+        }
+        let (mut matcher, mut cache) = explicit_matcher(&c, "release.*work(tree|flow)s?", false);
+        matcher.order_for(&c, "tools", &mut cache).unwrap();
+        assert_eq!(
+            matcher.tool_fts(None, false).as_deref(),
+            Some("(\"release\")")
+        );
+        assert_eq!(
+            matcher.tool_fts(None, true).as_deref(),
+            Some("(\"release\") AND (\"workflows\" OR \"worktree\")")
+        );
+        assert_eq!(matcher.bound_grams().len(), 1);
+        matcher.order_for(&c, "prose", &mut cache).unwrap();
+        assert_eq!(
+            matcher.prose_fts("").as_deref(),
+            Some("text : ((\"release\"))")
+        );
+        matcher.plan_anchors = true;
+        assert_eq!(
+            matcher.prose_fts("").as_deref(),
+            Some("text : ((\"release\") AND (\"workflow\" OR \"worktree\"))")
+        );
     }
     #[test]
     fn common_tool_questions_prefer_consecutive_literal_anchors() {

@@ -29,6 +29,10 @@ impl Home {
         fs::write(path, body).unwrap();
     }
     fn run(&self, args: &[&str]) -> Output {
+        self.run_in("compact", args)
+    }
+    /// A run under `AGREP_PROFILE=profile`, its stdout a pipe.
+    fn run_in(&self, profile: &str, args: &[&str]) -> Output {
         std::process::Command::new(support::binary())
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
@@ -37,7 +41,7 @@ impl Home {
             .env("AGREP_DATA_DIR", &self.d)
             .env("AGREP_MODEL_DIR", self.h.join("no-model"))
             .env("AGREP_CALLER_PUBLICATION_DIR", self.h.join("empty-callers"))
-            .env("AGREP_PROFILE", "compact")
+            .env("AGREP_PROFILE", profile)
             .args(args)
             .output()
             .unwrap()
@@ -316,16 +320,124 @@ fn pi_fork_copies_of_a_turn_fold_into_one_keyword_row() {
     assert_eq!(classic.matches("overfit\x1b").count(), 2, "{classic}");
     assert!(classic.contains(" also in 2 forks"), "{classic}");
 
-    // Flat rows keep a row per chat, the copies in place; `-l` and `-c` keep every chat.
-    let flat: Vec<String> = stdout(&["overfit", "--flat"])
+    // A flat row counts the copies it stands for; `-l` and `-c` keep every chat.
+    let flat = stdout(&["overfit", "--flat"]);
+    let rows: Vec<&str> = flat
         .lines()
-        .map(|l| l.split('\t').next().unwrap().to_owned())
+        .map(|l| l.split('\t').next().unwrap())
         .collect();
-    assert_eq!(flat, [PI_FORKS[1], PI_FORKS[0], PI_ROOT, PI_OLDER]);
+    assert_eq!(rows, [PI_FORKS[1], PI_OLDER], "{flat}");
+    assert!(
+        flat.lines().next().unwrap().ends_with(" (also in 2 forks)"),
+        "{flat}"
+    );
     assert_eq!(stdout(&["overfit", "-c"]), "4\n");
     let chats = stdout(&["overfit", "-l"]);
     for session in [PI_ROOT, PI_FORKS[0], PI_FORKS[1], PI_OLDER] {
         assert!(chats.contains(&session[..8]), "{chats}");
+    }
+}
+
+/// Four more older chats, each with its own turn about overfitting, the youngest first.
+fn pi_overfit_chats(home: &Home) -> Vec<String> {
+    (0..4)
+        .map(|i| {
+            let id = format!("0dd0001{i}-0000-7000-8000-00000000001{i}");
+            let day = 19 - i;
+            home.write(
+                &format!(".omp/agent/sessions/-work-chat/2026-08-{day}T10-00-00-000Z_{id}.jsonl"),
+                &[
+                    json!({"type":"session","version":3,"id":id,"timestamp":format!("2026-08-{day}T10:00:00.000Z"),"cwd":"/work/chat"}),
+                    json!({"type":"message","id":"u1","parentId":null,"timestamp":format!("2026-08-{day}T10:00:01.000Z"),"message":{"role":"user","model":"m","provider":"p","content":[{"type":"text","text":format!("chat {i} worried the model would overfit")}]}}),
+                ],
+            );
+            id
+        })
+        .collect()
+}
+
+/// `-n N` prints N rows in every output form, a row's fork copies counted on it rather
+/// than printed as rows, and the shared turn folds alike at every `-n`: at `-n 1` its
+/// copies rank below the page, which used to show it unfolded.
+#[test]
+fn every_form_prints_n_rows_and_folds_a_turn_alike_at_every_n() {
+    let home = Home::new();
+    pi_forks(&home);
+    pi_older(&home);
+    let chats = pi_overfit_chats(&home);
+    home.index();
+    let stdout = |profile: &str, args: &[&str]| {
+        let out = home.run_in(profile, args);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        text(&out.stdout)
+    };
+    for n in [1usize, 2, 5] {
+        let limit = n.to_string();
+        let expected: Vec<&str> = [PI_FORKS[1]]
+            .into_iter()
+            .chain(chats.iter().map(String::as_str))
+            .take(n)
+            .collect();
+
+        let lines: Vec<Value> = stdout("compact", &["overfit", "--json", "-n", &limit])
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let rows: Vec<&str> = lines[1..]
+            .iter()
+            .map(|r| r["session"].as_str().unwrap())
+            .collect();
+        assert_eq!(rows, expected, "-n {n}: {lines:?}");
+        let forks: Vec<&str> = lines[1]["forks"]
+            .as_array()
+            .unwrap_or_else(|| panic!("-n {n}: {lines:?}"))
+            .iter()
+            .map(|f| f["session"].as_str().unwrap())
+            .collect();
+        assert_eq!(forks, [PI_FORKS[0], PI_ROOT], "-n {n}");
+        assert!(lines[2..].iter().all(|r| r.get("forks").is_none()));
+        let completeness = &lines[0]["completeness"];
+        assert_eq!(completeness["shown"], n + 2, "-n {n}: {completeness}");
+        assert!(
+            completeness["total"].as_u64().unwrap() >= n as u64 + 2,
+            "-n {n}: {completeness}"
+        );
+
+        // Piped outside an agent profile, and `--flat` inside one, print TSV rows.
+        for (profile, args) in [
+            ("classic", vec!["overfit", "-n", &limit]),
+            ("compact", vec!["overfit", "--flat", "-n", &limit]),
+        ] {
+            let flat = stdout(profile, &args);
+            let rows: Vec<&str> = flat
+                .lines()
+                .map(|l| l.split('\t').next().unwrap())
+                .collect();
+            assert_eq!(rows, expected, "-n {n} {args:?}: {flat}");
+            assert!(
+                flat.lines().next().unwrap().ends_with(" (also in 2 forks)"),
+                "-n {n} {args:?}: {flat}"
+            );
+            assert_eq!(flat.matches("also in").count(), 1, "{flat}");
+        }
+
+        // The terminal page: one turn line per row, the folded one marked.
+        let classic = stdout("classic", &["overfit", "--color=always", "-n", &limit]);
+        let turns = classic
+            .lines()
+            .filter(|l| l.starts_with("  \x1b[33m"))
+            .count();
+        assert_eq!(turns, n, "-n {n}: {classic}");
+        assert_eq!(classic.matches(" also in 2 forks").count(), 1, "{classic}");
+
+        let compact = stdout("compact", &["overfit", "-n", &limit]);
+        assert_eq!(compact.lines().count(), n, "-n {n}: {compact}");
+        let first = compact.lines().next().unwrap();
+        assert!(
+            first.contains(&format!("@{}:", &PI_FORKS[1][..8]))
+                && first.contains("(also in 2 forks)"),
+            "-n {n}: {compact}"
+        );
     }
 }
 

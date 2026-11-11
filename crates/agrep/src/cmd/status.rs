@@ -1,4 +1,4 @@
-use agrep_core::{data::DataRoot, diagnostics, render, store};
+use agrep_core::{archive, data::DataRoot, diagnostics, render, store};
 use anyhow::Result;
 pub fn run(json: bool, no_auto: bool) -> Result<i32> {
     let root = DataRoot::discover()?;
@@ -18,10 +18,7 @@ pub fn run(json: bool, no_auto: bool) -> Result<i32> {
     if root.db().exists() {
         s["freshness"] = render::freshness(render::checked(no_auto));
     }
-    let failing = agrep_core::archive::failing_captures(&root);
-    if failing > 0 {
-        s["archive"]["failing_captures"] = failing.into();
-    }
+    archive_health(&root, &mut s);
     if json {
         agrep_core::outln!("{}", agrep_core::json_output::to_string(&s)?)?
     } else {
@@ -97,19 +94,27 @@ pub fn run(json: bool, no_auto: bool) -> Result<i32> {
                 item["path"].as_str().unwrap_or("")
             )?;
         }
-        let failing = if failing > 0 {
-            format!("; the last {failing} capture pass(es) failed - `agrep doctor` explains")
-        } else {
-            String::new()
+        let failing = match s["archive"]["failing_captures"].as_u64() {
+            Some(failing) => {
+                format!("; the last {failing} capture pass(es) failed - `agrep doctor` explains")
+            }
+            None => String::new(),
+        };
+        let damaged = match archive::damage_problem(&s["archive"]) {
+            Some(p) => format!("; {} - {}", p.detail, p.action.unwrap_or_default()),
+            None => String::new(),
         };
         agrep_core::outln!(
-            "archive: {}{failing}",
+            "archive: {}{failing}{damaged}",
             if s["archive"]["enabled"] == true {
                 "enabled"
             } else {
                 "off"
             }
         )?;
+        if let Some(error) = s["archive"]["catalog_error"].as_str() {
+            agrep_core::outln!("{}", render::safe(error))?;
+        }
     }
     Ok(
         if s["format"] == "unsupported"
@@ -125,6 +130,29 @@ pub fn run(json: bool, no_auto: bool) -> Result<i32> {
 
 fn count(v: &serde_json::Value) -> String {
     agrep_core::surface::number(v.as_u64().unwrap_or(0) as usize)
+}
+
+/// The archive's failing capture passes and the damage its last capture or deep check
+/// recorded, which a damaged catalog leaves unknown.
+fn archive_health(root: &DataRoot, s: &mut serde_json::Value) {
+    let failing = archive::failing_captures(root);
+    if failing > 0 {
+        s["archive"]["failing_captures"] = failing.into();
+    }
+    match archive::recorded_damage(root) {
+        Ok((0, _)) => {}
+        Ok((versions, files)) => {
+            s["archive"]["damaged_versions"] = versions.into();
+            s["archive"]["damaged_files"] = files.into();
+        }
+        Err(e) if e.is::<archive::CatalogDamaged>() => {
+            s["archive"]["catalog_error"] = e.to_string().into();
+        }
+        Err(e) => {
+            s["archive"]["catalog_error"] =
+                format!("archive catalog unreadable: {e:#} - `agrep doctor` explains").into();
+        }
+    }
 }
 
 /// The meaning model's and index's lines.

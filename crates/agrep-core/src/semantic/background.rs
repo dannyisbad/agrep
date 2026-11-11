@@ -73,8 +73,71 @@ pub struct Drain {
     pub background: bool,
     /// The most queued rows this drain embeds, newest first (`reindex --max-new`).
     pub limit: Option<usize>,
-    /// Rewrites a line on stderr with the rows covered, the rate and the time left.
-    pub progress: bool,
+    /// How it shows the rows covered, the rate and the time left on stderr.
+    pub progress: Progress,
+}
+
+/// How a drain shows its progress on stderr.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Progress {
+    #[default]
+    Hidden,
+    /// One line, rewritten as batches finish: for a terminal.
+    Rewritten,
+    /// A line every 30 seconds at most: for a pipe or a log, which would otherwise hear
+    /// nothing until a long drain ends.
+    Periodic,
+}
+impl Progress {
+    /// The form that suits this process's stderr.
+    pub fn for_stderr() -> Self {
+        use std::io::IsTerminal;
+        if std::io::stderr().is_terminal() {
+            Self::Rewritten
+        } else {
+            Self::Periodic
+        }
+    }
+}
+
+/// When a drain shows its progress, and the text that shows it.
+pub(super) struct Meter {
+    form: Progress,
+    started: Instant,
+    shown: Option<Instant>,
+}
+impl Meter {
+    pub(super) fn new(form: Progress, started: Instant) -> Self {
+        Self {
+            form,
+            started,
+            shown: None,
+        }
+    }
+    /// The text that shows `line` at `now`, when it is due: a rewritten line at once and
+    /// then every [`SHOW_EVERY`], a periodic one [`LINE_EVERY`] after the start or the last.
+    pub(super) fn show(&mut self, now: Instant, line: impl FnOnce() -> String) -> Option<String> {
+        let due = match self.form {
+            Progress::Hidden => false,
+            Progress::Rewritten => self.shown.is_none_or(|at| now - at >= SHOW_EVERY),
+            Progress::Periodic => now - self.shown.unwrap_or(self.started) >= LINE_EVERY,
+        };
+        due.then(|| {
+            self.shown = Some(now);
+            self.render(&line(), "")
+        })
+    }
+    /// The text that shows the final `line`, once any was shown, ended by a newline.
+    pub(super) fn finish(&self, line: impl FnOnce() -> String) -> Option<String> {
+        self.shown.map(|_| self.render(&line(), "\n"))
+    }
+    fn render(&self, line: &str, end: &str) -> String {
+        match self.form {
+            // Erases what is left of a longer earlier line.
+            Progress::Rewritten => format!("\r{line}\x1b[K{end}"),
+            Progress::Hidden | Progress::Periodic => format!("{line}\n"),
+        }
+    }
 }
 
 /// Rows covered per second of wall time over about the last minute. Rows whose text is
@@ -159,7 +222,7 @@ pub(super) fn drain_with(
     let mut mark = Instant::now();
     let mut loaded = false;
     let mut recorded: Option<Instant> = None;
-    let mut shown: Option<Instant> = None;
+    let mut meter = Meter::new(how.progress, mark);
     let stopped = loop {
         if !how.explicit && root.config()?.embeddings == "off" {
             break false;
@@ -217,30 +280,29 @@ pub(super) fn drain_with(
                 )?;
             }
         }
-        if how.progress && shown.is_none_or(|at| now - at >= SHOW_EVERY) {
-            shown = Some(now);
-            show_progress(&coverage, left, rate.per_second());
+        if let Some(text) = meter.show(now, || drain_line(&coverage, left, rate.per_second())) {
+            crate::surface::note(format_args!("{text}"));
         }
         std::thread::yield_now();
     };
-    if how.progress && shown.is_some() {
-        show_progress(&coverage, left, rate.per_second());
-        crate::surface::note(format_args!("\n"));
+    if let Some(text) = meter.finish(|| drain_line(&coverage, left, rate.per_second())) {
+        crate::surface::note(format_args!("{text}"));
     }
     Ok(stopped)
 }
 
 const RECORD_EVERY: Duration = Duration::from_secs(5);
 const SHOW_EVERY: Duration = Duration::from_millis(250);
+const LINE_EVERY: Duration = Duration::from_secs(30);
 
-fn show_progress(coverage: &semantic_store::Coverage, limit: Option<usize>, rate: Option<f64>) {
+fn drain_line(
+    coverage: &semantic_store::Coverage,
+    limit: Option<usize>,
+    rate: Option<f64>,
+) -> String {
     let pending = coverage.total.saturating_sub(coverage.embedded);
     let left = limit.map_or(pending, |n| n.min(pending));
-    // Erases what is left of a longer earlier line.
-    crate::surface::note(format_args!(
-        "\r{}\x1b[K",
-        progress_line(coverage.embedded, coverage.total, left, rate)
-    ));
+    progress_line(coverage.embedded, coverage.total, left, rate)
 }
 
 fn post_index_pending(root: &DataRoot) -> Result<bool> {

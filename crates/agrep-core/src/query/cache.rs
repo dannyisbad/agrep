@@ -161,6 +161,76 @@ impl PlanCache {
         }
         Ok(self.words[term].clone())
     }
+    /// The words of `term`'s expansion holding an occurrence of it with no ASCII letter,
+    /// digit or `_` beside it inside the word. A `-w` match has no word character beside
+    /// it, and a folded neighbour is an ASCII word character only where the original one
+    /// is a word character, so every match lies in such a word.
+    pub(super) fn bounded_words(
+        &mut self,
+        c: &Connection,
+        term: &str,
+    ) -> Result<Option<std::sync::Arc<Expansion>>> {
+        if !self.bounded_words.contains_key(term) {
+            let word = |b: Option<&u8>| b.is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+            let bounded = self.words(c, term)?.map(|expansion| {
+                let kept = expansion
+                    .words
+                    .iter()
+                    .filter(|w| {
+                        let bytes = w.term.as_bytes();
+                        (0..bytes.len().saturating_sub(term.len()) + 1).any(|at| {
+                            bytes[at..].starts_with(term.as_bytes())
+                                && !word(at.checked_sub(1).and_then(|p| bytes.get(p)))
+                                && !word(bytes.get(at + term.len()))
+                        })
+                    })
+                    .map(|w| crate::tool_index::Word {
+                        term: w.term.clone(),
+                        doc: w.doc,
+                        blocks: w.blocks.clone(),
+                    })
+                    .collect();
+                std::sync::Arc::new(Expansion::new(kept))
+            });
+            self.bounded_words.insert(term.to_owned(), bounded);
+        }
+        Ok(self.bounded_words[term].clone())
+    }
+    /// The tool rows `tools_sym` admits for `expression`, by block, unless more than `cap`
+    /// do: past that, reading them costs more than the rows they spare.
+    pub(super) fn symbol_rows(
+        &mut self,
+        c: &Connection,
+        expression: &str,
+        cap: usize,
+    ) -> Result<Option<CandidateGroups>> {
+        match self.symbols.get(expression) {
+            Some((read, rows)) if rows.is_some() || cap < *read => {
+                return Ok(rows.clone().filter(|_| *read <= cap));
+            }
+            _ => {}
+        }
+        let mut by_block: HashMap<i64, Vec<i64>> = HashMap::new();
+        let mut read = 0usize;
+        let mut query = c.prepare_cached("SELECT rowid FROM tools_sym WHERE tools_sym MATCH ?")?;
+        let mut rows = query.query([expression])?;
+        while let Some(row) = rows.next()? {
+            read += 1;
+            if read > cap {
+                self.symbols.insert(expression.to_owned(), (read, None));
+                return Ok(None);
+            }
+            let id: i64 = row.get(0)?;
+            by_block.entry(id / BLOCK).or_default().push(id);
+        }
+        for ids in by_block.values_mut() {
+            ids.sort_unstable();
+        }
+        let rows = std::sync::Arc::new(by_block);
+        self.symbols
+            .insert(expression.to_owned(), (read, Some(rows.clone())));
+        Ok(Some(rows))
+    }
     /// Every indexed tool word containing `run`, a non-ASCII run unicode61 keeps whole as
     /// itself, and the run alone as a token when it is too short for the dictionary.
     pub(super) fn run_words(

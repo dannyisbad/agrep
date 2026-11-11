@@ -63,26 +63,38 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   subagent`, counts and `around` show them as before.
 - A message that several chats hold as copies (a pi or omp fork copies its parent's
   history, ids and times included) is one meaning row: the copy from the most recently
-  active chat, marked `also in N forks`, with the other copies under its JSON `forks` and
-  as their own rows in `--flat`. 0.4.9 folded rows only after the page was cut (and only
-  on its compact and grouped pages, as `×N-chats`), so on the owner's history three
-  copies of one turn took three of `-s -n 5`'s five rows and its JSON listed all three.
-  0.5 folds while it ranks, so the page fills with other answers, and it folds only
-  copies of one message (same speaker, text and time), not different chats that typed
-  the same words. `-l` still lists every chat and `-c` counts every chat.
+  active chat, marked `also in N forks`, with the other copies under its JSON `forks`.
+  0.4.9 folded rows only after the page was cut (and only on its compact and grouped
+  pages, as `×N-chats`), so on the owner's history three copies of one turn took three
+  of `-s -n 5`'s five rows and its JSON listed all three. 0.5 folds while it ranks, so
+  the page fills with other answers, and it folds only copies of one message (same
+  speaker, text and time), not different chats that typed the same words. `-l` still
+  lists every chat and `-c` counts every chat.
 - Keyword pages fold fork copies by the same rule: a message several chats hold as
   copies (same agent, speaker, text and time) is one row at its best copy's rank, shown
   from the most recently active chat and marked `also in N forks` (`(also in N forks)`
-  on a compact row); its JSON row lists the other copies under `forks` and `--flat`
-  prints them right after it. The copies take no row, so the page ranks deeper to fill
-  `-n`, and on keyword and meaning pages alike `shown` and `showing N of M` count them,
-  so a page whose copies it stands for is not cut. 0.4.9 folded keyword rows only on
-  its compact and grouped pages (`×N-chats`, `×N chats`), keeping the best-ranked copy,
-  while `--json` and `--flat` listed every copy at its own rank; it also folded rows of
-  different chats with the same speaker and words (one prompt sent to many subagents)
-  and near-identical successful tool rows of one conversation lineage. 0.5 folds only
-  copies of one message, in every page form, so keyword and meaning pages agree. `-l`
-  lists every chat and `-c` counts every row, as in 0.4.9.
+  on a compact row); its JSON row lists the other copies under `forks`. A copy differs
+  from its row only in its chat, so it can rank just below the last row a page ranked;
+  such copies are looked up directly, and a row folds the same way, with the same
+  marker, at every `-n`. On keyword and meaning pages alike `shown` and `showing N of M`
+  count the copies, so a page whose copies it stands for is not cut. 0.4.9 folded
+  keyword rows only on its compact and grouped pages (`×N-chats`, `×N chats`), keeping
+  the best-ranked copy, while `--json` and `--flat` listed every copy at its own rank;
+  it also folded rows of different chats with the same speaker and words (one prompt
+  sent to many subagents) and near-identical successful tool rows of one conversation
+  lineage. 0.5 folds only copies of one message, in every page form, so keyword and
+  meaning pages agree. `-l` lists every chat and `-c` counts every row, as in 0.4.9.
+- `-n N` prints N result rows in every output form, and the copies a row stands for
+  take none of them. A `--flat` (or piped) row that stands for copies ends its snippet
+  with `(also in N forks)`, as the terminal row says `also in N forks`; `--json` lists
+  the copies under `forks`. 0.4.9 printed each copy as a `--flat` and `--json` row of
+  its own, so copies used up `-n` and a pipe got fewer answers.
+- On an agent's compact page, `-n N` below 40 shows the first N rows of the `-n 40` page,
+  meaning rows included: such a search ranks the 40 keyword rows (and automatic meaning
+  rows) the page without `-n` ranks, merges and orders them as that page does, and `-n`
+  cuts the result, so each page up to `-n 40` is the first rows of every larger one. 0.4.9
+  ranked, merged and ordered only the rows `-n` fetched, so a larger `-n` could reorder a
+  page and drop one of its rows. `-n 40` and above rank as before.
 - `--chat` on a Codex fork child also searches its parent's rows up to the fork. The
   child's rollout starts by replaying the parent's history, which is indexed once, under
   the parent; 0.4.9 searched only the child's own rows, so `-c --chat <child>` answered
@@ -121,6 +133,11 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
 - Digestless `@session:turn` handles are refused as malformed (exit 2) where 0.4.9 served
   them by position with a warning: 0.5 drops compatibility parsers, and
   `around SESSION TURN` navigates by position.
+- Tool calls of one turn that share their time and text each get a handle of their own,
+  where 0.4.9 gave them one handle that `around` served with every such call. Parallel
+  calls whose recorded input and output match are such calls, say two reads that differ
+  only past the characters ingest keeps. The first by call id keeps 0.4.9's handle, and
+  each other one's event selector also hashes its call id; every other handle is 0.4.9's.
 - A total the ranked scan stopped short of is a floor (`showing 40 of 118+ matching rows
   (a floor, not the total; -c counts exactly)`, compact `118+ matches (floor; -c exact)`,
   JSON `total_basis: "floor"` with `tool_rows_basis: "unknown"` instead of `tool_rows`)
@@ -142,6 +159,15 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   error at position 1: Opening parenthesis without closing parenthesis`, also the JSON
   record's `reason`) where 0.4.9 quoted Python's `re` (`missing ), unterminated subpattern
   at position 0`): 0.5 has no Python.
+- `-E` and `-w` find the rows 0.4.9 found but use the index differently. 0.4.9 narrowed
+  an `-E` expression by a run of three or more plain ASCII characters outside its groups
+  (`work` in `work(tree|flow)s?`) and read every row when it had none. 0.5 narrows by the
+  literals every match begins and ends with, in any script, taking an end's alternatives
+  together, up to 64 of them (`worktree` or `workflow`). The regex parser keeps only 100
+  bytes of a literal, and 0.5 keeps the whole characters of those: an early 0.5 build cut
+  a character in two there and so found nothing for `-E` with a long Japanese sentence.
+  `-w` reads only the indexed words in which the term can stand alone (`work`, not
+  `homework` or `worktree`), where 0.4.9 read every row holding the term.
 - A recall or pack handle that names no turn prints 0.5's handle message (`result handle
   is stale: turn 99 is outside chat turns 0-2; rerun the search for a current handle`),
   also the JSON record's `reason`, under 0.4.9's codes: 0.5 handles carry a content
@@ -212,8 +238,11 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   model's failed verification once and then leaves those files alone until they change.
 - A source that failed to read is listed with its cause alone (`source failed: PATH:
   permission denied`), and `index` and `reindex` end with one stderr line naming how many
-  failed, the first with its cause, and `agrep doctor` for the rest. 0.4.9's ingest printed
-  a `cannot read` line per file as it went; 0.5 collects the failures and reports them once.
+  failed, the first with its cause, and `agrep doctor` for the rest. A store folder that
+  cannot be listed is that source, named as the folder itself with its cause, by `index`,
+  `reindex` and `audit` alike, and `audit` goes on to count the rest of its store. 0.4.9's
+  ingest printed a `cannot read` line per file as it went; 0.5 collects the failures and
+  reports them once.
 - On a home where no supported agent keeps a store, `doctor` says so and names the agents it
   looked for. Its model row reads `present`, `not installed` (`agrep setup` installs it) or
   `failed`, and it checks an installed model even before the first index.
@@ -292,10 +321,17 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   build. So its stderr notice comes before the work, `rebuilding the search db (a rebuild
   can take a while on a large history) …`, where 0.4.9 printed `refreshing the search db …`
   after the ingest. Meaning vectors survive it: a row whose text was embedded before the
-  reindex is still covered after it, with or without a model or `embeddings` on.
+  reindex is still covered after it, with or without a model or `embeddings` on. A source
+  it cannot read keeps its last good rows and stays listed as failed, as after `index`,
+  with or without `--full`; 0.4.9's `reindex --full` published its rebuild without them.
+- A relative `AGREP_HOME`, `AGREP_DATA_DIR` or `AGREP_MODEL_DIR` is made absolute when
+  agrep starts, its links resolved, so a command run from another directory names every
+  source as the index does instead of indexing them all again; 0.4.9 resolved only the
+  data directory this way.
 - `index --semantic` and `reindex` show the embedding stage on a terminal's stderr as one
   rewritten line, `embedding messages: 1200 of 137768 rows · 150 rows/s · about 15m 11s
-  left`; 0.4.9's embed stage printed nothing until it finished. `status` says the time
+  left`, and on a stderr that is not a terminal write that line every 30 seconds; 0.4.9's
+  embed stage printed nothing until it finished. `status` says the time
   left the way `-s` does (`about 15m 19s left`), where 0.4.9 had no estimate; both divide
   the rows still to cover by the rate rows were covered at over the last minute of the
   build, rows whose text was already embedded included.
@@ -303,6 +339,17 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   double-encoded `Cwd` (a JSON string inside the JSON value), as 0.4.9's resume decoded it,
   where 0.4.9's index read the still-encoded text: one decoding serves both, so an escaped
   character such as `\u00e9` names the project as written.
+- 0.4.9 kept one trigram index of all text, tool output included, so every term of three
+  or more characters, symbols too, narrowed a search. 0.5 keeps trigrams for prose only
+  and indexes tool output by word, which keeps the index smaller and its build faster.
+  Beside the words it keeps a small index of the symbols in tool output: each character
+  that is no ASCII letter, digit or space (punctuation, emoji, other scripts), alone and
+  with its neighbour. A tool term that is no plain word (`C++`, `O(n log n)`, `::`, `🚀`)
+  reads only the rows holding all of its symbols, and finds the rows a full scan finds.
+  A term of one or two letters or digits (`a`, `go`) still reads every row, as in 0.4.9.
+  The symbol index makes this data format 9: an index an earlier 0.5 build made (format
+  8) is refused with one line naming `agrep reindex`, which rebuilds it in place and keeps
+  settings, archives and meaning vectors.
 - Codex rollouts that Codex has compressed (`rollout-*.jsonl.zst`) are indexed like plain
   ones, where 0.4.9 read only `rollout-*.jsonl` and so missed every compressed chat; on a
   long-used Codex install that is most of its history. While Codex compresses a chat both
@@ -385,26 +432,31 @@ entry gives its reason. Browse and diagnostics differences are in [BROWSE.md](BR
   them until a restore read them: a chunk whose file is missing, or changed since it was
   verified and no longer holds its content, is re-stored from a live file that still holds
   it, and versions no live file can repair are listed by that capture, `archive --status`
-  and `doctor`. A chunk file is fully re-read only when its file changed, so a pass costs one
-  `stat` per chunk. A restore that meets such a chunk says the archived copy is damaged,
-  naming the chunk, the archive directory and the remedy, where 0.4.9 gave the file system's
-  error for a missing chunk and `chunk … corrupt in archive store` for a corrupt one.
+  and `doctor`, and counted by `status`, which reads only the damage the last capture or
+  deep check recorded. A chunk file is fully re-read only when its file changed, so a pass
+  costs one `stat` per chunk. A restore that meets such a chunk says the archived copy is
+  damaged, naming the chunk, the archive directory and the remedy, where 0.4.9 gave the
+  file system's error for a missing chunk and `chunk … corrupt in archive store` for a
+  corrupt one.
 - `doctor --deep` decompresses and re-hashes every chunk the catalog references, where
   0.4.9's deep tier validated the archive manifest only: a chunk overwritten in place, which
   keeps its file's size and date and so passes a capture's `stat` check, is found too. It
   reports the damaged versions in two groups: those whose content a live file still holds,
   which `agrep archive` re-stores, and those no live file holds, which are lost, listed by
-  path. It records what it found in the catalog, so `archive --status` and `doctor` report
-  it from then on and the next capture re-reads those chunks; it writes nothing when it
-  finds no damage. Plain `doctor` and `archive --status` read no chunk.
-- An unreadable catalog is named, with `agrep archive --purge --yes` as its remedy, by every
-  archive command; the purge replaces it with an empty catalog and deletes every chunk, and
-  `--status` exits 2, as 0.4.9's did for an unreadable manifest.
+  path. It records what it found in the catalog, so `status`, `archive --status` and
+  `doctor` report it from then on and the next capture re-reads those chunks; it writes
+  nothing when it finds no damage. Plain `doctor` and `archive --status` read no chunk.
+- An unreadable catalog is named, with `agrep archive --purge --yes` as its remedy, by
+  `status` and every archive command; the purge replaces it with an empty catalog and
+  deletes every chunk, and `--status` exits 2, as 0.4.9's did for an unreadable manifest.
 - A forced restore into an existing SQLite file writes the archived contents into it through
   the backup API under SQLite's write lock, where 0.4.9 replaced the file and deleted its
   `-wal`, `-shm` and `-journal` files: open connections keep a coherent database instead of
   one swapped beneath them. A restore refuses a destination holding such a file without its
   database, which 0.4.9 deleted: it may hold the only copy of committed writes.
+- `restore --to` resolves the `.` and `..` of its destination by name against the working
+  directory, as a shell's `cd` does, where 0.4.9 left `..` to the file system: `--to
+  link/../x` restores into `./x` even when `link` links elsewhere.
 - A failing or timed-out `post_index` command prints one line on stderr naming its exit
   status and the file holding its output (`log/post_index.log` in the data directory, kept
   from the last run), where 0.4.9 wrote only to its own log. As in 0.4.9 the command never

@@ -113,7 +113,7 @@ pub fn run(deep: bool, fix: bool, no_semantic: bool, json_output: bool) -> Resul
             "detail":format!("{} isn't writable; new transcripts can't be indexed until it is", root.0.display()),
             "action":"make it writable, or point AGREP_DATA_DIR at a writable directory"}));
     }
-    if let Some(check) = index_check(&s) {
+    if let Some(check) = index_check(&root, &s) {
         checks.push(check);
     }
     if let Some(check) = agent_history_check() {
@@ -232,7 +232,12 @@ fn chunk_line(done: usize, total: usize, elapsed: Duration) -> String {
     line
 }
 /// A missing or unusable index, and what makes it usable.
-fn index_check(s: &serde_json::Value) -> Option<serde_json::Value> {
+fn index_check(root: &DataRoot, s: &serde_json::Value) -> Option<serde_json::Value> {
+    if root.earlier_format() {
+        return Some(json!({"check":"index","state":"failed",
+            "detail":"the index is from an earlier agrep build",
+            "action":"`agrep reindex` rebuilds it and keeps settings, archives and meaning vectors"}));
+    }
     if s["format"] == "unsupported" || s["format"] == "unreadable" {
         return Some(json!({"check":"index","state":"failed",
             "detail":format!("data format {}", s["format"].as_str().unwrap_or("")),

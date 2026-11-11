@@ -33,6 +33,17 @@ identifier-shaped grep. Plumbing surfaces (`--flat`, piped TSV, `--json`, `-l`,
 expression. Those explicit modes bypass boundary ranking. `--sort time` uses
 recency instead of the default score order.
 
+Indexes only choose which rows are read, never what matches: a search finds every row
+a full scan would, whatever the script or length of its literals. Plans that count or
+list every match (`-c`, `-n 0`, `--sort time`) read only the rows the indexes
+admit: for `-E`, rows holding one of the literals every match begins with and one of
+those it ends with (`worktree` or `workflow` for `work(tree|flow)s?`); for `-w`, the
+indexed words in which the term can stand alone (`work`, not `homework`); for a tool term
+that is not a plain word (`C++`, `O(n log n)`, `::`, `🚀`), the rows holding all of its
+symbols. A ranked page reads as it would without them and checks its rows against them
+only after its score ceiling has read them, so its rows, totals and floors do not depend
+on them.
+
 ## Hit snippets
 
 A hit's snippet is its match with 80 characters on each side, whitespace runs
@@ -202,7 +213,9 @@ meaning rows come first, then the keyword rows of other families, and last the
 keyword rows of the families the meaning rows already represent: no keyword row
 is dropped (0.4.9 dropped those last rows). A compact page keeps them after its
 lanes, so they fill the page when room is left and otherwise wait behind
-`--more`, and a larger `-n` shows them on one page.
+`--more`, and a larger `-n` shows them on one page. On a compact page the merge
+reads both lanes at least 40 rows deep, as the page without `-n` does, whatever
+`-n` asks.
 
 ## Recall lane hierarchy
 
@@ -268,9 +281,12 @@ caps that request at 200 chats. Without `-n` a search fetches the ranked top 40.
 
 A compact page:
 
-- orders rows as 0.4.9 did: `~meta` rows last, and within each quality lane
-  (phrase, meaning, all terms) one row per conversation family before the rest;
-  meaning rows follow the first three phrase rows that are not interior matches;
+- orders the ranked rows as 0.4.9 did: `~meta` rows last, and within each quality
+  lane (phrase, meaning, all terms) one row per conversation family before the
+  rest; meaning rows follow the first three phrase rows that are not interior
+  matches. Below `-n 40` a compact search still ranks, merges and orders the 40
+  rows the page without `-n` does, and `-n` cuts that order, so each such page is
+  the first rows of every larger one up to `-n 40`;
 - shows at most 16 lines (fewer when `-n` asks for fewer);
 - after four rows, stops at a 3,584-byte budget; if at least four valid matches
   exist, the best four still render, with lines shortened to share the budget;

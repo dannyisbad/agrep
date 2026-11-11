@@ -1,7 +1,6 @@
 use agrep_core::surface::line;
 use agrep_core::{data::DataRoot, semantic, store};
 use anyhow::Result;
-use std::io::IsTerminal;
 use std::time::Instant;
 
 pub(crate) fn run(full: bool, with_semantic: bool) -> Result<i32> {
@@ -19,7 +18,7 @@ pub(crate) fn run(full: bool, with_semantic: bool) -> Result<i32> {
         super::setup::download_model(&root)?;
         let drain = semantic::Drain {
             explicit: true,
-            progress: std::io::stderr().is_terminal(),
+            progress: semantic::Progress::for_stderr(),
             ..Default::default()
         };
         super::work::after_index(&root, Some(drain))?;
@@ -44,9 +43,12 @@ pub(crate) fn reindex(full: bool, max_new: Option<i64>) -> Result<i32> {
     }
     let started = Instant::now();
     let root = DataRoot::discover()?;
-    root.validate(true)?;
+    let upgrade = root.validate_rebuild()?;
     line("\n=== ingest transcripts ===")?;
     let refresh = store::reindex(&root)?;
+    if upgrade {
+        root.mark_current()?;
+    }
     let after = Instant::now();
     // The rebuild announced itself before parsing (store::reindex).
     report(&root, &refresh, true)?;
@@ -83,7 +85,7 @@ pub(crate) fn reindex(full: bool, max_new: Option<i64>) -> Result<i32> {
     let stage = Instant::now();
     let drain = semantic::Drain {
         limit,
-        progress: std::io::stderr().is_terminal(),
+        progress: semantic::Progress::for_stderr(),
         ..Default::default()
     };
     super::work::after_index(&root, Some(drain))?;

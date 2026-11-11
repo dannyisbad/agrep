@@ -6,6 +6,7 @@ use super::replay::{canonicalize, settle_turnless, source_sessions};
 use super::rows::{remove_source, replace};
 use super::sources::{gone, stamp_present};
 use super::text::digest;
+use super::unread;
 use super::{Changes, Refresh, Stamp, WRITE_TIMES};
 use crate::data::DataRoot;
 use crate::ingest::registry::{self, Adapter, ADAPTERS};
@@ -180,6 +181,9 @@ fn refresh_inner(
         info.adapter_write_ms
             .insert(adapter, adapter_write_start.elapsed().as_secs_f64() * 1000.);
     }
+    if rebuild && !first {
+        state.keep_unread(&tx, root, &stamps)?;
+    }
     let errors = state.finish(&tx, &mut info, stamps, &changed, parse_wait, write_start)?;
     tx.execute("INSERT INTO state VALUES('refreshed',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[chrono::Utc::now().timestamp_millis().to_string()])?;
     if scope.is_none() {
@@ -215,6 +219,11 @@ struct RefreshState {
     fast_sessions: HashSet<(String, String)>,
     forced_sessions: HashSet<(String, String)>,
     errors: HashMap<String, String>,
+    /// The sources written, the sources adapters retired, and the agents whose collection
+    /// reported a failure: what a rebuild needs to know which rows to keep.
+    written: HashSet<String>,
+    retired: HashSet<String>,
+    troubled: HashSet<&'static str>,
     pages: crate::incremental::GraphPages,
 }
 impl RefreshState {
@@ -230,6 +239,9 @@ impl RefreshState {
             fast_sessions: HashSet::new(),
             forced_sessions: HashSet::new(),
             errors: HashMap::new(),
+            written: HashSet::new(),
+            retired: HashSet::new(),
+            troubled: HashSet::new(),
             pages: crate::incremental::GraphPages::new(parsers),
         }
     }
@@ -241,9 +253,37 @@ impl RefreshState {
         }
         Ok(())
     }
+    /// Copies in the rows of the replaced index's sources this rebuild could not read, so
+    /// they stay searchable as an index refresh leaves them (see [`unread::sources`]).
+    fn keep_unread(
+        &mut self,
+        tx: &Transaction<'_>,
+        root: &DataRoot,
+        stamps: &[Stamp],
+    ) -> Result<()> {
+        if self.errors.is_empty() && stamps.iter().all(|s| s.error.is_none()) {
+            return Ok(());
+        }
+        let old = reader(root)?;
+        let read = unread::Read {
+            written: &self.written,
+            retired: &self.retired,
+            errors: &self.errors,
+            troubled: &self.troubled,
+            stamps,
+        };
+        let sources = unread::sources(&old, &read)?;
+        unread::copy(
+            &old,
+            tx,
+            &sources,
+            &mut self.changes,
+            &mut self.canonical_sessions,
+        )
+    }
 }
 fn clear_initial(initial: &Path) -> Result<()> {
-    for suffix in ["", "-journal", "-wal", "-shm"] {
+    for suffix in ["", "-journal", "-wal", "-shm", "-sym"] {
         let p = PathBuf::from(format!("{}{suffix}", initial.display()));
         match fs::remove_file(p) {
             Ok(()) => {}
@@ -545,6 +585,8 @@ impl RefreshState {
             forced_sessions,
             changes,
             errors,
+            retired,
+            troubled,
             ..
         } = self;
         for key in &b.retired {
@@ -555,6 +597,7 @@ impl RefreshState {
                 remove_source(tx, table, key, changes)?;
             }
         }
+        retired.extend(b.retired.iter().cloned());
 
         if b.issues.is_empty() {
             for key in b
@@ -579,6 +622,7 @@ impl RefreshState {
             }
         }
         for issue in std::mem::take(&mut b.issues) {
+            troubled.insert(issue.agent);
             errors.insert(issue.path.to_string_lossy().into_owned(), issue.reason);
         }
         Ok(())
@@ -602,6 +646,7 @@ impl RefreshState {
             turnless_before,
             changes,
             errors,
+            written,
             pages,
             ..
         } = self;
@@ -619,6 +664,7 @@ impl RefreshState {
             errors.insert(s.key.clone(), error);
             return Ok(());
         }
+        written.insert(s.key.clone());
         if !s.append {
             source_sessions(tx, &s.key, canonical_sessions)?;
             source_sessions(tx, &s.key, forced_sessions)?;
@@ -710,6 +756,7 @@ impl RefreshState {
             forced_sessions,
             errors,
             pages,
+            ..
         } = self;
         let phase = Instant::now();
         pages.finish(tx)?;
@@ -857,6 +904,7 @@ fn close_refresh(
     c.close().map_err(|(_, e)| e)?;
     // A connection that has not used the FTS tables caches none of their structures.
     let mut sealing = open_writer(initial, true)?;
+    crate::tool_symbols::import(&sealing)?;
     let tx = sealing.transaction()?;
     crate::fts_segments::seal(&tx)?;
     if replace {

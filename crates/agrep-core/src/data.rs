@@ -1,11 +1,14 @@
-//! The sole data format and kernel-owned writer locks.
+//! The data format and kernel-owned writer locks.
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
 };
-pub const FORMAT: &[u8] = b"agrep-data 8\n";
+pub const FORMAT: &[u8] = b"agrep-data 9\n";
+/// The format before [`FORMAT`]: the same files, with an index that lacks `tools_sym`.
+/// `agrep reindex` rebuilds such an index in place ([`DataRoot::validate_rebuild`]).
+const PREVIOUS: &[u8] = b"agrep-data 8\n";
 #[derive(Debug, Clone)]
 pub struct DataRoot(pub PathBuf);
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,19 +72,12 @@ impl DataRoot {
     }
     pub fn validate(&self, initialize: bool) -> Result<()> {
         match fs::read(self.0.join("FORMAT")) {
-            Ok(v) if v == FORMAT => {
-                if read_only() {
-                    return Ok(());
-                }
-                private_dir(&self.0)?;
-                for name in ["archive", "model", "log"] {
-                    let path = self.0.join(name);
-                    if path.is_dir() {
-                        private_dir(&path)?;
-                    }
-                }
-                return Ok(());
-            }
+            Ok(v) if v == FORMAT => return self.tighten(),
+            Ok(v) if v == PREVIOUS => bail!(
+                "the index in {} is from an earlier agrep build: run agrep reindex to rebuild it \
+                 (settings, archives and meaning vectors are kept)",
+                self.0.display()
+            ),
             Ok(_) => bail!("unsupported data format: {}", self.0.display()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e).with_context(|| format!("data root: {}", self.0.display())),
@@ -116,6 +112,40 @@ impl DataRoot {
                 }
             }
             Err(e) => return Err(e.into()),
+        }
+        Ok(())
+    }
+    /// Whether the root holds the format before [`FORMAT`], whose index `agrep reindex`
+    /// rebuilds in place.
+    pub fn earlier_format(&self) -> bool {
+        fs::read(self.0.join("FORMAT")).is_ok_and(|v| v == PREVIOUS)
+    }
+    /// [`Self::validate`] for a rebuild, which also takes a root of the format before
+    /// [`FORMAT`]. True when the root then needs [`Self::mark_current`], which must wait
+    /// until the rebuilt index is in place: until then other commands refuse the old one.
+    pub fn validate_rebuild(&self) -> Result<bool> {
+        if self.earlier_format() {
+            self.tighten()?;
+            return Ok(true);
+        }
+        self.validate(true)?;
+        Ok(false)
+    }
+    /// Marks a root whose index a rebuild replaced as holding the current format.
+    pub fn mark_current(&self) -> Result<()> {
+        crate::safe_fs::write_atomic(&self.0.join("FORMAT"), FORMAT, true)
+    }
+    /// Makes an existing root private again, unless this process must not write it.
+    fn tighten(&self) -> Result<()> {
+        if read_only() {
+            return Ok(());
+        }
+        private_dir(&self.0)?;
+        for name in ["archive", "model", "log"] {
+            let path = self.0.join(name);
+            if path.is_dir() {
+                private_dir(&path)?;
+            }
         }
         Ok(())
     }
@@ -232,6 +262,56 @@ impl DataRoot {
     pub fn path(&self) -> &Path {
         &self.0
     }
+}
+
+/// The variables naming the agent stores, the data directory and the model directory, each
+/// made absolute when it is relative, so that it names one directory from every working
+/// directory: the index keys sources by path, and a path spelled from elsewhere would make
+/// every source look new. Call it once at startup, before any thread starts; workers inherit
+/// the result. The variable's own path resolves its links; paths inside the stores keep theirs.
+pub fn resolve_path_variables() {
+    for key in ["AGREP_HOME", "AGREP_DATA_DIR", "AGREP_MODEL_DIR"] {
+        let Some(mut value) = std::env::var_os(key) else {
+            continue;
+        };
+        if value.is_empty() {
+            value = ".".into();
+        }
+        let path = Path::new(&value);
+        if path.is_absolute() {
+            continue;
+        }
+        if let Ok(full) = resolved(path) {
+            std::env::set_var(key, full);
+        }
+    }
+}
+/// `path` from the working directory: its longest existing part with links and `..`
+/// resolved, then the rest as written, which holds no link. Windows resolves it lexically,
+/// as its own full path names do.
+fn resolved(path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    if cfg!(windows) {
+        return Ok(absolute);
+    }
+    let parts: Vec<_> = absolute.components().collect();
+    for existing in (1..=parts.len()).rev() {
+        let Ok(mut resolved) = fs::canonicalize(parts[..existing].iter().collect::<PathBuf>())
+        else {
+            continue;
+        };
+        for part in &parts[existing..] {
+            match part {
+                std::path::Component::ParentDir => {
+                    resolved.pop();
+                }
+                std::path::Component::CurDir => {}
+                part => resolved.push(part),
+            }
+        }
+        return Ok(resolved);
+    }
+    Ok(absolute)
 }
 
 /// Whether this process must not write the data root: `AGREP_DATA_READONLY` is set, or

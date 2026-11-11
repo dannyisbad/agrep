@@ -1,6 +1,6 @@
 use super::text::{decode, search_key};
 use super::WriteTimer;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rayon::prelude::*;
 use rusqlite::{params, Transaction};
 use std::collections::BTreeMap;
@@ -8,8 +8,11 @@ use std::collections::BTreeMap;
 type FtsInput = Vec<(i64, Vec<u8>)>;
 type FtsPrepared = Vec<(i64, String, bool)>;
 type FtsWords = Vec<(i64, Vec<Box<[u8]>>)>;
-/// A prepared row: its id, indexed text and distinct dictionary words.
-type FtsRow = (i64, String, Vec<Box<[u8]>>, bool);
+/// Tool rows' symbol documents (`tool_symbols::document`).
+type FtsSymbols = Vec<(i64, String)>;
+/// A prepared row: its id, indexed text, distinct dictionary words, whether its case
+/// aliases differ, and its symbol document.
+type FtsRow = (i64, String, Vec<Box<[u8]>>, bool, String);
 fn read_fts_batch(rows: &mut rusqlite::Rows<'_>) -> Result<FtsInput> {
     let mut input = Vec::with_capacity(1024);
     for _ in 0..1024 {
@@ -22,7 +25,7 @@ fn prepare_fts_batch(
     table: &str,
     input: FtsInput,
     tokenizers: Option<&crate::tool_index::Tokenizers<'_>>,
-) -> Result<(FtsPrepared, FtsWords)> {
+) -> Result<(FtsPrepared, FtsWords, FtsSymbols)> {
     let rows: Vec<FtsRow> = input
         .into_par_iter()
         .map_init(
@@ -30,25 +33,55 @@ fn prepare_fts_batch(
             |tokenizer, (id, bytes)| {
                 let (text, aliases) = search_key(&decode(table, bytes)?);
                 if table != "tools" {
-                    return Ok((id, text, Vec::new(), aliases));
+                    return Ok((id, text, Vec::new(), aliases, String::new()));
                 }
+                let symbols = crate::tool_symbols::document(&text);
                 let text = crate::tool_index::index_text(&text).into_owned();
                 let words = match tokenizer {
                     Some(Ok(tokenizer)) => crate::tool_index::row_words(tokenizer, &text)?,
                     Some(Err(error)) => anyhow::bail!("{error:#}"),
                     None => Vec::new(),
                 };
-                Ok((id, text, words, aliases))
+                Ok((id, text, words, aliases, symbols))
             },
         )
         .collect::<Result<_>>()?;
     let mut prepared = Vec::with_capacity(rows.len());
     let mut words = Vec::with_capacity(rows.len());
-    for (id, text, row_words, aliases) in rows {
+    let mut symbols = Vec::new();
+    for (id, text, row_words, aliases, row_symbols) in rows {
         prepared.push((id, text, aliases));
         words.push((id, row_words));
+        if table == "tools" {
+            symbols.push((id, row_symbols));
+        }
     }
-    Ok((prepared, words))
+    Ok((prepared, words, symbols))
+}
+/// Starts building a first build's `tools_sym` on a thread and connection of its own,
+/// beside the writer's transaction, from the documents sent to it; the seal copies it in
+/// (`tool_symbols::import`). The build ends once every sender is gone.
+fn build_symbols(
+    tx: &Transaction<'_>,
+) -> Result<(
+    std::sync::mpsc::SyncSender<FtsSymbols>,
+    std::thread::JoinHandle<Result<()>>,
+)> {
+    let index = std::path::PathBuf::from(tx.path().context("the index has no file")?);
+    let (send, receive) = std::sync::mpsc::sync_channel::<FtsSymbols>(4);
+    let thread = std::thread::spawn(move || -> Result<()> {
+        let builder = crate::tool_symbols::Builder::open(&index)?;
+        while let Ok(rows) = receive.recv() {
+            builder.insert(&rows)?;
+        }
+        builder.finish()
+    });
+    Ok((send, thread))
+}
+fn join_symbols(thread: std::thread::JoinHandle<Result<()>>) -> Result<()> {
+    thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("the symbol index build panicked"))?
 }
 /// Returns tool word presence, gathered beside the inserts from the same text.
 pub(super) fn build_fts(tx: &Transaction<'_>) -> Result<Option<crate::tool_index::Presence>> {
@@ -61,10 +94,17 @@ pub(super) fn build_fts(tx: &Transaction<'_>) -> Result<Option<crate::tool_index
             "SELECT id,text FROM {table} WHERE visible=1 ORDER BY id"
         ))?;
         let mut rows = source.query([])?;
+        let (symbol_rows, symbols) = match table {
+            "tools" => {
+                let (send, thread) = build_symbols(tx)?;
+                (Some(send), Some(thread))
+            }
+            _ => (None, None),
+        };
         // SQLite remains exclusively on this thread. Two bounded batches let
         // decode/normalization overlap inserts, without a second writer or an
         // unbounded copy of the corpus.
-        std::thread::scope(|scope| -> Result<()> {
+        let built = std::thread::scope(|scope| -> Result<()> {
             let (send, input) = std::sync::mpsc::sync_channel::<FtsInput>(1);
             let (output, receive) = std::sync::mpsc::sync_channel::<Result<FtsPrepared>>(1);
             let tokenizers = (table == "tools").then_some(&tokenizers);
@@ -74,9 +114,13 @@ pub(super) fn build_fts(tx: &Transaction<'_>) -> Result<Option<crate::tool_index
                 let mut presence = tokenizers.map(|_| crate::tool_index::new_presence());
                 while let Ok(batch) = input.recv() {
                     match prepare_fts_batch(table, batch, tokenizers) {
-                        Ok((prepared, words)) => {
+                        Ok((prepared, words, symbols)) => {
                             if output.send(Ok(prepared)).is_err() {
                                 break;
+                            }
+                            if let Some(rows) = &symbol_rows {
+                                rows.send(symbols)
+                                    .map_err(|_| anyhow::anyhow!("the symbol index build ended"))?;
                             }
                             if let Some(presence) = presence.as_mut() {
                                 crate::tool_index::add_rows(presence, words)?;
@@ -145,7 +189,14 @@ pub(super) fn build_fts(tx: &Transaction<'_>) -> Result<Option<crate::tool_index
                 collected = presence;
             }
             Ok(())
-        })?;
+        });
+        if let Err(error) = built {
+            // A failed symbol build names its own cause; the writer only saw it end.
+            if let Some(thread) = symbols {
+                join_symbols(thread)?;
+            }
+            return Err(error);
+        }
         tx.execute(
             &format!("INSERT INTO {table}_fts({table}_fts) VALUES('optimize')"),
             [],
@@ -155,6 +206,9 @@ pub(super) fn build_fts(tx: &Transaction<'_>) -> Result<Option<crate::tool_index
             [],
         )?;
         crate::fts_segments::configure(tx, &format!("{table}_fts"))?;
+        if let Some(thread) = symbols {
+            join_symbols(thread)?;
+        }
     }
     Ok(collected)
 }
@@ -195,6 +249,10 @@ impl FtsWrites {
                 if before {
                     delete.execute([id])?;
                     tx.execute(&format!("DELETE FROM {table}_case_fts WHERE rowid=?"), [id])?;
+                    if table == "tools" {
+                        tx.prepare_cached("DELETE FROM tools_sym WHERE rowid=?")?
+                            .execute([id])?;
+                    }
                 }
                 if after {
                     let (normalized, aliases) =
@@ -217,6 +275,8 @@ impl FtsWrites {
                             id,
                             crate::tool_index::index_text(&normalized).as_ref()
                         ])?;
+                        tx.prepare_cached("INSERT INTO tools_sym(rowid,text) VALUES(?1,?2)")?
+                            .execute(params![id, crate::tool_symbols::document(&normalized)])?;
                     } else {
                         insert.execute(params![id, normalized])?;
                     }

@@ -16,7 +16,8 @@ This page defines the public command interface and output formats.
 - Search TSV has six columns in this order: **full session, agent, display
   project, turn, who, snippet**. A missing turn is empty. Fields escape or
   sanitize embedded tabs, newlines and terminal controls. `--flat` selects TSV;
-  pipes outside an agent profile also default to TSV.
+  pipes outside an agent profile also default to TSV. A row standing for fork
+  copies ends its snippet with ` (also in N forks)`.
 - `-c` prints the decimal match count, or `>=N` for a measured floor.
   `--count-by-tier` prints `phrase_aligned=N phrase_partial=N
   phrase_interior=N all_terms=N total=N` on one line. Counts advertised as exact
@@ -44,10 +45,12 @@ rerunning a query against a changed corpus.
 A message that several chats hold as copies (a pi or omp fork copies its parent's
 history, so a fork's copy has the same agent, speaker, text and time) is one row on a
 keyword or meaning page: the copy from the most recently active chat, marked `also in N
-forks`, with the other copies under its JSON `forks` (session and handle) and as rows of
-their own right after it in `--flat`. The copies take no row of the page, so the page
-ranks deeper to fill its rows; `shown` and `showing N of M` count the copies, in the
-unit of `total`. `-l` lists every chat and `-c` counts every row.
+forks`, with the other copies under its JSON `forks` (session and handle). The copies
+take no row of the page: `-n N` bounds the printed result rows in every form (terminal,
+compact, TSV and JSON), and the page ranks deeper to fill them. A row's copies are found
+however deep the page ranked, so a row carries the same marker at every `-n`. `shown`
+and `showing N of M` count the copies, in the unit of `total`, which is never below
+them. `-l` lists every chat and `-c` counts every row.
 
 Normal commands check source files and answer from a committed snapshot.
 Index-reading commands finish their source census and ingest its changes before querying.
@@ -191,7 +194,9 @@ rows for embedding. `index` and `reindex` print 0.4.9's human report
 while no agent is enrolled). With `AGREP_QUERY_TIMING` set they also print the
 refresh's statistics as a JSON `{"index": …}` line on stderr. While any source's last read
 failed, they print one stderr line with the count, the first such source and its reason,
-and, when there are more, `agrep doctor` to list them.
+and, when there are more, `agrep doctor` to list them. While they embed, a stderr that is
+not a terminal gets an `embedding messages: …` progress line every 30 seconds and one with
+the final count; stdout gets none.
 
 Only a missing model quietly disables automatic meaning retrieval. In automatic hybrid
 retrieval, any failure from an installed model is disclosed once on stderr and written to

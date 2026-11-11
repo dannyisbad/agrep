@@ -12,21 +12,28 @@ output contracts in [OUTPUT_CONTRACTS.md](OUTPUT_CONTRACTS.md), the meaning lane
 
 The root is `AGREP_DATA_DIR` if set, otherwise `~/Library/Application Support/agrep/0.5`
 on macOS, `$XDG_DATA_HOME/agrep/0.5` (or `~/.local/share/agrep/0.5`) on Linux and
-`%LOCALAPPDATA%\agrep\0.5` on Windows.
+`%LOCALAPPDATA%\agrep\0.5` on Windows. A relative `AGREP_DATA_DIR`, `AGREP_HOME` or
+`AGREP_MODEL_DIR` is made absolute once at startup (`data::resolve_path_variables`): its
+existing part with links and `..` resolved (lexically on Windows), so sources keep one
+path whatever directory a command runs from. Workers inherit the absolute values.
 
-`FORMAT` holds exactly `agrep-data 8\n`. An absent or empty root is initialized; the
-marker is created with `create_new`, so racing initializers agree. Other marker bytes,
-or a non-empty root without a marker, are refused with one line naming the path. On Unix
-the root and its `archive`, `model` and `log` directories are created with mode 0700,
-and validation tightens existing ones. With `AGREP_DATA_READONLY` set (to anything but
-empty, `0`, `false` or `off`), commands skip the census, report freshness as unchecked,
-and fail instead of taking a lock or writing: validation leaves directory modes as they
-are, and nothing is logged.
+`FORMAT` holds exactly `agrep-data 9\n`. An absent or empty root is initialized; the
+marker is created with `create_new`, so racing initializers agree. A root of the
+previous format, `agrep-data 8\n` (an earlier 0.5 build's, whose index lacks
+`tools_sym`), is refused with one line naming `agrep reindex`, and `doctor` names it too:
+`reindex` rebuilds that index in place like any other, keeping settings, archives and
+meaning vectors, and rewrites the marker once the rebuilt index is in place. Other
+marker bytes, or a non-empty root without a marker, are refused with one line naming the
+path. On Unix the root and its `archive`, `model` and `log` directories are created with
+mode 0700, and validation tightens existing ones. With `AGREP_DATA_READONLY` set (to
+anything but empty, `0`, `false` or `off`), commands skip the census, report freshness
+as unchecked, and fail instead of taking a lock or writing: validation leaves directory
+modes as they are, and nothing is logged.
 
 | Path | Contents |
 |---|---|
 | `index.db` (`-wal`, `-shm`) | all derived state: sources, sessions, rows, tool events, FTS, block bounds, statistics, vector references, embedding queue |
-| `index.building.db` | a first build or `reindex` until it is moved into place; the next writer deletes a leftover |
+| `index.building.db` (`-sym`) | a first build or `reindex` until it is moved into place, and its `tools_sym` built beside it until the seal copies it in; the next writer deletes a leftover |
 | `pages.db` | frozen result pages for `agrep --more`, kept five minutes |
 | `vectors/<sha256>.q8f16` | immutable embedding blocks referenced from `index.db` |
 | `model/granite-embedding-small-english-r2/` | the pinned embedding model (`AGREP_MODEL_DIR` overrides) |
@@ -197,19 +204,24 @@ How commands use it (`ready` and `finish_census` in `crates/agrep/src/main.rs`):
    - the deletion of sessions left without rows, and the refresh time.
 6. For the first build and `reindex`, writes `index.building.db` with a rollback journal
    and creates secondary indexes and triggers after the bulk insert, then queues every
-   visible row for embedding. On commit it switches to WAL. A first build renames the file
-   to `index.db` and fsyncs the directory. A reindex copies into it the vector chunks and
-   blocks of `index.db`, the references of rows whose content key had one, and the `state`
-   values it did not set. Then, on Unix, it takes an exclusive lock on `index.db`, which
-   SQLite grants only while no other connection has read it (a WAL connection keeps its
-   shared lock until it closes), checkpoints and empties its WAL, and renames the new file
-   over it. Readers and writers open `index.db` with a read and then check that the file
-   they opened is still the one at the path, reopening it if not, so none reads the new
-   file's WAL against the old file. When another connection has the index open, or on
-   Windows, it copies the new file over `index.db` with SQLite's backup API in one WAL
-   transaction instead: readers keep their snapshot of the old index until it commits.
-   Either way a crash before the end leaves the old index whole, and the result has a
-   first build's pages.
+   visible row for embedding. Before those, a reindex copies from `index.db` the rows of
+   each source it could not read, as a refresh keeps them: one whose read, stamp or
+   store failed, or one below a directory the census could not list that is not gone.
+   It copies them as a parse writes rows, visible at their own turns for the replay to
+   place, with the sessions' rows it has none of, and without their parser cursors, so
+   the next read parses the source whole. On commit it switches to WAL. A first build
+   renames the file to `index.db` and fsyncs the directory. A reindex copies into it the
+   vector chunks and blocks of `index.db`, the references of rows whose content key had
+   one, and the `state` values it did not set. Then, on Unix, it takes an exclusive lock
+   on `index.db`, which SQLite grants only while no other connection has read it (a WAL
+   connection keeps its shared lock until it closes), checkpoints and empties its WAL,
+   and renames the new file over it. Readers and writers open `index.db` with a read and
+   then check that the file they opened is still the one at the path, reopening it if
+   not, so none reads the new file's WAL against the old file. When another connection
+   has the index open, or on Windows, it copies the new file over `index.db` with
+   SQLite's backup API in one WAL transaction instead: readers keep their snapshot of the
+   old index until it commits. Either way a crash before the end leaves the old index
+   whole, and the result has a first build's pages.
 
 ## Row storage and compression
 
@@ -284,6 +296,25 @@ native discovery fallback.
 - `tools_fts`: contentless FTS5 with `unicode61 remove_diacritics 0` word tokens and
   positions. SQLite truncates tokens at 32 KiB, so words over 8 KiB are indexed as
   overlapping 8 KiB windows and literals up to 4 KiB stay findable.
+- `tools_sym`: contentless FTS5 (`detail=none`) over the same visible tool rows, holding
+  what the dictionary cannot. A row's document is the distinct characters of its case
+  keys that are no ASCII letter, digit, whitespace or control character (punctuation,
+  symbols, emoji, other scripts), and each adjacent pair holding one, written as tokens
+  (the `ascii` tokenizer with every ASCII punctuation character a token character).
+  Wherever a case key holds a folded literal it holds each of the literal's grams, so
+  a tool term the dictionary cannot expand (`C++`, `🚀`, `::`, `O(n`) can match only
+  rows holding all of them. A term asks for at most 24 grams, pairs first; a plan ANDs
+  at most eight such terms, each an OR of its spellings. Python's lowercase shortcut
+  turns `İ` into `i` and U+0307, which the case key does not, so grams touching `i`,
+  `ı`, `İ` or U+0307 are neither indexed nor asked for, and dotted-İ queries and the
+  content-terms tier take none. Outside a selective scope the admitted rows are read
+  when there are at most half the lane's rows, or 65,536 on a page: plans that count or
+  list every match read only those rows, and a ranked page checks its rows against them
+  only after its ceiling has read them, so its rows, totals and floors stay those of a
+  full scan.
+  A first build fills the table on a connection and thread of its own, from documents
+  the FTS preparation workers compute, and copies it in before the seal; refreshes
+  maintain it beside `tools_fts`.
 - Tool dictionary: `tool_words` holds each indexed word of three or more characters with
   its document frequency and the tool blocks containing it, `tool_lexicon` is a trigram
   FTS5 index of those words (`detail=none`), and `tool_trigrams` holds the summed
@@ -293,7 +324,8 @@ native discovery fallback.
   without decoding the base lists. Presence may conservatively retain removed blocks.
   A term of 3 to 4,096 ASCII letters and
   digits expands through the lexicon to the indexed words containing it; the tool lane
-  searches for any of them. Other tool terms are verified on decoded text.
+  searches for any of them. Other tool terms are verified on decoded text, of the rows
+  `tools_sym` admits where it applies.
 - `prose_terms` holds the exact document frequency of each prose trigram, and
   `term_stats` the family counts the boundary factor uses. Both are maintained in the
   refresh transaction.
@@ -353,7 +385,18 @@ crate, and backtracks at most 100,000 times per search on the others. `-w` match
 0.4.9's `(?<!\w)` + term + `(?!\w)` under Python's `re.I`, without backtracking: the
 regex crate finds the term with each character spelled as `re`'s case-insensitive
 matching allows, and a match stands where neither neighbor is `\w` (`str.isalnum()` or
-`_`). The literal every match begins or ends with, if there is one, drives the index.
+`_`). The literals every match begins with, and those every match ends with, drive the
+index: each end gives a group of folded spellings, at most 64, one of which every match
+holds (`work(tree|flow)s?` gives `worktree` or `workflow`). The regex parser keeps 100
+bytes of a literal, which can cut a character; only its whole characters are used. A
+group of several literals (an alternation, an optional part) narrows only plans that
+count or list every match (`-c`, `-n 0`, time order); a ranked page reads,
+bounds and estimates rows as with the single literals alone, and checks the tool rows
+such a group admits only after its ceiling has read them, so its rows, totals and floors
+stay those of the plain plan. `-w` reads, in those same plans, only the indexed words in
+which some occurrence of its term has no ASCII letter, digit or `_` beside it: a match
+has no word character beside it, and a case key is an ASCII word character only where
+the original character is a word character.
 
 - Terms are ordered by estimated document frequency: in prose, the least frequent of the
   term's trigrams in `prose_terms`; in tools, the summed frequency of its words. Prose
@@ -366,7 +409,8 @@ matching allows, and a match stands where neither neighbor is `\w` (`str.isalnum
   first use FTS5's native phrase check for consecutive groups, or its proximity check
   for spaced groups, then the same ordered-position verifier.
 - Terms shorter than three characters stay out of the FTS expression and are verified on
-  row text. Every candidate is verified on its stored text before it scores.
+  row text; in tools, `tools_sym` admits the rows of one holding a symbol (`c#`, `::`).
+  Every candidate is verified on its stored text before it scores.
 - For a single ASCII alphanumeric tool term, indexed word occurrences in the folded text bound
   the snippet's repetition score. A positive literal occurrence count proves the match;
   when its score ceiling loses to the page, it is counted without decoding or scoring.
@@ -510,12 +554,15 @@ only while the lock is free, and leaves the queue to a background worker.
 - JSONL resume checks the first and last parsed chunks under the append-only log
   assumption; use `index --full` after an in-place edit confined to the middle of a
   parsed prefix. Other formats are re-parsed whole when they change.
-- A source that fails to parse keeps its last good rows and is parsed again only when
-  its file changes or on a full rebuild.
+- A source that fails to parse keeps its last good rows, through a reindex too, and is
+  parsed again only when its file changes, by `index --full` or by a reindex.
 - Terms shorter than three characters, and tool terms that are not ASCII letters and
-  digits, are verified on row text instead of read through an index, so an exact count
-  of such a query reads every row in scope. Non-ASCII text gets the universal block
-  ceiling, so early termination helps it less.
+  digits, have no word or trigram index. Counting a prose term under three characters
+  alone verifies every prose row in scope. Such a tool term reads only the rows holding
+  all of its `tools_sym` grams, which for a common symbol (`.`, `/`, `-`) can be most
+  rows: when more than half the lane is admitted a count reads every row, as it does for
+  a tool term with no gram (`a`, `go`, `ı`), a dotted-İ query and the content-terms tier.
+  Non-ASCII text gets the universal block ceiling, so early termination helps it less.
 - An `-E` expression that needs fancy-regex's own features and exceeds the backtrack limit
   fails the command (exit 2).
 - Until a merger runs, each refresh leaves one more segment per FTS table for lookups to

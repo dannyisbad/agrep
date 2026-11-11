@@ -1,9 +1,13 @@
 //! The full audit's reparse of every selected source, source by source: each parse is
 //! reduced to its row digests as it completes, so memory holds digests and a bounded
 //! window of parses rather than a whole history's texts.
-use super::tally::{text_digest, SourceRows, Tally};
+use super::{
+    problems::{Problems, Seen},
+    tally::{text_digest, SourceRows, Tally},
+};
 use agrep_core::{
     data::DataRoot,
+    diagnostics,
     ingest::registry::ADAPTERS,
     intake_batch::{IntakeBatch, Pending, ReadOutcome},
     model::{Event, Message},
@@ -11,7 +15,7 @@ use agrep_core::{
     store,
 };
 use anyhow::Result;
-use serde_json::{json, Value};
+use serde_json::json;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     panic::AssertUnwindSafe,
@@ -26,7 +30,7 @@ pub(super) fn reparse(
     root: &DataRoot,
     live: &[store::Stamp],
     selected: &impl Fn(&str) -> bool,
-    errors: &mut Vec<Value>,
+    problems: &mut Problems,
     tally: &mut Tally,
 ) -> Result<()> {
     let policy = HarnessPolicy::parse(
@@ -50,22 +54,23 @@ pub(super) fn reparse(
         tally.add_source(source_rows(messages, events, &policy));
         for source in std::mem::take(&mut batch.batches) {
             if let Some(error) = source.error {
-                errors.push(json!({"path":source.key,"reason":error}));
+                let path = diagnostics::source_path(&source.key, &source.agent);
+                problems.source(path, error, Seen::Reparse);
             }
             tally.add_source(source_rows(source.messages, source.events, &policy));
         }
         let pending = std::mem::take(&mut batch.pending);
         for (path, error) in parse_each(pending, &sizes, &policy, |rows| tally.add_source(rows)) {
             if let Some(error) = error {
-                errors.push(json!({"path":path,"reason":error}));
+                problems.source(path, error, Seen::Reparse);
             }
         }
         for issue in issues.into_iter().chain(batch.issues) {
-            errors.push(json!({"path":issue.path,"reason":issue.reason}));
+            problems.source(json!(issue.path), issue.reason, Seen::Reparse);
         }
-        if !matches!(outcome, ReadOutcome::Complete | ReadOutcome::Undone) && errors.is_empty() {
-            errors
-                .push(json!({"agent":adapter.name(),"reason":format!("source read {outcome:?}")}));
+        if !matches!(outcome, ReadOutcome::Complete | ReadOutcome::Undone) && problems.is_empty() {
+            problems
+                .other(json!({"agent":adapter.name(),"reason":format!("source read {outcome:?}")}));
         }
     }
     Ok(())

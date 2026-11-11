@@ -1,25 +1,59 @@
 use super::*;
 
-pub(super) fn literal_terms(s: &str) -> Vec<String> {
+/// The folded literals every match of `s` begins with, then those it ends with, as groups
+/// of spellings one of which every match holds. Each comes with whether the extractor
+/// found a single literal at that end (see [`Matcher::literal_sets`]). A spelling
+/// containing another adds nothing to its group and is left out. The extractor cuts a
+/// literal past 100 bytes, possibly inside a character, so only its whole characters
+/// remain; a group with an empty spelling, or more than 64, constrains nothing.
+pub(super) fn literal_terms(s: &str) -> Vec<(Vec<String>, bool)> {
     use regex_syntax::hir::literal::{ExtractKind, Extractor};
     let Ok(hir) = regex_syntax::ParserBuilder::new().build().parse(s) else {
         return vec![];
     };
-    let mut out = Vec::new();
-    for kind in [ExtractKind::Prefix, ExtractKind::Suffix] {
+    let mut out: Vec<(Vec<String>, bool)> = Vec::new();
+    for (kind, prefix) in [(ExtractKind::Prefix, true), (ExtractKind::Suffix, false)] {
         let seq = Extractor::new().kind(kind).extract(&hir);
-        let Some([literal]) = seq.literals() else {
+        let Some(literals) = seq.literals().filter(|l| (1..=64).contains(&l.len())) else {
             continue;
         };
-        let literal = String::from_utf8_lossy(literal.as_bytes());
-        if !literal.is_empty() {
-            let literal = store::search_fold(&literal);
-            if !out.contains(&literal) {
-                out.push(literal);
-            }
+        let Some(spellings) = literals
+            .iter()
+            .map(|literal| whole_characters(literal.as_bytes(), prefix).filter(|s| !s.is_empty()))
+            .map(|literal| literal.map(store::search_fold))
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        let mut group: Vec<String> = spellings
+            .iter()
+            .filter(|s| {
+                !spellings
+                    .iter()
+                    .any(|o| o.len() < s.len() && s.contains(o.as_str()))
+            })
+            .cloned()
+            .collect();
+        group.sort_unstable();
+        group.dedup();
+        let single = literals.len() == 1;
+        match out.iter_mut().find(|(existing, _)| *existing == group) {
+            Some(found) => found.1 |= single,
+            None => out.push((group, single)),
         }
     }
     out
+}
+/// The longest prefix of `bytes` that is whole characters, or else suffix: a cut leaves
+/// at most three continuation bytes of a character in front.
+fn whole_characters(bytes: &[u8], prefix: bool) -> Option<&str> {
+    if prefix {
+        return match std::str::from_utf8(bytes) {
+            Ok(s) => Some(s),
+            Err(e) => std::str::from_utf8(&bytes[..e.valid_up_to()]).ok(),
+        };
+    }
+    (0..=bytes.len().min(3)).find_map(|skip| std::str::from_utf8(&bytes[skip..]).ok())
 }
 /// Whether a regular expression matches at most once in a snippet, whose collapsed
 /// whitespace leaves no line break: it is `A.*B` with `A` never empty and `.*` greedy and
@@ -167,10 +201,10 @@ impl Matcher {
         if o.pattern.is_empty() || (terms.is_empty() && !o.regex && !o.word) {
             bail!("a nonempty search pattern is required")
         }
-        let (explicit, required, phrase, capture) = if o.word {
+        let (explicit, literals, phrase, capture) = if o.word {
             (
                 Some(Pattern::word(&o.pattern)?),
-                vec![store::search_fold(&o.pattern)],
+                vec![(vec![store::search_fold(&o.pattern)], true)],
                 None,
                 None,
             )
@@ -198,6 +232,12 @@ impl Matcher {
             let capture = regex::Regex::new(&groups.join(gap))?;
             (None, vec![], Some(capture.clone()), Some(capture))
         };
+        let literal_sets = literals
+            .iter()
+            .filter(|(_, single)| !single)
+            .map(|(group, _)| group.clone())
+            .collect();
+        let required = literals.into_iter().map(|(group, _)| group).collect();
         let query_chars = tokens.iter().map(|t| t.chars().count()).sum();
         let mut stats = Stats::new();
         for token in boundary_rank::query_tokens(&o.pattern) {
@@ -234,6 +274,8 @@ impl Matcher {
             boundary: boundary_rank::prepare_query(&o.pattern, &stats),
             query_chars,
             required,
+            literal_sets,
+            word_terms: HashMap::new(),
             idf: vec![],
             tool_terms: HashMap::new(),
             tool_supported: HashSet::new(),

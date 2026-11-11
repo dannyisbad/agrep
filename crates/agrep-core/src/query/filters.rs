@@ -20,6 +20,19 @@ pub(super) fn id_list(ids: &[i64]) -> String {
     out.push(']');
     out
 }
+/// The agent and speaker filters as rows store them: each name trimmed and lowercase.
+pub(super) fn normalize(f: &mut Filters) {
+    for text in [&mut f.agent, &mut f.who, &mut f.no_who]
+        .into_iter()
+        .flatten()
+    {
+        *text = text
+            .split(',')
+            .map(|part| part.trim().to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join(",");
+    }
+}
 pub(super) fn sql_filters(
     f: &Filters,
     alias: &str,

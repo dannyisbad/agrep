@@ -1,5 +1,8 @@
 use super::*;
 
+/// Symbol rows a bounded plan reads at most, as for its other candidate rows.
+const SYMBOL_ROWS: usize = 65_536;
+
 pub(super) struct TablePlan<'a> {
     pub(super) ctx: PassContext<'a>,
     pub(super) lane_total: usize,
@@ -10,6 +13,8 @@ pub(super) struct TablePlan<'a> {
     pub(super) scope_blocks: Option<ScopeBlocks>,
     pub(super) selective: bool,
     pub(super) bounded: bool,
+    /// Tool rows the symbol index admits (`TablePlan::symbol_rows`).
+    pub(super) symbols: Option<CandidateGroups>,
 }
 impl<'a> TablePlan<'a> {
     pub(super) fn new(ctx: PassContext<'a>, cache: &mut PlanCache) -> Result<Self> {
@@ -72,6 +77,7 @@ impl<'a> TablePlan<'a> {
             && !o.exact
             && o.limit > 0
             && matches!(o.sort.as_str(), "score" | "time");
+        let symbols = Self::symbol_rows(ctx, lane_total, selective, bounded, cache)?;
         Ok(Self {
             ctx,
             lane_total,
@@ -82,7 +88,30 @@ impl<'a> TablePlan<'a> {
             scope_blocks,
             selective,
             bounded,
+            symbols,
         })
+    }
+    /// The tool rows the symbol index admits, read where they spare reading others: in
+    /// plans that may skip the rows no index admits, and on a bounded page, which checks
+    /// them only after its ceilings. A plan reading every admitted row takes up to half
+    /// the lane this way, a bounded one up to [`SYMBOL_ROWS`], and neither more than the
+    /// dictionary's estimate.
+    fn symbol_rows(
+        ctx: PassContext<'_>,
+        lane_total: usize,
+        selective: bool,
+        bounded: bool,
+        cache: &mut PlanCache,
+    ) -> Result<Option<CandidateGroups>> {
+        let m = ctx.m;
+        if ctx.table != "tools" || selective || !(m.plan_anchors || bounded) {
+            return Ok(None);
+        }
+        let Some(expression) = m.symbol_expression() else {
+            return Ok(None);
+        };
+        let cap = if bounded { SYMBOL_ROWS } else { lane_total / 2 };
+        cache.symbol_rows(ctx.c, &expression, cap.min(m.estimated))
     }
     fn scope_blocks(
         ctx: PassContext<'_>,
@@ -136,25 +165,29 @@ impl<'a> TablePlan<'a> {
         let mut blocks = if bounded {
             block_bounds(c, m, now, table, cache, None)?
         } else {
-            vec![(
-                -1,
-                f64::INFINITY,
-                i64::MAX,
-                String::new(),
-                0,
-                c.query_row(
-                    &format!(
-                        "SELECT coalesce(max(max_gap),0) FROM {}",
-                        if table == "tools" {
-                            "tool_blocks"
-                        } else {
-                            "blocks"
-                        }
-                    ),
-                    [],
-                    |r| r.get(0),
-                )?,
-            )]
+            let max_gap = c.query_row(
+                &format!(
+                    "SELECT coalesce(max(max_gap),0) FROM {}",
+                    if table == "tools" {
+                        "tool_blocks"
+                    } else {
+                        "blocks"
+                    }
+                ),
+                [],
+                |r| r.get(0),
+            )?;
+            match &self.symbols {
+                // Such a plan reads only the rows the symbol index admits, by block.
+                Some(symbols) => {
+                    let mut ids: Vec<i64> = symbols.keys().copied().collect();
+                    ids.sort_unstable();
+                    ids.into_iter()
+                        .map(|block| (block, f64::INFINITY, i64::MAX, String::new(), 0, max_gap))
+                        .collect()
+                }
+                None => vec![(-1, f64::INFINITY, i64::MAX, String::new(), 0, max_gap)],
+            }
         };
         if bounded && o.sort == "time" {
             blocks.sort_by(|a, b| b.2.cmp(&a.2).then(a.3.cmp(&b.3)).then(a.4.cmp(&b.4)));

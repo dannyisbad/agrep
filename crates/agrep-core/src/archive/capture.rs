@@ -151,10 +151,11 @@ pub(super) fn capture_one(
         bail!("source changed during capture")
     }
     if archive.repaired > repaired {
+        // Named as the damaged-version list names it: a base name recurs across sessions.
         log(&format!(
             "re-stored {} damaged chunk(s) of {}",
             archive.repaired - repaired,
-            file_name(source)
+            source.path.to_string_lossy()
         ));
     }
     if captured.size == 0 {

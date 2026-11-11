@@ -417,6 +417,66 @@ fn handle_rescue_clamp_and_tool_identity() {
     let bad = handle.replace(claim.event.as_ref().unwrap(), "000000000000000000000000");
     assert_eq!(cli(&h, &d, &["around", &bad], &[]).status.code(), Some(2));
 }
+/// Parallel calls can share a session, turn, time and text: here two reads whose outputs
+/// differ only past the characters ingest keeps. Each row still has a handle of its own,
+/// and `around` serves each handle its own call. The first call by id keeps the selector
+/// such a row always had; the other also hashes its call id.
+#[test]
+fn identical_parallel_calls_get_a_handle_each() {
+    let t = TempDir::new().unwrap();
+    let (h, d) = (t.path().join("h"), t.path().join("d"));
+    let session = "0ddd0000-0000-7000-8000-000000000001";
+    let at = "2026-10-03T12:00:01.000Z";
+    let call = |id: &str| serde_json::json!({"type":"toolCall","id":id,"name":"bash","arguments":{"command":"cat notes.txt"}});
+    let result = |id: &str, parent: &str, filler: usize| serde_json::json!({"type":"message","id":format!("r-{id}"),"parentId":parent,"timestamp":at,"message":{"role":"toolResult","toolCallId":id,"toolName":"bash","isError":false,"content":[{"type":"text","text":format!("needle {}", "y".repeat(filler))}]}});
+    let records = [
+        serde_json::json!({"type":"session","id":session,"version":3,"cwd":"/work/calls","timestamp":at}),
+        serde_json::json!({"type":"message","id":"u0","parentId":null,"timestamp":at,"message":{"role":"user","content":[{"type":"text","text":"read the notes twice"}]}}),
+        serde_json::json!({"type":"message","id":"a0","parentId":"u0","timestamp":at,"message":{"role":"assistant","model":"m","provider":"p","stopReason":"toolUse","content":[call("call-b"),call("call-a")]}}),
+        result("call-b", "a0", 950),
+        result("call-a", "r-call-b", 900),
+    ];
+    let dir = h.join(".pi/agent/sessions/-work-calls");
+    fs::create_dir_all(&dir).unwrap();
+    let lines: Vec<String> = records.iter().map(Value::to_string).collect();
+    fs::write(
+        dir.join(format!("2026-10-03T12-00-00-000Z_{session}.jsonl")),
+        lines.join("\n") + "\n",
+    )
+    .unwrap();
+    ok(cli(&h, &d, &["index"], &[]));
+    let db = Connection::open(d.join("index.db")).unwrap();
+    let stored = |call: &str| -> (i64, String) {
+        let (ts, text) = db
+            .query_row("SELECT ts,text FROM tools WHERE extra=?", [call], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        (ts, agrep_core::store::decode("tools", text).unwrap())
+    };
+    let (ts, text) = stored("call-a");
+    assert_eq!(stored("call-b"), (ts, text.clone()));
+    let rows = values(&ok(cli(
+        &h,
+        &d,
+        &["needle", "--who", "tool", "--json"],
+        &[],
+    )));
+    let found: Vec<&str> = rows.iter().filter_map(|r| r["handle"].as_str()).collect();
+    assert_eq!(found.len(), 2, "{rows:?}");
+    assert_ne!(found[0], found[1]);
+    let mut served = Vec::new();
+    for handle in &found {
+        let window = values(&ok(cli(&h, &d, &["around", handle, "--json"], &[])));
+        let tools: Vec<_> = window.iter().filter(|r| r["kind"] == "tool").collect();
+        assert_eq!(tools.len(), 1, "{handle}: {window:?}");
+        let event = handles::parse(handle).unwrap().event.unwrap();
+        served.push((event, tools[0]["output_chars"].as_u64().unwrap()));
+    }
+    served.sort_by_key(|(_, chars)| *chars);
+    assert_eq!(served[0], (handles::event_id(session, ts, &text), 907));
+    assert_eq!(served[1].1, 957);
+}
 #[test]
 fn caller_window_applies_to_every_machine_lane() {
     let (_t, h, d) = pi();
@@ -2170,7 +2230,8 @@ fn meta_rows_scale_sink_and_mark_as_0_4_9() {
 // terminal and in one pipe holding both streams, was the row, then `3 matches · broader rerun
 // (may repeat): agrep --deeper m.<TOKEN>`, then the --no-auto line. A classic terminal page
 // printed its rows, then its summary, then that line. The footers' own wording differs as
-// PORTING.md says (a floor, no --deeper, the classic summary).
+// PORTING.md says (no --deeper; the classic summary gives a floor). A compact page ranks a
+// full page whatever `-n` asks, so it counts all three matches, as 0.4.9 did.
 #[cfg(unix)]
 #[test]
 fn page_footers_follow_rows_on_a_terminal_and_in_a_pipe() {
@@ -2239,7 +2300,7 @@ fn page_footers_follow_rows_on_a_terminal_and_in_a_pipe() {
     let stale = "history may be stale: automatic freshness checks are disabled by --no-auto";
     let compact = [
         "@01930000:2.18ba pi/user alpha <age> now add jitter to the retry",
-        "2+ matches (floor; -c exact) · larger page: agrep --no-auto --classic -n 80 -- retry",
+        "3 matches · larger page: agrep --no-auto --classic -n 80 -- retry",
         stale,
     ];
     for env in [

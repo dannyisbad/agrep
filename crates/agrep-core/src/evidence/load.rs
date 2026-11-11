@@ -108,16 +108,20 @@ fn has_claim(
             continue;
         }
         let mut q = c.prepare(&format!(
-            "SELECT text,ts FROM {table} WHERE session=? AND position=? AND visible=1"
+            "SELECT text,ts,extra FROM {table} WHERE session=? AND position=? AND visible=1 ORDER BY ts,extra"
         ))?;
+        let mut ids = handles::EventIds::new(session);
         for row in q.query_map(params![session, turn], |r| {
-            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?))
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+            ))
         })? {
-            let (raw, ts) = row?;
+            let (raw, ts, call) = row?;
             let text = store::decode(table, raw)?;
-            if content_digest(&text) == digest
-                && event.is_none_or(|id| handles::event_id(session, ts, &text) == id)
-            {
+            let id = event.map(|_| ids.next_id(turn, ts, &call, &text));
+            if content_digest(&text) == digest && event.is_none_or(|e| id.as_deref() == Some(e)) {
                 return Ok(true);
             }
         }
@@ -169,6 +173,7 @@ pub fn load_events(c: &Connection, session: &str, lo: i64, hi: i64) -> Result<Ve
     let mut q=c.prepare("SELECT e.position,e.ts,e.text,e.body FROM events e WHERE e.visible=1 AND e.session=? AND e.position BETWEEN ? AND ? ORDER BY e.position,e.ts,e.call_id")?;
     let mut events = Vec::new();
     let mut seen = BTreeSet::new();
+    let mut ids = handles::EventIds::new(session);
     for r in q.query_map(params![session, lo, hi], |r| {
         Ok((
             r.get::<_, i64>(0)?,
@@ -184,12 +189,13 @@ pub fn load_events(c: &Connection, session: &str, lo: i64, hi: i64) -> Result<Ve
             .unwrap_or_default();
         let raw: Value = serde_json::from_str(&body)?;
         let string = |key: &str| raw[key].as_str().unwrap_or_default().to_owned();
+        let call = string("call_id");
         // Replay copies of one call share its id; separate identical calls stay separate,
         // and so do copies the replay keeps searchable because their texts differ.
-        if !seen.insert((string("call_id"), text.clone())) {
+        if !seen.insert((call.clone(), text.clone())) {
             continue;
         }
-        let identity = handles::event_id(session, ts, if text.is_empty() { &body } else { &text });
+        let identity = ids.next_id(turn, ts, &call, if text.is_empty() { &body } else { &text });
         let kind = raw["kind"].as_str().unwrap_or("tool");
         let (input, output) = if kind == "control" {
             (string("meta"), String::new())

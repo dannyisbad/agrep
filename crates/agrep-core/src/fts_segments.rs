@@ -9,7 +9,7 @@ use serde::Serialize;
 use std::time::Instant;
 
 /// Every FTS5 table that queries read.
-const TABLES: [&str; 3] = ["prose_fts", "tools_fts", "tool_lexicon"];
+const TABLES: [&str; 4] = ["prose_fts", "tools_fts", "tool_lexicon", "tools_sym"];
 
 /// One level of an FTS5 index: the number of its segments that are inputs to an
 /// unfinished merge, and each segment's size in leaf pages, oldest first.

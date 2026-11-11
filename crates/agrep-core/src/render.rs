@@ -488,7 +488,7 @@ pub fn emit_semantic(
             out += &chat_head(h, n, s.color);
         }
     } else if s.flat {
-        out = flat_page(r, |hit| {
+        out = flat_page(r, s.color, |hit| {
             if s.color {
                 marks.paint(hit, true)
             } else {
@@ -515,29 +515,26 @@ pub fn emit_semantic(
     }
     Ok(())
 }
-/// One tab-separated row per hit: session, agent, project, turn, speaker and snippet. A
-/// machine row list keeps every chat holding a row: a meaning row's forks follow it.
-fn flat_page(r: &Results, snippet: impl Fn(&Hit) -> String) -> String {
+/// One tab-separated row per page row: session, agent, project, turn, speaker and
+/// snippet. A row standing for its copies in forks ends its snippet with `(also in N
+/// forks)`; JSON lists them.
+fn flat_page(r: &Results, color: bool, snippet: impl Fn(&Hit) -> String) -> String {
     let mut out = String::new();
     for h in &r.hits {
-        let snippet = snippet(h);
-        let copies = h
-            .forks
-            .iter()
-            .map(|fork| (&fork.session, &fork.project, fork.turn));
-        for (session, project_name, turn) in
-            std::iter::once((&h.session, &h.project, h.turn)).chain(copies)
-        {
-            out += &format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\n",
-                safe(session),
-                safe(&h.agent),
-                safe(&project(project_name)),
-                turn,
-                safe(&h.who),
-                snippet
-            );
-        }
+        let forks = match forks_note(h) {
+            Some(note) if color => format!("\x1b[2m ({note})\x1b[0m"),
+            Some(note) => format!(" ({note})"),
+            None => String::new(),
+        };
+        out += &format!(
+            "{}\t{}\t{}\t{}\t{}\t{}{forks}\n",
+            safe(&h.session),
+            safe(&h.agent),
+            safe(&project(&h.project)),
+            h.turn,
+            safe(&h.who),
+            snippet(h)
+        );
     }
     out
 }
@@ -577,8 +574,31 @@ fn classic_page(r: &Results, paint: impl Fn(&Hit) -> String) -> String {
     }
     out
 }
-/// A compact page's rows, frozen behind their continuation, and the footer printed below
-/// them.
+/// A compact page's rows in 0.4.9's compact order ([`diversify`]), keyword rows of the
+/// families meaning rows lead last, cut at `limit` (0: none). A compact search ranks at
+/// least the 40 rows of the page without `-n` whatever `-n` asks, so `-n` below 40 cuts the
+/// order of those same rows: such a page is the first rows of each larger one up to 40.
+pub fn compact_order(r: &mut Results, limit: usize) {
+    let mut led = std::mem::take(&mut r.hits);
+    let folded = led.split_off(led.len() - r.hybrid_folded);
+    let mut hits = demote_meta(
+        diversify(demote_meta(led))
+            .into_iter()
+            .chain(folded)
+            .collect(),
+    );
+    if limit > 0 && hits.len() > limit {
+        hits.truncate(limit);
+        // Merged rows the cut left out are more rows the search held.
+        if let Some(more) = r.hybrid_more.as_mut() {
+            *more = true;
+        }
+    }
+    r.hybrid_folded = 0;
+    r.hits = hits;
+}
+/// A compact page's rows, in [`compact_order`], frozen behind their continuation, and the
+/// footer printed below them.
 fn compact_page(
     r: &Results,
     q: &str,
@@ -588,18 +608,12 @@ fn compact_page(
     truncated: bool,
     exhaustible: bool,
 ) -> Result<(String, Option<String>)> {
-    let (led, folded) = r.hits.split_at(r.hits.len() - r.hybrid_folded);
-    let ordered = demote_meta(
-        diversify(demote_meta(led.to_vec()))
-            .into_iter()
-            .chain(folded.iter().cloned())
-            .collect(),
-    );
     // A page merged with meaning rows is cut only when a lane held more, whatever its floor
     // total says (py/search.py:8321-8325).
     let cut = r.hybrid_more.unwrap_or(truncated);
     let frozen = pages::Frozen {
-        records: ordered
+        records: r
+            .hits
             .iter()
             .map(|h| pages::Record {
                 line: compact_line(h, marks),
@@ -816,10 +830,10 @@ mod tests {
         };
         assert!(compact_line(&hit, &Marks::new("", &Style::default())).contains("meaning match"));
     }
-    /// A meaning row standing for its copies in forks says so on the pages people read, and
-    /// the machine row list keeps a row for every chat holding it.
+    /// A meaning row standing for its copies in forks says so on every page: one flat row
+    /// counts them where the classic row does, so `-n` bounds the rows a pipe gets.
     #[test]
-    fn a_folded_meaning_row_names_its_forks_and_flat_rows_keep_them() {
+    fn a_folded_meaning_row_names_its_forks_on_one_row() {
         let fork = |session: &str, turn| crate::query::Fork {
             session: session.into(),
             project: "merger".into(),
@@ -851,13 +865,22 @@ mod tests {
             r.hits = vec![hit];
             r
         };
-        assert!(classic_page(&page(one), |h| h.snippet.clone()).contains(" also in 1 fork"));
-        let flat = flat_page(&page(hit), |h| h.snippet.clone());
+        assert!(classic_page(&page(one.clone()), |h| h.snippet.clone()).contains(" also in 1 fork"));
+        let alone = Hit {
+            forks: Vec::new(),
+            ..hit.clone()
+        };
         assert_eq!(
-            flat,
-            "fork-b\tpi\tmerger\t4\tuser\tdont overfit the prompt\n\
-             fork-a\tpi\tmerger\t4\tuser\tdont overfit the prompt\n\
-             root\tpi\tmerger\t3\tuser\tdont overfit the prompt\n"
+            flat_page(&page(hit), false, |h| h.snippet.clone()),
+            "fork-b\tpi\tmerger\t4\tuser\tdont overfit the prompt (also in 2 forks)\n"
+        );
+        assert_eq!(
+            flat_page(&page(one), true, |h| h.snippet.clone()),
+            "fork-b\tpi\tmerger\t4\tuser\tdont overfit the prompt\x1b[2m (also in 1 fork)\x1b[0m\n"
+        );
+        assert_eq!(
+            flat_page(&page(alone), false, |h| h.snippet.clone()),
+            "fork-b\tpi\tmerger\t4\tuser\tdont overfit the prompt\n"
         );
     }
     /// A keyword row standing for its fork copies says so beside its match quality, lists
@@ -1030,10 +1053,11 @@ mod tests {
     // fixture with its models installed: the strong meaning row, then the other chats'
     // bag-of-words rows, and no footer, since neither lane held more. Under `-n 3` it showed
     // two rows and `7+ matches (floor) · broader rerun (may repeat): agrep --deeper m.<TOKEN>`,
-    // whose rerun PORTING.md drops. The lanes are that fixture's: seven content rows (each
-    // reply naming the secret store, and the vault chat's question) and the meaning rows,
-    // only the vault chat's reply strong. 0.4.9 dropped the vault chat's question as covered
-    // by its meaning row; 0.5 freezes it behind the page, which now says it holds more.
+    // whose rerun PORTING.md drops; 0.5's `-n 3` shows the first three rows of that page. The
+    // lanes are that fixture's: seven content rows (each reply naming the secret store, and
+    // the vault chat's question) and the meaning rows, only the vault chat's reply strong.
+    // 0.4.9 dropped the vault chat's question as covered by its meaning row; 0.5 freezes it
+    // behind the page, which now says it holds more.
     #[test]
     fn hybrid_compact_page_and_footer_match_0_4_9() {
         let row = |chat: u8, who: &str, digest: &str, score: f64, matched: &str, weak: bool| {
@@ -1051,7 +1075,7 @@ mod tests {
                 ..Hit::default()
             }
         };
-        let lanes = |rows: usize| {
+        let lanes = || {
             let mut keyword = Results::default();
             keyword.hits = [
                 (2, "agent", "f529", 0.1752),
@@ -1063,7 +1087,6 @@ mod tests {
                 (0, "agent", "cb01", 0.064),
             ]
             .into_iter()
-            .take(rows)
             .map(|(chat, who, digest, score)| row(chat, who, digest, score, "content-terms", false))
             .collect();
             keyword.total = 7;
@@ -1077,11 +1100,12 @@ mod tests {
             ];
             meaning.total = 4;
             meaning.total_basis = "exact".into();
-            crate::hybrid::merge(keyword, Some(meaning), rows, true)
+            crate::hybrid::merge(keyword, Some(meaning), 40, true)
         };
         let q = "how do we rotate secret credentials";
-        let page = |rows: usize, requested: Option<usize>| {
-            let r = lanes(rows);
+        let page = |requested: Option<usize>| {
+            let mut r = lanes();
+            compact_order(&mut r, requested.unwrap_or(40));
             let s = Style {
                 compact: true,
                 diversify: true,
@@ -1109,7 +1133,7 @@ mod tests {
             (handles, footer)
         };
         assert_eq!(
-            page(40, None),
+            page(None),
             (
                 [
                     "f002:0.f529",
@@ -1125,9 +1149,11 @@ mod tests {
             )
         );
         assert_eq!(
-            page(3, Some(3)),
+            page(Some(3)),
             (
-                ["f002:0.f529", "f005:0.689b"].map(String::from).to_vec(),
+                ["f002:0.f529", "f005:0.689b", "f004:0.d404"]
+                    .map(String::from)
+                    .to_vec(),
                 Some("7+ matches (floor)".to_owned())
             )
         );
@@ -1165,7 +1191,9 @@ mod tests {
             ];
             meaning.total = 2;
             meaning.total_basis = "exact".into();
-            crate::hybrid::merge(keyword, Some(meaning), 40, true)
+            let mut r = crate::hybrid::merge(keyword, Some(meaning), 40, true);
+            compact_order(&mut r, 40);
+            r
         };
         let t = tempfile::tempdir().unwrap();
         let root = crate::data::DataRoot(t.path().to_owned());
@@ -1221,6 +1249,107 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sessions(&text).len(), 8);
+    }
+    // The owner's history for "production deployment live money verification rollback
+    // config": one keyword row, and a meaning lane led by weak neighbors, one of them in the
+    // keyword row's family, ahead of strong rows. A page read the meaning lane only `-n`
+    // rows deep, so the three rows a merge takes changed with `-n`: the page held 1, 1, 3
+    // and 2 rows at -n 1/2/5/10, and the -n 5 page's meaning row of that family was gone at
+    // -n 10. Both lanes are now read as deep as the page without `-n` reads them whatever
+    // `-n` asks, so every page is the first rows of each larger one.
+    #[test]
+    fn a_larger_n_keeps_every_row_of_a_smaller_hybrid_page() {
+        let row = |session: &str, family: &str, matched: &str, score: f64, weak: bool| Hit {
+            handle: format!("@{session}:1.abcd"),
+            session: session.into(),
+            family: family.into(),
+            agent: "pi".into(),
+            who: "agent".into(),
+            turn: 1,
+            text: format!("{session} production deployment rollback"),
+            score,
+            matched: matched.into(),
+            sem_weak: weak,
+            ..Hit::default()
+        };
+        let lanes = |meaning_rows: usize| {
+            let mut keyword = Results::default();
+            keyword.hits = vec![row("kept", "f", "phrase", 0.4, false)];
+            keyword.total = 1;
+            keyword.total_basis = "exact".into();
+            let mut meaning = Results::default();
+            meaning.hits = [
+                ("cousin", "f", 0.88, true),
+                ("near", "g", 0.87, true),
+                ("strong", "h", 0.86, false),
+                ("near2", "i", 0.85, true),
+                ("near3", "j", 0.849, true),
+                ("strong2", "k", 0.848, false),
+                ("strong3", "l", 0.847, false),
+            ]
+            .into_iter()
+            .take(meaning_rows)
+            .map(|(session, family, score, weak)| row(session, family, "semantic", score, weak))
+            .collect();
+            meaning.total = meaning.hits.len();
+            meaning.total_basis = "exact".into();
+            (keyword, meaning)
+        };
+        let sessions =
+            |r: Results| -> Vec<String> { r.hits.into_iter().map(|h| h.session).collect() };
+        let per_n = |n: usize| {
+            let (keyword, meaning) = lanes(n);
+            let mut r = crate::hybrid::merge(keyword, Some(meaning), n, true);
+            compact_order(&mut r, n);
+            sessions(r)
+        };
+        assert_eq!(per_n(5), ["strong", "cousin", "kept"]);
+        assert_eq!(per_n(10), ["kept", "strong"]);
+        let page = |n: usize| {
+            let (keyword, meaning) = lanes(40);
+            let mut r = crate::hybrid::merge(keyword, Some(meaning), 40, true);
+            compact_order(&mut r, n);
+            sessions(r)
+        };
+        let largest = page(20);
+        assert_eq!(largest, ["kept", "strong"]);
+        for n in 1..20 {
+            assert_eq!(page(n), largest[..n.min(largest.len())], "-n {n}");
+        }
+    }
+    // A compact page orders the rows the page without `-n` ranks (lived rows first, each
+    // family's first row before its others), so a smaller `-n` cuts that order rather than
+    // ordering fewer rows, which put a family's second row before another family's first.
+    #[test]
+    fn compact_rows_are_cut_from_the_full_page_order() {
+        let row = |session: &str, family: &str, meta: bool| Hit {
+            session: session.into(),
+            family: family.into(),
+            agent: "pi".into(),
+            matched: "phrase".into(),
+            meta_marker: meta,
+            ..Hit::default()
+        };
+        let ranked = || {
+            let mut r = Results::default();
+            r.hits = vec![
+                row("a1", "a", false),
+                row("a2", "a", false),
+                row("m1", "m", true),
+                row("b1", "b", false),
+                row("c1", "c", false),
+            ];
+            r
+        };
+        let page = |n: usize| {
+            let mut r = ranked();
+            compact_order(&mut r, n);
+            r.hits.into_iter().map(|h| h.session).collect::<Vec<_>>()
+        };
+        assert_eq!(page(0), ["a1", "b1", "c1", "a2", "m1"]);
+        for n in 1..=5 {
+            assert_eq!(page(n), page(0)[..n], "-n {n}");
+        }
     }
     #[test]
     fn compact_meaning_rows_narrow_their_whole_text_around_a_keyword() {

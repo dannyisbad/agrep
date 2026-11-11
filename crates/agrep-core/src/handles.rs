@@ -2,6 +2,7 @@
 use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Claim {
@@ -204,20 +205,82 @@ pub fn normalize(value: &str) -> Result<String> {
         Ok(value.into())
     }
 }
+/// A tool row's event selector: its session, time and text hashed. Parallel calls can
+/// share all three within a turn; a row that does with a visible row of a smaller call
+/// id hashes its own call id too ([`repeat_event_id`]), so that each selector names one
+/// row and the first of them keeps the selector handles named before.
 pub fn event_id(session: &str, ts: i64, text: &str) -> String {
+    selector(&[
+        session.as_bytes(),
+        ts.to_string().as_bytes(),
+        text.as_bytes(),
+    ])
+}
+/// The selector of a tool row repeating the time and text of a smaller call id's row.
+pub fn repeat_event_id(session: &str, ts: i64, text: &str, call: &str) -> String {
+    selector(&[
+        session.as_bytes(),
+        ts.to_string().as_bytes(),
+        text.as_bytes(),
+        call.as_bytes(),
+    ])
+}
+fn selector(fields: &[&[u8]]) -> String {
     let mut state = blake2b_simd::Params::new()
         .hash_length(12)
         .personal(b"agrep-event-v1")
         .to_state();
-    for v in [
-        session.as_bytes(),
-        ts.to_string().as_bytes(),
-        text.as_bytes(),
-    ] {
+    for v in fields {
         state.update(&(v.len() as u64).to_le_bytes());
         state.update(v);
     }
     state.finalize().to_hex().to_string()
+}
+/// The call ids of the visible tool rows `ids` that repeat the time and text of a visible
+/// row with a smaller call id in their turn, by tool id: the rows whose selector is their
+/// [`repeat_event_id`], as [`EventIds`] gives it. One query reads every row.
+pub fn repeated_calls(c: &Connection, ids: &[i64]) -> Result<HashMap<i64, String>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    // Equal blobs are equal texts: tool text is stored once per digest. A common text's
+    // blob is shared by thousands of rows, so the rows are found by turn and time.
+    let found = c
+        .prepare_cached(
+            "SELECT e.tool_id,e.call_id FROM json_each(?1) j JOIN event_rows e INDEXED BY event_tool_id ON e.tool_id=j.value AND e.active=1 JOIN event_sessions s ON s.id=e.session_key WHERE EXISTS(SELECT 1 FROM event_sessions k JOIN event_rows o INDEXED BY event_position ON o.session_key=k.id AND o.position=e.position AND o.ts=e.ts WHERE k.session=s.session AND o.id<>e.id AND o.blob=e.blob AND o.call_id<e.call_id AND o.active=1 AND o.visible=1)",
+        )?
+        .query_map([serde_json::to_string(ids)?], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(found)
+}
+/// Gives the event selectors of one session's tool rows, read in turn, time and call id
+/// order.
+pub struct EventIds<'a> {
+    session: &'a str,
+    /// The turn and time of the rows read last, and their texts and call ids.
+    run: Option<(i64, i64)>,
+    seen: Vec<(String, String)>,
+}
+impl<'a> EventIds<'a> {
+    pub fn new(session: &'a str) -> Self {
+        Self {
+            session,
+            run: None,
+            seen: Vec::new(),
+        }
+    }
+    /// The selector of the next row; `text` is what the selector hashes.
+    pub fn next_id(&mut self, turn: i64, ts: i64, call: &str, text: &str) -> String {
+        if self.run != Some((turn, ts)) {
+            self.run = Some((turn, ts));
+            self.seen.clear();
+        }
+        if self.seen.iter().any(|(t, c)| t == text && c != call) {
+            return repeat_event_id(self.session, ts, text, call);
+        }
+        self.seen.push((text.to_owned(), call.to_owned()));
+        event_id(self.session, ts, text)
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -235,6 +298,71 @@ mod tests {
         assert!(!is_handle("abc:2"));
         assert!(!is_handle("@abc:2"));
         assert!(parse("@abc:2").is_err());
+    }
+
+    /// A row's selector is the same whether search reads the row alone or on a page with
+    /// other rows, or a window reads its turn: only rows repeating the time and text of a
+    /// smaller visible call id in their turn hash their call id, whichever agent read the
+    /// session.
+    #[test]
+    fn a_selector_is_the_same_read_alone_or_with_its_turn() {
+        let c = Connection::open_in_memory().unwrap();
+        crate::store::schema(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO event_sessions VALUES(1,'pi','s'),(2,'codex','s'),(3,'pi','t')",
+        )
+        .unwrap();
+        let texts = [(10, "same"), (11, "other")];
+        // (tool id, session key, call id, time, turn, blob, visible)
+        let rows = [
+            (1, 1, "c", 5, 0, 10, true),
+            (2, 1, "a", 5, 0, 10, true),
+            (3, 1, "b", 5, 0, 10, false),
+            (4, 2, "d", 5, 0, 10, true),
+            (5, 1, "e", 6, 0, 10, true),
+            (6, 1, "f", 5, 1, 10, true),
+            (7, 1, "g", 5, 0, 11, true),
+            (8, 3, "h", 5, 0, 10, true),
+        ];
+        for (id, key, call, ts, turn, blob, visible) in rows {
+            c.execute("INSERT INTO event_rows(id,tool_id,source,session_key,call_id,kind_key,name_key,ts,native_turn,position,input_chars,output_chars,output_bytes,child_session,meta,state,project_key,blob,visible) VALUES(?1,?1,1,?2,?3,0,0,?4,?5,?5,0,0,0,'','','',0,?6,?7)", rusqlite::params![id, key, call, ts, turn, blob, visible]).unwrap();
+        }
+        let text = |blob| texts.iter().find(|(b, _)| *b == blob).unwrap().1;
+        // The selector search gives row `id` when `page` holds the page's repeated calls.
+        let searched = |page: &HashMap<i64, String>, id, session, ts, text| match page.get(&id) {
+            Some(call) => repeat_event_id(session, ts, text, call),
+            None => event_id(session, ts, text),
+        };
+        let visible: Vec<i64> = rows.iter().filter(|r| r.6).map(|r| r.0).collect();
+        let page = repeated_calls(&c, &visible).unwrap();
+        let mut window: Vec<_> = rows.iter().filter(|r| r.6 && r.1 != 3).collect();
+        window.sort_by_key(|r| (r.4, r.3, r.2));
+        let mut ids = EventIds::new("s");
+        let mut repeats = Vec::new();
+        for &&(id, _, call, ts, turn, blob, _) in &window {
+            let in_turn = ids.next_id(turn, ts, call, text(blob));
+            let alone = repeated_calls(&c, &[id]).unwrap();
+            assert_eq!(
+                searched(&alone, id, "s", ts, text(blob)),
+                in_turn,
+                "row {id}"
+            );
+            assert_eq!(
+                searched(&page, id, "s", ts, text(blob)),
+                in_turn,
+                "row {id}"
+            );
+            if in_turn != event_id("s", ts, text(blob)) {
+                assert_eq!(in_turn, repeat_event_id("s", ts, text(blob), call));
+                repeats.push(id);
+            }
+        }
+        repeats.sort();
+        assert_eq!(repeats, [1, 4]);
+        let alone = repeated_calls(&c, &[8]).unwrap();
+        for page in [&alone, &page] {
+            assert_eq!(searched(page, 8, "t", 5, "same"), event_id("t", 5, "same"));
+        }
     }
 
     /// Ids over a small alphabet share long prefixes; agents repeat some ids.

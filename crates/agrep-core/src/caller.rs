@@ -559,14 +559,14 @@ pub fn search_with(
 ) -> Result<Results> {
     let options = options(o, caller, include_self, no_self);
     let mut result = query::search_with(c, &options, plans)?;
-    decorate(c, &mut result, caller)?;
+    decorate(c, &mut result.hits, caller)?;
     Ok(result)
 }
 /// The forced coverage lane under options `caller::options` already scoped, its rows
 /// marked and given handles as search's are.
 pub fn coverage(c: &Connection, o: &Options, caller: &Caller) -> Result<Results> {
     let mut result = query::coverage(c, o)?;
-    decorate(c, &mut result, caller)?;
+    decorate(c, &mut result.hits, caller)?;
     Ok(result)
 }
 /// Session-list surfaces use the same native row predicate as retrieval.
@@ -778,20 +778,30 @@ pub fn decorate_semantic(c: &Connection, result: &mut Results, caller: &Caller) 
     }
     Ok(())
 }
-fn decorate(c: &Connection, result: &mut Results, caller: &Caller) -> Result<()> {
-    if result.hits.is_empty() {
+/// Marks the caller's own keyword rows and gives each its handle.
+pub fn decorate(c: &Connection, hits: &mut [query::Hit], caller: &Caller) -> Result<()> {
+    if hits.is_empty() {
         return Ok(());
     }
     let index = caller.sessions(c)?;
-    for h in &mut result.hits {
+    // Search names its tool rows' events; the coverage lane reads its rows without them.
+    let unnamed: Vec<i64> = hits
+        .iter()
+        .filter(|h| h.who == "tool" && h.event.is_none() && h.span.is_some_and(|(a, b)| b > a))
+        .map(|h| h.rowid)
+        .collect();
+    let repeated = handles::repeated_calls(c, &unnamed)?;
+    for h in hits {
         h.self_marker = caller.resolved && h.agent == caller.agent && h.session == caller.session;
         h.handle = index.mint(&h.session, h.turn, &h.text);
         if h.who == "tool" {
             if let Some((start, end)) = h.span.filter(|(a, b)| b > a) {
-                h.handle += &format!(
-                    "~{}:{start}-{end}",
-                    handles::event_id(&h.session, h.ts, &h.text)
-                );
+                let event = match (&h.event, repeated.get(&h.rowid)) {
+                    (Some(event), _) => event.clone(),
+                    (None, Some(call)) => handles::repeat_event_id(&h.session, h.ts, &h.text, call),
+                    (None, None) => handles::event_id(&h.session, h.ts, &h.text),
+                };
+                h.handle += &format!("~{event}:{start}-{end}");
             }
         }
     }

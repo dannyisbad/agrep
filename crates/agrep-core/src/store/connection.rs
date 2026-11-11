@@ -7,7 +7,7 @@ pub fn reader(root: &DataRoot) -> Result<Connection> {
     loop {
         let c = {
             let _span = crate::semantic_profile::span("reader_open");
-            match settled_unwritable(root) {
+            match settled_uri(&root.db()) {
                 Some(uri) => Connection::open_with_flags(
                     uri,
                     OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -56,18 +56,19 @@ fn unmoved(c: &Connection) -> bool {
     };
     rc != rusqlite::ffi::SQLITE_OK || moved == 0
 }
-/// A WAL reader must create or map `index.db-shm`, which a directory this user may not write
-/// refuses (SQLITE_READONLY_DIRECTORY). Such a root has no agrep writer, so once its WAL holds
-/// no frames the database file is the whole index and opens as immutable.
+/// A WAL reader must create or map the database's `-shm`, which a directory this user may
+/// not write refuses (SQLITE_READONLY_DIRECTORY). Such a root has no agrep writer, so once
+/// the database's WAL holds no frames the file is the whole database and opens as immutable.
 #[cfg(unix)]
-fn settled_unwritable(root: &DataRoot) -> Option<String> {
+pub(crate) fn settled_uri(db: &Path) -> Option<String> {
     use std::os::unix::ffi::OsStrExt;
-    let wal = root.path().join("index.db-wal");
-    if !crate::data::unwritable() || wal.metadata().is_ok_and(|m| m.len() > 0) {
+    let mut wal = db.as_os_str().to_owned();
+    wal.push("-wal");
+    if !crate::data::unwritable() || Path::new(&wal).metadata().is_ok_and(|m| m.len() > 0) {
         return None;
     }
     let mut uri = String::from("file:");
-    for &b in root.db().as_os_str().as_bytes() {
+    for &b in db.as_os_str().as_bytes() {
         if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
             uri.push(b as char);
         } else {
@@ -78,7 +79,7 @@ fn settled_unwritable(root: &DataRoot) -> Option<String> {
     Some(uri)
 }
 #[cfg(not(unix))]
-fn settled_unwritable(_: &DataRoot) -> Option<String> {
+pub(crate) fn settled_uri(_: &Path) -> Option<String> {
     None
 }
 pub fn writer(root: &DataRoot) -> Result<Connection> {
@@ -157,6 +158,7 @@ CREATE TRIGGER IF NOT EXISTS prose_user_count_visibility AFTER UPDATE OF visible
             "CREATE VIRTUAL TABLE IF NOT EXISTS {table}_vocab USING fts5vocab({table}_fts, row);"
         ))?;
     }
+    c.execute_batch(crate::tool_symbols::SCHEMA)?;
     crate::row_stats::schema(c)?;
     c.execute_batch("CREATE TABLE IF NOT EXISTS bound_updates(id INTEGER PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS tool_bound_updates(id INTEGER PRIMARY KEY);

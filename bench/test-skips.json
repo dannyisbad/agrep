@@ -263,6 +263,20 @@
         "cfg(unix)"
       ],
       "reason": "Sends INT, TERM and HUP and hands the hook an inherited descriptor; Windows has no such signals, and Ctrl-C reaches the hook there because it shares agrep's console."
+    },
+    {
+      "test": "crates/agrep/tests/foundation.rs::reindex_keeps_the_rows_below_a_directory_it_cannot_list",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Makes a store directory unlistable with POSIX mode bits, which Windows does not have; reindex_keeps_the_rows_index_keeps_of_sources_it_cannot_read covers sources Windows cannot open."
+    },
+    {
+      "test": "crates/agrep/tests/integrations_archive.rs::status_reads_the_archive_of_an_unwritable_data_directory",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Windows ignores a directory's read-only attribute, so only POSIX permissions can make the data directory unwritable; the catalog-read assertions of the writable case run on every platform."
     }
   ],
   "partial_assertions": [
@@ -369,6 +383,13 @@
         "cfg(windows)"
       ],
       "reason": "Each platform starts a background child through its own shell and converts the output pipe with its own handle type; the time-out and process-tree assertions run on both."
+    },
+    {
+      "test": "crates/agrep/tests/foundation.rs::relative_path_variables_name_the_same_folders_from_any_directory",
+      "gates": [
+        "cfg!(windows)"
+      ],
+      "reason": "Chooses how the expected folder is spelled: canonical on POSIX, lexical on Windows, where canonicalize adds a \\\\?\\ prefix; every platform runs every assertion."
     }
   ],
   "reason": "Only these exact platform gates are permitted. The sole runtime exclusion is the registered Metal capability guard at the start of a GPU-only test; no ignored tests or other runtime skips."

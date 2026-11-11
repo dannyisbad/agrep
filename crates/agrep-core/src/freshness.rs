@@ -166,14 +166,11 @@ impl<'a> Walk<'a> {
             Ok(Some(d)) => d,
             Ok(None) => return,
             Err(error) => {
-                self.issues.lock().unwrap().push(Stamp {
-                    path: path.to_string_lossy().into_owned(),
-                    agent: agent.into(),
-                    size: 0,
-                    mtime_ns: 0,
-                    token: SourceToken::default(),
-                    error: Some(error.to_string()),
-                });
+                let failure = (!root)
+                    .then(|| unlisted(agent, &path))
+                    .flatten()
+                    .unwrap_or_else(|| store::unreadable(agent, &path, &error));
+                self.issues.lock().unwrap().push(failure);
                 return;
             }
         };
@@ -248,7 +245,11 @@ fn walk(cached: HashMap<String, Directory>, listing_ms: f64) -> Census {
                     } else {
                         Path::new(directory).join(name)
                     };
-                    store::stamp_owned(owner, path)
+                    let stamp = store::stamp_owned(owner, path)?;
+                    if stamp.error.is_some() && !name.is_empty() {
+                        return Some(unlisted(owner, Path::new(&stamp.path)).unwrap_or(stamp));
+                    }
+                    Some(stamp)
                 })
                 .collect()
         })
@@ -276,6 +277,14 @@ fn walk(cached: HashMap<String, Directory>, listing_ms: f64) -> Census {
         cached_directories: walk.cache_hits.into_inner(),
         stat_files,
     }
+}
+/// The failure of the folder holding `path` when that folder cannot be listed. A census
+/// that reuses the folder's cached listing reaches `path` without reading the folder, so
+/// the failure of `path` is the folder's, which a census listing it names.
+fn unlisted(agent: &str, path: &Path) -> Option<Stamp> {
+    let folder = path.parent()?;
+    let error = fs::read_dir(folder).err()?;
+    Some(store::unreadable(agent, folder, &error.into()))
 }
 /// The current listing of one freshness root or directory: reused while its mtime
 /// is unchanged, otherwise read again. Only a root may be a link, which is followed to its

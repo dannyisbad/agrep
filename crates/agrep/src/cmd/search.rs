@@ -64,6 +64,13 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
     }
     let caller = caller::Caller::resolve(&c, identity)?;
     let (options, default_rows) = query_options(&s, &pattern, &f, config.tools, compact_page);
+    // A compact page ranks at least the rows of the page without `-n` and orders them as
+    // that page does, so a smaller `-n` only cuts that order.
+    let depth = if compact_page && options.limit > 0 {
+        options.limit.max(default_rows)
+    } else {
+        options.limit
+    };
     let include_self = s.scope.include_self || (s.scope.chat.is_some() && !s.scope.no_self);
     let options = caller::options(&options, &caller, include_self, s.scope.no_self);
     let wants_meaning = !s.semantic
@@ -94,6 +101,8 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
             no_auto,
             pattern: &pattern,
             request,
+            compact_page,
+            depth,
         },
         automatic,
         timing,
@@ -203,6 +212,9 @@ struct Retrieval<'a> {
     no_auto: bool,
     pattern: &'a str,
     request: caller::Request<'a>,
+    compact_page: bool,
+    /// The rows each lane ranks: `-n`, or on a compact page at least a full page's.
+    depth: usize,
 }
 struct Retrieved {
     result: agrep_core::query::Results,
@@ -225,9 +237,15 @@ fn retrieve(
         no_auto,
         pattern,
         request,
+        compact_page,
+        depth,
     } = ctx;
     let lane = if s.semantic || automatic {
-        Some(semantic::begin(root, c, options, !s.scope.all_side_chats))
+        let ranked = Options {
+            limit: depth,
+            ..options.clone()
+        };
+        Some(semantic::begin(root, c, &ranked, !s.scope.all_side_chats))
     } else {
         None
     };
@@ -255,7 +273,12 @@ fn retrieve(
         if s.chats || s.count || s.count_by_tier {
             search(options.limit)?
         } else {
-            agrep_core::forks::keyword_page(c, options.limit, search)?
+            let mut copies = agrep_core::query::Copies::new(c, options);
+            agrep_core::forks::keyword_page(c, depth, &options.sort, search, |row| {
+                let mut found = copies.of(row)?;
+                caller::decorate(c, &mut found, caller)?;
+                Ok(found)
+            })?
         }
     };
     if timing {
@@ -268,7 +291,7 @@ fn retrieve(
     } else {
         keyword_start.elapsed().as_secs_f64() * 1000.
     };
-    let (result, semantic_coverage, keyword_only) = if let Some(lane) = lane {
+    let (mut result, semantic_coverage, keyword_only) = if let Some(lane) = lane {
         match lane.and_then(|work| semantic::finish(c, work)) {
             Ok(mut found) => {
                 caller::decorate_semantic(c, &mut found.result, caller)?;
@@ -282,12 +305,7 @@ fn retrieve(
                     // them (py/search.py:7956-7960).
                     keyword
                 } else {
-                    hybrid::merge(
-                        keyword,
-                        Some(found.result),
-                        options.limit,
-                        !s.scope.all_side_chats,
-                    )
+                    hybrid::merge(keyword, Some(found.result), depth, !s.scope.all_side_chats)
                 };
                 (result, Some(found.coverage), false)
             }
@@ -315,6 +333,9 @@ fn retrieve(
     };
     if timing {
         agrep_core::errln!("{}", serde_json::json!({"keyword_ms":keyword_ms}));
+    }
+    if compact_page {
+        render::compact_order(&mut result, options.limit);
     }
     Ok(std::ops::ControlFlow::Continue(Retrieved {
         result,
